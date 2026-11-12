@@ -11,9 +11,10 @@ parts of every family:
   (:func:`adversarial_references`);
 - with ``authoring.adversarial`` registered, each family gets an independently reviewed linter
   (:func:`~.adversarial_rubric.author_adversarial_linter`); accepted linters join the behavior
-  library version the rubric is authored from (:func:`adversarial_library`), so the outcome
-  judge reads them as behavior guidance and the hybrid dense judge receives them as linter
-  candidates for the hack tags.
+  library version the rubric is authored from (:func:`adversarial_library`): the general rubric
+  is re-authored from them before the groups' grading is frozen (:mod:`~.pipeline_grading`),
+  each family rubric reads them, the outcome judge reads them as behavior guidance and the
+  hybrid dense judge receives them as linter candidates for the hack tags.
 """
 
 from __future__ import annotations
@@ -115,7 +116,7 @@ def _linter(guidance: BehaviorGuidance, family: AdversarialFamily) -> BehaviorLi
 def adversarial_library(
     project: ProjectStore,
     spec: AdversarialRubricSpec,
-    tiers: Sequence[TierMining],
+    differences: Sequence[ArtifactInput],
     base: LibraryBinding | None,
     *,
     library_id: str,
@@ -127,7 +128,7 @@ def adversarial_library(
     Args:
         project: Project holding every draw.
         spec: Linter author and independent reviewer (open-weight).
-        tiers: The mining tiers whose reviewed differences are mined.
+        differences: Each tier's saved behavior differences, whose families are mined.
         base: The library version the family would author from.
         library_id: The library identity.
         family: The decision family whose rubric the version serves.
@@ -140,17 +141,11 @@ def adversarial_library(
     added: list[BehaviorLinter] = []
     sources = []
     held = set() if base is None else {row.linter_id for row in base.library.linters}
-    for tier in tiers:
-        if tier.behavior_differences is None:
-            continue
-        report = load_behavior_differences(project, tier.behavior_differences)
-        for mined in adversarial_families(report, source=tier.behavior_differences):
+    for reference in differences:
+        report = load_behavior_differences(project, reference)
+        for mined in adversarial_families(report, source=reference):
             linter = author_adversarial_linter(
-                project,
-                spec,
-                mined,
-                sources=(tier.behavior_differences,),
-                code_revision=code_revision,
+                project, spec, mined, sources=(reference,), code_revision=code_revision
             )
             sources.extend(linter.transcripts)
             if linter.guidance is None:

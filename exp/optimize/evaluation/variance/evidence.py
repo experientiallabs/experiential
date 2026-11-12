@@ -1,16 +1,14 @@
 """The privileged evidence packet point selectors and critics read about one group of attempts.
 
 The agent under test never sees this packet. Point selectors and critics see all of it: every
-attempt in the group with its whole trajectory and historical grade, the group's historical
-verifier rate, the task verifier (the mechanical specification those grades come from), every
-reference or specification the run registered, and, for the one trajectory whose value is being
-estimated, every boundary at which a continuation could start, each with the conversation the
-actor had seen by then.
+attempt in the group with its whole trajectory and, when the run registered them, the frozen
+rubric judge's verdict and criterion findings for it, the group's judged pass rate, the rubric the
+judge applies, every other reference or specification the run registered, and, for the one
+trajectory whose value is being estimated, every boundary at which a continuation could start,
+each with the conversation the actor had seen by then.
 
-The group grades and rate are **historical diagnostics** of the mechanical verifier. They are not
-the success labels the run's critics are scored against: continuation outcomes are labelled only
-by the frozen episode judge (:mod:`~exp.optimize.evaluation.variance.judged`), and the packet says
-so in its ``label_authority`` entry.
+The only grades are the frozen episode judge's, registered as a ``judge_verdicts`` reference;
+without it the packet carries no grade and says so.
 
 The packet also names what it does *not* contain. Every reference kind the run did not register is
 listed as unavailable, and so is any independent correctness label, so a role is never told it
@@ -20,11 +18,11 @@ inventory, so an answer that cites anything else is refused rather than trusted.
 Locators address exact pieces of evidence, which :func:`execute_evidence_tool` (the read-only
 tools a role calls inside :mod:`exp.optimize.evaluation.variance.evidence_tools`) fetches:
 
-- ``group`` and ``verifier``: the group summary and the declared grader specification;
+- ``group``: the group summary, with the judged pass rate when verdicts were registered;
 - ``attempt:<n>``: one attempt's summary; ``attempt:<n>/step:<i>`` its ``i``-th tool turn
   (1-based, so point ``i`` is the boundary after it); ``attempt:<n>/call:<i>`` its ``i``-th
   actor model output (1-based);
-- ``grade:<n>``: the grader evidence for attempt ``n``: its grade and the evaluator projection;
+- ``grade:<n>``: the judge's verdict, findings and evaluator projection for attempt ``n``;
 - ``point:<k>``: one offered checkpoint with the actor-visible prefix at that boundary;
 - ``reference:<name>``: one registered reference; a rule book also exposes ``rule:<id>`` and
   ``contract:<tool>`` entries, and a ``traceml-labels`` artifact registered as
@@ -39,7 +37,7 @@ tools a role calls inside :mod:`exp.optimize.evaluation.variance.evidence_tools`
 Two derived views are computed from those documents, never from anything else:
 :func:`compare_attempts` lines attempts up step by step, and :func:`divergence_points` lists, for
 every group of attempts sharing an identical action history, the step at which they split, with
-each branch's historical grades. :class:`TraceSearch` serves read-only, tag-aware retrieval over
+each branch's judged verdicts. :class:`TraceSearch` serves read-only, tag-aware retrieval over
 world-learning traces only.
 
 Point ``k`` of the picked trajectory is the boundary before its ``k``-th tool turn: point 0 is the
@@ -58,7 +56,7 @@ from pydantic import Field, JsonValue
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject
 from exp.common.models import ToolCall
 from exp.common.project import ArtifactStore, artifact_input
-from exp.optimize.evaluation.continuations.study import ContinuationStudy, known_outcomes
+from exp.optimize.evaluation.continuations.study import ContinuationStudy
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
 from exp.simulation.continuations import ContinuationCheckpoint
 from exp.simulation.retrieval.contracts import RAGAction, RAGQuery
@@ -78,8 +76,9 @@ ReferenceKind = Literal[
     "traceml_labels",
     "error_points",
     "behavior_differences",
+    "judge_verdicts",
 ]
-"""Reference or specification material a run may register beside the verifier."""
+"""Reference or specification material a run may register."""
 
 REFERENCE_KINDS: tuple[ReferenceKind, ...] = (
     "task_specification",
@@ -90,8 +89,12 @@ REFERENCE_KINDS: tuple[ReferenceKind, ...] = (
     "traceml_labels",
     "error_points",
     "behavior_differences",
+    "judge_verdicts",
 )
 """Every reference kind, in the order unavailable kinds are named."""
+
+JUDGE_VERDICTS_TYPE = "judge-verdicts"
+"""Artifact type a ``judge_verdicts`` reference must have; its producer is not imported here."""
 
 TRACEML_LABELS_TYPE = "traceml-labels"
 """Artifact type a ``traceml_labels`` reference must have; its producer is not imported here."""
@@ -103,16 +106,14 @@ _TYPED = {
     "traceml_labels": TRACEML_LABELS_TYPE,
     "error_points": ERROR_POINTS_TYPE,
     "behavior_differences": "behavior-differences",
+    "judge_verdicts": JUDGE_VERDICTS_TYPE,
 }
 """Reference kinds that must come from one artifact type."""
 
+NO_VERDICTS: JsonObject = {"material": "judged_verdicts", "reason": "not registered; no grades"}
+"""Named when a packet has no ``judge_verdicts`` reference."""
+
 ALWAYS_UNAVAILABLE: tuple[JsonObject, ...] = (
-    {
-        "material": "independent_correctness_labels",
-        "reason": "group grades come only from the declared mechanical verifier and are "
-        "historical diagnostics; continuation labels come from the frozen episode judge, whose "
-        "verdicts on these attempts are not supplied",
-    },
     {
         "material": "actor_hidden_reasoning",
         "reason": "only actor-visible messages, tool calls and returned outputs are recorded",
@@ -123,11 +124,11 @@ ALWAYS_UNAVAILABLE: tuple[JsonObject, ...] = (
 _TRACE_KEYS = frozenset({"steps", "model_calls"})
 """Outcome keys served as trajectory locators rather than as grader evidence."""
 
-_HISTORICAL = (
-    "historical mechanical verifier diagnostic; continuation success labels come only from the "
-    "frozen episode judge"
+_AUTHORITY = (
+    "frozen rubric judge over the epoch's rubric; the only grade on this path, also labelling "
+    "every continuation"
 )
-"""How the packet labels every verifier grade it shows."""
+"""How the packet labels every verdict it shows."""
 
 
 class ReferenceSource(ContractModel):
@@ -227,19 +228,22 @@ def load_references(
     return tuple(loaded)
 
 
-def group_rate(study: ContinuationStudy) -> tuple[int, int]:
-    """Return the historical verifier ``(passes, graded)`` over the group's attempts.
+def judged_verdicts(references: Sequence[LoadedReference]) -> dict[int, JsonObject]:
+    """Return each attempt's verdict row of the ``judge_verdicts`` reference, if registered."""
+    rows: dict[int, JsonObject] = {}
+    for loaded in references:
+        content = loaded.content if loaded.source.kind == "judge_verdicts" else None
+        attempts = content.get("attempts") if isinstance(content, dict) else None
+        for row in attempts if isinstance(attempts, list) else []:
+            if isinstance(row, dict) and isinstance(attempt := row.get("attempt"), int):
+                rows[attempt] = row
+    return rows
 
-    This is a diagnostic of the mechanical verifier, never the judged success rate.
 
-    Args:
-        study: The group of attempts.
-
-    Returns:
-        Passing attempts and attempts with a known grade.
-    """
-    labels = known_outcomes(branch.assessment for branch in study.branches)
-    return sum(labels), len(labels)
+def judged_rate(verdicts: Mapping[int, JsonObject]) -> tuple[int, int]:
+    """Return the judged ``(passes, judged)`` over a group's verdict rows."""
+    judged = [row["verdict"] for row in verdicts.values() if row.get("verdict") in ("pass", "fail")]
+    return sum(verdict == "pass" for verdict in judged), len(judged)
 
 
 def candidate_branches(study: ContinuationStudy) -> tuple[int, ...]:
@@ -321,34 +325,31 @@ def evidence_packet(
     )
     if len(points) < 2:
         raise ValueError(f"group attempt {branch} offers fewer than two continuable points")
-    passes, graded = group_rate(study)
+    verdicts = judged_verdicts(references)
+    passes, judged = judged_rate(verdicts)
     group: JsonObject = {
         "attempts_planned": len(study.branches),
-        "attempts_graded": graded,
+        "attempts_judged": judged,
         "passes": passes,
-        "success_rate": None if graded == 0 else passes / graded,
-        "label_authority": _HISTORICAL,
+        "success_rate": None if judged == 0 else passes / judged,
+        "label_authority": _AUTHORITY if verdicts else "no verdicts registered",
     }
-    verifier = study.spec.verifier.model_dump(mode="json")
-    documents: dict[str, JsonValue] = {"group": group, "verifier": verifier}
-    has_differences = any(ref.source.kind == "behavior_differences" for ref in references)
-    unavailable: list[JsonValue] = [
-        dict(row)
-        for row in ALWAYS_UNAVAILABLE
-        if not (has_differences and row["material"] == "independent_correctness_labels")
-    ]
+    documents: dict[str, JsonValue] = {"group": group}
+    unavailable: list[JsonValue] = [dict(row) for row in ALWAYS_UNAVAILABLE]
+    if not verdicts:
+        unavailable.append(dict(NO_VERDICTS))
     attempts: list[JsonValue] = []
     summaries: list[JsonValue] = []
     for row in study.branches:
-        grade = None if row.assessment is None else row.assessment.model_dump(mode="json")
+        verdict = verdicts.get(row.index)
         steps, calls = _rows(row.outcome.get("steps")), _rows(row.outcome.get("model_calls"))
         attempts.append(
-            {"attempt": row.index, "status": row.status, "grade": grade, "outcome": row.outcome}
+            {"attempt": row.index, "status": row.status, "grade": verdict, "outcome": row.outcome}
         )
         summary: JsonObject = {
             "attempt": row.index,
             "status": row.status,
-            "grade_status": None if row.assessment is None else row.assessment.status,
+            "grade_status": None if verdict is None else verdict.get("verdict"),
             "tool_turns": len(steps),
             "model_calls": len(calls),
             "saved_checkpoints": len(row.checkpoints),
@@ -360,14 +361,15 @@ def evidence_packet(
             documents[f"attempt:{row.index}/step:{turn}"] = step
         for number, call in enumerate(calls, start=1):
             documents[f"attempt:{row.index}/call:{number}"] = _call_output(call)
-        documents[f"grade:{row.index}"] = {
-            "grade": grade,
-            "grader": "verifier",
-            "label_authority": _HISTORICAL,
-            "evaluator_projection": {
-                key: value for key, value in row.outcome.items() if key not in _TRACE_KEYS
-            },
-        }
+        if verdict is not None:
+            documents[f"grade:{row.index}"] = {
+                "grade": verdict,
+                "grader": "rubric judge",
+                "label_authority": _AUTHORITY,
+                "evaluator_projection": {
+                    key: value for key, value in row.outcome.items() if key not in _TRACE_KEYS
+                },
+            }
         if row.status != "completed":
             unavailable.append(
                 {
@@ -411,7 +413,6 @@ def evidence_packet(
         )
     rendered: JsonObject = {}
     supplied: list[JsonValue] = [
-        {"material": "grader_specification", "locator": "verifier"},
         {"material": "environment_and_harness_definition", "locator": "environment"},
         {"material": "declared_tool_schemas", "locator": "tool:<name>"},
     ]
@@ -458,7 +459,6 @@ def evidence_packet(
     }
     payload: JsonObject = {
         "group": group,
-        "verifier": verifier,
         "environment": environment,
         "attempts": attempts,
         "picked_attempt": branch,
@@ -468,7 +468,6 @@ def evidence_packet(
     }
     overview: JsonObject = {
         "group": group,
-        "verifier": verifier,
         "attempts": summaries,
         "picked_attempt": branch,
         "checkpoint_inventory": inventory,
@@ -597,7 +596,7 @@ def _histories(documents: Mapping[str, JsonValue]) -> dict[int, list[JsonValue]]
 
 
 def _grade_status(documents: Mapping[str, JsonValue], attempt: int) -> JsonValue:
-    """Return one attempt's historical grade status, or None when it has none."""
+    """Return one attempt's judged verdict, or None when it has none."""
     summary = documents.get(f"attempt:{attempt}")
     return summary.get("grade_status") if isinstance(summary, dict) else None
 
@@ -649,7 +648,7 @@ def compare_attempts(
             for a in attempts
         },
         "steps": rows,
-        "label_authority": _HISTORICAL,
+        "label_authority": _AUTHORITY,
     }
 
 
@@ -662,7 +661,7 @@ def divergence_points(documents: Mapping[str, JsonValue]) -> JsonObject:
     Returns:
         One row per split: the step (1-based) at which attempts with identical earlier actions
         took different actions, the shared attempts, and each branch's attempts, first action
-        and historical grade statuses. An attempt that stops while others continue is its own
+        and judged verdicts. An attempt that stops while others continue is its own
         branch with a null action.
     """
     histories = _histories(documents)
@@ -700,7 +699,7 @@ def divergence_points(documents: Mapping[str, JsonValue]) -> JsonObject:
             )
         frontier.extend((step + 1, rows) for rows in live.values() if len(rows) > 1)
     splits.sort(key=lambda row: (row[0], row[1]))
-    return {"divergence_points": [row for _, _, row in splits], "label_authority": _HISTORICAL}
+    return {"divergence_points": [row for _, _, row in splits], "label_authority": _AUTHORITY}
 
 
 class TraceSearchSpec(ContractModel):

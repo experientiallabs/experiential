@@ -27,8 +27,8 @@ the judge definition. :func:`require_run` refuses, before any judge call, a run 
 differ from the ones the judge binds, so a judge bound to a frozen variant labels only episodes
 that ran from that variant's start under its frozen runtime definition.
 
-The mechanical verifier grade the continuation owners still compute is simulator and protocol
-diagnostics only; nothing here reads it.
+The decision-variance studies register no mechanical verifier, so their branches carry no
+mechanical grade; the judge's verdict is the only label.
 """
 
 from __future__ import annotations

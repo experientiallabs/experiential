@@ -7,11 +7,14 @@
    world-learning index and world model, and the tag retrieval bindings.
 2. ``rules``: the learned rule book over world-learning traces, its boundary workloads executed
    against the bound world, then the rule book frozen and bound into the mining job before any
-   probe runs.
-3. ``traceml``: each tier's group of mining-probe attempts labelled step by step and registered
-   as a reference for that tier's selectors and critics (optional, on by default).
-4. ``error-mining``: the mining-probe task's rubric (registered, or authored over a whole-task
-   packet), then one actor-critic run per actor tier, never pooled, each labelled by an episode
+   probe runs; then the mining-probe task's general rubric (registered, or authored over a
+   whole-task packet and the epoch's behavior library), the sole grader of every attempt.
+3. ``traceml``: each tier's group of mining-probe attempts, judged by the general rubric (with
+   behavior tags, reviewed Added/Removed differences and, when adversarial linters are on, one
+   rubric revision from the mined hack and failure modes, frozen for the epoch), then labelled
+   step by step and registered as a reference for that tier's selectors and critics (optional,
+   on by default; without it error mining grades the groups the same way).
+4. ``error-mining``: one actor-critic run per actor tier, never pooled, each labelled by an episode
    judge whose profile is fixed before any family rubric, its selectors and critics searching
    the scoped world-learning index; optionally driven by the training schedule.
 5. ``families``: per screened point, the coalition evidence, one authoring packet with observed
@@ -20,8 +23,8 @@
    starts (options forced by the decision-state author's calls unless the spec gives actions),
    judged confirmation, the rubric-revision loop when judging reports rubric problems, and
    admission.
-6. ``records``: training records of admitted families, selector records, executable
-   qualification and Harbor exports of admitted variants, and the optional cross-talk probe.
+6. ``records``: training records of admitted families, selector records, judged acceptance and
+   simulator-only Harbor exports of admitted variants, and the optional cross-talk probe.
 
 **Bootstrap.** ``mining.bootstrap`` may name a task's registered start in a frozen
 start-bootstrap batch instead of a hand-registered ``mining.job``; the entry resolves it to the

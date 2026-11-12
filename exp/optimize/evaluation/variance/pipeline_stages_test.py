@@ -55,10 +55,8 @@ def test_an_attempt_past_the_priced_step_bound_is_labelled_over_its_first_steps(
     assert pipeline_stages.labelled_steps(empty, "actor-kimi", 80) == []
 
 
-def test_zero_qualified_points_means_zero_rubric_author_calls(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Run 31 authored the mining rubric although no point of any attempt qualified."""
+def test_a_tier_without_a_qualified_point_stops_mining_before_any_pick(tmp_path: Path) -> None:
+    """The pick-time guard refuses mining until every gated tier has a qualified point."""
     from exp.common.project import ProjectStore
     from exp.optimize.evaluation.variance.point_bar import (
         DEFAULT_BAR,
@@ -68,15 +66,7 @@ def test_zero_qualified_points_means_zero_rubric_author_calls(
     from exp.optimize.evaluation.variance.point_selection import save_point_bar
     from exp.optimize.evaluation.variance.reward_states import PointState
 
-    project = ProjectStore(tmp_path, "eligible-rubric")
-    authored: list[object] = []
-    rubric = ArtifactInput(artifact_id="rubric-authored", sha256="1" * 64)
-
-    def author(context: object, build: object, rules: object) -> tuple[ArtifactInput, None]:
-        authored.append(context)
-        return rubric, None
-
-    monkeypatch.setattr(pipeline_stages, "mining_rubric", author)
+    project = ProjectStore(tmp_path, "pickable-tiers")
 
     def bars(*states: PointState) -> ArtifactInput:
         """Save one tier's attempts, one point per attempt in the given states."""
@@ -91,41 +81,26 @@ def test_zero_qualified_points_means_zero_rubric_author_calls(
         }
         return save_point_bar(project.artifacts, DEFAULT_BAR, records, code_revision="test")
 
-    spec = SimpleNamespace(
-        mining=SimpleNamespace(rubric=None, qualification=object(), schedule=None)
-    )
+    spec = SimpleNamespace(mining=SimpleNamespace(qualification=object(), schedule=None))
     context = SimpleNamespace(project=project, spec=spec)
 
-    def rubric_for(traceml: SimpleNamespace) -> object:
-        """Ask the stage helper for the rubric over these tiers' saved bars."""
-        return pipeline_stages.eligible_rubric(
-            cast(Any, context), cast(Any, None), cast(Any, None), cast(Any, traceml)
-        )
+    def guard(traceml: SimpleNamespace) -> None:
+        """Run the stage guard over these tiers' saved bars."""
+        pipeline_stages.require_pickable_tiers(cast(Any, context), cast(Any, traceml))
 
     rejected = bars(PointState.REJECTED, PointState.UNCERTAIN)
-    none = SimpleNamespace(point_bars={"actor-kimi": rejected, "actor-mimo": rejected})
     with pytest.raises(ValueError, match="no point qualified by the bar"):
-        rubric_for(none)
-    assert authored == []
-
-    one = SimpleNamespace(
-        point_bars={
-            "actor-kimi": bars(PointState.UNCERTAIN, PointState.QUALIFIED),
-            "actor-mimo": rejected,
-        }
-    )
+        guard(SimpleNamespace(point_bars={"actor-kimi": rejected, "actor-mimo": rejected}))
+    one = {"actor-kimi": bars(PointState.UNCERTAIN, PointState.QUALIFIED), "actor-mimo": rejected}
     with pytest.raises(ValueError, match="actor-mimo"):
-        rubric_for(one)
-    assert authored == []
-
-    every = SimpleNamespace(
-        point_bars={
-            "actor-kimi": bars(PointState.QUALIFIED),
-            "actor-mimo": bars(PointState.QUALIFIED),
-        }
+        guard(SimpleNamespace(point_bars=one))
+    every = {"actor-kimi": bars(PointState.QUALIFIED), "actor-mimo": bars(PointState.QUALIFIED)}
+    guard(SimpleNamespace(point_bars=every))
+    ungated = SimpleNamespace(
+        project=project,
+        spec=SimpleNamespace(mining=SimpleNamespace(qualification=None, schedule=None)),
     )
-    assert rubric_for(every) == (rubric, None)
-    assert len(authored) == 1
+    pipeline_stages.require_pickable_tiers(cast(Any, ungated), cast(Any, SimpleNamespace()))
 
 
 def test_a_simulator_ending_is_masked_from_the_bar_but_kept_in_the_record() -> None:
@@ -152,7 +127,10 @@ def test_a_simulator_ending_is_masked_from_the_bar_but_kept_in_the_record() -> N
     assert branch.outcome["steps"] == steps
     legacy = branch.model_copy(update={"failure_detail": None})
     assert pipeline_stages.labelled_steps(legacy, "actor-kimi", 80) == steps[:2]
-    actor = branch.model_copy(
+    # A verifier-derived actor attribution no longer decides: the phase does.
+    graded = branch.model_copy(
         update={"failure_detail": detail.model_copy(update={"attribution": "actor"})}
     )
+    assert pipeline_stages.labelled_steps(graded, "actor-kimi", 80) == steps[:2]
+    actor = branch.model_copy(update={"failure": "InvisibleToolCallError", "failure_detail": None})
     assert pipeline_stages.labelled_steps(actor, "actor-kimi", 80) == steps

@@ -289,8 +289,8 @@ class MiningSettings(ContractModel):
         rubric: Saved ``episode-rubric`` of the mining-probe task the episode judge applies, or
             None to author it: the agentic rubric author (``authoring.rubric_author`` with
             ``authoring.rubric_profile``) reads a whole-task authoring packet over the
-            rule-bound start, the world-learning sources, the rule book and observed replay
-            episodes, after the judge profile is fixed.
+            rule-bound start, the world-learning sources, the rule book, observed replay
+            episodes and the epoch's behavior library, in the rules stage before any attempt.
         judge: Admitted episode-judge request settings.
         judge_prompt_set: Episode-judge prompt set, fixed in the profile before any rubric.
         judge_evidence_tool_budget: Event ranges the judge may read when evidence is large.
@@ -534,6 +534,19 @@ class AuthoringSettings(ContractModel):
         if len(self.actions) == 1:
             raise ValueError("give two or more option actions, or none to derive them")
         return self
+
+    def adversarial_spec(self) -> AdversarialRubricSpec | None:
+        """Return the adversarial linter settings with their roles bound, or None when off."""
+        if self.adversarial is None:
+            return None
+        return self.adversarial.model_copy(
+            update={
+                "author": self.adversarial.author or self.rubric_author,
+                "reviewer": self.adversarial.reviewer
+                or self.decision_reviewer
+                or self.rubric_author,
+            }
+        )
 
     def decision_measure(self) -> DecisionMeasureSpec | None:
         """Return the family's decision-variance measurement, or None when it is off."""
@@ -818,6 +831,11 @@ class RulesOutputs(ContractModel):
         job: The mining job bound to the build's world, its binding, the rule book and the rule
             memory, with a start captured there.
         rule_memory: The governed rule memory set and its recall policy, under ``jev_memory``.
+        rubric: The mining-probe task's general rubric: registered, or authored once the rule
+            book is frozen. It is the sole grader of every attempt and is frozen for the epoch.
+        rubric_packet: The whole-task packet the rubric was authored from, when it was authored.
+        rubric_library: The behavior library version (with its reviewed adversarial linters)
+            the authored rubric was assembled from, when one was saved.
     """
 
     report: ArtifactInput
@@ -825,6 +843,9 @@ class RulesOutputs(ContractModel):
     challenges: int = Field(default=0, ge=0)
     job: ContinuationJob
     rule_memory: RuleMemoryBinding | None = None
+    rubric: ArtifactInput
+    rubric_packet: ArtifactInput | None = None
+    rubric_library: ArtifactInput | None = None
 
 
 class TraceMLOutputs(ContractModel):
@@ -838,6 +859,15 @@ class TraceMLOutputs(ContractModel):
         error_points: Each tier's saved ``error-points``: every attempt's points ranked by its
             step error tags, registered as that tier's selector and critic reference.
         point_bars: Each tier's saved ``point-bar-records`` under ``mining.qualification``.
+        judged: Each tier's group judged by the epoch's frozen rubric, the grading every later
+            reader reuses.
+        behavior_differences: Each tier's reviewed behavior differences over its judged group,
+            under ``mining.behaviors``.
+        rubric: The rubric the groups were graded by: the rules stage's general rubric, or its
+            revision from the groups' adversarial linters. Frozen for the rest of the epoch.
+        rubric_packet: The packet ``rubric`` was authored from, when it was authored.
+        rubric_library: The behavior library version ``rubric`` was assembled from, if any.
+        rubric_revised: Whether ``rubric`` was re-authored from the groups' adversarial linters.
     """
 
     groups: dict[str, ArtifactInput] = Field(default_factory=dict)
@@ -846,6 +876,12 @@ class TraceMLOutputs(ContractModel):
     error_steps: dict[str, ArtifactInput] = Field(default_factory=dict)
     error_points: dict[str, ArtifactInput] = Field(default_factory=dict)
     point_bars: dict[str, ArtifactInput] = Field(default_factory=dict)
+    judged: dict[str, ArtifactInput] = Field(default_factory=dict)
+    behavior_differences: dict[str, ArtifactInput] = Field(default_factory=dict)
+    rubric: ArtifactInput | None = None
+    rubric_packet: ArtifactInput | None = None
+    rubric_library: ArtifactInput | None = None
+    rubric_revised: bool = False
 
 
 class TierMining(ContractModel):

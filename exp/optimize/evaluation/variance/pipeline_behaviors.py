@@ -1,4 +1,9 @@
-"""Mixed behavioral tags and reviewed difference groups in the decision-variance pipeline."""
+"""Behavior tags and reviewed difference groups in the decision-variance pipeline.
+
+Every attempt's steps are answered with the authored behavior bank: genuine-work tags and
+hack or failure-mode tags, with the polarity the bank's families declare. Judged passes are
+paired with judged failures of the same task and the reviewed Added/Removed signatures grouped.
+"""
 
 from __future__ import annotations
 
@@ -14,16 +19,12 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation.continuations.job import (
-    ContinuationJob,
-    continuation_result_reference,
-    execute_continuation_job,
-    saved_continuation_job,
-)
+from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.executable.costs import evaluation_costs
 from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost
 from exp.optimize.evaluation.variance.behavior_differences import (
     BEHAVIOR_DIFFERENCES_TYPE,
+    BehaviorDifferenceSpec,
 )
 from exp.optimize.evaluation.variance.behavior_pairs import (
     compact_differences,
@@ -31,7 +32,6 @@ from exp.optimize.evaluation.variance.behavior_pairs import (
 )
 from exp.optimize.evaluation.variance.evidence import ReferenceSource
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
-from exp.optimize.evaluation.variance.judged import EpisodeJudge, judge_study
 from exp.optimize.evaluation.variance.pipeline_inputs import admitted_transport
 from exp.optimize.evaluation.variance.pipeline_spec import (
     DecisionVarianceSpec,
@@ -45,20 +45,37 @@ from exp.simulation.mining.tagging import DecisionCache
 
 
 def behavior_bank(spec: DecisionVarianceSpec) -> QuestionBank | None:
-    """Resolve the exact local mixed vocabulary before pricing or provider dispatch."""
+    """Resolve the exact local behavior bank before pricing or provider dispatch."""
+    resolved = behavior_settings(spec)
+    return None if resolved is None else resolved[1]
+
+
+def behavior_settings(
+    spec: DecisionVarianceSpec,
+) -> tuple[BehaviorDifferenceSpec, QuestionBank] | None:
+    """Return the behavior settings resolved against their authored bank, and the bank.
+
+    The polarity comes from the bank's declared families unless the settings declare it; the
+    pair aligner defaults to the rubric author and the auditor to the decision reviewer.
+    """
     settings = spec.mining.behaviors
     if settings is None:
         return None
     bank = resolve_question_bank(settings.bank_id, root=spec.traceml.bank_root)
-    settings.check_bank(bank)
-    return bank
+    authoring = spec.authoring
+    resolved = settings.resolved(
+        bank, authoring.rubric_author, authoring.decision_reviewer or authoring.rubric_author
+    )
+    return resolved, bank
 
 
 def behavior_costs(project: ProjectStore, spec: DecisionVarianceSpec) -> tuple[CostComponent, ...]:
     """Bound per-step tagging plus one alignment and independent audit per proposed pair."""
-    settings, bank = spec.mining.behaviors, behavior_bank(spec)
-    if settings is None or bank is None:
+    resolved = behavior_settings(spec)
+    if resolved is None:
         return ()
+    settings, bank = resolved
+    assert settings.author is not None and settings.reviewer is not None
     mining = spec.mining
     steps = mining.registered.maximum_model_calls * (spec.traceml.steps_per_call + 1)
     calls = mining.attempts * steps * math.ceil(len(bank.questions) / 32)
@@ -78,34 +95,41 @@ def behavior_lines(spec: DecisionVarianceSpec) -> tuple[str, ...]:
     if settings is None:
         return ()
     return (
-        f"Behavior differences: mixed bank {settings.bank_id}, up to {settings.maximum_pairs} "
-        "same-task pairs per tier, one alignment and independent audit per pair; accepted "
-        "Added/Removed groups inform selectors and rubrics, never actor rewards.",
+        f"Behavior differences: authored bank {settings.bank_id} answered on every step of every "
+        f"attempt, up to {settings.maximum_pairs} same-task judged pass/fail pairs per tier, one "
+        "alignment and independent audit per pair; accepted Added/Removed groups (adversarial "
+        "families first) inform the rubric, selectors and critics, never actor rewards.",
     )
 
 
-def prepare_behavior_reference(
+def behavior_differences(
     context: StageContext,
     job: ContinuationJob,
-    judge: EpisodeJudge,
+    source: ArtifactInput,
+    judged: ArtifactInput,
     exposure: ExposurePlan,
 ) -> ArtifactInput | None:
-    """Judge the saved actor group before selectors, then mine its reviewed differences."""
+    """Mine one tier's reviewed behavior differences over its judged group, when enabled.
+
+    Args:
+        context: The running stage.
+        job: The tier's group job.
+        source: The tier's saved group result.
+        judged: The group judged by the rubric judge.
+        exposure: The frozen data roles.
+
+    Returns:
+        The saved behavior differences, or None without ``mining.behaviors``.
+    """
     spec, project = context.spec, context.project
-    settings, bank = spec.mining.behaviors, behavior_bank(spec)
-    if settings is None or bank is None:
+    resolved = behavior_settings(spec)
+    if resolved is None:
         return None
-    result = saved_continuation_job(project, job, code_revision=context.code_revision)
-    if result is None:
-        execute_continuation_job(project, job, code_revision=context.code_revision)
-    source = continuation_result_reference(project, job, code_revision=context.code_revision)
-    judged, _ = judge_study(
-        project, source, judge, configuration=job.configuration, code_revision=context.code_revision
-    )
+    settings, bank = resolved
     tagger = context.dependencies.traceml_tagger
     if tagger is None:
         catalog = load_model_catalog(project.model_catalog_path)
-        resolved = RuntimeModelCatalog(catalog).resolve(spec.traceml.decision_alias)
+        model = RuntimeModelCatalog(catalog).resolve(spec.traceml.decision_alias)
         steps = job.maximum_model_calls * (spec.traceml.steps_per_call + 1)
         calls = spec.mining.attempts * steps * math.ceil(len(bank.questions) / 32)
         transport = admitted_transport(
@@ -115,7 +139,7 @@ def prepare_behavior_reference(
             datetime.now(UTC) + timedelta(hours=spec.traceml.deadline_hours),
         ).priced_as(spec.traceml.decision_alias)
         tagger = DecisionsTraceTagger.for_alias(
-            resolved,
+            model,
             transport=transport,
             cache=DecisionCache(project.paths),
             maximum_concurrency=spec.traceml.concurrency,

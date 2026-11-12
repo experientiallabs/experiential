@@ -178,7 +178,7 @@ def _roles(scenarios: list[JsonObject] | None = None) -> list[JsonHttpResponse]:
                     {
                         "category": "guess_required",
                         "explanation": "The target row is never shown.",
-                        "evidence_refs": ["verifier"],
+                        "evidence_refs": ["group"],
                     }
                 ],
                 "limitations": ["Simulated grades only."],

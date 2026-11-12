@@ -1,9 +1,11 @@
 """Owner-bound executors for build, rules, TraceML and error mining.
 
 The build fixes exposure before tagging and scopes learned worlds. Rules are learned over the
-world-learning traces, challenged, then frozen into the mining runtime. TraceML labels grouped
-attempts through the decision tagger. Error mining runs each actor tier with bounded selectors,
-critics and one frozen episode judge. Every owner persists its work for exact replay.
+world-learning traces, challenged, then frozen into the mining runtime, and the general rubric is
+authored over them. TraceML grades each tier's group by the rubric judge and the behavior tags
+(:mod:`~.pipeline_grading`), then labels the attempts through the decision tagger. Error mining
+runs each actor tier with bounded selectors, critics and one frozen episode judge. Every owner
+persists its work for exact replay.
 
 Family authoring and record export live in ``pipeline_families`` and ``pipeline_records``.
 """
@@ -54,7 +56,6 @@ from exp.optimize.evaluation.variance.bounded import run_at_once
 from exp.optimize.evaluation.variance.build_records import (
     load_exposure_plan,
 )
-from exp.optimize.evaluation.variance.episode_evidence import run_task_sha256, run_world_sha256
 from exp.optimize.evaluation.variance.episodes import JudgeProfile
 from exp.optimize.evaluation.variance.evidence import (
     ReferenceSource,
@@ -62,15 +63,14 @@ from exp.optimize.evaluation.variance.evidence import (
     open_trace_search,
 )
 from exp.optimize.evaluation.variance.exposure import ExposurePlan
-from exp.optimize.evaluation.variance.judge_prompt import judge_model_calls, judge_profile
-from exp.optimize.evaluation.variance.judged import EpisodeJudge, judge_study
+from exp.optimize.evaluation.variance.judge_prompt import judge_model_calls
+from exp.optimize.evaluation.variance.judged import judge_study
 from exp.optimize.evaluation.variance.pipeline_adversarial import adversarial_references
 from exp.optimize.evaluation.variance.pipeline_behaviors import (
     behavior_bank,
     behavior_costs,
     behavior_lines,
     behavior_reference,
-    prepare_behavior_reference,
 )
 from exp.optimize.evaluation.variance.pipeline_errors import (
     attempt_error_points,
@@ -81,9 +81,20 @@ from exp.optimize.evaluation.variance.pipeline_errors import (
     tag_tier_errors,
     tier_error_bank,
 )
+from exp.optimize.evaluation.variance.pipeline_grading import (
+    GroupGrading,
+    grade_groups,
+    grading_costs,
+    judge_costs,
+    mining_profile,
+    rubric_reference,
+    tier_judge,
+    verdict_reference,
+)
 from exp.optimize.evaluation.variance.pipeline_inputs import (
+    GeneralRubric,
     admitted_transport,
-    mining_rubric,
+    general_rubric,
     retrieval_costs,
     retrieval_embedder,
     rubric_author_sha256,
@@ -122,7 +133,6 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     cost_lines,
 )
 from exp.optimize.evaluation.variance.point_selection import load_point_bar
-from exp.optimize.evaluation.variance.rubric_author import judge_definition
 from exp.optimize.evaluation.variance.schedule import complete_rollout, next_rollout_plan
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.models.providers.transport import ProviderTransportError
@@ -155,6 +165,9 @@ def tier_job(
 ) -> ContinuationJob:
     """Return the job with another catalog actor, its exact snapshot and optionally new repeats.
 
+    Every tier's study registers no mechanical verifier: its attempts are graded only by the
+    rubric judge and the tag signals, and its endings are attributed by execution phase.
+
     Args:
         project: Project whose catalog resolves the alias.
         job: The registered job.
@@ -169,31 +182,11 @@ def tier_job(
     study = job.study.model_copy(
         update={
             "actor_model": snapshot,
+            "verifier": None,
             **({} if repeats is None else {"repeats": repeats}),
         }
     )
     return job.model_copy(update={"actor_alias": alias, "study": study})
-
-
-def mining_profile(spec: DecisionVarianceSpec) -> JudgeProfile:
-    """Return the episode-judge profile, fixed from the spec before any family rubric exists."""
-    judge = spec.mining.judge
-    return judge_profile(
-        model_alias=judge.model_alias,
-        model=judge.model,
-        maximum_output_tokens=judge.output_tokens,
-        evidence_tool_budget=spec.mining.judge_evidence_tool_budget,
-        maximum_input_bytes=judge.maximum_input_bytes,
-        prompt_set=spec.mining.judge_prompt_set,
-    )
-
-
-def judge_costs(
-    project: ProjectStore, spec: DecisionVarianceSpec, episodes: int
-) -> tuple[CostComponent, ...]:
-    """Price judging ``episodes`` episodes at the profile's most draws per judgment."""
-    calls = judge_model_calls(mining_profile(spec)) * episodes
-    return tuple(row.scaled(calls) for row in evaluation_costs(project, spec.mining.judge))
 
 
 def group_job(
@@ -276,16 +269,13 @@ def operational_ending(branch: ContinuationBranch) -> list[JsonValue]:
     """The trailing steps of a branch that ended on a simulator, provider or store fault.
 
     Those steps (a refused, rolled-back prediction; a dispatch the provider or store failed)
-    record the fault, not an actor decision, so mining masks them from the point bar. A record
-    saved before attributions existed is attributed from its exception and phase.
+    record the fault, not an actor decision, so mining masks them from the point bar. The owner
+    comes from the exception and execution phase alone, never from a verifier grade.
     """
     if branch.status == "completed":
         return []
-    detail = branch.failure_detail
-    owner = detail.attribution if detail is not None else None
-    if owner is None:
-        phase = branch.outcome.get("execution_phase")
-        owner = ending_owner(branch.failure, phase if isinstance(phase, str) else None)
+    phase = branch.outcome.get("execution_phase")
+    owner = ending_owner(branch.failure, phase if isinstance(phase, str) else None)
     if owner not in NON_ACTOR:
         return []
     steps = branch.outcome.get("steps")
@@ -326,17 +316,25 @@ class _RulesStage:
     """The ``rules`` stage."""
 
     def keys(self, project: ProjectStore, spec: DecisionVarianceSpec) -> JsonObject:
-        """The stage also reads the mining job it binds the rule book into."""
+        """The stage reads the mining job it binds the rule book into and the rubric author."""
         del project
-        return {"job": sha256_json(spec.mining.registered)}
+        return {
+            "job": sha256_json(spec.mining.registered),
+            **(
+                {}
+                if spec.mining.rubric is not None
+                else {"rubric_author": rubric_author_sha256(spec)}
+            ),
+        }
 
     def plan(
         self, project: ProjectStore, spec: DecisionVarianceSpec, code_revision: str
     ) -> tuple[tuple[CostLine, ...], tuple[str, ...]]:
-        """Price one extraction draw per world-learning trace, up to the trace cap."""
+        """Price one extraction draw per world-learning trace and the general rubric."""
         del code_revision
+        rubric_costs, rubric_line = general_rubric_plan(project, spec)
         if spec.mining.bootstrap is not None:
-            return (), (PLAN_LINE,)
+            return cost_lines(rubric_costs), (PLAN_LINE, rubric_line)
         settings = spec.rules
         start = load_continuation_checkpoint(
             project.artifacts, spec.mining.registered.study.checkpoint
@@ -353,10 +351,10 @@ class _RulesStage:
         )
         if challenge:
             costs += _runtime_allowance(project, spec.mining.registered)
-        return cost_lines(costs), lines
+        return cost_lines((*costs, *rubric_costs)), (*lines, rubric_line)
 
     def run(self, context: StageContext) -> StageRun:
-        """Learn the rule book, execute its challenges and bind it before any probe."""
+        """Learn and bind the rule book, then author the general rubric before any attempt."""
         if context.spec.mining.bootstrap is not None:
             return run_bootstrapped_rules(context)
         project, spec, revision = context.project, context.spec, context.code_revision
@@ -410,15 +408,43 @@ class _RulesStage:
             definition = _world(job, build, report.rulebook, memory)
             job = bound_job(project, job, definition, revision)
         executed = 0 if report.challenges is None else len(report.challenges.runs)
+        rubric = general_rubric(context, job, report.rulebook)
         outputs = RulesOutputs(
             report=saved,
             rulebook=report.rulebook,
             challenges=executed,
             job=job,
             rule_memory=memory if spec.rules.bind_rule_book else None,
+            rubric=rubric.rubric,
+            rubric_packet=rubric.packet,
+            rubric_library=rubric.library,
         )
-        summary = _rules_summary(report) | {"challenges_executed": executed}
-        return StageRun(outputs, (saved, report.rulebook, job.study.checkpoint), summary)
+        summary = _rules_summary(report) | {"challenges_executed": executed, **rubric.summary()}
+        references = (saved, report.rulebook, job.study.checkpoint, *rubric.references())
+        return StageRun(outputs, references, summary)
+
+
+def general_rubric_plan(
+    project: ProjectStore, spec: DecisionVarianceSpec
+) -> tuple[tuple[CostComponent, ...], str]:
+    """Price the general rubric the rules stage authors and describe it in the plan."""
+    if spec.mining.rubric is not None:
+        return (), f"General rubric: saved rubric {spec.mining.rubric.artifact_id}."
+    draws = rubric_draws(spec.authoring.rubric_profile)
+    author = spec.authoring.rubric_author
+    costs = tuple(row.scaled(draws) for row in evaluation_costs(project, author))
+    library = (
+        "no behavior library"
+        if spec.authoring.library_id is None
+        else f"the newest {spec.authoring.library_id} library version (reviewed adversarial "
+        "linters included)"
+    )
+    line = (
+        f"General rubric: authored by {author.model_alias} over a whole-task packet and "
+        f"{library} once the rule book is frozen, before any attempt runs; it is the sole grader "
+        "of every attempt and stays frozen for the epoch."
+    )
+    return costs, line
 
 
 def bound_job(
@@ -470,9 +496,11 @@ class _TraceMLStage:
         if not spec.traceml.enabled:
             return {}
         errors = tier_error_bank(spec)
+        behaviors = behavior_bank(spec)
         return {
             "bank": sha256_json(traceml_bank(spec.traceml.bank_root)),
             **({} if errors is None else {"error_bank": sha256_json(errors)}),
+            **({} if behaviors is None else {"behavior_bank": sha256_json(behaviors)}),
         }
 
     def plan(
@@ -500,7 +528,10 @@ class _TraceMLStage:
             )
         costs.extend(error_tag_costs(project, spec))
         costs.extend(bar_tag_costs(project, spec))
+        grading, grading_line = grading_costs(project, spec, behavior_costs(project, spec))
+        costs.extend(grading)
         lines = (
+            grading_line,
             f"TraceML: {len(spec.mining.actors)} tier groups of G={spec.mining.attempts}, up to "
             f"{steps} steps each labelled with {bank.bank_id} on {settings.decision_alias}; "
             "labels are registered as each tier's selector and critic reference.",
@@ -514,14 +545,15 @@ class _TraceMLStage:
                 "coalition's mistake patterns) and step by step (error-ranked points)."
             ),
         )
-        return cost_lines(tuple(costs)), lines
+        return cost_lines(tuple(costs)), (*lines, *behavior_lines(spec))
 
     def run(self, context: StageContext) -> StageRun:
-        """Run or replay each tier's group, then label and save its attempts."""
+        """Run or replay each tier's group, grade it by the rubric judge, then label it."""
         project, spec, revision = context.project, context.spec, context.code_revision
         if not spec.traceml.enabled:
             return StageRun(TraceMLOutputs(), (), {"enabled": False})
-        job = RulesOutputs.model_validate(context.upstream["rules"].outputs).job
+        rules = RulesOutputs.model_validate(context.upstream["rules"].outputs)
+        job = rules.job
         bank = traceml_bank(spec.traceml.bank_root)
         tagger = context.dependencies.traceml_tagger or _tagger(context)
         groups: dict[str, ArtifactInput] = {}
@@ -537,6 +569,14 @@ class _TraceMLStage:
         judge_settings = spec.traceml.move_judge
         assert judge_settings is not None
         groups_run = run_groups(project, spec, job, revision)
+        grading = grade_groups(
+            context,
+            rules,
+            {
+                alias: (reference, group_job(project, spec, job, alias))
+                for alias, (reference, _) in groups_run.items()
+            },
+        )
         masked: JsonObject = {}
         for alias in spec.mining.actors:
             reference, study = groups_run[alias]
@@ -603,13 +643,21 @@ class _TraceMLStage:
             error_steps=error_steps,
             error_points=error_points,
             point_bars=bars,
+            judged=grading.judged,
+            behavior_differences=grading.behavior,
+            rubric=grading.rubric.rubric,
+            rubric_packet=grading.rubric.packet,
+            rubric_library=grading.rubric.library,
+            rubric_revised=grading.rubric.revised,
         )
         summary: JsonObject = {
             "labels": {alias: ref.artifact_id for alias, ref in labels.items()},
             "error_points": points,
             "masked_operational_endings": masked,
+            **grading.summary(),
         }
         saved = (
+            *grading.references(),
             *groups.values(),
             *labels.values(),
             *errors.values(),
@@ -620,53 +668,40 @@ class _TraceMLStage:
         return StageRun(outputs, saved, summary)
 
 
-def eligible_rubric(
-    context: StageContext, build: BuildOutputs, rules: RulesOutputs, traceml: TraceMLOutputs
-) -> tuple[ArtifactInput, ArtifactInput | None]:
-    """Return the mining rubric, authoring it only once every gated tier can be picked.
+def require_pickable_tiers(context: StageContext, traceml: TraceMLOutputs) -> None:
+    """Refuse a mining run in which a gated tier has no qualified point to pick.
 
     Under the qualification bar a tier whose attempts have no qualified point stops at its pick,
-    so the check runs before the rubric author is called (:func:`require_qualified_points`). The
-    scheduled tier is left to its rollout plan's own registration.
-
-    Returns:
-        The rubric and the packet it was authored from (None for a registered rubric).
+    so the guard runs before any selector or critic is called (:func:`require_qualified_points`).
+    The scheduled tier is left to its rollout plan's own registration.
 
     Raises:
-        ValueError: A gated tier has no qualified point, or authoring failed.
+        ValueError: A gated tier has no qualified point.
     """
     spec = context.spec
-    if spec.mining.qualification is not None:
-        schedule = spec.mining.schedule
-        scheduled = None if schedule is None else schedule.base.initial.actor_alias
-        require_qualified_points(
-            {
-                alias: load_point_bar(context.project.artifacts, reference)
-                for alias, reference in traceml.point_bars.items()
-                if alias != scheduled
-            }
-        )
-    if spec.mining.rubric is not None:
-        return spec.mining.rubric, None
-    return mining_rubric(context, build, rules)
+    if spec.mining.qualification is None:
+        return
+    schedule = spec.mining.schedule
+    scheduled = None if schedule is None else schedule.base.initial.actor_alias
+    require_qualified_points(
+        {
+            alias: load_point_bar(context.project.artifacts, reference)
+            for alias, reference in traceml.point_bars.items()
+            if alias != scheduled
+        }
+    )
 
 
 class _MiningStage:
     """The ``error-mining`` stage."""
 
     def keys(self, project: ProjectStore, spec: DecisionVarianceSpec) -> JsonObject:
-        """An authored mining rubric also reads the rubric author's settings and profile.
+        """Under the qualification bar the stage also reads each tier's deferred points.
 
-        Under the qualification bar it also reads each tier's deferred points, so a phase that
-        deferred points runs again on the next pass and carries them forward.
+        A phase that deferred points runs again on the next pass and carries them forward.
         """
         bank = behavior_bank(spec)
         return {
-            **(
-                {}
-                if spec.mining.rubric is not None
-                else {"rubric_author": rubric_author_sha256(spec)}
-            ),
             **({} if bank is None else {"behavior_bank": sha256_json(bank)}),
             **(
                 {}
@@ -678,15 +713,11 @@ class _MiningStage:
     def plan(
         self, project: ProjectStore, spec: DecisionVarianceSpec, code_revision: str
     ) -> tuple[tuple[CostLine, ...], tuple[str, ...]]:
-        """Price the mining rubric and every tier's draws, suffixes and judgments as bounds."""
+        """Price every tier's draws, suffixes and judgments as bounds."""
         del code_revision
         mining = spec.mining
         planned = scheduled_preview(project, spec)
         costs: list[CostComponent] = []
-        if mining.rubric is None:
-            draws = rubric_draws(spec.authoring.rubric_profile)
-            author = spec.authoring.rubric_author
-            costs.extend(row.scaled(draws) for row in evaluation_costs(project, author))
         if mining.qualification is not None and not spec.traceml.enabled:
             raise ValueError("mining.qualification needs traceml enabled to answer the bar")
         points = (
@@ -701,12 +732,6 @@ class _MiningStage:
                 costs.extend(actor_critic_costs(project, planned.spec))
                 assert mining.schedule is not None
                 costs.extend(point_option_costs(project, mining.schedule, planned.spec))
-                if mining.behaviors is not None:
-                    if not spec.traceml.enabled:
-                        costs.extend(
-                            job_costs(project, group_job(project, spec, mining.registered, alias))
-                        )
-                    costs.extend(judge_costs(project, spec, mining.attempts))
                 continue
             if not spec.traceml.enabled:
                 costs.extend(job_costs(project, group_job(project, spec, mining.registered, alias)))
@@ -722,15 +747,19 @@ class _MiningStage:
             costs.extend(row.scaled(points) for row in job_costs(project, suffix))
             costs.extend(judge_costs(project, spec, episodes))
         costs.extend(retrieval_costs(project, spec))
-        costs.extend(behavior_costs(project, spec))
+        grading_line: tuple[str, ...] = ()
+        if not spec.traceml.enabled:
+            grading, line = grading_costs(project, spec, behavior_costs(project, spec))
+            costs.extend(grading)
+            grading_line = (line, *behavior_lines(spec))
         costs.extend(blast_costs(project, spec))
         costs.extend(cross_tier_costs(project, spec))
         profile = mining_profile(spec)
         rubric = (
             f"saved rubric {mining.rubric.artifact_id}"
             if mining.rubric is not None
-            else f"rubric authored by {spec.authoring.rubric_author.model_alias} over a "
-            "whole-task packet after the judge profile is fixed"
+            else "the rules stage's general rubric, revised once from the groups' adversarial "
+            "linters when they are on"
         )
         selection = (
             f"K={mining.points}"
@@ -754,7 +783,7 @@ class _MiningStage:
             ),
         )
         scheduled = () if planned is None else (scheduled_line(planned),)
-        return cost_lines(tuple(costs)), (*lines, *scheduled, *behavior_lines(spec))
+        return cost_lines(tuple(costs)), (*lines, *scheduled, *grading_line)
 
     def run(self, context: StageContext) -> StageRun:
         """Run or replay every tier's error mining and judge its group of attempts."""
@@ -770,7 +799,9 @@ class _MiningStage:
         profile = mining_profile(spec)
         start = load_continuation_checkpoint(project.artifacts, rules.job.study.checkpoint)
         probe = probe_line(build, start.task.task_id)
-        rubric, packet = eligible_rubric(context, build, rules, traceml)
+        require_pickable_tiers(context, traceml)
+        grading = _grading(context, rules, traceml)
+        rubric, packet = grading.rubric.rubric, grading.rubric.packet
         embedder = None
         if spec.mining.retrieval and build.index is not None:
             embedder = retrieval_embedder(context, build.index)
@@ -788,6 +819,8 @@ class _MiningStage:
                     labels.get(alias),
                     ranked.get(alias),
                     traceml.point_bars.get(alias),
+                    grading.behavior.get(alias),
+                    grading.judged.get(alias),
                 ),
                 build,
                 embedder,
@@ -867,17 +900,13 @@ class _MiningStage:
             require_scheduled_plan(context, plan)
         tier = group_job(project, spec, tier_inputs.job, alias)
         start = load_continuation_checkpoint(project.artifacts, tier.study.checkpoint)
-        definition = judge_definition(
-            project,
-            tier_inputs.profile,
-            tier_inputs.rubric,
-            task_sha256=run_task_sha256(start),
-            world_sha256=run_world_sha256(tier.configuration),
-        )
-        judge = EpisodeJudge(definition=definition, settings=mining.judge)
-        behavior = prepare_behavior_reference(context, tier, judge, tier_inputs.exposure)
+        judge = tier_judge(project, spec, tier, tier_inputs.rubric)
+        behavior = tier_inputs.behavior
         labels = tier_inputs.labels
+        judged_group = tier_inputs.judged
         references = (
+            rubric_reference(tier_inputs.rubric),
+            *(() if judged_group is None else (verdict_reference(project, judged_group),)),
             *((behavior_reference(project, behavior),) if behavior is not None else ()),
             *adversarial_references(project, behavior),
             *(
@@ -977,6 +1006,8 @@ class _Tier:
         labels: The tier's TraceML labels, when labelled.
         error_points: The tier's error-ranked attempt points, when its attempts were tagged.
         point_bar: The tier's saved per-attempt qualification, under the bar.
+        behavior: The tier's reviewed behavior differences over its judged group, if mined.
+        judged: The tier's group judged by the epoch's rubric, registered as its verdicts.
     """
 
     exposure: ExposurePlan
@@ -987,6 +1018,37 @@ class _Tier:
     labels: ArtifactInput | None
     error_points: ArtifactInput | None = None
     point_bar: ArtifactInput | None = None
+    behavior: ArtifactInput | None = None
+    judged: ArtifactInput | None = None
+
+
+def _grading(context: StageContext, rules: RulesOutputs, traceml: TraceMLOutputs) -> GroupGrading:
+    """Return the groups' grading: TraceML's, or graded here when TraceML is off.
+
+    Either way every tier's group is judged by the epoch's frozen rubric before any selector or
+    critic reads it, and no start verifier grades an attempt.
+    """
+    if traceml.rubric is not None:
+        return GroupGrading(
+            rubric=GeneralRubric(
+                rubric=traceml.rubric,
+                packet=traceml.rubric_packet,
+                library=traceml.rubric_library,
+                revised=traceml.rubric_revised,
+            ),
+            judged=traceml.judged,
+            behavior=traceml.behavior_differences,
+        )
+    project, spec, revision = context.project, context.spec, context.code_revision
+    groups = run_groups(project, spec, rules.job, revision)
+    return grade_groups(
+        context,
+        rules,
+        {
+            alias: (reference, group_job(project, spec, rules.job, alias))
+            for alias, (reference, _) in groups.items()
+        },
+    )
 
 
 def load_report(project: ProjectStore, reference: ArtifactInput) -> ActorCriticReport:

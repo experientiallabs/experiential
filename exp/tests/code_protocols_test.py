@@ -54,13 +54,13 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.behavior_differences:BEHAVIOR_DIFFERENCES_PROTOCOL",
-        "behavior-differences-v1",
+        "behavior-differences-v2",
         (
             "exp.optimize.evaluation.variance.behavior_differences",
             "exp.optimize.evaluation.variance.behavior_pairs",
             "exp.optimize.evaluation.variance.pipeline_behaviors",
         ),
-        "cb3a77644e7d4f623d0c4220ed04e55d156e4932154a29d9ee88a6ab53c79bd5",
+        "e28893757e92a0dd496e1b4fdc1c9ed94e8b9e87574972e48b0ab25841a0c007",
     ),
     Protocol(
         "exp.simulation.mining.descriptors:DESCRIPTOR_EMBEDDING",
@@ -294,7 +294,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.variance.roles:ROLE_PROTOCOL",
-        "variance-roles-v7",
+        "variance-roles-v8",
         (
             "exp.optimize.evaluation.variance.roles",
             "exp.optimize.evaluation.variance.contracts:EstimationPoint",
@@ -306,7 +306,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.role_prompts",
             "exp.optimize.evaluation.variance.evidence",
         ),
-        "cd0fddb7297c7cde2a651402b0c7018a727cdc12b85faad7ea5ad76d34950075",
+        "00d5e8e3d17dcd0ba70ab26944e8e019d107466eec83ff45f460815c2c6bc485",
     ),
     Protocol(
         "exp.optimize.evaluation.rules.extraction:EXTRACTION_PROTOCOL",
@@ -441,7 +441,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.judged",
             "exp.optimize.evaluation.variance.episode_evidence",
         ),
-        "f6b5acc9b55206575906c508e8d8ca3364cca12b1ad763bd0a064a9e8d70ee52",
+        "871e22b4d6f64b5696b0385785e23a31949439f414040b2e279a973588180c51",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.admission:FAMILY_ADMISSION_POLICY",

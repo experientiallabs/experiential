@@ -73,8 +73,14 @@ def align(payload: JsonObject) -> JsonObject:
     assert isinstance(good_trace, dict) and isinstance(poor_trace, dict)
     good_steps, poor_steps = good_trace["steps"], poor_trace["steps"]
     assert isinstance(good_steps, list) and isinstance(poor_steps, list)
-    g = next(s for s in good_steps if isinstance(s, dict) and s.get("tool") == "escalate")
-    p = next(s for s in poor_steps if isinstance(s, dict) and s.get("tool") == "close")
+    g = next((s for s in good_steps if isinstance(s, dict) and s.get("tool") == "escalate"), None)
+    p = next((s for s in poor_steps if isinstance(s, dict) and s.get("tool") == "close"), None)
+    if g is None or p is None:
+        return {
+            "status": "reject",
+            "mechanism": "The pair does not contrast escalating with closing",
+            "rationale": "Only an escalation against a closure is the reviewed mechanism",
+        }
     return {
         "status": "aligned",
         "good_window": {"start": g["index"], "stop": int(str(g["index"])) + 1},

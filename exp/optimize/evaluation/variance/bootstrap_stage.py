@@ -1,10 +1,10 @@
 """The pipeline's rules stage for a bootstrapped mining job: reuse the family's frozen rules.
 
 When ``mining.bootstrap`` names a task's registered start, that start already binds its family's
-frozen rule book and rule memory. The rules stage then learns nothing: it plans no cost, runs no
-global extraction over the build's world-learning traces and makes no call. It verifies the
-registration's family rules and hands them, with the registered job, to the later stages, so
-every stage reads the same family-scoped rules the start was captured with.
+frozen rule book and rule memory. The rules stage then learns nothing: it runs no global
+extraction over the build's world-learning traces. It verifies the registration's family rules
+and hands them, with the registered job and the general rubric authored over them, to the later
+stages, so every stage reads the same family-scoped rules the start was captured with.
 """
 
 from __future__ import annotations
@@ -21,11 +21,12 @@ from exp.optimize.evaluation.variance.bootstrap_contracts import (
     BootstrapBinding,
     BootstrapRegistration,
 )
+from exp.optimize.evaluation.variance.pipeline_inputs import general_rubric
 from exp.optimize.evaluation.variance.pipeline_spec import RulesOutputs, StageContext, StageRun
 
 PLAN_LINE = (
     "Rules stage: reuses the bootstrapped family's frozen rule book and rule memory; no "
-    "extraction, no challenges and no call."
+    "extraction and no challenges."
 )
 """The rules stage's plan line for a bootstrapped mining job."""
 
@@ -70,17 +71,22 @@ def run_bootstrapped_rules(context: StageContext) -> StageRun:
         )
     if frozen_report(project, report).rulebook != registration.rulebook:
         raise ValueError("the bootstrapped family's rules report names another rule book")
+    rubric = general_rubric(context, spec.mining.registered, registration.rulebook)
     outputs = RulesOutputs(
         report=report,
         rulebook=registration.rulebook,
         challenges=0,
         job=spec.mining.registered,
         rule_memory=registration.rule_memory,
+        rubric=rubric.rubric,
+        rubric_packet=rubric.packet,
+        rubric_library=rubric.library,
     )
     summary: JsonObject = {
         "bootstrapped_family": registration.family_id,
         "rules_learned": False,
         "challenges_executed": 0,
+        **rubric.summary(),
     }
-    references = (report, registration.rulebook, registration.checkpoint)
+    references = (report, registration.rulebook, registration.checkpoint, *rubric.references())
     return StageRun(outputs, references, summary)

@@ -4,8 +4,9 @@
   and replayed as observed episodes for the world author's program validation.
 - Tag-aware retrieval over the build's scoped, fit-only world-learning index for error-mining
   selectors and critics, with the build's catalog embedder role bound for a semantic index.
-- The mining-probe task's rubric, authored by the agentic rubric author over a whole-task
-  authoring packet when the spec does not register one.
+- The mining-probe task's general rubric, authored by the agentic rubric author over a
+  whole-task authoring packet (and the epoch's behavior library) when the spec does not register
+  one. It is authored in the rules stage, before any attempt is graded.
 
 Held-out traces never enter: every trace read here is checked against the frozen exposure plan,
 and the retrieval index is refused unless it is fit-only and scoped to world learning.
@@ -15,13 +16,15 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 
-from exp.common.core.artifacts import ArtifactInput, sha256_json, stable_id
+from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json, stable_id
 from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.traces import Trace
 from exp.common.traces.store import load_trace_dataset
+from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.executable.costs import evaluation_costs
 from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
 from exp.optimize.evaluation.executable.model_costs import CostComponent
@@ -34,6 +37,11 @@ from exp.optimize.evaluation.variance.authoring_packet import (
     build_authoring_packet,
     save_packet,
 )
+from exp.optimize.evaluation.variance.behavior_profiles import (
+    LibraryBinding,
+    library_head,
+    refuse_actor_exposure,
+)
 from exp.optimize.evaluation.variance.build_records import (
     load_exposure_plan,
     load_tag_retrieval_binding,
@@ -44,7 +52,6 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     AuthoringSettings,
     BuildOutputs,
     DecisionVarianceSpec,
-    RulesOutputs,
     StageContext,
 )
 from exp.optimize.evaluation.variance.rubric_agent import (
@@ -243,14 +250,25 @@ def trace_search(
 
 
 def mining_rubric(
-    context: StageContext, build: BuildOutputs, rules: RulesOutputs
+    context: StageContext,
+    build: BuildOutputs,
+    job: ContinuationJob,
+    rulebook: ArtifactInput,
+    library: LibraryBinding | None = None,
 ) -> tuple[ArtifactInput, ArtifactInput]:
-    """Author, or replay, the mining-probe task's rubric over a whole-task packet.
+    """Author, or replay, the mining-probe task's general rubric over a whole-task packet.
+
+    The rubric is the sole grader of every attempt, so it is authored before any attempt runs,
+    from the task, the rule book and the observed episodes. ``library`` carries the behavior
+    library version the epoch reads: its reviewed adversarial linters (reward-hacking and
+    failure modes mined from earlier judged groups) join the rubric the author assembles.
 
     Args:
         context: The running stage.
         build: The variance build.
-        rules: The rules stage, whose bound job starts at the task's initial context.
+        job: The rule-bound mining job, starting at the task's initial context.
+        rulebook: The frozen rule book bound into ``job``.
+        library: The behavior library version the rubric is assembled from, if any.
 
     Returns:
         The saved rubric and the packet it was authored from.
@@ -260,7 +278,6 @@ def mining_rubric(
             author returned no ready rubric.
     """
     project, spec, revision = context.project, context.spec, context.code_revision
-    job = rules.job
     start = load_continuation_checkpoint(project.artifacts, job.study.checkpoint)
     actor = ChatAgentRuntime(
         maximum_model_calls=job.maximum_model_calls, system_prompt=job.system_prompt
@@ -286,17 +303,23 @@ def mining_rubric(
             build, (*start.task.source_trace_ids, *(row.episode_id for row in episodes))
         ),
         exposure=exposure,
-        rule_book=rules.rulebook,
-        book=load_rulebook(project, rules.rulebook),
+        rule_book=rulebook,
+        book=load_rulebook(project, rulebook),
         decision=None,
         scenarios=(),
         observed_episodes=episodes,
     )
+    if library is not None:
+        refuse_actor_exposure(library.library, (start.task.instruction,))
     packet = fitted_packet(packet, spec.authoring.rubric_author, spec.authoring.rubric_profile)
     packet_ref = save_packet(project, packet, code_revision=revision)
     identity = stable_id(
         "mining-rubric",
-        {"packet": packet_ref.sha256, "author": rubric_author_sha256(spec)},
+        {
+            "packet": packet_ref.sha256,
+            "author": rubric_author_sha256(spec),
+            **({} if library is None else {"library": library.reference.sha256}),
+        },
     )
     run = author_rubric_agentic(
         project,
@@ -305,6 +328,7 @@ def mining_rubric(
         identity=identity,
         code_revision=revision,
         profile=spec.authoring.rubric_profile,
+        library=library,
     )
     if run.draft.status != "ready":
         raise ValueError(
@@ -312,6 +336,64 @@ def mining_rubric(
             "register mining.rubric or fix the author settings"
         )
     return save_rubric(project, run.draft, code_revision=revision), packet_ref
+
+
+@dataclass(frozen=True)
+class GeneralRubric:
+    """The mining-probe task's general rubric and what it was authored from.
+
+    Attributes:
+        rubric: The saved rubric.
+        packet: The whole-task packet it was authored from, or None when registered.
+        library: The behavior library version it was assembled from, if any.
+        revised: Whether it was re-authored from the groups' adversarial linters.
+    """
+
+    rubric: ArtifactInput
+    packet: ArtifactInput | None = None
+    library: ArtifactInput | None = None
+    revised: bool = False
+
+    def references(self) -> tuple[ArtifactInput, ...]:
+        """Every saved artifact the rubric cites."""
+        return tuple(r for r in (self.rubric, self.packet, self.library) if r is not None)
+
+    def summary(self) -> JsonObject:
+        """The rubric's short operator summary."""
+        return {"rubric": self.rubric.artifact_id, "rubric_authored": self.packet is not None}
+
+
+def general_rubric(
+    context: StageContext, job: ContinuationJob, rulebook: ArtifactInput
+) -> GeneralRubric:
+    """Return the general rubric: registered, or authored over the frozen rule book.
+
+    Every attempt is graded by this rubric (and the tag signals), never by a start verifier, so
+    the rules stage authors it before any group runs. The epoch's behavior library
+    (:func:`epoch_library`) brings the reviewed reward-hacking and failure-mode linters that
+    earlier judged groups produced.
+    """
+    spec = context.spec
+    if spec.mining.rubric is not None:
+        return GeneralRubric(rubric=spec.mining.rubric)
+    build = BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
+    library = epoch_library(context.project, spec)
+    rubric, packet = mining_rubric(context, build, job, rulebook, library)
+    return GeneralRubric(
+        rubric=rubric, packet=packet, library=None if library is None else library.reference
+    )
+
+
+def epoch_library(project: ProjectStore, spec: DecisionVarianceSpec) -> LibraryBinding | None:
+    """Return the behavior library version this epoch's general rubric reads, if any.
+
+    It is the newest saved version of ``authoring.library_id``: the curated behavior guidance
+    and the reviewed adversarial linters every earlier family added. The rubric authored from
+    it is frozen in the rules stage record for the whole epoch; linters a later family adds
+    reach the rubric of the next epoch only.
+    """
+    library_id = spec.authoring.library_id
+    return None if library_id is None else library_head(project, library_id)
 
 
 def rubric_author_sha256(spec: DecisionVarianceSpec) -> str:

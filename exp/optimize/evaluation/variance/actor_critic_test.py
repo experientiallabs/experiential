@@ -196,7 +196,7 @@ def test_a_run_judges_estimates_continues_and_rewards_then_replays(
                     {
                         "category": "guess_required",
                         "explanation": "The target row is never shown.",
-                        "evidence_refs": ["verifier"],
+                        "evidence_refs": ["group"],
                     }
                 ],
                 "limitations": ["Simulated grades only."],

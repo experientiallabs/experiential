@@ -88,22 +88,23 @@ STANCES: dict[RoleName, dict[str, str]] = {
 
 READ_ONLY_INSTRUCTION = """
 
-You may read evidence before answering. The opening message is an overview: the group, the
-verifier, attempt summaries, the checkpoint inventory, the evidence inventory (including material
-that was not supplied) and every locator. The read-only tools fetch exact evidence by locator;
-they cannot run actions, change any state or grade, or reach the actor. Your budget is frozen:
-{budget}. When it runs low you must submit your answer with {answer}. Cite only listed locators."""
+You may read evidence before answering. The opening message is an overview: the group and its
+judged pass rate, attempt summaries with their judged verdicts, the checkpoint inventory, the
+evidence inventory (including material that was not supplied) and every locator. The read-only
+tools fetch exact evidence by locator; they cannot run actions, change any state or grade, or
+reach the actor. Your budget is frozen: {budget}. When it runs low you must submit your answer
+with {answer}. Cite only listed locators."""
 """Addendum of the read-only tool profile: read, then answer."""
 
 AGENTIC_INSTRUCTION = """
 
-You investigate as an agent, in phases. The opening message is an overview: the group, the
-verifier, attempt summaries, the checkpoint inventory, the evidence inventory (including material
-that was not supplied), whether world-learning retrieval is available, and every locator. The
-read-only tools fetch exact evidence, world state at a checkpoint, tool contracts and the harness
-definition, registered references, side-by-side attempt comparisons, divergence points across the
-group, step labels and world-learning traces. They cannot run actions, change any state or grade,
-or reach the actor. Phases:
+You investigate as an agent, in phases. The opening message is an overview: the group and its
+judged pass rate, attempt summaries with their judged verdicts, the checkpoint inventory, the
+evidence inventory (including material that was not supplied), whether world-learning retrieval
+is available, and every locator. The read-only tools fetch exact evidence, world state at a
+checkpoint, tool contracts and the harness definition, registered references, side-by-side
+attempt comparisons, divergence points across the group, step labels and world-learning traces.
+They cannot run actions, change any state or grade, or reach the actor. Phases:
 1. plan: record what you will investigate and why, with record_plan.
 2. investigate: read the evidence your plan needs, then submit a draft with submit_draft.
 3. self_check: check the draft against the evidence (and the host's validation of it), read more
@@ -203,7 +204,10 @@ EVIDENCE_TOOLS: tuple[ToolSchema, ...] = (
     ),
     ToolSchema(
         name="read_grader_evidence",
-        description="Read one attempt's grade and the evaluator projection it was graded on.",
+        description=(
+            "Read one attempt's rubric-judge verdict, criterion findings and the evaluator "
+            "projection it was judged on."
+        ),
         input_schema=_schema({"attempt": _INT}, ("attempt",)),
     ),
     ToolSchema(

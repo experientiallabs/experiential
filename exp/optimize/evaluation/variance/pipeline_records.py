@@ -93,6 +93,7 @@ from exp.optimize.evaluation.variance.pipeline_dense import (
     attach_family_dense,
     dense_costs,
 )
+from exp.optimize.evaluation.variance.pipeline_grading import judge_costs
 from exp.optimize.evaluation.variance.pipeline_points import mining_provenance
 from exp.optimize.evaluation.variance.pipeline_rewards import (
     dense_inputs,
@@ -117,12 +118,7 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     cost_lines,
     family_key,
 )
-from exp.optimize.evaluation.variance.pipeline_stages import (
-    group_job,
-    judge_costs,
-    load_report,
-    tier_job,
-)
+from exp.optimize.evaluation.variance.pipeline_stages import group_job, load_report, tier_job
 from exp.optimize.evaluation.variance.point_options import point_decisions
 from exp.optimize.evaluation.variance.records import selector_records
 from exp.optimize.evaluation.variance.rewards import SelectorObjectiveV2

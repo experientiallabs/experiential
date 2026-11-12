@@ -15,12 +15,16 @@ from exp.common.models import ToolCall
 from exp.common.project import ArtifactStore, artifact_input
 from exp.optimize.evaluation.variance.evidence import (
     ERROR_POINTS_TYPE,
+    JUDGE_VERDICTS_TYPE,
+    LoadedReference,
     ReferenceSource,
     TraceSearchSpec,
     _error_points,
     _step_labels,
     divergence_points,
     execute_evidence_tool,
+    judged_rate,
+    judged_verdicts,
     load_references,
     open_trace_search,
 )
@@ -227,4 +231,40 @@ def test_error_points_are_an_optional_reference_read_by_attempt(tmp_path: Path) 
 
     wrong = source.model_copy(update={"artifact": _labels_artifact(store, "traceml-labels")})
     with pytest.raises(ValueError, match="not a error-points artifact"):
+        load_references(store, (wrong,))
+
+
+def test_rubric_judge_verdicts_are_the_only_grades_a_packet_reads(tmp_path: Path) -> None:
+    """Verdict rows come only from a judge-verdicts artifact; the judged rate ignores gaps."""
+    store = _store(tmp_path, "verdicts")
+    record: JsonObject = {
+        "attempts": [
+            {"attempt": 0, "verdict": "pass", "findings": []},
+            {"attempt": 1, "verdict": "fail", "findings": [{"criterion_id": "c1"}]},
+            {"attempt": 2, "verdict": None, "gap": "no evidence"},
+            {"attempt": 3, "verdict": "unassessable"},
+        ]
+    }
+    manifest = store.write_json(
+        artifact_id="verdicts",
+        artifact_type=JUDGE_VERDICTS_TYPE,
+        envelope=ArtifactEnvelope(
+            schema_version=1, created_at=datetime.now(UTC), code_revision="test", inputs=()
+        ),
+        files={"verdicts.json": record},
+    )
+    source = ReferenceSource(
+        kind="judge_verdicts",
+        name="judge-verdicts",
+        artifact=artifact_input(manifest),
+        file="verdicts.json",
+    )
+    loaded = load_references(store, (source,))
+    rows = judged_verdicts(loaded)
+    assert sorted(rows) == [0, 1, 2, 3] and rows[1]["findings"] == [{"criterion_id": "c1"}]
+    assert judged_rate(rows) == (1, 2)
+    other = LoadedReference(source=source.model_copy(update={"kind": "rule_book"}), content={})
+    assert judged_verdicts((other,)) == {}
+    wrong = source.model_copy(update={"artifact": _labels_artifact(store, "reference-fixture")})
+    with pytest.raises(ValueError, match="not a judge-verdicts artifact"):
         load_references(store, (wrong,))

@@ -25,6 +25,7 @@ from exp.optimize.evaluation.continuations.job import (
     continuation_result_reference,
     execute_continuation_job,
 )
+from exp.optimize.evaluation.continuations.study import required_verifier
 from exp.optimize.evaluation.executable.package import verify_executable_package
 from exp.optimize.evaluation.executable.qualification import (
     ExecutableQualificationSpec,
@@ -148,7 +149,7 @@ def _roles(*, held: bool) -> ScriptedJsonTransport:
                         {
                             "category": "guess_required",
                             "explanation": "The tier is never read in some attempts.",
-                            "evidence_refs": ["verifier"],
+                            "evidence_refs": ["group"],
                         }
                     ],
                     "limitations": ["Simulated grades only."],
@@ -277,7 +278,7 @@ def _qualification(run: _Run, report: FamilyReport, scenario_id: str) -> Artifac
     )
     study = execute_continuation_job(project, task.job, code_revision="test")
     feasibility = continuation_result_reference(project, task.job, code_revision="test")
-    verifier = task.job.study.verifier
+    verifier = required_verifier(task.job.study)
     independent = TaskVerifier(
         description="Authored ticket acceptance with an independent outcome schema.",
         outcome_schema={

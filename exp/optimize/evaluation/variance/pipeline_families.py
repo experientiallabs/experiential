@@ -79,6 +79,7 @@ from exp.optimize.evaluation.variance.pipeline_adversarial import (
     coalition_differences,
 )
 from exp.optimize.evaluation.variance.pipeline_errors import coalition_patterns, tier_error_bank
+from exp.optimize.evaluation.variance.pipeline_grading import judge_costs, mining_profile
 from exp.optimize.evaluation.variance.pipeline_inputs import (
     library_draws,
     local_id,
@@ -103,12 +104,7 @@ from exp.optimize.evaluation.variance.pipeline_spec import (
     TraceMLOutputs,
     cost_lines,
 )
-from exp.optimize.evaluation.variance.pipeline_stages import (
-    judge_costs,
-    load_report,
-    mining_profile,
-    tier_job,
-)
+from exp.optimize.evaluation.variance.pipeline_stages import load_report, tier_job
 from exp.optimize.evaluation.variance.rubric_agent import author_rubric_agentic
 from exp.optimize.evaluation.variance.rubric_author import (
     judge_definition,
@@ -369,13 +365,14 @@ class _Point:
             curated = LibraryBinding(
                 reference=curation.library, library=load_library(project, curation.library)
             )
-        if authoring.adversarial is None:
+        adversarial = authoring.adversarial_spec()
+        if adversarial is None:
             return curated
         mining = MiningOutputs.model_validate(context.upstream["error-mining"].outputs)
         return adversarial_library(
             project,
-            authoring.adversarial,
-            mining.tiers,
+            adversarial,
+            tuple(t.behavior_differences for t in mining.tiers if t.behavior_differences),
             curated,
             library_id=library_id,
             family=prefix,
