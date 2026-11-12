@@ -59,10 +59,10 @@ from exp.optimize.evaluation.variance.bootstrap_selection import (
     SelectedBootstrap,
     select_bootstrap_families,
 )
-from exp.optimize.evaluation.variance.build import (
-    plan_variance_build,
-    run_variance_build,
-    variance_build_costs,
+from exp.optimize.evaluation.variance.build import variance_build_costs
+from exp.optimize.evaluation.variance.build_plans import (
+    planned_variance_build,
+    replay_or_run_variance_build,
 )
 from exp.optimize.evaluation.variance.build_records import VarianceBuildReport, load_exposure_plan
 from exp.optimize.evaluation.variance.family_simulators import save_family_simulator
@@ -341,7 +341,7 @@ def plan_bootstrap_preparation(
         raise ValueError("bootstrap planning requires the maintained grounded.py runtime file")
     reviewer = spec.build.reviewer
     assert reviewer is not None
-    build = plan_variance_build(
+    build = planned_variance_build(
         project,
         spec.build.spec,
         code_revision=code_revision,
@@ -498,7 +498,7 @@ def run_bootstrap_preparation(
             raise ValueError("bootstrap approval does not cover its priced and unpriced inventory")
     if dependencies.tagger is not None:
         injected = ModelSnapshot.model_validate(dependencies.tagger.model_identity)
-        expected = plan_variance_build(
+        expected = planned_variance_build(
             project,
             spec.build.spec,
             code_revision=code_revision,
@@ -571,7 +571,7 @@ def _run(
     revision: str,
 ) -> BootstrapPreparationReport:
     """Execute existing build and bootstrap owners inside the already installed ceiling."""
-    report = run_variance_build(
+    report = replay_or_run_variance_build(
         project,
         spec.build.spec,
         code_revision=revision,

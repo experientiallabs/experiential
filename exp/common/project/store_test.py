@@ -382,6 +382,49 @@ def test_read_bytes_rejects_a_symlink_swapped_after_full_verification(
         verified_read("task-set-v1")
 
 
+def test_a_verified_blob_is_read_and_hashed_once_until_its_file_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Intent: repeated reads of a large immutable artifact reuse its verified bytes.
+
+    The bytes are reused only while the open file has the same device, inode, size and
+    timestamps; a rewritten blob is read and verified again, so corruption is still refused.
+    """
+    from exp.common.project import artifact_files
+
+    artifact_files.VERIFIED_BLOBS.clear()
+    store = _store(tmp_path)
+    payload = b"original" * 200_000
+    store.artifacts.write(
+        artifact_id="task-set-v1",
+        artifact_type="task-set",
+        envelope=_envelope(),
+        files={"large.bin": payload},
+    )
+    reads: list[int] = []
+    real = artifact_files._read_file_descriptor
+
+    def counted(descriptor: int) -> bytes:
+        reads.append(descriptor)
+        return real(descriptor)
+
+    monkeypatch.setattr(artifact_files, "_read_file_descriptor", counted)
+    for _ in range(3):
+        assert store.artifacts.read_bytes("task-set-v1", "large.bin") == payload
+    assert len(reads) == 1
+    target = store.paths.project_directory / "blobs" / hashlib.sha256(payload).hexdigest()
+    target.chmod(0o600)
+    target.write_bytes(b"tampered" * 200_001)  # a different size: never the same stat
+    with pytest.raises(ArtifactCorruptionError, match="digest mismatch"):
+        store.artifacts.read("task-set-v1")
+    assert len(reads) == 2
+    monkeypatch.setattr(artifact_files, "VERIFIED_BLOBS", artifact_files.VerifiedBlobs(0))
+    target.write_bytes(payload)
+    assert store.artifacts.read_bytes("task-set-v1", "large.bin") == payload
+    assert store.artifacts.read_bytes("task-set-v1", "large.bin") == payload
+    assert len(reads) == 4
+
+
 @pytest.mark.parametrize("separator", ["\u0085", "\u2028", "\u2029"])
 @pytest.mark.parametrize("line_ending", [b"\n", b"\r\n"])
 def test_jsonl_artifacts_preserve_unicode_separators_inside_strings(
