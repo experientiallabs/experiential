@@ -785,18 +785,18 @@ Route narrowing prefers exposing rungs and discloses
 `messages.reasoning_content->dropped(unsupported_by_provider)` when a rung cannot replay it,
 including routes with no exposing rung. Reasoning display, which every rung does by default and which never changes replay, is described in [gateway-reasoning-display.md](gateway-reasoning-display.md).
 
-A rung whose chat template accepts a system message only as the very first message declares
-`system_messages_leading_only` (the official Qwen3.6+ `chat_template.jinja` raises
-`System message must be at the beginning.` for any system turn that is not the first message, a
-second leading system turn included, so a vLLM origin serving it 400s the whole request; coding
-agents inject a system turn after the first user turn and after every tool result). On a
-declared rung the Chat wire builder merges a run of leading instruction turns into one system
-message and folds every later plain-text system or developer turn into user text in place
-(appended to a preceding text-only user turn, else re-roled as a user turn), for the Chat,
-Responses, and Messages surfaces alike, and admission discloses
-`messages.system->folded(system_messages_leading_only)` when a turn moved. An undeclared rung's
-messages are never rewritten; the 400 stays classified as a lane limitation the ladder fails
-over.
+A rung whose chat template accepts a system message only as the first message declares
+`system_messages_leading_only` (Qwen3.6+'s `chat_template.jinja` raises `System message must be
+at the beginning.` for any later system turn, which coding agents inject after every tool
+result, so a vLLM origin 400s the request). On a declared rung the Chat wire builder merges the
+leading instruction run into one system message and folds every later plain-text system or
+developer turn into user text in place (appended to a preceding text-only user turn, else its
+own) on all three surfaces, disclosing `messages.system->folded(system_messages_leading_only)`.
+An undeclared rung's messages are never rewritten; its 400 is a lane limitation the ladder fails
+over, as is a Chat relay's Bedrock pairing verdict (`Each tool_result block must have a
+corresponding tool_use block in the previous message`) over a paired outgoing history (every tool
+result answers the preceding assistant turn), which judged the relay's own translation into
+Messages blocks; an unpaired history, or a direct Anthropic rung's verdict, is the caller's error.
 
 The instruction-hoisting wires (Gemini `systemInstruction`, Bedrock Converse `system`) carry
 instructions only outside the turn list, so a system turn after conversation start has no

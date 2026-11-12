@@ -12,7 +12,7 @@ use crate::param_attribution::{
     rejected_by_account_quota, rejected_by_lane_limitation, rejected_by_routing_gate,
     rejected_caller_reference_not_found, rejected_code, rejected_detail,
     rejected_encrypted_reasoning, rejected_model_not_found, rejected_parameter,
-    rejected_via_decode_failure, sanitized_detail,
+    rejected_relayed_pairing, rejected_via_decode_failure, sanitized_detail,
 };
 use crate::rate_limit_headers::{harvest_rate_limit_headers, retry_after_seconds};
 
@@ -719,9 +719,14 @@ async fn non_success_failure(
     // contract allows) keeps the caller's class and detail but fails over:
     // another rung serves the same request, and only a route with no other
     // rung surfaces the 400.
-    let lane_limitation = body
-        .as_deref()
-        .is_some_and(|body| rejected_by_lane_limitation(dialect, body));
+    // A Chat-dialect relay's tool pairing verdict over a history the gateway
+    // itself paired is likewise the lane's (the relay's translation into
+    // Messages blocks), read against the outgoing payload so a caller's
+    // genuine orphan result is never failed over.
+    let lane_limitation = body.as_deref().is_some_and(|body| {
+        rejected_by_lane_limitation(dialect, body)
+            || rejected_relayed_pairing(dialect, payload, body)
+    });
     // A refused replayed reasoning payload keeps the caller's class too,
     // but the waterfall re-dials this rung once without those items
     // before the class is allowed to surface.

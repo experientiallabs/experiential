@@ -33,7 +33,7 @@ use crate::error_envelope::{openai_family_envelope, parse_error_document, ErrorE
 pub use crate::rejection_shapes::{
     content_filtered_completion, rejected_by_account_quota, rejected_by_lane_limitation,
     rejected_by_routing_gate, rejected_caller_reference_not_found, rejected_encrypted_reasoning,
-    rejected_via_decode_failure, upstream_relayed_message,
+    rejected_relayed_pairing, rejected_via_decode_failure, upstream_relayed_message,
 };
 
 /// Longest parameter path relayed; anything longer is treated as prose.

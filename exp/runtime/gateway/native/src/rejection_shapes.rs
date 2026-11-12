@@ -78,6 +78,87 @@ pub fn rejected_by_lane_limitation(dialect: Dialect, body: &str) -> bool {
     })
 }
 
+/// The Anthropic Messages API's verdict on a `tool_result` block whose
+/// `tool_use_id` names no `tool_use` block of the immediately preceding
+/// assistant message. A Chat-dialect rung that relays to that API translates
+/// the OpenAI history (assistant `tool_calls[].id`, tool `tool_call_id`) into
+/// those blocks itself, so the verdict can describe the relay's translation of
+/// a paired history as much as the caller's own unpaired one; the two are told
+/// apart by reading the outgoing request (see [`rejected_relayed_pairing`]).
+const RELAYED_PAIRING_PHRASES: &[&str] =
+    &["must have a corresponding `tool_use` block in the previous message"];
+
+/// Whether a Chat-dialect 4xx carries the Messages API's tool pairing verdict
+/// ([`RELAYED_PAIRING_PHRASES`]) against an outgoing `payload` whose history
+/// IS paired: every `role: tool` message's `tool_call_id` is a `tool_calls[].id`
+/// of the nearest preceding assistant message, with only other tool results in
+/// between. The gateway sent a history the Messages contract accepts, so the
+/// rejection is the relaying lane's and the ladder advances; the same sentence
+/// over an unpaired history, or on any other dialect (a direct Anthropic rung
+/// judges the caller's own blocks), stays the caller's error. The verdict is
+/// read off the dialect's message field only; the pairing is read off the
+/// gateway's own encoding, never off body text.
+pub fn rejected_relayed_pairing(dialect: Dialect, payload: &Value, body: &str) -> bool {
+    if dialect != Dialect::OpenAiCompatible {
+        return false;
+    }
+    let Some(value) = parse_error_document(body) else {
+        return false;
+    };
+    let relayed_verdict = error_message_field(dialect, &value).is_some_and(|message| {
+        let lowered = message.to_ascii_lowercase();
+        RELAYED_PAIRING_PHRASES
+            .iter()
+            .any(|phrase| lowered.contains(phrase))
+    });
+    relayed_verdict && chat_history_is_paired(payload)
+}
+
+/// Whether every tool result in a Chat `messages` history answers a tool call
+/// of the assistant message immediately before its run of results. A history
+/// with no `messages` array, a result with no preceding assistant call, or an
+/// id the preceding assistant message never issued is unpaired. The other
+/// direction (a call left unanswered) is not read: the Messages API names that
+/// with a different sentence, and it is never this verdict's cause.
+fn chat_history_is_paired(payload: &Value) -> bool {
+    let Some(messages) = payload.get("messages").and_then(Value::as_array) else {
+        return false;
+    };
+    // Ids issued by the nearest preceding assistant message; `None` until one
+    // is seen and again after any non-tool, non-assistant turn breaks the run.
+    let mut issued: Option<Vec<&str>> = None;
+    for message in messages {
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                issued = Some(
+                    message
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .map(|calls| {
+                            calls
+                                .iter()
+                                .filter_map(|call| call.get("id").and_then(Value::as_str))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
+            }
+            Some("tool") => {
+                let answered = message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty());
+                match (answered, issued.as_deref()) {
+                    (Some(id), Some(ids)) if ids.contains(&id) => {}
+                    _ => return false,
+                }
+            }
+            _ => issued = None,
+        }
+    }
+    true
+}
+
 /// Sentences a provider answers under a client-error status when the
 /// ACCOUNT, not the request, is what it refuses: the house credential is out
 /// of prepaid balance or quota. Novita answers `400 "Insufficient quota
@@ -535,6 +616,134 @@ mod tests {
         assert!(!rejected_by_lane_limitation(
             Dialect::OpenAiCompatible,
             other
+        ));
+    }
+
+    /// The Messages API's pairing verdict as a Chat-dialect relay wrapping a
+    /// Bedrock Runtime error forwards it (ids shortened).
+    const RELAYED_PAIRING_VERDICT: &str = r#"{"error":{"message":"InvokeModelWithResponseStream: operation error Bedrock Runtime: InvokeModelWithResponseStream, https response error StatusCode: 400, RequestID: 6f1c, ValidationException: messages.38.content.0: unexpected `tool_use_id` found in `tool_result` blocks: toolu_bdrk_01A, toolu_bdrk_01B. Each `tool_result` block must have a corresponding `tool_use` block in the previous message.","type":"invalid_request_error","code":400}}"#;
+
+    /// A Chat history whose every tool result answers the nearest preceding
+    /// assistant message's call: results in any order within one run, and a
+    /// second call-and-result run after the first.
+    fn paired_chat_history() -> serde_json::Value {
+        serde_json::json!({"model": "m", "messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                {"id": "call_2", "type": "function", "function": {"name": "g", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_2", "content": "r2"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "r1"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_3", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_3", "content": "r3"},
+            {"role": "user", "content": "next"}
+        ]})
+    }
+
+    #[test]
+    fn a_relays_pairing_verdict_over_a_paired_history_fails_over() {
+        let paired = paired_chat_history();
+        assert!(rejected_relayed_pairing(
+            Dialect::OpenAiCompatible,
+            &paired,
+            RELAYED_PAIRING_VERDICT
+        ));
+        // The flat reseller envelope carries the same verdict.
+        let flat = r#"{"code":400,"reason":"INVALID_REQUEST_BODY","message":"ValidationException: messages.3.content.0: unexpected `tool_use_id` found in `tool_result` blocks: toolu_01X. Each `tool_result` block must have a corresponding `tool_use` block in the previous message.","metadata":{}}"#;
+        assert!(rejected_relayed_pairing(
+            Dialect::OpenAiCompatible,
+            &paired,
+            flat
+        ));
+        // A direct Anthropic rung's own pairing verdict is the caller's
+        // error: the gateway replays that wire byte for byte.
+        assert!(!rejected_relayed_pairing(
+            Dialect::AnthropicMessages,
+            &paired,
+            RELAYED_PAIRING_VERDICT
+        ));
+        // A different tool_result complaint is still the caller's.
+        let other = r#"{"code":400,"reason":"INVALID_REQUEST_BODY","message":"messages.3.content.0.tool_use_id: Field required"}"#;
+        assert!(!rejected_relayed_pairing(
+            Dialect::OpenAiCompatible,
+            &paired,
+            other
+        ));
+        // The sentence is never a plain lane limitation: without the payload
+        // there is no pairing to vouch for.
+        assert!(!rejected_by_lane_limitation(
+            Dialect::OpenAiCompatible,
+            RELAYED_PAIRING_VERDICT
+        ));
+    }
+
+    #[test]
+    fn a_pairing_verdict_over_a_genuine_orphan_stays_the_callers() {
+        // A result answering an id the preceding assistant message never
+        // issued.
+        let orphan_id = serde_json::json!({"messages": [
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_9", "content": "r"}
+        ]});
+        assert!(!rejected_relayed_pairing(
+            Dialect::OpenAiCompatible,
+            &orphan_id,
+            RELAYED_PAIRING_VERDICT
+        ));
+        // A result whose call sits two assistant turns back: the Messages
+        // contract pairs with the immediately preceding assistant message.
+        let stale_call = serde_json::json!({"messages": [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+            ]},
+            {"role": "assistant", "content": "thinking aloud"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "r"}
+        ]});
+        assert!(!rejected_relayed_pairing(
+            Dialect::OpenAiCompatible,
+            &stale_call,
+            RELAYED_PAIRING_VERDICT
+        ));
+        // A result after a user turn broke the run, a result with no
+        // assistant turn before it at all, and an empty id.
+        for messages in [
+            serde_json::json!([
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                ]},
+                {"role": "user", "content": "interrupt"},
+                {"role": "tool", "tool_call_id": "call_1", "content": "r"}
+            ]),
+            serde_json::json!([
+                {"role": "user", "content": "u"},
+                {"role": "tool", "tool_call_id": "call_1", "content": "r"}
+            ]),
+            serde_json::json!([
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "", "content": "r"}
+            ]),
+        ] {
+            let payload = serde_json::json!({"messages": messages});
+            assert!(!rejected_relayed_pairing(
+                Dialect::OpenAiCompatible,
+                &payload,
+                RELAYED_PAIRING_VERDICT
+            ));
+        }
+        // No history to vouch for at all.
+        assert!(!rejected_relayed_pairing(
+            Dialect::OpenAiCompatible,
+            &serde_json::json!({"model": "m"}),
+            RELAYED_PAIRING_VERDICT
         ));
     }
 
