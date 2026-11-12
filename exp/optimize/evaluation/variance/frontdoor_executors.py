@@ -69,6 +69,7 @@ from exp.optimize.evaluation.variance.refined_prompts import SLOT_ROLES, refined
 from exp.runtime.gateway.decisions_contracts import MAX_DECISION_QUESTIONS
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.codex_cli import offline_closed_model
+from exp.runtime.models.providers.errors import ProviderRetryableResponseError
 from exp.runtime.models.providers.transport import HttpxJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
@@ -79,6 +80,7 @@ from exp.simulation.mining.environment_families import (
     admitted_families,
     load_environment_families,
 )
+from exp.simulation.mining.environment_review import ReviewerError
 from exp.simulation.mining.questions import resolve_question_bank
 from exp.simulation.mining.scrub import scrub_units
 from exp.simulation.mining.tag_authoring import (
@@ -359,13 +361,32 @@ def decision_tagger(
 def author_draw(
     project: ProjectStore, settings: AuthorSettings, code_revision: str
 ) -> Callable[..., ModelResponse]:
-    """Return a buy-or-replay draw through the admitted author-response owner."""
+    """Return a buy-or-replay draw through the admitted author-response owner.
+
+    A draw that spends its whole output allowance without a usable answer (a reasoning model
+    that never reaches its tool call) fails only that draw, as :class:`ReviewerError`, the
+    way the compatibility reviewer's draws do. Its rejection stays saved and replays as the
+    same failure; the authoring loop records it and goes on with its other draws instead of
+    aborting the whole slot.
+    """
 
     def draw(request: ModelRequest, *, identity: str) -> ModelResponse:
         """Buy or replay one exact draw."""
-        _, response = author_response(
-            project, settings, request, identity=identity, sources=(), code_revision=code_revision
-        )
+        try:
+            _, response = author_response(
+                project,
+                settings,
+                request,
+                identity=identity,
+                sources=(),
+                code_revision=code_revision,
+            )
+        except ProviderRetryableResponseError as error:
+            if not error.hit_length_limit:
+                raise
+            raise ReviewerError(
+                f"the author exhausted its {settings.output_tokens}-token output allowance"
+            ) from error
         return response
 
     return draw
