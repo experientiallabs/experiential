@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from exp.common.core.artifacts import JsonObject
@@ -106,7 +108,9 @@ def _rung(
         capabilities=ModelCapabilities(maximum_output_tokens=64_000),
         gateway=GatewayDeploymentMetadata(
             capabilities=GatewayDeploymentCapabilities(
-                supports_streaming=True, supports_streaming_tool_arguments=True
+                supports_streaming=True,
+                supports_streaming_tool_arguments=True,
+                reports_cache_creation_input_tokens=True,
             ),
             dispatch=None
             if setting is None
@@ -229,12 +233,69 @@ def test_unmarked_request_gets_a_bedrock_cache_point(surface: str) -> None:
     assert "cache_control" not in payload
 
 
-def test_claude_on_vertex_and_azure_cache_by_default() -> None:
-    """The documented Claude hosts cache by default; the Vertex envelope keeps the marker."""
-    payload = _payload(_rung("vertex"), _VERTEX, _chat())
+def test_claude_on_vertex_and_azure_stay_off_unless_the_lane_opts_in() -> None:
+    """Vertex and Azure Foundry are unproven for the top-level field; an opted-in lane gets it."""
+    assert not caches_by_default(_rung("vertex"), _VERTEX)
+    assert not caches_by_default(_rung("azure"), _PROXY)
+    assert "cache_control" not in _payload(_rung("vertex"), _VERTEX, _chat())
+    payload = _payload(_rung("vertex", setting=True), _VERTEX, _chat())
     assert payload["cache_control"] == {"type": "ephemeral"}
     assert "model" not in payload
-    assert caches_by_default(_rung("azure"), _PROXY)
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "anthropic.claude-3-haiku-20240307-v1:0",
+        "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "anthropic.claude-v2:1",
+    ],
+)
+def test_bedrock_claude_models_without_cache_points_stay_off(model_id: str) -> None:
+    """Claude models that predate Bedrock prompt caching never get a ``cachePoint``."""
+    assert not caches_by_default(_rung("bedrock", provider_model=model_id), _BEDROCK)
+    assert caches_by_default(
+        _rung("bedrock", provider_model="anthropic.claude-3-5-haiku-20241022-v1:0"),
+        dataclasses.replace(_BEDROCK, model_id="us.anthropic.claude-3-5-haiku-20241022-v1:0"),
+    )
+
+
+@pytest.mark.parametrize("profile", [_ANTHROPIC, _BEDROCK])
+def test_rung_without_cache_write_reporting_gets_nothing(profile: GatewayWireProfile) -> None:
+    """A rung whose reservation cannot price a cache write is never asked to write one."""
+    provider = "anthropic" if profile is _ANTHROPIC else "bedrock"
+    rung = _rung(provider, setting=True)
+    rung = rung.model_copy(
+        update={
+            "gateway": rung.gateway.model_copy(
+                update={
+                    "capabilities": rung.gateway.capabilities.model_copy(
+                        update={"reports_cache_creation_input_tokens": False}
+                    )
+                }
+            )
+        }
+    )
+    assert not automatic_prompt_caching_applies(rung, profile, _chat(), _AUTHORIZATION, environ={})
+
+
+def test_explicit_cache_mode_without_breakpoints_caches_nothing() -> None:
+    """``prompt_cache_options.mode: "explicit"`` with no breakpoint is a caller choice to skip."""
+    request = _chat().model_copy(update={"prompt_cache_mode": "explicit"})
+    assert not automatic_prompt_caching_applies(
+        _rung("anthropic"), _ANTHROPIC, request, _AUTHORIZATION, environ={}
+    )
+
+
+def test_tool_heavy_prompts_are_not_skipped_as_short() -> None:
+    """Each tool definition adds wrapper framing, so many small tools reach the minimum."""
+    tools = tuple(
+        GatewayToolDefinition(name=f"t{index}", parameters={"type": "object"})
+        for index in range(10)
+    )
+    request = _chat(system="Be brief.").model_copy(update={"tools": tools})
+    assert not certainly_below_cacheable_minimum(request)
+    assert certainly_below_cacheable_minimum(_chat(system="Be brief."))
 
 
 def test_caller_markers_win() -> None:

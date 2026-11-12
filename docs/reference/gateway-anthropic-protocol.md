@@ -37,19 +37,20 @@ Responses expose observed cache reads and writes; absent write counts remain unk
 
 Chat Completions and Responses callers rarely send cache markers, so the gateway adds
 Anthropic's automatic prompt caching for them (`exp/runtime/gateway/automatic_prompt_caching.py`).
-A request on either surface that carries no marker of its own (no `cache_control` anywhere, no
-`prompt_cache_breakpoint`, no `prompt_cache_options.ttl`, no advisor `caching` switch) and is
+A request on either surface that carries no cache choice of its own (no `cache_control` anywhere,
+no `prompt_cache_breakpoint`, no `prompt_cache_options` mode or ttl, no advisor `caching` switch) and is
 dispatched to an Anthropic Messages rung gets the top-level `cache_control: {"type": "ephemeral"}`;
 on a Bedrock Converse rung serving Claude it gets a `cachePoint` after the last message's content.
 Both are five-minute entries that move forward with the conversation, so each turn of an agent
 loop reads the previous turn's prefix. Caller markers always win and are never supplemented.
-Messages requests are never touched. It is on by default where the origin documents automatic
-caching (Anthropic's own API, Claude on Vertex AI, Claude on Azure AI Foundry, Claude on
-Bedrock), including bring-your-own-key rungs, whose provider invoices then show cache
-writes and reads, and off on other origins of those wires (a proxy or another vendor's
-Anthropic-compatible endpoint), because a provider 400 does not fail over. The rung's dispatch
-policy overrides the default (`automatic_prompt_caching: false` opts a rung out, `true` opts an
-unknown origin in). A request routed under zero data retention never gets it (the caller's
+Messages requests are never touched. It is on by default only where the field is verified
+(Anthropic's own API, and Claude 3.5 Haiku and later on Bedrock), including bring-your-own-key
+rungs, whose provider invoices then show cache writes and reads. It is off on every other origin
+of those wires (Claude on Vertex AI and on Azure AI Foundry until a probe proves the top-level
+field there, a proxy, another vendor's Anthropic-compatible endpoint), because a provider 400
+does not fail over. The rung's dispatch policy overrides the default (`automatic_prompt_caching:
+false` opts a rung out, `true` opts another origin in). Either way the rung must declare
+`reports_cache_creation_input_tokens`, so the attempt reservation covers the cache-write rate. A request routed under zero data retention never gets it (the caller's
 `provider: {"zdr": true}`, `AuthorizationSnapshot.zdr_requested`, which a host sets for an
 organization that requires ZDR, or a rung the host flagged for ZDR-constrained dispatch); its own
 markers still forward. An organization with prompt caching off never gets it, and

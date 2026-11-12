@@ -20,8 +20,9 @@ five-minute lifetime:
   content, the same translation the Messages surface's top-level marker
   receives on Bedrock.
 
-Any caller marker wins and disables the gateway's own (a request is never given
-a second breakpoint the caller did not place). Nothing is added to a request
+Any caller marker or explicit cache choice (``prompt_cache_options``) wins and
+disables the gateway's own (a request is never given a second breakpoint the
+caller did not place). Nothing is added to a request
 routed under zero data retention (:func:`zdr_routed`), when the
 organization turned prompt caching off
 (``AuthorizationSnapshot.prompt_caching_disabled``), when the operator stopped the
@@ -72,7 +73,10 @@ FRAMING_TOKENS_PER_MESSAGE = 8
 """Allowance for role and turn framing tokens that the text bytes do not count."""
 
 FRAMING_TOKENS_PER_REQUEST = 64
-"""Allowance for request-level framing (system wrapper, tool schema wrappers)."""
+"""Allowance for request-level framing (system wrapper, tool list wrapper)."""
+
+FRAMING_TOKENS_PER_TOOL = 64
+"""Allowance for each tool definition's own wrapper fields and schema structure."""
 
 CACHING_WIRES = frozenset({"anthropic_messages", "bedrock_converse_stream"})
 """The wires whose cache checkpoints this module knows how to place."""
@@ -99,12 +103,13 @@ def automatic_prompt_caching_stopped(environ: Mapping[str, str] | None = None) -
 def caches_by_default(deployment: ExactModelDeployment, profile: GatewayWireProfile) -> bool:
     """Whether a rung that authored no setting is known to honor automatic caching.
 
-    The Anthropic Messages wire also serves connections with a custom base URL
-    (proxies and Anthropic-compatible origins of other model makers) whose
-    handling of the field is unknown, and a provider 400 does not fail over, so
-    the default covers only origins that document automatic caching: Anthropic's
-    own API, Claude on Vertex AI and Claude on Azure AI Foundry. On Bedrock only
-    Claude models take a ``cachePoint``. Any other rung opts in by authoring
+    A provider 400 does not fail over, so the default covers only origins where
+    the field is verified: Anthropic's own API (the top-level ``cache_control``
+    was verified live there) and Claude models on Bedrock that take a
+    ``cachePoint`` (Claude 3.5 Haiku and later; the Claude 3 generation and
+    Claude 3.5 Sonnet reject one). Claude on Vertex AI and on Azure AI Foundry,
+    proxies and other vendors' Anthropic-compatible origins stay off until a
+    probe proves the field there; such a rung opts in by authoring
     ``automatic_prompt_caching=True``.
 
     Args:
@@ -116,11 +121,13 @@ def caches_by_default(deployment: ExactModelDeployment, profile: GatewayWireProf
     """
     match profile.dialect:
         case "anthropic_messages":
-            if deployment.provider == "anthropic":
-                return anthropic_official_origin(profile.url)
-            return deployment.provider in {"vertex", "azure"}
+            return deployment.provider == "anthropic" and anthropic_official_origin(profile.url)
         case "bedrock_converse_stream":
-            return deployment.provider == "bedrock" and _names_claude(deployment, profile)
+            return (
+                deployment.provider == "bedrock"
+                and _names_claude(deployment, profile)
+                and not _names_pre_caching_claude(deployment, profile)
+            )
         case _:
             return False
 
@@ -162,11 +169,17 @@ def automatic_prompt_caching_applies(
     setting = None if policy is None else policy.automatic_prompt_caching
     if setting is False or (setting is None and not caches_by_default(deployment, profile)):
         return False
+    # The attempt reservation prices a cache write only on a rung that reports
+    # them; without it a gateway-requested write could settle above the hold.
+    if not deployment.gateway.capabilities.reports_cache_creation_input_tokens:
+        return False
     if automatic_prompt_caching_stopped(environ):
         return False
     if (
         cache_markers(request)
         or request.prompt_cache_ttl is not None
+        # ``prompt_cache_options.mode: "explicit"`` with no breakpoint means cache nothing.
+        or request.prompt_cache_mode is not None
         or any(_SERVER_TOOL_CACHING in tool for tool in request.provider_server_tools)
     ):
         return False
@@ -223,6 +236,7 @@ def certainly_below_cacheable_minimum(request: GatewayRequest) -> bool:
         prompt_text_bytes(request)
         + FRAMING_TOKENS_PER_REQUEST
         + FRAMING_TOKENS_PER_MESSAGE * len(request.messages)
+        + FRAMING_TOKENS_PER_TOOL * (len(request.tools) + len(request.provider_server_tools))
     )
     return upper_bound < SMALLEST_CACHEABLE_PREFIX_TOKENS
 
@@ -265,6 +279,28 @@ def with_automatic_prompt_caching(payload: JsonObject, dialect: str) -> JsonObje
             return {**payload, "messages": [*messages[:-1], marked]}
         case _:
             raise ValueError(f"automatic prompt caching has no placement on {dialect!r}")
+
+
+_PRE_CACHING_CLAUDE = (
+    "claude-v2",
+    "claude-instant",
+    "claude-3-haiku",
+    "claude-3-sonnet",
+    "claude-3-opus",
+    "claude-3-5-sonnet",
+)
+"""Bedrock Claude model-id stems that predate Bedrock prompt caching (no ``cachePoint``)."""
+
+
+def _names_pre_caching_claude(
+    deployment: ExactModelDeployment, profile: GatewayWireProfile
+) -> bool:
+    """Whether the Bedrock rung serves a Claude model that rejects a ``cachePoint``."""
+    return any(
+        stem in name.lower()
+        for name in (profile.model_id, deployment.provider_model, deployment.exact_model_id)
+        for stem in _PRE_CACHING_CLAUDE
+    )
 
 
 def _names_claude(deployment: ExactModelDeployment, profile: GatewayWireProfile) -> bool:
