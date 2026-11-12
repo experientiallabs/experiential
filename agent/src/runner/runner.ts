@@ -44,7 +44,7 @@ import { readInbox } from "./inbox.js";
 import { type RunEndStatus, type RunSpec, type RunStatus, SESSION_FILE } from "./protocol.js";
 import { EventPusher } from "./push.js";
 import { repairDanglingToolCalls, RESUME_NOTE } from "./recovery.js";
-import { type SandboxAccount, sandboxBashOperations, sandboxEditOperations, sandboxWriteOperations } from "./sandbox.js";
+import { type SandboxAccount, sandboxBashOperations, sandboxEditOperations, sandboxReadOperations, sandboxWriteOperations } from "./sandbox.js";
 import { freshState, loadState, saveState } from "./state.js";
 
 const HEARTBEAT_MS = 5_000;
@@ -69,8 +69,13 @@ export interface RunnerOptions {
   apiKey: string;
   /** Bearer for the completion callback and the event push. */
   callbackToken?: string;
-  /** Run the model's commands as this account (when the runner is root). */
+  /** Run the model's commands and file operations as this account (when the runner is root). */
   account?: SandboxAccount;
+  /**
+   * Where the bundled skills are written. It must be readable by the account the model's tools run
+   * as (the private session directory is not); defaults to the session's agent directory.
+   */
+  skillsRoot?: string;
   /** fetch for the callback, push, and web search (model calls use Pi's own HTTP client). */
   fetch?: typeof globalThis.fetch;
   /** Clock, for tests. */
@@ -96,7 +101,7 @@ function runnerTools(spec: RunSpec, options: RunnerOptions, gateway: GatewayConf
   const account = options.account;
   const shell = account ? sandboxBashOperations(account) : createLocalBashOperations();
   const tools: ToolDefinition[] = [
-    createReadToolDefinition(options.workDir) as ToolDefinition,
+    createReadToolDefinition(options.workDir, account ? { operations: sandboxReadOperations(account, options.sessionDir) } : {}) as ToolDefinition,
     createWebFetchTool({ shell, cwd: options.workDir }) as ToolDefinition,
     createWebSearchTool({ gateway, model: spec.model, fetch: options.fetch }) as ToolDefinition
   ];
@@ -203,7 +208,8 @@ export async function runOnce(options: RunnerOptions): Promise<RunEndStatus> {
     { projectTrusted: false }
   );
   const runnerExtension: ExtensionFactory = (pi) => {
-    if (options.account) for (const name of ["bash", "write", "edit"]) pi.registerTool(tools.get(name)!);
+    // Pi's own file tools run with the runner's privileges; replace every one with the account's.
+    if (options.account) for (const name of ["read", "bash", "write", "edit"]) pi.registerTool(tools.get(name)!);
     if (spec.reasoningEffort !== null) {
       const effort = spec.reasoningEffort;
       pi.on("before_provider_request", (event) => ({ ...(event.payload as Record<string, unknown>), reasoning_effort: effort }));
@@ -217,7 +223,7 @@ export async function runOnce(options: RunnerOptions): Promise<RunEndStatus> {
     noExtensions: true,
     noPromptTemplates: true,
     noThemes: true,
-    additionalSkillPaths: [resolveSkillsDir(agentDir)],
+    additionalSkillPaths: [resolveSkillsDir(options.skillsRoot ?? agentDir)],
     extensionFactories: [
       {
         name: "exp-code",
@@ -225,7 +231,7 @@ export async function runOnce(options: RunnerOptions): Promise<RunEndStatus> {
           gateway,
           shell: options.account ? sandboxBashOperations(options.account) : undefined,
           searchModel: spec.model,
-          skillsRoot: agentDir,
+          skillsRoot: options.skillsRoot ?? agentDir,
           provider: {
             fetch: options.fetch,
             wire: "openai-completions",

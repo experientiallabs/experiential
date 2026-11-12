@@ -12,6 +12,9 @@
 
 import { applyCliEnvironment } from "../cli/environment.js";
 import { SESSION_DIR, WORK_DIR } from "./protocol.js";
+
+/** Where a root runner writes the bundled skills: root-owned and readable by the model's account. */
+const SHARED_SKILLS_ROOT = "/usr/local/share/exp-code";
 import { accountEnvironment, accountIds, type SandboxAccount } from "./sandbox.js";
 
 interface RunnerArgs {
@@ -63,7 +66,10 @@ export async function main(): Promise<void> {
     account = { uid: ids.uid, gid: ids.gid, env: accountEnvironment(parsed.user, ids.home) };
   }
   const { runOnce } = await import("./runner.js");
-  const status = await runOnce({ sessionDir: parsed.sessionDir, workDir: parsed.workDir, runId: parsed.runId, apiKey, callbackToken, account });
+  // The model's tools run as the account and cannot read the private session directory, so the
+  // skills live in a root-owned, world-readable place.
+  const skillsRoot = account ? SHARED_SKILLS_ROOT : undefined;
+  const status = await runOnce({ sessionDir: parsed.sessionDir, workDir: parsed.workDir, runId: parsed.runId, apiKey, callbackToken, account, skillsRoot });
   process.exit(status === "error" ? 1 : 0);
 }
 
