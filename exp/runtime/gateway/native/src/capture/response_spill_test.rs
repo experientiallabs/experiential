@@ -1,7 +1,7 @@
 //! The tap with a spill store: nothing is trimmed and capture memory stays bounded.
 
 use super::*;
-use crate::capture::collector::Configuration;
+use crate::capture::collector::{CheckpointFailure, Configuration};
 use crate::capture::delivery::{Limits, Sink};
 use crate::capture::record::{Protocol, Record, Request, Scope};
 use crate::capture::spill::{self, SpillStore};
@@ -119,6 +119,7 @@ fn spill_collector(
             capture_hidden_reasoning: true,
             capture_logprobs: false,
             spill: Some(spill_config),
+            checkpoint_failure: CheckpointFailure::Fail,
         },
         SplitSink {
             store: store.clone(),
@@ -477,6 +478,7 @@ fn budgeted_collector(name: &str) -> (Arc<Collector>, mpsc::Receiver<Delivered>)
             capture_hidden_reasoning: true,
             capture_logprobs: false,
             spill: Some(spill_config),
+            checkpoint_failure: CheckpointFailure::Fail,
         },
         SplitSink {
             store: store.clone(),

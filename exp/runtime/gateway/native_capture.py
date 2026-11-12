@@ -125,6 +125,12 @@ class CaptureConfiguration(ContractModel):
         spill: Disk spill for content past the in-memory window, absent by
             default. With it a request may be up to 128 MiB and is never
             trimmed, and ``maximum_response_bytes`` is only the in-memory window.
+        checkpoint_failure: What a hosted prompt checkpoint that cannot be handed
+            to delivery (pending budget full, delivery refused, deadline passed)
+            does to its request. ``"fail"`` (the default) fails the request before
+            any output is exposed. ``"discard"`` drops that request's capture,
+            counts it in ``CaptureCollector.checkpoint_discarded()``, and returns
+            the response unchanged, so capture pressure never fails a request.
     """
 
     delivery: CaptureDeliveryLimits = Field(default_factory=CaptureDeliveryLimits)
@@ -144,6 +150,7 @@ class CaptureConfiguration(ContractModel):
     capture_hidden_reasoning: bool = False
     capture_logprobs: bool = False
     spill: CaptureSpillConfiguration | None = None
+    checkpoint_failure: Literal["fail", "discard"] = "fail"
 
     @model_validator(mode="after")
     def _validate_pending_budget(self) -> CaptureConfiguration:

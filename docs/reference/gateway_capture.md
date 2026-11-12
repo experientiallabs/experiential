@@ -47,6 +47,12 @@ only the prompt. This avoids a delayed prompt update overwriting a full response
 A hosted collector can persist an early prompt checkpoint once the selected lane
 permits capture. Final settlement independently gates the response. The destination
 rechecks current privacy policy for every write, including delayed checkpoints.
+By default a checkpoint that cannot be handed to delivery (the pending budget is
+full, delivery refuses it, or its deadline passes) fails the request before any
+output is exposed. A host for which capture must never fail a request sets
+`checkpoint_failure="discard"`: that request's capture is dropped, counted by
+`CaptureCollector.checkpoint_discarded()`, and the response is returned unchanged.
+Monitor that counter; a discarded request leaves no capture record.
 
 Chat Completions, Responses and Messages HTTP surfaces share the same native tap.
 JSON bodies and ordered SSE data payloads retain unknown fields. The observation

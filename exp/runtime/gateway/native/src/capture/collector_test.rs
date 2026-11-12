@@ -42,6 +42,7 @@ pub(super) fn config() -> Configuration {
         capture_hidden_reasoning: true,
         capture_logprobs: false,
         spill: None,
+        checkpoint_failure: CheckpointFailure::Fail,
     }
 }
 
@@ -203,6 +204,54 @@ fn hosted_checkpoint_is_queued_before_terminal_and_shares_effective_input() {
     assert!(records[0].response.is_some());
     assert_eq!(records[0].request.context, prompt.request.context);
     assert_eq!(records[0].captured_at, prompt.captured_at);
+}
+
+#[test]
+fn checkpoint_failure_defaults_to_fail_and_parses_discard() {
+    let mut document = serde_json::to_value(json!({
+        "delivery": {"maximum_records": 8, "maximum_bytes": 65536, "maximum_record_bytes": 8192},
+        "maximum_pending_records": 4,
+        "maximum_pending_bytes": 65536,
+        "maximum_request_bytes": 4096,
+        "maximum_response_bytes": 4096,
+        "ttl_seconds": 30,
+        "settlement_required": true
+    }))
+    .unwrap();
+    let parsed: Configuration = serde_json::from_value(document.clone()).unwrap();
+    assert_eq!(parsed.checkpoint_failure, CheckpointFailure::Fail);
+    document["checkpoint_failure"] = json!("discard");
+    let parsed: Configuration = serde_json::from_value(document.clone()).unwrap();
+    assert_eq!(parsed.checkpoint_failure, CheckpointFailure::Discard);
+    document["checkpoint_failure"] = json!("retry");
+    assert!(serde_json::from_value::<Configuration>(document).is_err());
+}
+
+#[test]
+fn a_discarded_checkpoint_releases_its_entry_and_retains_nothing() {
+    let mut configuration = config();
+    configuration.checkpoint_failure = CheckpointFailure::Discard;
+    let (collector, receiver) = collector(configuration);
+    assert!(collector.begin(request("discarded")));
+    assert!(collector.begin(request("kept")));
+    collector.discard_checkpoint("discarded");
+    assert_eq!(collector.checkpoint_discarded(), 1);
+    {
+        let pending = collector.pending.lock().unwrap();
+        assert!(!pending.entries.contains_key("discarded"));
+        assert!(pending.entries.contains_key("kept"));
+    }
+    // Later output, settlement and a second checkpoint find nothing to retain.
+    assert!(!collector.finish("discarded", Some(response()), None));
+    collector.settle("discarded", true, true);
+    assert!(collector.checkpoint("discarded"));
+    // The admission slot is released: the pending budget admits new captures.
+    assert!(collector.begin(request("after-1")));
+    assert!(collector.begin(request("after-2")));
+    collector.settle("kept", false, false);
+    collector.settle("after-1", false, false);
+    collector.settle("after-2", false, false);
+    assert!(drain(&collector, receiver).is_empty());
 }
 
 #[test]

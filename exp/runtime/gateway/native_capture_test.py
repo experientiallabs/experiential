@@ -755,6 +755,7 @@ def test_accepted_routing_failure_keeps_effective_prompt_without_inventing_model
         "hosted-late",
         "hosted-byok",
         "hosted-checkpoint-failed",
+        "hosted-checkpoint-discard",
         "absent",
         "off",
         "broken",
@@ -784,9 +785,10 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
         asynchronous_delivery=policy.startswith("hosted"),
         delivery=(
             CaptureDeliveryLimits(maximum_record_bytes=1024, maximum_bytes=6400)
-            if policy == "hosted-checkpoint-failed"
+            if policy.startswith("hosted-checkpoint-")
             else CaptureDeliveryLimits()
         ),
+        checkpoint_failure="discard" if policy == "hosted-checkpoint-discard" else "fail",
     )
 
     def write_batch(values: tuple[str | bytes, ...]) -> list[bool]:
@@ -866,7 +868,12 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
             document["request_id"] = result["request_id"]
             assert process_collector.begin(json.dumps(document))
             process_request_ids.append(result["request_id"])
-        if policy in {"hosted", "hosted-late", "hosted-checkpoint-failed"}:
+        if policy in {
+            "hosted",
+            "hosted-late",
+            "hosted-checkpoint-failed",
+            "hosted-checkpoint-discard",
+        }:
             for wire in result["route"]:
                 wire["billing_customer_managed"] = False
         return json.dumps(result)
@@ -880,7 +887,7 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
         result = settle(argument)
         value = json.loads(argument)
         settlements.append(value)
-        if policy == "hosted-checkpoint-failed":
+        if policy.startswith("hosted-checkpoint-"):
             collector.settle(value["request_id"], False, False)
         return result
 
@@ -908,7 +915,7 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
         for surface in ("chat/completions", "responses", "messages"):
             for stream in (False, True):
                 payload: dict[str, object] = {"model": "coding", "stream": stream}
-                prompt = "capture task" * (400 if policy == "hosted-checkpoint-failed" else 1)
+                prompt = "capture task" * (400 if policy.startswith("hosted-checkpoint-") else 1)
                 if surface == "responses":
                     payload["input"] = prompt
                 else:
@@ -946,6 +953,11 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
                     continue
                 assert response.status_code == 200, response.text
                 assert "hello " in response.text and "world" in response.text
+                if policy == "hosted-checkpoint-discard":
+                    # The checkpoint could not be delivered: the capture is
+                    # dropped and counted, and the caller gets the answer.
+                    assert settlements[-1]["outcome"] != "failed"
+                    continue
                 if policy == "hosted":
                     collector.settle(response.headers["x-request-id"], True, True)
                 elif policy == "hosted-late":
@@ -986,6 +998,11 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     assert collector.close(1)
     assert collector.counts()[0] == 0
     assert _LoopbackProvider.calls == (0 if policy in {"broken", "full"} else 6)
+    if policy == "hosted-checkpoint-discard":
+        # Every surface answered; each oversized checkpoint was dropped and counted.
+        assert collector.checkpoint_discarded() == 6
+        assert records == []
+        return
     if policy in {"absent", "off", "broken", "full", "hosted-byok", "hosted-checkpoint-failed"}:
         assert records == []
         return
