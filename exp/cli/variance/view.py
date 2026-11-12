@@ -25,13 +25,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from rich.console import Console, Group, RenderableType
-from rich.live import Live
-from rich.spinner import Spinner
-from rich.table import Table
-from rich.text import Text
+from rich.console import Console
 
-from exp.cli.shared.progress import duration_text
+from exp.cli.shared.progress import Phase, ProgressDisplay, duration_text
 from exp.cli.variance.sources import (
     PIPELINE_STAGES,
     Admission,
@@ -176,7 +172,6 @@ class FrontDoorView:
     _pipelines: tuple[int, int] | None = None
     _preview: tuple[str, ...] = ()
     _lock: threading.RLock = field(default_factory=threading.RLock)
-    _spinner: Spinner = field(default_factory=lambda: Spinner("dots", style="cyan"))
 
     # ------------------------------------------------------------ inputs
 
@@ -361,29 +356,6 @@ class FrontDoorView:
                 lines.append(f"{row.name} · {elapsed} · " + (", ".join(parts) or "no calls yet"))
             return lines
 
-    def calls_table(self) -> Table | None:
-        """Per-role calls across the run."""
-        with self._lock:
-            if self.traffic is None or not self.traffic.calls:
-                return None
-            table = Table(box=None, pad_edge=False, header_style="dim", show_edge=False)
-            for column in ("role", "calls", "done", "in flight", "errors", "429", "timeouts",
-                           "last min", "p50"):  # fmt: skip
-                table.add_column(column, justify="left" if column == "role" else "right")
-            for row in self.traffic.roles(time.time()):
-                table.add_row(
-                    _role(row.role),
-                    str(row.total),
-                    str(row.done),
-                    str(row.in_flight),
-                    _warn(row.errors),
-                    _warn(row.rate_limited),
-                    _warn(row.timeouts),
-                    str(row.last_minute),
-                    "-" if row.p50 is None else f"{row.p50:.1f}s",
-                )
-            return table
-
     def calls_lines(self) -> list[str]:
         """Per-role calls as plain lines."""
         with self._lock:
@@ -504,57 +476,107 @@ class FrontDoorView:
             out.extend(f"  {line}" for line in summary)
         return out
 
-    def render(self) -> RenderableType:
-        """The interactive region: tree, running stage, calls, cap and the last preview."""
-        with self._lock:
-            parts: list[RenderableType] = [Text(self.header(), style="bold")]
-            if self.note:
-                parts.append(Text(f"  {self.note}", style="dim"))
-            for row in self.rows():
-                parts.append(self._render_row(row))
-            running = self.running()
-            if running:
-                parts.append(
-                    Text("Running" if self.interrupted is None else "Last running", style="bold")
-                )
-                parts.extend(Text(f"  {line}", style="cyan") for line in running)
-            table = self.calls_table()
-            if table is not None:
-                parts.append(Text("Calls", style="bold"))
-                parts.append(table)
-            cap = self.cap_line()
-            if cap:
-                parts.append(Text.assemble(("Cap  ", "bold"), (cap, "dim")))
-            if self._preview:
-                parts.append(Text("Last phase preview", style="bold"))
-                parts.extend(Text(line, style="dim") for line in self._preview[:5])
-            if self.stopped:
-                parts.append(Text.assemble(("Stopped  ", "bold yellow"), self.stopped))
-            summary = self.summary_lines()
-            if summary:
-                parts.append(Text("Summary", style="bold"))
-                parts.extend(Text(f"  {line}") for line in summary)
-            return Group(*parts)
+    # ------------------------------------------------------------ the one progress line
 
-    def _render_row(self, row: Row) -> RenderableType:
-        """One tree row with its glyph (a spinner while running)."""
-        glyph, style = _GLYPH.get(row.state, ("·", "dim"))
-        line = Text(no_wrap=True, overflow="ellipsis")
-        line.append("  " * (row.depth + 1))
-        if row.state == "running":
-            frames = self._spinner.frames
-            frame = frames[int(time.time() * 1000 / self._spinner.interval) % len(frames)]
-            line.append(frame or glyph, style=style)
-        else:
-            line.append(glyph, style=style)
-        label_style = "dim" if row.state in ("planned", "blocked", "pending") else ""
-        line.append(f" {row.label:<{max(1, 38 - 2 * row.depth)}}", style=label_style)
-        line.append(f" {_WORDS.get(row.state, row.state):<11}", style=style)
-        if row.elapsed is not None:
-            line.append(f" {duration_text(row.elapsed):>7}", style="dim")
-        if row.note:
-            line.append(f"  {row.note}", style="dim")
-        return line
+    def bucket_of(self, name: str) -> str:
+        """The progress-line phase a front-door phase belongs to."""
+        if name in ("project-build", "variance-build"):
+            return "build"
+        if name == "pipelines" or name.startswith("pipeline "):
+            return "pipelines"
+        if name == "bootstrap-preparation":
+            return "preparation"
+        order = self.phases
+        position = order.index(name) if name in order else len(order)
+        preparation = (
+            order.index("bootstrap-preparation") if "bootstrap-preparation" in order else 0
+        )
+        pipelines = [i for i, row in enumerate(order) if row.startswith("pipeline")]
+        if pipelines and position > pipelines[0]:
+            return "after"
+        return "families" if position < preparation else "preparation"
+
+    def status(self, *, calls: bool = True) -> tuple[str, ProgressEvent, ProgressEvent] | None:
+        """The progress phase, its counting event and the running front-door phase's event.
+
+        The counting event (stage ``starts`` in the pipelines group, ``phases`` elsewhere) is
+        the phase's driver; the other names what runs inside it, with its calls in a terminal.
+        """
+        with self._lock:
+            rows = [row for row in self.rows() if row.depth == 0]
+            running = [row for row in rows if row.state in ("running", "interrupted")]
+            if not running:
+                return None
+            row = running[-1]
+            bucket = self.bucket_of(row.key)
+            detail = row.note if calls and row.note else None
+            if bucket == "pipelines":
+                starts = [r for r in rows if r.key.startswith("pipeline ")]
+                done = sum(1 for r in starts if r.state == "done")
+                total = max(len(starts), self._pipelines[1] if self._pipelines else 0)
+                stage = next(
+                    (
+                        r.label
+                        for r in self.rows()
+                        if r.key.startswith(f"{row.key}/") and r.state in ("running", "interrupted")
+                    ),
+                    None,
+                )
+                name = row.key.removeprefix("pipeline ") + (f" {stage}" if stage else "")
+                count = ProgressEvent("starts", completed=min(done, total), total=total)
+                return bucket, count, ProgressEvent(name, detail=detail)
+            members = [r for r in rows if self.bucket_of(r.key) == bucket]
+            done = sum(1 for r in members if r.state == "done")
+            count = ProgressEvent("phases", completed=min(done, len(members)), total=len(members))
+            return bucket, count, ProgressEvent(row.key, detail=detail)
+
+    def finished_buckets(self) -> set[str]:
+        """Progress phases whose front-door phases are all done."""
+        with self._lock:
+            rows = [row for row in self.rows() if row.depth == 0]
+            buckets: dict[str, list[str]] = {}
+            for row in rows:
+                buckets.setdefault(self.bucket_of(row.key), []).append(row.state)
+            return {key for key, states in buckets.items() if all(s == "done" for s in states)}
+
+    def result_lines(self) -> list[str]:
+        """The few lines shown when the run ends, in the ``exp build`` summary style."""
+        with self._lock:
+            rows = [row for row in self.rows() if row.depth == 0]
+            done = sum(1 for row in rows if row.state == "done")
+            starts = [row for row in rows if row.key.startswith("pipeline ")]
+            complete = sum(1 for row in starts if row.state == "done")
+            calls = self.traffic.used() if self.traffic is not None else 0
+            ok = all(row.state == "done" for row in rows)
+            mark = "[green]✓[/green]" if ok else "[yellow]![/yellow]"
+            lines = [
+                f"{mark} front door {done}/{len(rows)} phases · {len(starts)} starts, "
+                f"{complete} pipelines complete · {calls:,} model attempts"
+            ]
+            result = self.outcome
+            if result is not None and (starts or result.harbor):
+                points = result.qualified_points
+                qualified = sum(
+                    n for state, n in points.items() if state not in ("rejected", "uncertain")
+                )
+                lines.append(
+                    f"  {qualified} qualified points [dim]({sum(points.values())} judged)[/dim] · "
+                    f"{sum(result.error_points.values())} error points · "
+                    f"{result.families.get('admitted', 0)} families admitted · "
+                    f"{result.admitted} tasks admitted"
+                )
+                lines.extend(f"  harbor {path}" for path in result.harbor)
+            return lines
+
+
+_PHASES = (
+    ("build", "Building", 0.05, "phases"),
+    ("families", "Families", 0.25, "phases"),
+    ("preparation", "Preparing starts", 0.2, "phases"),
+    ("pipelines", "Pipelines", 0.4, "starts"),
+    ("after", "Curriculum and rewards", 0.1, "phases"),
+)
+"""The progress line's phases: the front door's phases grouped as the operator reads them."""
 
 
 def _role(role: str) -> str:
@@ -562,83 +584,70 @@ def _role(role: str) -> str:
     return f"tier {role.removeprefix('actor-')}" if role.startswith("actor-") else role
 
 
-def _warn(count: int) -> str:
-    """A count styled as a warning when it is not zero."""
-    return f"[yellow]{count}[/yellow]" if count else "0"
-
-
-class LinePrinter:
-    """Stable lines for a non-interactive stream: the tree once, then each row that changes."""
-
-    def __init__(self, console: Console) -> None:
-        """Print nothing yet."""
-        self._console = console
-        self._seen: dict[str, str] = {}
-
-    def __call__(self, view: FrontDoorView) -> None:
-        """Print the rows whose state changed since the last call."""
-        first = not self._seen
-        if first:
-            self._console.print(view.header(), markup=False, highlight=False)
-        for row in view.rows():
-            if self._seen.get(row.key) == row.state:
-                continue
-            self._seen[row.key] = row.state
-            self._console.print(row.text(), markup=False, highlight=False)
-
-
 @contextmanager
-def live_view(
+def progress_view(
     console: Console,
     view: FrontDoorView,
     refresh: Callable[[], None],
     *,
     interval: float = 2.0,
 ) -> Iterator[FrontDoorView]:
-    """Own the terminal while a run (or a watch) is in progress, refreshing sources in a thread.
+    """Drive the one shared progress line (:class:`ProgressDisplay`) from the view's sources.
+
+    A source thread re-reads the journal, ledger and store every ``interval`` seconds and
+    reports the running phase into the line: the phase group, its exact counts, the front-door
+    phase inside it and, in a terminal, the calls it has made. A log gets the stable lines
+    ``ProgressDisplay`` prints for any command.
 
     Args:
         console: The command's console.
-        view: The model to draw.
-        refresh: Re-reads every source into the view; errors are kept as the view's note.
-        interval: Seconds between source refreshes.
+        view: The model folded from the sources.
+        refresh: Re-reads every source into the view; a failing source never stops the run.
+        interval: Seconds between refreshes.
 
     Yields:
         The view, for the caller's progress hook and announcements.
     """
+    display = ProgressDisplay(
+        console,
+        [Phase(key, label, weight, driver=unit, unit=unit) for key, label, weight, unit in _PHASES],
+    )
     stop = threading.Event()
-    printer = None if console.is_interactive else LinePrinter(console)
+    last: list[object] = [None]
 
     def tick() -> None:
-        """Refresh once; a failing source is shown, never raised."""
+        """Refresh once and report the running phase if it changed."""
         try:
             refresh()
-        except Exception as error:  # noqa: BLE001 - a view must not kill the run
-            view.update(note=f"view refresh failed: {type(error).__name__}: {error}")
-        if printer is not None:
-            printer(view)
+        except Exception as error:  # noqa: BLE001 - the line must not stop the run
+            view.update(note=f"refresh failed: {type(error).__name__}: {error}")
+        for key in view.finished_buckets():
+            display.complete(key)
+        current = view.status(calls=console.is_interactive)
+        if current is not None and current != last[0]:
+            last[0] = current
+            bucket, count, inner = current
+            hook = display.phase(bucket)
+            hook(count)
+            hook(inner)
 
     def loop() -> None:
         """Refresh until stopped."""
         while not stop.wait(interval):
             tick()
 
+    display.start()
     tick()
-    worker = threading.Thread(target=loop, name="front-door-view", daemon=True)
-    live = (
-        Live(console=console, get_renderable=view.render, refresh_per_second=4, transient=True)
-        if printer is None
-        else None
-    )
-    if live is not None:
-        live.start(refresh=True)
+    worker = threading.Thread(target=loop, name="front-door-progress", daemon=True)
     worker.start()
     try:
         yield view
-    finally:
+    except BaseException:
         stop.set()
         worker.join(timeout=interval + 5)
-        tick()
-        if live is not None:
-            live.stop()
-            console.print(view.render())
+        display.abort()
+        raise
+    stop.set()
+    worker.join(timeout=interval + 5)
+    tick()
+    display.stop()

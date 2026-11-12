@@ -63,6 +63,7 @@ def fakes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Fakes:
     )
     monkeypatch.setattr(launch, "slot_names", lambda value: ["tag-banks", "dense-hybrid"])
     monkeypatch.setattr(launch, "journal_name", lambda store, value: RUN)
+    monkeypatch.setattr(launch, "source_revision", lambda: "rev-1")
 
     def dependencies(store: ProjectStore, value: object, revision: str, **kwargs: object) -> str:
         """Record how the dependencies were bound."""
@@ -101,14 +102,14 @@ def fakes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Fakes:
 
 
 def _invoke(tmp_path: Path, *arguments: str) -> Result:
-    """Run ``exp variance run demo SPEC --root ROOT --code-revision rev-1 ARGUMENTS``."""
+    """Run ``exp variance run demo SPEC --root ROOT ARGUMENTS``."""
     spec = tmp_path / "front-door.json"
     spec.write_text("{}")
     return CliRunner().invoke(
         app,
         [
             "variance", "run", "demo", str(spec), "--root", str(tmp_path / "root"),
-            "--code-revision", "rev-1", *arguments,
+            *arguments,
         ],
     )  # fmt: skip
 
@@ -120,11 +121,12 @@ def test_the_dry_run_prints_preflight_plan_and_digest_and_never_runs(
     result = _invoke(tmp_path, "--dry-run")
     assert result.exit_code == 0, result.output
     output = result.output
-    assert "Front-door preflight" in output and "open-weight only" in output
+    assert "Front-door preflight" in output and "no astra_alias" in output
     assert "2. slot tag-banks: up to $0.500000" in output
     assert "3. pipelines: waiting on an earlier stage" in output
     assert f"Plan digest {PLAN.digest}" in output
     assert "State machines" not in output
+    assert "dry run complete" in output
     assert f"--consent {PLAN.digest} --non-interactive" in output.replace("\n", " ")
     assert fakes.planned == 1 and fakes.runs == [] and fakes.ceilings == []
     assert fakes.dependencies[0]["revision"] == "rev-1"
@@ -135,13 +137,14 @@ def test_consent_by_digest_installs_the_ceiling_runs_and_records(
     tmp_path: Path, fakes: Fakes
 ) -> None:
     """``--consent`` with the digest's first 12 runs once under the scripts' ceiling."""
-    result = _invoke(tmp_path, "--consent", PLAN.digest[:12], "--ceiling-usd", "10")
+    result = _invoke(tmp_path, "--consent", PLAN.digest[:12])
     assert result.exit_code == 0, result.output
-    assert f"Consented to plan {PLAN.digest}" in result.output
+    assert f"Front-door plan {PLAN.digest}" in result.output
+    assert "to run       slot tag-banks (at most 12 physical requests)" in result.output
     assert fakes.ceilings == [
         {
             "digest": PLAN.digest,
-            "ceiling_usd": 10.0,
+            "ceiling_usd": 250.0,
             "real_attempts": 1_000_000,
             "command": "exp " + " ".join(_options(tmp_path).rerun(PLAN.digest)),
         }
@@ -154,7 +157,8 @@ def test_consent_by_digest_installs_the_ceiling_runs_and_records(
     (record,) = load_records(ProjectStore(tmp_path / "root", "demo"))
     assert record.digest == PLAN.digest and record.journal == RUN
     assert record.state == "finished" and record.operation == launch.operation_name(PLAN.digest)
-    assert "Complete" in result.output
+    assert "front door 0/3 phases · 0 starts" in result.output
+    assert "Report: " in result.output and "Complete" in result.output
 
 
 def test_a_consent_naming_another_plan_is_refused_before_any_run(
@@ -180,7 +184,6 @@ def test_yes_consents_to_the_plan_shown(tmp_path: Path, fakes: Fakes) -> None:
     """``--yes`` is the explicit confirmation of the displayed digest."""
     result = _invoke(tmp_path, "--yes", "--non-interactive")
     assert result.exit_code == 0, result.output
-    assert f"Consent covers exactly plan {PLAN.digest[:12]}" in result.output
     assert len(fakes.runs) == 1
 
 
@@ -198,7 +201,6 @@ def test_a_declined_question_runs_nothing(
     monkeypatch.setattr(command, "require_spend_consent", decline)
     result = _invoke(tmp_path)
     assert result.exit_code == 0, result.output
-    assert "Not consented; nothing ran." in result.output
     assert len(asked) == 1 and asked[0]["cost_is_upper_bound"] is False
     assert f"--consent {PLAN.digest}" in asked[0]["command"]
     assert fakes.runs == []
@@ -208,12 +210,11 @@ def test_detach_starts_the_exact_consented_command_and_records_it(
     tmp_path: Path, fakes: Fakes
 ) -> None:
     """The child gets --consent DIGEST and the revision; the record names its PID and log."""
-    result = _invoke(tmp_path, "--consent", PLAN.digest, "--detach", "--no-watch")
+    result = _invoke(tmp_path, "--consent", PLAN.digest, "--detach", "--non-interactive")
     assert result.exit_code == 0, result.output
     (spawned,) = fakes.spawned
     assert spawned[:3] == ["variance", "run", "demo"]
     assert spawned[spawned.index("--consent") + 1] == PLAN.digest
-    assert spawned[spawned.index("--code-revision") + 1] == "rev-1"
     assert "--non-interactive" in spawned and "--log" in spawned
     assert fakes.runs == []
     (record,) = load_records(ProjectStore(tmp_path / "root", "demo"))
@@ -258,8 +259,6 @@ def _options(tmp_path: Path) -> command.RunOptions:
         project="demo",
         spec=tmp_path / "front-door.json",
         root=tmp_path / "root",
-        code_revision="rev-1",
-        ceiling_usd=10.0,
     )
 
 

@@ -24,7 +24,7 @@ from exp.cli.variance.sources import (
     journal_segments,
     segment_after,
 )
-from exp.cli.variance.view import FrontDoorView, LinePrinter
+from exp.cli.variance.view import FrontDoorView, progress_view
 from exp.common.progress import ProgressEvent
 
 NOW = (START + timedelta(minutes=75)).timestamp()
@@ -155,33 +155,37 @@ def test_the_summary_names_points_verdicts_admissions_and_packages() -> None:
     assert summary[-2:] == ["  /tmp/harbor/task-a", "  /tmp/harbor/task-b (diagnostic)"]
 
 
-def test_a_log_gets_the_tree_once_then_only_changes(tmp_path: Path) -> None:
-    """Non-interactive output is stable lines: nothing repeats until a row changes state."""
+def test_the_progress_line_names_the_group_counts_and_running_start(tmp_path: Path) -> None:
+    """One status: the phase group, its exact counts and the start and stage inside it."""
+    view = _view(tmp_path)
+    assert view.bucket_of("slot tag-banks") == "families"
+    assert view.bucket_of("slot dense-hybrid") == "after"
+    assert view.bucket_of(f"pipeline {TASK}") == "pipelines"
+    assert view.status(calls=False) == (
+        "pipelines",
+        ProgressEvent("starts", completed=0, total=1),
+        ProgressEvent(f"{TASK} traceml"),
+    )
+    assert view.finished_buckets() == {"build"}  # task-types, state-rag never ran here
+
+
+def test_the_closing_lines_are_few_like_exp_build(tmp_path: Path) -> None:
+    """Phases, starts and attempts in one line; points, admissions and packages after it."""
+    view = _view(tmp_path)
+    view.update(outcome=Outcome(qualified_points=Counter({"qualified": 2}), harbor=["/h/a"]))
+    lines = view.result_lines()
+    assert lines[0].startswith("[yellow]![/yellow] front door 5/12 phases · 1 starts, 0 pipelines")
+    assert lines[0].endswith("6 model attempts")
+    assert lines[1].startswith("  2 qualified points")
+    assert lines[-1] == "  harbor /h/a"
+
+
+def test_a_log_gets_the_shared_progress_lines(tmp_path: Path) -> None:
+    """Non-interactive output is ProgressDisplay's stable lines: each phase once, no calls."""
     view = _view(tmp_path)
     stream = io.StringIO()
-    printer = LinePrinter(Console(file=stream, width=200, theme=EXP_THEME))
-    printer(view)
-    first = stream.getvalue().splitlines()
-    assert first[0].startswith("front door 0123456789ab · demo · running")
-    assert any("✓ slot tag-banks  done  30m00s" in line for line in first)
-    printer(view)
-    assert stream.getvalue().splitlines() == first
-    view.observe(ProgressEvent(f"pipeline {TASK}", completed=3, total=6, detail="traceml"))
-    printer(view)
-    added = stream.getvalue().splitlines()[len(first) :]
-    assert len(added) == 2
-    assert "✓ traceml  done" in added[0] and "● error-mining  running" in added[1]
-
-
-def test_the_interactive_region_renders_tree_calls_cap_and_preview(tmp_path: Path) -> None:
-    """The rich region carries the tree, the calls table, the cap and the last preview."""
-    view = _view(tmp_path)
-    view.announce(("Before phase slot dense-hybrid:", "   Completed work: project-build."))
-    console = Console(record=True, width=160, theme=EXP_THEME, force_terminal=True)
-    console.print(view.render())
-    text = console.export_text()
-    assert "front door 0123456789ab · demo · running" in text
-    assert "slot tag-banks" in text and "30m00s" in text
-    assert "tier gemma4" in text and "in flight" in text
-    assert "Cap  6 / 1,000 real attempts" in text
-    assert "Before phase slot dense-hybrid:" in text
+    console = Console(file=stream, width=200, theme=EXP_THEME)
+    with progress_view(console, view, lambda: None, interval=0.5):
+        view.observe(ProgressEvent(f"pipeline {TASK}", completed=3, total=6, detail="traceml"))
+    out = stream.getvalue().splitlines()
+    assert out == ["  Pipelines..."]  # a counted phase logs again only when its count completes
