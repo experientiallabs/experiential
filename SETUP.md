@@ -7,7 +7,7 @@ Conductor) and it runs the setup for you. Your account is created instantly from
 the email you give the agent. Email confirmation and card/payment verification
 are separate steps; email alone does not unlock Free core model access.
 For the current machine-readable contract, see
-https://platform.experientiallabs.ai/llms.txt.
+https://platform.experientiallabs.ai/llms.txt .
 
 Each block below is one self-contained prompt. Each prompt includes the verification and Free core usage rules relevant to setup.
 
@@ -138,7 +138,7 @@ When you're done, report back to me: my org_id, whether you pulled live or
 uploaded a file (and from which provider/format), the ingest_id and its
 trace_count, and the total_traces the verify read returned. My traces are now
 telemetry on the platform. I can see them in my dashboard at https://platform.experientiallabs.ai/telemetry,
-and the machine-readable contract is https://platform.experientiallabs.ai/llms.txt.
+and the machine-readable contract is https://platform.experientiallabs.ai/llms.txt .
 
 One last thing to tell me, then you're done: check my email inbox for a message
 from Experiential Labs and click the verification link (or enter the code at
@@ -254,8 +254,8 @@ as the bearer token on every call below.
 When you're done, report back to me: my org_id, which providers you connected and
 each one's verification status, and any inference keys you found but I declined.
 Models I call on my own connected keys are free pass-through — no credit draw,
-still tracked in my usage and credit views at https://platform.experientiallabs.ai/credits. I can manage these
-connections anytime at https://platform.experientiallabs.ai/settings/integrations.
+still tracked in my usage and credit views at https://platform.experientiallabs.ai/credits . I can manage these
+connections anytime at https://platform.experientiallabs.ai/settings/integrations .
 
 One last thing to tell me, then you're done: to also use Experiential's
 platform-funded credits (calling models WITHOUT your own keys), check my email
@@ -504,7 +504,7 @@ When you're done, report back to me: my org_id, my starting credit balance
 connected and each one's status, what spend history you imported, and which
 coding agents (or Conductor) you repointed at the gateway. My dashboard is at
 https://platform.experientiallabs.ai (credits and every session at https://platform.experientiallabs.ai/credits); the machine-readable
-contract is https://platform.experientiallabs.ai/llms.txt.
+contract is https://platform.experientiallabs.ai/llms.txt .
 
 One last thing to tell me, then you're done: to use Experiential's
 platform-funded credits (calling models WITHOUT my own keys), check my email
