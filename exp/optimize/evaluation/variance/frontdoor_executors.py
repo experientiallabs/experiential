@@ -29,10 +29,11 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from pydantic import Field
 
@@ -67,10 +68,16 @@ from exp.optimize.evaluation.variance.pipeline_review import family_reviewer, re
 from exp.optimize.evaluation.variance.pipeline_spec import CostLine, cost_lines
 from exp.optimize.evaluation.variance.refined_prompts import SLOT_ROLES, refined_identity
 from exp.runtime.gateway.decisions_contracts import MAX_DECISION_QUESTIONS
+from exp.runtime.gateway.reservation_tokenizer import count_reservation_tokens
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.codex_cli import offline_closed_model
 from exp.runtime.models.providers.errors import ProviderRetryableResponseError
-from exp.runtime.models.providers.transport import HttpxJsonTransport
+from exp.runtime.models.providers.transport import (
+    HttpxJsonTransport,
+    JsonHttpResponse,
+    JsonHttpTransport,
+    ProviderTransportError,
+)
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.mining.authoring_loop import AuthoringLoopSpec, author_family_bank
@@ -81,7 +88,7 @@ from exp.simulation.mining.environment_families import (
     load_environment_families,
 )
 from exp.simulation.mining.environment_review import ReviewerError
-from exp.simulation.mining.questions import resolve_question_bank
+from exp.simulation.mining.questions import Question, resolve_question_bank
 from exp.simulation.mining.scrub import scrub_units
 from exp.simulation.mining.tag_authoring import (
     TagAuthor,
@@ -347,14 +354,114 @@ def admitted(
     )
 
 
+MAXIMUM_DECISION_STATE_TOKENS = 100_000
+"""Largest rendered state, in o200k reservation tokens, one front-door decision call carries.
+
+Hosted Clef refuses an over-long input with a bare HTTP 400 ("rejected the request without giving
+a reason"): a 130,740-token observations view (about 151,000 Clef input tokens) is refused while a
+100,628-input-token state is answered. The observations view's own budget cannot bound a view
+whose fixed head is the problem, such as a request that inlines a whole repository, so the state
+is fitted here, at the call, instead of in the view (which would re-key the saved variance build).
+"""
+
+_ELISION = "\n\n[... {count} characters elided to fit the decision model's input ...]\n\n"
+
+
+def fit_decision_unit(unit: Unit, maximum_tokens: int = MAXIMUM_DECISION_STATE_TOKENS) -> Unit:
+    """Return the unit unchanged when it fits, otherwise its head and tail around an elision.
+
+    The start (what was asked) and the end (the final answer) carry most of what a question
+    reads, so the middle gives way. The cut is a pure function of the text and the ceiling, and
+    the decision cache keys on the fitted text, so a rerun replays the same answer, and a view
+    that already fits keeps every answer it was saved with.
+    """
+    text = unit.text
+    if count_reservation_tokens(text) <= maximum_tokens:
+        return unit
+
+    def cut(keep: int) -> str:
+        head = (keep * 3) // 4
+        marker = _ELISION.format(count=len(text) - keep)
+        return text[:head] + marker + text[len(text) - (keep - head) :]
+
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if count_reservation_tokens(cut(middle)) <= maximum_tokens:
+            low = middle
+        else:
+            high = middle - 1
+    return Unit(unit.trace_id, unit.view, cut(low), dict(unit.meta))
+
+
+class FittedDecisionsTagger(DecisionsTraceTagger):
+    """The native decision tagger, sending each unit fitted to the decision model's input.
+
+    Rows still carry the rendered unit's own identity; only the request and its cache key use the
+    fitted text.
+    """
+
+    maximum_state_tokens = MAXIMUM_DECISION_STATE_TOKENS
+
+    def _unit_answers(self, unit: Unit, chunks: Sequence[Sequence[Question]]) -> Any:  # noqa: ANN401
+        """Answer the bank about the unit as fitted to the input ceiling."""
+        return super()._unit_answers(fit_decision_unit(unit, self.maximum_state_tokens), chunks)
+
+
+def _refusal_reason(body: object) -> str:
+    """Return the provider's stated error type, code and message, bounded, never the request."""
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return "no error object in the response"
+    parts = [
+        f"{key}={str(error[key])[:300]}"
+        for key in ("type", "code", "message")
+        if isinstance(error.get(key), str)
+    ]
+    return "; ".join(parts) or "an error object with no type, code or message"
+
+
+@dataclass(frozen=True)
+class ReasonedDecisionTransport(JsonHttpTransport):
+    """Raise a refused decision call with the provider's stated reason, not just its status.
+
+    The decision tagger raises the same error, with the same status, for any response that is not
+    an HTTP 200 object, so retry classification is unchanged; only the message gains the reason.
+    """
+
+    inner: JsonHttpTransport
+
+    def post(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        payload: JsonObject,
+        timeout_seconds: float,
+    ) -> JsonHttpResponse:
+        """Post through the inner transport and name a refusal's reason."""
+        response = self.inner.post(
+            url, headers=headers, payload=payload, timeout_seconds=timeout_seconds
+        )
+        if response.status_code != 200 or not isinstance(response.body, dict):
+            raise ProviderTransportError(
+                f"tagging decision returned HTTP {response.status_code}: "
+                f"{_refusal_reason(response.body)}",
+                status_code=response.status_code,
+            )
+        return response
+
+
 def decision_tagger(
     project: ProjectStore, alias: str, purpose: str, attempts: int, code_revision: str
 ) -> DecisionsTraceTagger:
     """Return the native decision tagger of an alias over the project decision cache."""
     resolved = RuntimeModelCatalog(load_model_catalog(project.model_catalog_path)).resolve(alias)
     transport = admitted(project, purpose, attempts, code_revision).priced_as(alias)
-    return DecisionsTraceTagger.for_alias(
-        resolved, transport=transport, cache=DecisionCache(project.paths)
+    return FittedDecisionsTagger.for_alias(
+        resolved,
+        transport=ReasonedDecisionTransport(transport),
+        cache=DecisionCache(project.paths),
     )
 
 
