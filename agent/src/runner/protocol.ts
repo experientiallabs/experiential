@@ -85,7 +85,12 @@ export type RunEventBody =
   | { type: "todo"; items: TodoItem[] }
   /** The agent asked the user something and ended its turn. */
   | { type: "question"; id: string; question: string; options: string[] }
-  /** One model response finished. costUsd is the gateway's settled cost when it reported one. */
+  /**
+   * One model response finished. costUsd is the credits the gateway charged when it reported
+   * them. byok: the call ran on the user's own provider key (bring your own key), which that
+   * provider bills directly; byokListUsd is that provider's list price for the call. listUsd is
+   * the list price of a call charged below it (free under a promotion or plan, or discounted).
+   */
   | {
       type: "turn";
       model: string;
@@ -93,6 +98,9 @@ export type RunEventBody =
       cachedInputTokens: number;
       outputTokens: number;
       costUsd: number | null;
+      byok?: boolean;
+      byokListUsd?: number | null;
+      listUsd?: number;
       durationMs: number;
       stopReason: string;
     }

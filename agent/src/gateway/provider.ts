@@ -29,11 +29,44 @@ export function literalApiKey(key: string): string {
 
 /** Read a provider-reported cost off a parsed stream event, when the event carries one. */
 export function reportedCost(data: unknown): number | undefined {
+  return reportedBilling(data)?.cost;
+}
+
+/**
+ * What the gateway reported about a response's billing: `usage.cost` (the credits it charged),
+ * and for a call served on the caller's own provider key (bring your own key) `usage.is_byok`
+ * with that provider's list price as `usage.cost_details.upstream_inference_cost`. A call charged
+ * below its list price (free under a promotion or a plan, or discounted) carries the list price
+ * as `usage.cost_details.list_cost`.
+ */
+export interface ReportedBilling {
+  cost: number;
+  byok: boolean;
+  byokListUsd: number | null;
+  /** List price of a call charged below it (free or discounted); null when it paid list. */
+  listUsd: number | null;
+}
+
+export function reportedBilling(data: unknown): ReportedBilling | undefined {
   if (typeof data !== "object" || data === null) return undefined;
   const usage = (data as { usage?: unknown; response?: { usage?: unknown } }).usage ?? (data as { response?: { usage?: unknown } }).response?.usage;
   if (typeof usage !== "object" || usage === null) return undefined;
-  const cost = (usage as { cost?: unknown }).cost;
-  return typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? cost : undefined;
+  const record = usage as { cost?: unknown; is_byok?: unknown; cost_details?: { upstream_inference_cost?: unknown; list_cost?: unknown } };
+  const cost = record.cost;
+  if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) return undefined;
+  const amount = (value: unknown): number | null => (typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null);
+  const listUsd = amount(record.cost_details?.list_cost);
+  return {
+    cost,
+    byok: record.is_byok === true,
+    byokListUsd: amount(record.cost_details?.upstream_inference_cost),
+    listUsd: listUsd !== null && listUsd > cost ? listUsd : null
+  };
+}
+
+/** The billing the gateway reported for an assistant message (see registerGatewayProvider), if any. */
+export function messageBilling(message: unknown): ReportedBilling | undefined {
+  return (message as { gatewayBilling?: ReportedBilling }).gatewayBilling;
 }
 
 /** Build the provider models for a listing. */
@@ -81,22 +114,25 @@ export async function registerGatewayProvider(pi: ExtensionAPI, config: GatewayC
     )
   );
 
-  // Settled cost: the last reported value of the current response, applied at message_end.
-  let pendingCost: number | undefined;
+  // Settled billing: the last reported value of the current response, applied at message_end.
+  // The cost becomes the message's total; the whole report rides along as `gatewayBilling`.
+  let pending: ReportedBilling | undefined;
   pi.on("message_start", (event) => {
-    if (event.message.role === "assistant") pendingCost = undefined;
+    if (event.message.role === "assistant") pending = undefined;
   });
   pi.on("provider_stream_event", (event) => {
     if (event.provider !== GATEWAY_PROVIDER_ID) return;
-    const cost = reportedCost(event.data);
-    if (cost !== undefined) pendingCost = cost;
+    const billing = reportedBilling(event.data);
+    if (billing !== undefined) pending = billing;
   });
   pi.on("message_end", (event) => {
     const message = event.message;
-    if (message.role !== "assistant" || message.provider !== GATEWAY_PROVIDER_ID || pendingCost === undefined) return;
-    const total = pendingCost;
-    pendingCost = undefined;
-    return { message: { ...message, usage: { ...message.usage, cost: { ...message.usage.cost, total, totalFromProvider: true } } } };
+    if (message.role !== "assistant" || message.provider !== GATEWAY_PROVIDER_ID || pending === undefined) return;
+    const billing = pending;
+    pending = undefined;
+    return {
+      message: { ...message, usage: { ...message.usage, cost: { ...message.usage.cost, total: billing.cost, totalFromProvider: true } }, gatewayBilling: billing }
+    };
   });
   return models;
 }

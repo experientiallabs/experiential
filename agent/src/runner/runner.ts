@@ -36,7 +36,7 @@ import { createWebFetchTool } from "../extension/web-fetch.js";
 import { createWebSearchTool } from "../extension/web-search.js";
 import { GATEWAY_PROVIDER_ID, type GatewayConfig, trimBaseUrl } from "../gateway/config.js";
 import { DEFAULT_MAX_TOKENS, type ListedModel } from "../gateway/models.js";
-import { gatewayProviderConfig, gatewayProviderModels } from "../gateway/provider.js";
+import { gatewayProviderConfig, gatewayProviderModels, messageBilling } from "../gateway/provider.js";
 import { INTERRUPTED_LIMIT_MESSAGE, modelErrorEvent, RESTART_LIMIT_MESSAGE, RUN_LIMIT_MESSAGE } from "./errors.js";
 import { currentRun, EventLog, readEventLog } from "./event-log.js";
 import { listWorkFiles } from "./files.js";
@@ -348,6 +348,7 @@ export async function runOnce(options: RunnerOptions): Promise<RunEndStatus> {
         saveState(statePath, state);
         status.turns += 1;
         const cost = assistant.usage.cost.totalFromProvider ? assistant.usage.cost.total : null;
+        const billing = messageBilling(assistant);
         status.costUsd += cost ?? 0;
         emit({
           type: "turn",
@@ -356,6 +357,8 @@ export async function runOnce(options: RunnerOptions): Promise<RunEndStatus> {
           cachedInputTokens: assistant.usage.cacheRead,
           outputTokens: assistant.usage.output,
           costUsd: cost,
+          ...(billing?.byok ? { byok: true, byokListUsd: billing.byokListUsd } : {}),
+          ...(billing?.listUsd != null ? { listUsd: billing.listUsd } : {}),
           durationMs: assistant.durationMs ?? now() - turnStartedAt,
           stopReason: assistant.stopReason
         });
