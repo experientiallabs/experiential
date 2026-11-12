@@ -372,6 +372,21 @@ class GatewayRungDispatchPolicy(ContractModel):
     ``build_rung_dispatch`` injects it only on ``openai_responses``. ``None``
     injects nothing.
     """
+    automatic_prompt_caching: bool | None = None
+    """Whether the gateway adds Anthropic automatic prompt caching on this rung.
+
+    Applies to Chat Completions and Responses requests that carry no cache
+    marker of their own, dispatched on the Anthropic Messages or Bedrock
+    Converse wire (``exp.runtime.gateway.automatic_prompt_caching``): the
+    payload gets the top-level ``cache_control`` (``{"type": "ephemeral"}``),
+    or a Converse ``cachePoint`` after the last message. ``None`` (default)
+    turns it on where the origin is known to honor it (Anthropic's own API,
+    Claude on Vertex AI, Claude on Azure AI Foundry, Claude on Bedrock) and
+    leaves it off on any other origin of those wires. ``True`` turns it on for
+    a rung on either wire whose origin the default does not cover; ``False``
+    opts the rung out. Never read on any other wire, and never on the Messages
+    surface, whose caller places its own markers.
+    """
     max_prompt_tokens: int | None = Field(default=None, ge=1)
     """The longest prompt this rung takes, by the prompt's lower-bound estimate.
 

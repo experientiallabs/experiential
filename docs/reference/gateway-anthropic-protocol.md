@@ -34,6 +34,33 @@ Cache markers retain their requested TTL. Gateway reservations require the corre
 five-minute or one-hour price; settlement uses provider-observed TTL counts, never the request
 marker. Missing rates or incomplete TTL evidence remain unknown rather than using another rate.
 Responses expose observed cache reads and writes; absent write counts remain unknown.
+
+Chat Completions and Responses callers rarely send cache markers, so the gateway adds
+Anthropic's automatic prompt caching for them (`exp/runtime/gateway/automatic_prompt_caching.py`).
+A request on either surface that carries no marker of its own (no `cache_control` anywhere, no
+`prompt_cache_breakpoint`, no `prompt_cache_options.ttl`, no advisor `caching` switch) and is
+dispatched to an Anthropic Messages rung gets the top-level `cache_control: {"type": "ephemeral"}`;
+on a Bedrock Converse rung serving Claude it gets a `cachePoint` after the last message's content.
+Both are five-minute entries that move forward with the conversation, so each turn of an agent
+loop reads the previous turn's prefix. Caller markers always win and are never supplemented.
+Messages requests are never touched. It is on by default where the origin documents automatic
+caching (Anthropic's own API, Claude on Vertex AI, Claude on Azure AI Foundry, Claude on
+Bedrock) and off on other origins of those wires (a proxy or another vendor's
+Anthropic-compatible endpoint), because a provider 400 does not fail over. The rung's dispatch
+policy overrides the default (`automatic_prompt_caching: false` opts a rung out, `true` opts an
+unknown origin in). An organization with prompt caching off never gets it, and
+`EXP_GATEWAY_AUTOMATIC_PROMPT_CACHING=0` (or `false`, `off`, `no`) stops it for the process
+without a catalog change.
+
+Cost: Anthropic bills a write at 1.25 times the input rate and a read at about 0.1 times. A
+prompt shorter than the model's minimum cacheable prefix (512 to 4,096 tokens depending on the
+model) is never written and costs nothing extra; the gateway also leaves the field off any
+prompt whose upper-bound token count (UTF-8 text bytes plus a framing allowance, no media) is
+under 512. A single-shot prompt above the minimum pays the 25% premium once on its prefix; a
+second turn that shares the prefix already pays less in total than two uncached turns. Writes
+and reads settle through the same usage legs as caller-marked caching
+(`cache_creation_input_tokens`, `cached_input_tokens`), and the reservation already holds the
+write rate on any rung that reports cache writes.
 The decoder also
 carries the provider-native tool annotations (`strict`,
 `eager_input_streaming`, `defer_loading`, `allowed_callers`, `input_examples`; each accepted

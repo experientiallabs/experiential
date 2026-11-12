@@ -12,6 +12,11 @@ frozen with OpenRouter's zero-data-retention routing constraint on its payload
 and the metadata opt-in header on its dispatch; a flagged rung on any other
 wire fails closed here, never dispatching unconstrained.
 
+A Chat Completions or Responses request with no cache marker of its own gets
+Anthropic's five-minute automatic prompt caching on an Anthropic Messages or
+Bedrock Converse rung (``automatic_prompt_caching``), unless the organization,
+the operator or the rung turned it off.
+
 A rung whose authored dispatch policy sets ``upstream_priority`` (a self-hosted
 vLLM lane) carries the caller's admission level as vLLM's ``priority`` field.
 
@@ -34,6 +39,10 @@ from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import JsonObject, sha256_bytes
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.runtime.gateway.automatic_prompt_caching import (
+    automatic_prompt_caching_applies,
+    with_automatic_prompt_caching,
+)
 from exp.runtime.gateway.class_throttles import fast_on_rung, upstream_priority
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayApiSurface, GatewayRequest
 from exp.runtime.gateway.native_admission import shape_parallel_tool_calls
@@ -213,6 +222,10 @@ def build_rung_dispatch(
     upstream_payload = image_aware_stream_payload(
         profile, rung_request, capabilities, deployment.provider
     )
+    if automatic_prompt_caching_applies(deployment, profile, rung_request, authorization):
+        # A Chat or Responses caller with no markers of its own: ask an
+        # Anthropic-wire rung for its five-minute automatic cache.
+        upstream_payload = with_automatic_prompt_caching(upstream_payload, profile.dialect)
     upstream_payload, sampling_disclosures = forward_sampling_extras(
         upstream_payload,
         rung_request.sampling_extras,
