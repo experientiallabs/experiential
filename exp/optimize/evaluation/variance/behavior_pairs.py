@@ -581,10 +581,15 @@ def load_behavior_differences(
             _citations(poor, pair.alignment.poor_events)
             _citations(good, pair.audit.good_events)
             _citations(poor, pair.audit.poor_events)
-            if (
-                good.verdict != "pass"
-                or poor.verdict != "fail"
-                or pair.delta != behavior_delta(good, poor, pair.alignment, report.spec)
+            contrasted = (
+                (good.verdict, poor.verdict) == ("pass", "fail")
+                if report.pairing == "verdict"
+                else good.verdict == poor.verdict
+                and not flagged(good, report.spec)
+                and flagged(poor, report.spec)
+            )
+            if not contrasted or pair.delta != behavior_delta(
+                good, poor, pair.alignment, report.spec
             ):
                 raise ValueError("saved behavioral difference is inconsistent with its evidence")
     if report.groups != difference_groups(report.pairs, bank_sha256=sha256_json(report.bank)):
