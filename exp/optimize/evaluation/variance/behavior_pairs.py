@@ -276,7 +276,12 @@ def _attempts(
             require_turns=True,
         )
         if len(trajectory.steps) > maximum_steps:
-            raise ValueError("behavior trajectory exceeds the registered step bound")
+            # One attempt past the priced tagging bound is left out, never the tier's grading.
+            failures[branch.index] = (
+                f"behavior trajectory has {len(trajectory.steps)} steps, more than the "
+                f"registered bound {maximum_steps}"
+            )
+            continue
         if not trajectory.steps:
             failures[branch.index] = "episode has no taggable action steps"
             continue
