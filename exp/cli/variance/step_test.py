@@ -108,3 +108,65 @@ def test_stage_keys_and_summaries(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert stage_key("pipeline task-1 traceml") == "pipeline-task-1-traceml"
     assert evidence("bootstrap-preparation").endswith("(not built yet)[/dim]")
     assert one_line({"a": "x" * 200}, limit=20) == "a " + "x" * 17 + "…"
+
+
+def test_from_begins_at_a_named_stage_and_earlier_cards_pass_silently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--from slot curriculum: earlier phases replay without a card or a pause."""
+    monkeypatch.setattr(step, "WIKI", tmp_path / "wiki")
+    stream = io.StringIO()
+    console = Console(file=stream, width=160, theme=EXP_THEME)
+    stepper = Stepper(
+        console=console,
+        store=ProjectStore(tmp_path, "demo"),
+        view=FrontDoorView(title="t", project="demo"),
+        plan=PLAN,
+        journal=write_journal(tmp_path / "transitions.jsonl", RECORDED),
+        pause=False,
+        start_at="curriculum",
+    )
+    waits: list[str] = []
+    stepper.wait = waits.append  # ty: ignore[invalid-assignment]
+    stepper.observe(ProgressEvent("project-build", detail="replayed"))
+    stepper.observe(ProgressEvent("slot tag-banks", detail="replayed"))
+    stepper.observe(ProgressEvent("slot curriculum", detail="running"))
+    out = stream.getvalue()
+    assert "· 1. project-build (skipped, replayed)" in out
+    assert "· 2. slot tag-banks (skipped, replayed)" in out
+    assert "▸ slot tag-banks" not in out and "▸ slot curriculum" in out
+    assert waits == ["run"]
+
+
+def test_a_number_typed_at_a_pause_jumps_forward(tmp_path: Path) -> None:
+    """Typing 3 at the first pause skips straight to the third card."""
+    answers = iter(["3"])
+    stream = io.StringIO()
+    console = Console(file=stream, width=160, theme=EXP_THEME)
+    console.input = lambda prompt="": next(answers)  # ty: ignore[invalid-assignment]
+    stepper = Stepper(
+        console=console,
+        store=ProjectStore(tmp_path, "demo"),
+        view=FrontDoorView(title="t", project="demo"),
+        plan=PLAN,
+        journal=write_journal(tmp_path / "transitions.jsonl", RECORDED),
+        pause=True,
+    )
+    stepper.observe(ProgressEvent("project-build", detail="replayed"))
+    stepper.observe(ProgressEvent("slot tag-banks", detail="replayed"))
+    out = stream.getvalue()
+    assert "▸ project-build" in out
+    assert "· 2. slot tag-banks (skipped, replayed)" in out
+
+
+def test_an_unknown_from_is_refused(tmp_path: Path) -> None:
+    """--from must name a stage of the plan."""
+    with pytest.raises(ValueError, match="names no stage"):
+        Stepper(
+            console=Console(file=io.StringIO()),
+            store=ProjectStore(tmp_path, "demo"),
+            view=FrontDoorView(title="t", project="demo"),
+            plan=PLAN,
+            journal=None,
+            start_at="no-such-stage",
+        )

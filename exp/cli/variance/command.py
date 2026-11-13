@@ -76,6 +76,7 @@ class RunOptions:
     non_interactive: bool = False
     detach: bool = False
     step: bool = False
+    step_from: str | None = None
     log: Path | None = None
     code_revision: str | None = None
 
@@ -382,6 +383,7 @@ def stepping(
         journal=runtime / "front-door" / record.journal / "transitions.jsonl",
         traffic=Traffic(ledger, content_database_path(options.root), options.project),
         pause=not options.non_interactive and can_prompt(console),
+        start_at=options.step_from,
     )
     replay = (
         "every stage replays from the store; no model call"
@@ -389,6 +391,8 @@ def stepping(
         else ("stages that are saved replay; the others run now")
     )
     console.print(f"[bold]Step mode[/bold] [dim]{replay}[/dim]")
+    console.print("[dim]Stages (type a number or name at any pause to jump forward):[/dim]")
+    relay.stepper.listing()
     try:
         yield
     finally:

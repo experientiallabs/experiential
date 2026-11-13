@@ -52,6 +52,11 @@ def run_command(
     step: bool = typer.Option(
         False, "--step", help="Pause before and after each stage to show its evidence."
     ),
+    step_from: str | None = typer.Option(
+        None,
+        "--from",
+        help="With --step: begin at this stage (number or name); earlier ones replay silently.",
+    ),
     log: Path | None = LOG_OPTION,
     code_revision: str | None = REVISION_OPTION,
 ) -> None:
@@ -70,7 +75,8 @@ def run_command(
                 consent=consent,
                 non_interactive=non_interactive,
                 detach=detach,
-                step=step,
+                step=step or step_from is not None,
+                step_from=step_from,
                 log=log,
                 code_revision=code_revision,
             ),

@@ -101,12 +101,80 @@ class Stepper:
     journal: Path | None
     traffic: Traffic | None = None
     pause: bool = True
+    start_at: str | None = None
     _started: dict[str, float] = field(default_factory=dict)
+    _target: str | None = None
+    _position: int = 0
+
+    def __post_init__(self) -> None:
+        """Every card in order: each phase, and each stage of a start's pipeline."""
+        self.steps: list[str] = []
+        for row in self.plan.stages:
+            self.steps.append(row.stage)
+            if row.stage.startswith("pipeline "):
+                task = row.stage.removeprefix("pipeline ")
+                self.steps.extend(f"{task} {stage}" for stage in PIPELINE_STAGES)
+        if self.start_at is not None:
+            self._target = self._resolve(self.start_at, 0)
+            if self._target is None:
+                raise ValueError(
+                    f"--from {self.start_at!r} names no stage; stages: " + ", ".join(self.steps)
+                )
+
+    def _resolve(self, wanted: str, after: int) -> str | None:
+        """A step by its number (1-based) or by name (exact, else first containing it)."""
+        wanted = wanted.strip()
+        if wanted.isdigit():
+            index = int(wanted) - 1
+            return self.steps[index] if 0 <= index < len(self.steps) else None
+        lower = wanted.lower()
+        for step in self.steps[after:]:
+            if step.lower() == lower:
+                return step
+        for step in self.steps[after:]:
+            if lower in step.lower():
+                return step
+        return None
+
+    def _show(self, name: str) -> bool:
+        """Whether this card is shown; cards before a jump target pass silently."""
+        if name in self.steps:
+            self._position = self.steps.index(name)
+        if self._target is None:
+            return True
+        if name == self._target:
+            self._target = None
+            return True
+        number = self._position + 1
+        self.console.print(f"  [dim]· {number}. {name} (skipped, replayed)[/dim]")
+        return False
+
+    def listing(self) -> None:
+        """Every card with its number."""
+        for number, step in enumerate(self.steps, 1):
+            here = "  ◂ here" if number - 1 == self._position else ""
+            self.console.print(f"  [dim]{number:>2}.[/dim] {step}{here}")
 
     def wait(self, verb: str) -> None:
-        """Wait for Enter."""
-        if self.pause:
-            self.console.input(f"  [dim]Enter to {verb}[/dim] ")
+        """Wait for Enter; a number or a stage name jumps forward to that card, l lists them."""
+        while self.pause:
+            answer = self.console.input(
+                f"  [dim]Enter to {verb} · number or name to jump · l to list[/dim] "
+            ).strip()
+            if not answer:
+                return
+            if answer.lower() in ("l", "list", "?"):
+                self.listing()
+                continue
+            target = self._resolve(answer, self._position + 1)
+            if target is None:
+                self.console.print(
+                    "  [yellow]no later stage matches; the replay only moves forward "
+                    "(restart with --from to begin elsewhere)[/yellow]"
+                )
+                continue
+            self._target = target
+            return
 
     # ------------------------------------------------------------ front-door phases
 
@@ -117,14 +185,20 @@ class Stepper:
             return
         name = event.stage
         if event.detail == "running":
-            self.before(name)
-            self.wait("run")
+            shown = self._show(name)
+            if shown:
+                self.before(name)
+                self.wait("run")
             self._started[name] = time.time()
         elif event.detail == "replayed":
-            self.before(name)
-            self.replayed(name)
+            if self._show(name):
+                self.before(name)
+                self.replayed(name)
+            elif name.startswith("pipeline "):
+                self._pipeline_steps(name.removeprefix("pipeline "))
         elif event.detail in ("finished", "stopped", "raised", "refused"):
-            self.after(name, event.detail)
+            if self._target is None:
+                self.after(name, event.detail)
 
     def before(self, name: str) -> None:
         """What the phase does, what it reads and its bound."""
@@ -146,10 +220,10 @@ class Stepper:
         saved = self._saved_at(name)
         when = f"saved {saved:%Y-%m-%d %H:%M} UTC" if saved else "saved earlier"
         self.console.print(f"[green]✓[/green] {name}  replayed ({when}) · no model call")
-        if name.startswith("pipeline "):
-            self._pipeline_cards(name.removeprefix("pipeline "))
         self.console.print(f"  [dim]evidence[/dim]   {evidence(name)}")
         self.wait("continue")
+        if name.startswith("pipeline "):
+            self._pipeline_steps(name.removeprefix("pipeline "))
 
     def after(self, name: str, outcome: str) -> None:
         """A phase that ran now: how long, how many model attempts, its evidence."""
@@ -169,6 +243,9 @@ class Stepper:
 
     def before_stage(self, task: str, stage: str) -> None:
         """A pipeline stage about to run now."""
+        if not self._show(f"{task} {stage}"):
+            self._started[f"{task}/{stage}"] = time.time()
+            return
         self.console.print(f"\n  [bold]▸ {stage}[/bold] [dim]{task}[/dim]")
         self.console.print(Text.assemble(("    does     ", "dim"), STAGE_COVERS[stage]))
         self.console.print(Text.assemble(("    reads    ", "dim"), STAGE_READS[stage]))
@@ -177,6 +254,9 @@ class Stepper:
 
     def after_stage(self, task: str, stage: str, summary: Mapping[str, object]) -> None:
         """A pipeline stage that just ran: its summary and evidence."""
+        if self._target is not None:
+            self._started.pop(f"{task}/{stage}", None)
+            return
         started = self._started.pop(f"{task}/{stage}", None)
         took = "" if started is None else f" in {duration_text(time.time() - started)}"
         attempts = self._attempts_since(started)
@@ -205,6 +285,36 @@ class Stepper:
                 f"{one_line(record.get('summary') or {})}"
             )
             self.console.print(f"    [dim]evidence[/dim] {evidence(f'pipeline {task} {stage}')}")
+
+    def _pipeline_steps(self, task: str) -> None:
+        """A replayed start's saved stages, each its own card and pause."""
+        start = pipeline_stages(self.store, [task]).get(task)
+        if start is None or start.run is None:
+            self.console.print("  [dim]no pipeline registration saved yet[/dim]")
+            return
+        for stage in PIPELINE_STAGES:
+            card = f"{task} {stage}"
+            if not self._show(card):
+                continue
+            self.console.print(f"\n  [bold]▸ {stage}[/bold] [dim]{task}[/dim]")
+            self.console.print(Text.assemble(("    does     ", "dim"), STAGE_COVERS[stage]))
+            self.console.print(Text.assemble(("    reads    ", "dim"), STAGE_READS[stage]))
+            if stage not in start.saved:
+                self.console.print("    [dim]·[/dim] not saved")
+            else:
+                record = json.loads(
+                    self.store.artifacts.read_bytes(start.saved[stage], "record.json")
+                )
+                moment = start.saved_at[stage].astimezone(UTC)
+                self.console.print(
+                    f"  [green]✓[/green] {stage}  replayed (saved {moment:%Y-%m-%d %H:%M} UTC)"
+                    " · no model call"
+                )
+                self.console.print(
+                    Text.assemble(("    outputs  ", "dim"), one_line(record.get("summary") or {}))
+                )
+            self.console.print(f"    [dim]evidence[/dim] {evidence(f'pipeline {task} {stage}')}")
+            self.wait("continue")
 
     # ------------------------------------------------------------ sources
 
