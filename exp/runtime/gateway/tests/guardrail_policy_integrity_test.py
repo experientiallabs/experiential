@@ -82,6 +82,62 @@ def _body(surface: str, stream: bool) -> tuple[str, JsonObject]:
     return ("/v1/messages" if surface == "messages" else "/v1/chat/completions"), body
 
 
+@pytest.mark.parametrize("protected", [False, True])
+def test_unavailable_output_adapter_obeys_its_admitted_uncertainty_policy(
+    tmp_path: Path, protected: bool
+) -> None:
+    """An unavailable native output adapter cannot turn optional inspection into rejection."""
+    policy = GuardrailPolicy(
+        policy_id="output",
+        organization_id="local",
+        identity_id="default",
+        protected=protected,
+        checks=(
+            GuardrailCheck(
+                check_id="output",
+                stage=GuardrailCheckStage.OUTPUT,
+                action=GuardrailAction.BLOCK,
+                capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+                adapter_id="unavailable",
+                timeout_ms=500,
+            ),
+        ),
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"unavailable": ScriptedClassifier()})),
+        monotonic=time.monotonic,
+    )
+    try:
+        with _provider(_content_chunk("allowed") + _terminal_frames()) as (base_url, received):
+            manager, key = _configured_gateway(tmp_path, base_url=base_url)
+            components = load_gateway_components(
+                tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"}
+            )
+            control = NativeControlPlane(components, guardrails=engine)
+            with _serving(control) as url:
+                route, body = _body("chat", False)
+                response = httpx.post(
+                    url + route,
+                    headers={"authorization": f"Bearer {key}"},
+                    json=body,
+                    timeout=5,
+                )
+                assert response.status_code == (503 if protected else 200), response.text
+                assert len(received) == 1
+                assert control.close(2)
+            with connect_sqlite(manager.database_path) as connection:
+                reports = connection.execute(
+                    "SELECT result FROM gateway_input_moderation"
+                ).fetchall()
+            assert len(reports) == 1
+            observation = json.loads(reports[0][0])["observations"][0]
+            assert observation["stage"] == "output"
+            assert observation["outcome"] == "unavailable"
+    finally:
+        engine.close(timeout_seconds=2)
+
+
 @pytest.mark.parametrize("surface", ["chat", "responses"])
 @pytest.mark.parametrize("change", ["added", "removed", "changed"])
 def test_replay_claim_and_admission_must_share_the_same_policy_snapshot(

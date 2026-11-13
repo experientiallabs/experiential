@@ -94,11 +94,8 @@ class GuardrailEngine:
             monotonic: Process-local clock in seconds.
             inspects: Optional async inflight limiter. ``None`` uses the
                 default shared cap.
-            deterministic_specifications: Content-free native rules for the
-                registered deterministic adapters, keyed by adapter. A host
-                that runs the Rust data plane compiles these once and lets
-                matching chains run in plane. Omitting them keeps every
-                chain on this engine.
+            deterministic_specifications: Native rules keyed by adapter. Hosts compile
+                them once for matching chains; omission keeps checks on this engine.
             max_observations: Maximum retained asynchronous observation jobs, default 8.
             max_observation_bytes: Maximum complete subject bytes retained, default 8 MiB.
             max_observation_records: Maximum queued plus active metadata records, default 128.
@@ -138,12 +135,15 @@ class GuardrailEngine:
         return self._store.policies_for(authorization)
 
     def native_output_configuration(self, *, check: GuardrailCheck) -> JsonObject:
-        """Resolve the exact native adapter while Python still owns admission."""
-
+        """Export adapter availability so Rust applies the admitted uncertainty policy."""
         if not isinstance(self._client, NativeClassifierClient):
-            message = "The classifier client has no native execution contract"
-            raise ValueError(message)
-        return self._client.native_output_configuration(check=check)
+            return {"kind": "unavailable"}
+        try:
+            return self._client.native_output_configuration(check=check)
+        except ClassifierCoverageError:
+            return {"kind": "coverage_error"}
+        except Exception:  # noqa: BLE001 - detector setup cannot bypass uncertainty policy.
+            return {"kind": "unavailable"}
 
     def native_output_registration(
         self, *, policy: GuardrailPolicy, check: GuardrailCheck

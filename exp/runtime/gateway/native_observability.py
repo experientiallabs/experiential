@@ -179,7 +179,14 @@ class NativeObservabilityMixin:
             self._accounting.throttle_cache_counters()
         )
         moderation_records = json.loads(self._accounting.native.moderation_recording_json())
+        moderation = moderation_records["telemetry"]
         control_plane: JsonObject = {
+            "moderation": moderation,
+            "moderation_samples": moderation["totals"]["samples"],
+            "classifier_cache_hits": moderation["totals"]["cache_hits"],
+            "classifier_cache_misses": moderation["totals"]["cache_misses"],
+            "classifier_errors": moderation["totals"]["errors"],
+            "classifier_latency_seconds": moderation["totals"]["classifier_latency_seconds"],
             "sweep_retained_settlements_replayed": retained_replayed,
             "sweep_abandoned_attempts_cancelled": abandoned_cancelled,
             "admission_dead_rungs_skipped": dead_rungs_skipped,

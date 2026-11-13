@@ -268,6 +268,29 @@ def upstream_requests_reasoning(wire_route: Sequence[JsonObject]) -> bool:
     return False
 
 
+def discard_unaccepted_input(session: GuardrailSession | None) -> None:
+    """Cancel unowned inspections and record bounded loss without a financial admission."""
+    if session is None:
+        return
+    inspections = list(session.native_completed)
+    if session.native_observation is not None:
+        inspections.append(session.native_observation)
+    session.cancel()
+    for inspection in inspections:
+        inspection.cancel()
+    session.native_observation = None
+    session.native_completed.clear()
+    if inspections:
+        logging.getLogger(__name__).warning(
+            "moderation records dropped before request acceptance",
+            extra={
+                "operation": "native_moderation_unaccepted",
+                "samples": len(inspections),
+                "outcome": "dropped",
+            },
+        )
+
+
 class _GuardrailPlane(Protocol):
     """Services used by each admitted request's sole guardrail session.
 
@@ -298,6 +321,7 @@ class NativeGuardrailsMixin:
             self._write_ledger.accept_request(authorization=authorization)
         except Exception:  # noqa: BLE001 - diagnostic storage cannot change a decided refusal.
             logging.getLogger(__name__).warning("could not record rejected input admission")
+            discard_unaccepted_input(session)
             return
         self._accounting.finish_request_quietly(authorization, failure, input_session=session)
 

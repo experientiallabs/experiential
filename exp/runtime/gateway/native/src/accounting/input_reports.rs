@@ -43,6 +43,7 @@ impl Reports {
     pub fn counters(&self) -> Value {
         json!({"dropped": self.dropped.load(Ordering::Relaxed),
             "failed": self.failed.load(Ordering::Relaxed),
+            "telemetry":self.telemetry.lock().map(|state| state.metrics()).unwrap_or(Value::Null),
             "pending": self.pending.lock().map(|n| *n).unwrap_or(0)})
     }
 }
@@ -148,6 +149,9 @@ impl Factory {
                 "capability":if checkless {Value::Null} else {check.check["capability"].clone()},
                 "stage":if checkless {Value::Null} else {check.check["stage"].clone()},
                 "mode":"enforce", "action":action,
+                "would_action":check.check["action"],
+                "classifier_kind":result["classifier_kind"], "scores":result["scores"],
+                "cached":result["cached"], "subject_sha256":result["subject_sha256"],
                 "outcome":if unavailable {"unavailable"} else if action == "allow" {"allow"} else {"flagged"},
                 "latency_ms":started.elapsed().as_secs_f64() * 1000.0}]
         }}));

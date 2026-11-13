@@ -23,6 +23,8 @@ struct Totals {
 pub(super) struct Telemetry {
     buckets: BTreeMap<String, Totals>,
     dropped: u64,
+    cumulative: Totals,
+    cumulative_dropped: u64,
 }
 
 impl Telemetry {
@@ -31,6 +33,9 @@ impl Telemetry {
             return;
         };
         for record in records {
+            self.cumulative_dropped = self
+                .cumulative_dropped
+                .saturating_add(self.cumulative.record(record));
             let mut dimensions = json!({});
             for name in [
                 "policy_id",
@@ -58,50 +63,62 @@ impl Telemetry {
                 dimensions,
                 ..Totals::default()
             });
-            if !(totals.duration_ms + duration).is_finite() {
-                self.dropped = self.dropped.saturating_add(1);
-                continue;
-            }
-            totals.samples = totals.samples.saturating_add(1);
-            totals.duration_ms += duration;
-            if record["classifier_kind"] != "decision_model" {
-                continue;
-            }
-            if record["cached"] == true {
-                totals.cache_hits = totals.cache_hits.saturating_add(1);
-            } else {
-                totals.cache_misses = totals.cache_misses.saturating_add(1);
-                totals.classifier_latency_seconds += duration / 1000.0;
-                if !record["scores"].is_array() {
-                    totals.errors = totals.errors.saturating_add(1);
-                }
-            }
-            if let Some(scores) = record["scores"].as_array() {
-                for score in scores {
-                    let (Some(category), Some(value)) = (score[0].as_str(), score[1].as_f64())
-                    else {
-                        continue;
-                    };
-                    if category.len() > 128
-                        || !value.is_finite()
-                        || !(0.0..=1.0).contains(&value)
-                        || (totals.score_buckets.len() >= MAX_CATEGORIES
-                            && !totals.score_buckets.contains_key(category))
-                    {
-                        self.dropped = self.dropped.saturating_add(1);
-                        continue;
-                    }
-                    let counts = totals.score_buckets.entry(category.into()).or_default();
-                    let index = ((value * 20.0).floor() as usize).min(19);
-                    counts[index] = counts[index].saturating_add(1);
-                }
-            }
+            self.dropped = self.dropped.saturating_add(totals.record(record));
         }
     }
 
     pub fn drain(&mut self) -> Value {
         json!({"aggregates": std::mem::take(&mut self.buckets).into_values().collect::<Vec<_>>(),
             "dropped": std::mem::take(&mut self.dropped)})
+    }
+
+    /// Metrics are cumulative and never consume the background logger's deltas.
+    pub fn metrics(&self) -> Value {
+        json!({"totals":self.cumulative,"dropped":self.cumulative_dropped})
+    }
+}
+
+impl Totals {
+    fn record(&mut self, record: &Value) -> u64 {
+        let duration = record["latency_ms"].as_f64().unwrap_or(0.0);
+        if !duration.is_finite() || duration < 0.0 || !(self.duration_ms + duration).is_finite() {
+            return 1;
+        }
+        self.samples = self.samples.saturating_add(1);
+        self.duration_ms += duration;
+        if record["classifier_kind"] != "decision_model" {
+            return 0;
+        }
+        if record["cached"] == true {
+            self.cache_hits = self.cache_hits.saturating_add(1);
+        } else {
+            self.cache_misses = self.cache_misses.saturating_add(1);
+            self.classifier_latency_seconds += duration / 1000.0;
+            if !record["scores"].is_array() {
+                self.errors = self.errors.saturating_add(1);
+            }
+        }
+        let mut dropped = 0;
+        if let Some(scores) = record["scores"].as_array() {
+            for score in scores {
+                let (Some(category), Some(value)) = (score[0].as_str(), score[1].as_f64()) else {
+                    continue;
+                };
+                if category.len() > 128
+                    || !value.is_finite()
+                    || !(0.0..=1.0).contains(&value)
+                    || (self.score_buckets.len() >= MAX_CATEGORIES
+                        && !self.score_buckets.contains_key(category))
+                {
+                    dropped += 1;
+                    continue;
+                }
+                let counts = self.score_buckets.entry(category.into()).or_default();
+                let index = ((value * 20.0).floor() as usize).min(19);
+                counts[index] = counts[index].saturating_add(1);
+            }
+        }
+        dropped
     }
 }
 
@@ -122,6 +139,7 @@ mod tests {
         record["scores"] = Value::Null;
         telemetry.record(&json!({"observations":[record]}));
         let snapshot = telemetry.drain();
+        let metrics = telemetry.metrics();
         let aggregate = &snapshot["aggregates"][0];
         assert_eq!(aggregate["samples"], 3);
         assert_eq!(aggregate["cache_hits"], 1);
@@ -131,6 +149,9 @@ mod tests {
         assert_eq!(aggregate["classifier_latency_seconds"], 0.008);
         assert!(!snapshot.to_string().contains("private-"));
         assert_eq!(telemetry.drain(), json!({"aggregates":[],"dropped":0}));
+        assert_eq!(telemetry.metrics(), metrics);
+        assert_eq!(metrics["totals"]["cache_hits"], 1);
+        assert_eq!(metrics["totals"]["score_buckets"]["category"][19], 2);
         for index in 0..MAX_BUCKETS + 1 {
             record["revision"] = json!(index.to_string());
             telemetry.record(&json!({"observations":[record]}));
@@ -141,5 +162,6 @@ mod tests {
             MAX_BUCKETS
         );
         assert_eq!(snapshot["dropped"], 1);
+        assert_eq!(telemetry.metrics()["totals"]["samples"], MAX_BUCKETS + 4);
     }
 }

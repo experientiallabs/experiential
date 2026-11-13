@@ -10,10 +10,10 @@ from typing import cast
 from unittest.mock import Mock
 
 import pytest
-from exp_gateway_native import NativeCallbacks
+from exp_gateway_native import CaptureCollector, NativeCallbacks
 
 from exp.common.sqlite.native import connect
-from exp.runtime.gateway.contracts import AuthorizationSnapshot
+from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.ledger_test import (
     FakeLedgerClock,
@@ -23,6 +23,7 @@ from exp.runtime.gateway.ledger_test import (
     _request,
 )
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+from exp.runtime.gateway.native_capture import CaptureConfiguration, CaptureController
 from exp.runtime.gateway.native_continuation_store import NativeContinuationStore
 from exp.runtime.gateway.native_execution import InflightRequest
 from exp.runtime.gateway.native_handoff import NativeRequestHandoff, accounting_drained, uses_native
@@ -137,6 +138,41 @@ def test_host_memos_release_only_after_native_registration(
             accounting.abandon(json.dumps({"request_id": entry.authorization.request_id}))
     finally:
         assert accounting.close()
+
+
+@pytest.mark.parametrize("fail_preparation", [False, True])
+def test_failed_handoff_releases_capture_without_a_provider_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_preparation: bool
+) -> None:
+    """A capture started before ownership transfer cannot retain a rejected request."""
+    underlying, entry, _ = _prepared(tmp_path)
+    records: list[str] = []
+    collector = CaptureCollector(CaptureConfiguration().model_dump_json(), records.append)
+    capture = CaptureController(collector, application_for=lambda _auth: "fixture")
+    accounting = NativeAttemptAccounting(
+        native_request_factory=underlying, background_recovery=False, capture=capture
+    )
+    if not fail_preparation:
+        monkeypatch.setattr(
+            "exp.runtime.gateway.native_registration.registration_json", lambda *_a, **_k: "{}"
+        )
+
+    def prepare() -> None:
+        """Start real native capture before the injected admission failure."""
+        assert isinstance(entry.request, GatewayRequest)
+        assert capture.begin(entry.authorization, entry.request, "fixture")
+        if fail_preparation:
+            raise ValueError("preparation failed")
+
+    try:
+        with pytest.raises(ValueError):
+            accounting.register(entry, prepare=prepare)
+        assert accounting_drained(accounting)
+        assert collector.close(0.1)
+        assert records == []
+    finally:
+        assert accounting.close()
+        collector.close(1)
 
 
 @pytest.mark.parametrize("cleanup_fails", [False, True])

@@ -43,11 +43,13 @@ from exp.runtime.gateway.guardrails.subjects_test import _changed_subject
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeControlPlane
+from exp.runtime.gateway.native_execution import NativeDialectUnavailableError
 from exp.runtime.gateway.tests.guardrail_policy_integrity_test import _body, _provider
 from exp.runtime.gateway.tests.mandatory_guardrails_paths_test import _serving
 from exp.runtime.gateway.tests.native_classifier_fixture_test import NativeClassifierFixture
 from exp.runtime.gateway.tests.native_tool_search_test import _TOOLS_CHAT, _configure, _Provider
 from exp.runtime.gateway.tests.native_waterfall_test import _content_chunk, _terminal_frames
+from exp.runtime.models.providers.errors import ProviderParameterError
 
 
 @pytest.fixture(autouse=True)
@@ -763,6 +765,96 @@ def test_native_serial_rejection_retains_one_observation_without_dispatch(
             assert [(r["policy_id"], r["outcome"]) for r in observed] == [
                 ("platform-observer", "flagged")
             ]
+    finally:
+        classifier.release.set()
+        engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize("stage", ["parameter", "escalation", "unseal", "accept"])
+def test_admission_failure_retains_observation_or_reports_unaccepted_loss(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, stage: str
+) -> None:
+    """Accepted failures store evidence; unaccepted failures never mutate financial state."""
+    classifier = _Classifier(GuardrailOutcome.FLAGGED)
+    engine = _Engine(classifier, _policy(timeout_ms=5000))
+    unaccepted = stage in {"unseal", "accept"}
+    try:
+        with _provider(_content_chunk("unreachable") + _terminal_frames()) as (url, received):
+            manager, key = _configured_gateway(tmp_path, base_url=url)
+            components = load_gateway_components(
+                tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"}
+            )
+            control = NativeControlPlane(components, guardrails=engine)
+            error = ProviderParameterError(
+                message="This route cannot preserve the parameter.",
+                param="temperature",
+                code="unsupported_parameter",
+            )
+            failure = (
+                patch.object(control._write_ledger, "accept_request", side_effect=error)
+                if stage == "accept"
+                else patch(
+                    "exp.runtime.gateway.native_bridge."
+                    + {
+                        "parameter": "build_rung_dispatch",
+                        "escalation": "dispatchable_route_profiles",
+                        "unseal": "unseal_reasoning_history",
+                    }[stage],
+                    side_effect=NativeDialectUnavailableError("fixture route is unavailable")
+                    if stage == "escalation"
+                    else error,
+                )
+            )
+            with (
+                _serving(control) as gateway,
+                failure,
+                patch.object(
+                    control._accounting,
+                    "finish_request_quietly",
+                    wraps=control._accounting.finish_request_quietly,
+                ) as finish,
+            ):
+                route, body = _body("chat", False)
+                response = httpx.post(
+                    gateway + route,
+                    headers={"authorization": f"Bearer {key}"},
+                    json=body,
+                    timeout=5,
+                )
+                assert response.status_code >= 400, response.text
+                assert not received
+                assert finish.call_count == (0 if unaccepted else 1)
+                if not unaccepted:
+                    assert classifier.started.wait(2)
+                classifier.release.set()
+                assert control.close(timeout_seconds=2)
+                if not unaccepted:
+                    metrics = httpx.get(gateway + "/metrics.json", timeout=5).json()
+                    assert metrics["control_plane"]["moderation_samples"] == 1
+                    control._accounting.native.drain_moderation_telemetry_json()
+                    repeated = httpx.get(gateway + "/metrics.json", timeout=5).json()
+                    assert (
+                        repeated["control_plane"]["moderation"]
+                        == metrics["control_plane"]["moderation"]
+                    )
+            with connect_sqlite(manager.database_path) as db:
+                reports = db.execute("SELECT result FROM gateway_input_moderation").fetchall()
+            observations = [
+                record
+                for report in reports
+                for record in json.loads(report[0])["observations"]
+                if record["mode"] == "observe"
+            ]
+            if unaccepted:
+                assert observations == []
+                losses = [
+                    record.__dict__["samples"]
+                    for record in caplog.records
+                    if record.__dict__.get("operation") == "native_moderation_unaccepted"
+                ]
+                assert losses == [1]
+            else:
+                assert [record["outcome"] for record in observations] == ["flagged"]
     finally:
         classifier.release.set()
         engine.close(timeout_seconds=2)

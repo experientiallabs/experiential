@@ -29,11 +29,13 @@ from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import (
     NativeGuardrailsMixin,
+    discard_unaccepted_input,
     native_output_mode,
     open_admission_guardrails,
     require_capture,
     validate_guardrail_engine,
 )
+from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
@@ -400,8 +402,10 @@ class NativeControlPlane(
                 request,
             )
         except ProviderParameterError as exc:
+            discard_unaccepted_input(guardrails)
             raise NativeBridgeError(invalid_field(exc.param, str(exc))) from exc
         except Exception as exc:  # noqa: BLE001 - one public shape prevents an oracle.
+            discard_unaccepted_input(guardrails)
             log_reasoning_continuation_rejection(authorization, "unseal", exc)
             error = invalid_field(
                 "messages.reasoning_content",
@@ -413,6 +417,7 @@ class NativeControlPlane(
             and verified_reasoning_route is not None
             and pinned_reasoning_route.deployment != verified_reasoning_route.deployment
         ):
+            discard_unaccepted_input(guardrails)
             log_reasoning_continuation_rejection(
                 authorization, "route_pin", "authenticate and unseal resolved different deployments"
             )
@@ -442,6 +447,7 @@ class NativeControlPlane(
         try:
             self._write_ledger.accept_request(authorization=authorization)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
+            discard_unaccepted_input(guardrails)
             raise _authority_error(exc) from exc
 
         pending_capture = (
@@ -500,7 +506,9 @@ class NativeControlPlane(
                 ):
                     raise _continuation_binding_error()
                 # No dispatchable rung remains; finalize the accepted request closed.
-                return self._escalate_accepted(authorization, UNAVAILABLE_AT_ADMISSION)
+                return self._escalate_accepted(
+                    authorization, UNAVAILABLE_AT_ADMISSION, input_session=guardrails
+                )
             route = select_route_deployments(route, dispatchable.indexes)
             resolved_wires = dispatchable.resolved_wires
             route, resolved_wires, selected_placement = select_single_route_before_search(
@@ -546,7 +554,10 @@ class NativeControlPlane(
             raise
         except NativeDialectUnavailableError as exc:
             return self._escalate_accepted(
-                authorization, str(exc), web_search_requests=int(web_search_admission is not None)
+                authorization,
+                str(exc),
+                web_search_requests=int(web_search_admission is not None),
+                input_session=guardrails,
             )
         except OpenAIProtocolError as exc:
             # Preserve client failures as non-internal and retain any completed search.
@@ -561,6 +572,7 @@ class NativeControlPlane(
                     safe_message=exc.detail.message,
                 ),
                 web_search_requests=int(web_search_admission is not None),
+                input_session=guardrails,
             )
             raise NativeBridgeError(exc) from exc
         except Exception as exc:  # noqa: BLE001 - raised after route packaging below.
@@ -575,6 +587,7 @@ class NativeControlPlane(
                     authorization,
                     "host policy does not permit native execution of this route",
                     web_search_requests=int(web_search_admission is not None),
+                    input_session=guardrails,
                 )
 
         # Admission returns the full ordered route; no attempt row before `start_attempt`.
@@ -606,8 +619,7 @@ class NativeControlPlane(
             signers: list[GatewayDispatchSigner | None] = []
             dispatch_bindings: list[FrozenDispatchBinding | None] = []
             carrier_authorities: list[ReasoningCarrierAuthority | None] = []
-            # Per-rung throttle waits for THIS request (pool schedule scaled by the cache
-            # at stake), over the admitted route whose last rung has no cold alternative.
+            # Per-rung waits account for cached context and remaining fallback routes.
             redial_budgets = throttle_redial_budgets(
                 self._accounting.loads,
                 route,
@@ -617,10 +629,7 @@ class NativeControlPlane(
             for deployment, (profile, client), budget in zip(
                 route.deployments, resolved_wires, redial_budgets, strict=True
             ):
-                # A reasoning-pinned route's fallback rung is frozen WITHOUT the
-                # pinned provider's sealed reasoning (it cannot unseal it), so a
-                # failover past the issuing rung dispatches the conversation
-                # minus that turn's thinking, never a foreign sealed block.
+                # Fallback rungs omit reasoning sealed for a different provider.
                 dispatch = build_rung_dispatch(
                     route,
                     deployment,
@@ -667,6 +676,7 @@ class NativeControlPlane(
                 authorization,
                 admission_boundary_failure(exc),
                 web_search_requests=int(web_search_admission is not None),
+                input_session=guardrails,
             )
             raise
         except (ProviderParameterError, ProviderCapabilityError) as exc:
@@ -702,7 +712,10 @@ class NativeControlPlane(
             else:
                 public_error = public_failure_error(failure, param=exc.param)
             self._accounting.finish_request_quietly(
-                authorization, failure, web_search_requests=int(web_search_admission is not None)
+                authorization,
+                failure,
+                web_search_requests=int(web_search_admission is not None),
+                input_session=guardrails,
             )
             raise NativeBridgeError(public_error) from exc
         except GatewayRoutingError as exc:
@@ -711,7 +724,10 @@ class NativeControlPlane(
             # so it never pages as INTERNAL. The public error is already a 503.
             failure = gateway_updating_failure()
             self._accounting.finish_request_quietly(
-                authorization, failure, web_search_requests=int(web_search_admission is not None)
+                authorization,
+                failure,
+                web_search_requests=int(web_search_admission is not None),
+                input_session=guardrails,
             )
             raise _authority_error(exc) from exc
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
@@ -732,7 +748,10 @@ class NativeControlPlane(
                 },
             )
             self._accounting.finish_request_quietly(
-                authorization, failure, web_search_requests=int(web_search_admission is not None)
+                authorization,
+                failure,
+                web_search_requests=int(web_search_admission is not None),
+                input_session=guardrails,
             )
             raise error from exc
 
@@ -954,12 +973,14 @@ class NativeControlPlane(
         reason: str,
         *,
         web_search_requests: int = 0,
+        input_session: GuardrailSession | None = None,
     ) -> str:
         """Close an accepted request with its prework meter and return its disposition."""
         self._accounting.finish_request_quietly(
             authorization,
             escalation_failure(authorization, reason),
             web_search_requests=web_search_requests,
+            input_session=input_session,
         )
         return _escalation(reason)
 

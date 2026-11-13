@@ -78,6 +78,7 @@ async fn one(
     subject: &Subject,
     deadline: Instant,
     observed: &mut Value,
+    classification: &mut Value,
 ) -> Result<Subject, Value> {
     let id = check.check["check_id"].as_str();
     if check.adapter["input_limit"]
@@ -119,6 +120,14 @@ async fn one(
         }
         Ok(verdict)
     });
+    if check_for_input.adapter["kind"] == "decision_model" {
+        *classification = json!({"classifier_kind":"decision_model",
+            "subject_sha256":check_for_input.adapter["subject_sha256"]});
+        if let Ok(verdict) = &result {
+            classification["scores"] = verdict["scores"].clone();
+            classification["cached"] = verdict["cached"].clone();
+        }
+    }
     let verdict = match result {
         Err(_) => {
             *observed = inspection::decision(
@@ -157,9 +166,10 @@ async fn recorded(
 ) -> Result<Subject, Value> {
     let started = Instant::now();
     let mut observed = Value::Null;
-    let result = one(check, subject, deadline, &mut observed).await;
+    let mut classification = Value::Null;
+    let result = one(check, subject, deadline, &mut observed, &mut classification).await;
     if let Some(reporting) = reporting {
-        let decision = if !observed.is_null() {
+        let mut decision = if !observed.is_null() {
             observed
         } else {
             match &result {
@@ -169,6 +179,11 @@ async fn recorded(
                 Err(failure) => failure.clone(),
             }
         };
+        if let Some(fields) = classification.as_object() {
+            for (key, value) in fields {
+                decision[key] = value.clone();
+            }
+        }
         reporting.decision(check, &decision, started);
     }
     result

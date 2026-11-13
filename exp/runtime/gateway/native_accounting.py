@@ -14,7 +14,7 @@ from exp.runtime.gateway.native_accounting_errors import (
     NativeBridgeError,
     accounting_recovering_error,
 )
-from exp.runtime.gateway.native_capture import CaptureController
+from exp.runtime.gateway.native_capture import CaptureController, discard_capture
 from exp.runtime.gateway.native_execution import InflightRequest
 from exp.runtime.gateway.native_handoff import NativeRequestFactory, NativeRequestHandoff
 from exp.runtime.gateway.native_loads import NativeLoads
@@ -111,6 +111,7 @@ class NativeAttemptAccounting:
             if isinstance(handoff, NativeRequestHandoff):
                 handoff.registered()
         except Exception as exc:
+            discard_capture(self._native_capture, entry.authorization.request_id)
             discard_guardrails(entry)
             if transferred:
                 try:
