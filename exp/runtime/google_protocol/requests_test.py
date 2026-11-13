@@ -6,6 +6,7 @@ import pytest
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.content import AudioContentPart, DocumentContentPart
 from exp.runtime.gateway.contracts import GatewayApiSurface
 from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice, GatewayNamedToolChoice
 from exp.runtime.google_protocol.requests import (
@@ -225,6 +226,51 @@ def test_thoughts_and_safety_settings_drop_with_disclosure() -> None:
     ).request
     assert request.messages[1].content == "yo"
     assert set(request.ignored_parameters) == {THOUGHT_DROPPED, SAFETY_SETTINGS_DROPPED}
+
+
+def test_gemini_audio_spellings_and_file_urls_land_on_their_own_part_kinds() -> None:
+    """``audio/mp3`` is MP3; a PDF fileData URL is a document, never an image; audio URLs refuse."""
+    request = decode_generate_content(
+        _body(
+            contents=[
+                {
+                    "role": "user",
+                    "parts": [
+                        {"inlineData": {"mimeType": "audio/mp3", "data": "SUQz"}},
+                        {
+                            "fileData": {
+                                "mimeType": "application/pdf",
+                                "fileUri": "https://example.com/paper.pdf",
+                            }
+                        },
+                        {"fileData": {"fileUri": "https://example.com/photo.png"}},
+                    ],
+                }
+            ]
+        ),
+        model="m",
+        stream=False,
+    ).request
+    parts = request.messages[0].content_parts
+    assert [part.kind for part in parts] == ["audio", "document", "image"]
+    audio, document = parts[0], parts[1]
+    assert isinstance(audio, AudioContentPart)
+    assert audio.media_type == "audio/mpeg"
+    assert isinstance(document, DocumentContentPart)
+    assert document.url == "https://example.com/paper.pdf"
+    error = _error(
+        _body(
+            contents=[
+                {
+                    "role": "user",
+                    "parts": [
+                        {"fileData": {"mimeType": "audio/mp3", "fileUri": "https://x.test/a.mp3"}}
+                    ],
+                }
+            ]
+        )
+    )
+    assert error.detail.param == "contents.0.parts.0.fileData.fileUri"
 
 
 def test_inline_media_becomes_canonical_parts() -> None:

@@ -88,6 +88,13 @@ MEDIA_RESOLUTION_DROPPED = "generationConfig.mediaResolution->dropped(unsupporte
 VALIDATED_MODE_AS_AUTO = "toolConfig.functionCallingConfig.mode->auto(validated)"
 BEHAVIOR_DROPPED = "tools.functionDeclarations.behavior->dropped(unsupported)"
 _THOUGHT_SIGNATURE_MAX = 65_536
+# Gemini spells MP3 audio `audio/mp3` (and WAV sometimes `audio/x-wav`); the
+# canonical audio contract knows the IANA names.
+_AUDIO_MIME_ALIASES = {
+    "audio/mp3": "audio/mpeg",
+    "audio/x-wav": "audio/wav",
+    "audio/wave": "audio/wav",
+}
 
 
 def _names(camel: str, snake: str) -> AliasChoices:
@@ -723,7 +730,7 @@ def _response_text(response: JsonObject | None) -> str:
 
 def _inline_part(blob: _Blob, param: str) -> MessageContentPart:
     """One inline media part by its declared media type."""
-    media = blob.mime_type.lower()
+    media = _AUDIO_MIME_ALIASES.get(blob.mime_type.lower(), blob.mime_type.lower())
     try:
         if media in IMAGE_MEDIA_TYPES:
             return ImageContentPart(media_type=IMAGE_MEDIA_TYPES[media], data=blob.data.strip())
@@ -757,11 +764,20 @@ def _file_part(file: _FileData, param: str) -> MessageContentPart:
             ),
         )
     media = (file.mime_type or "").lower()
+    if media.startswith("audio/"):
+        raise unsupported_field(
+            f"{param}.fileData.fileUri",
+            message=(
+                "Audio is served inline only (inlineData); a fileData audio URL is not fetched."
+            ),
+        )
     try:
         if media.startswith("video/"):
             return video_part_from_url(uri)
+        if media in DOCUMENT_MEDIA_TYPES or uri.lower().split("?")[0].endswith(".pdf"):
+            return DocumentContentPart(url=uri)
         return image_part_from_url(uri)
-    except ValueError as exc:
+    except (ValueError, ValidationError) as exc:
         raise invalid_field(f"{param}.fileData.fileUri", str(exc)) from exc
 
 

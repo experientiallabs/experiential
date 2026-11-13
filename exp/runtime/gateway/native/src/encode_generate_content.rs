@@ -268,6 +268,12 @@ impl GenerateContentEncoder {
         self.terminal
     }
 
+    /// Whether the provider's output was a refusal: the terminal then renders
+    /// as Google's error frame and the attempt settles as the typed refusal.
+    pub fn refusal_seen(&self) -> bool {
+        self.refusal_seen
+    }
+
     /// Whether any caller-visible part was emitted so far.
     pub fn has_content(&self) -> bool {
         self.started || !self.parts.parts.is_empty()

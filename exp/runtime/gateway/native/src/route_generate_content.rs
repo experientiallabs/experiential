@@ -18,12 +18,12 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::admission::{
-    acquire_permit, apply_output_guardrail, new_guard, served_headers, Admission,
+    acquire_permit_with, apply_output_guardrail, new_guard, served_headers, Admission,
 };
 use crate::capture::reasoning::{checkpoint_winner, observe_winner};
 use crate::encode::compact_json;
 use crate::encode_generate_content::{
-    completed_generate_content_body, google_error_body, AggregatedGenerateContent,
+    completed_generate_content_body, google_error_body, refusal_failure, AggregatedGenerateContent,
     GenerateContentEncoder,
 };
 use crate::errors::{Failure, FailureClass, PublicError};
@@ -345,7 +345,15 @@ async fn generate(
     };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
     guard.record_web_search(admission.web_search_meter());
-    let permit = match acquire_permit(&state, &mut guard, deadline, admission.class).await {
+    let permit = match acquire_permit_with(
+        &state,
+        &mut guard,
+        deadline,
+        admission.class,
+        google_error_response,
+    )
+    .await
+    {
         Ok(permit) => permit,
         Err(response) => return *response,
     };
@@ -879,6 +887,19 @@ async fn stream_response(
                             usage.as_ref(),
                             &tool_names,
                             Some(&Failure::empty_completion()),
+                        )
+                        .await
+                } else if encoder.refusal_seen() && !matches!(event, Event::Failed(_)) {
+                    // A refusal the provider closed with a plain stop has no
+                    // part on this surface: the encoder answers Google's error
+                    // frame, so the ledger records the typed refusal, exactly
+                    // as the non-streaming aggregate settles it.
+                    guard
+                        .price_or_settle(
+                            "failed",
+                            usage.as_ref(),
+                            &tool_names,
+                            Some(&refusal_failure().boundary()),
                         )
                         .await
                 } else {
