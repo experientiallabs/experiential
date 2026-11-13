@@ -21,6 +21,7 @@ use super::shared::Shared;
 pub(super) struct Ledger {
     pub(super) calls: Mutex<Vec<(String, Value)>>,
     pub(super) fail_settle: AtomicBool,
+    pub(super) fail_price: AtomicBool,
     fail_reserve: AtomicBool,
     fail_abandon: AtomicBool,
     incomplete_abandon: AtomicBool,
@@ -49,6 +50,7 @@ impl CallbackTarget for Ledger {
             .push((method.into(), data.clone()));
         if (matches!(method, "settle" | "record_late_meter")
             && self.fail_settle.load(Ordering::SeqCst))
+            || (method == "price" && self.fail_price.load(Ordering::SeqCst))
             || (method == "start_attempt" && self.fail_reserve.load(Ordering::SeqCst))
             || (method == "abandon" && self.fail_abandon.load(Ordering::SeqCst))
             || (method == "fleet_release" && self.fail_fleet_release.load(Ordering::SeqCst))
