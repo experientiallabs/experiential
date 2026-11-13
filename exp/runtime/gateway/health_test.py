@@ -5,14 +5,15 @@ from __future__ import annotations
 import pytest
 
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass, GatewayHeaderTimeout
+from exp.runtime.gateway.failover_pass import no_failure_claim, sideways_claim
 from exp.runtime.gateway.health import (
     PLAN_WINDOW_MAXIMUM_SECONDS,
     DeploymentHealthKey,
     DeploymentHealthRegistry,
+    claim_route_from,
     health_failure_cause,
 )
 from exp.runtime.gateway.lane_ejection import LaneEjectionPolicy
-from exp.runtime.gateway.native_execution import claim_route_from
 
 _KEY: DeploymentHealthKey = ("catalog", "deployment", "connection")
 
@@ -237,6 +238,167 @@ def test_throttle_without_retry_after_keeps_the_default_window() -> None:
     assert not registry.claim(_KEY)
     now[0] = 131.0
     assert registry.claim(_KEY)
+
+
+def test_a_lone_lane_dispatches_the_next_request_after_one_hintless_429() -> None:
+    """A single-lane route probes a hintless window instead of refusing every caller.
+
+    One 429 with no Retry-After used to refuse the whole model on the worker for
+    the default window while the provider kept serving. The next first dial now
+    takes a paced probe; concurrent ones within the interval still refuse, so a
+    real throttle is not stampeded, and the probe's own success lifts the window.
+    """
+    now = [100.0]
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+
+    assert claim_route_from(registry, (_KEY,), 0) is None
+    assert claim_route_from(registry, (_KEY,), 0, throttle_probe=True) == 0
+    registry.bind_throttle_probe(_KEY, "probe-one")
+    # Paced: a concurrent request inside the interval is still refused.
+    assert claim_route_from(registry, (_KEY,), 0, throttle_probe=True) is None
+    assert registry.throttled_remaining_seconds((_KEY,)) is not None
+
+    # The provider served the probe: the hintless window lifts at once.
+    registry.succeeded(_KEY, "probe-one")
+    assert registry.claim(_KEY)
+    assert registry.throttled_remaining_seconds((_KEY,)) is None
+
+
+def test_only_the_probe_attempt_lifts_the_window() -> None:
+    """An older request finishing lifts nothing; the reserved probe's success does."""
+    now = [100.0]
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+
+    assert registry.claim_throttle_probe(_KEY)
+    # Dispatched before the 429, settling now: not evidence about the probe.
+    registry.succeeded(_KEY, "older-request")
+    registry.dispatch_opened(_KEY, "older-request")
+    assert not registry.claim(_KEY)
+    # An unrelated release between claim and reservation cannot drop the probe.
+    registry.release_probe(_KEY, "other-request")
+    registry.bind_throttle_probe(_KEY, "probe-one")
+    registry.dispatch_opened(_KEY, "probe-one")
+    assert registry.claim(_KEY)
+
+
+def test_a_probe_bound_outside_a_window_is_not_a_probe() -> None:
+    """A reservation made while no hintless window runs records nothing."""
+    now = [100.0]
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
+    registry.bind_throttle_probe(_KEY, "plain-request")
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+    registry.succeeded(_KEY, "plain-request")
+    assert not registry.claim(_KEY)
+
+
+def test_a_reset_reported_beside_a_probe_success_keeps_suppression() -> None:
+    """A plan reset the probe's own response reports outranks the probe's success."""
+    now = [100.0]
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+    assert registry.claim_throttle_probe(_KEY)
+    registry.bind_throttle_probe(_KEY, "probe-one")
+    registry.exhausted(_KEY, 600.0)
+    registry.succeeded(_KEY, "probe-one")
+    assert not registry.claim(_KEY)
+    assert not registry.claim_throttle_probe(_KEY)
+
+
+def test_a_probe_that_is_throttled_again_keeps_the_window_and_the_pace() -> None:
+    """A probe answered with another 429 re-arms the window; no instant re-probe."""
+    now = [100.0]
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+    assert registry.claim_throttle_probe(_KEY)
+    registry.bind_throttle_probe(_KEY, "probe-one")
+    now[0] += 0.5
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED), "probe-one")
+    assert not registry.claim(_KEY)
+    assert not registry.claim_throttle_probe(_KEY)
+    now[0] += 0.5
+    assert registry.claim_throttle_probe(_KEY)
+
+
+def test_a_newer_429_outranks_a_probe_dispatched_before_it() -> None:
+    """A 429 from another request after the probe left keeps the window."""
+    now = [100.0]
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+    assert registry.claim_throttle_probe(_KEY)
+    registry.bind_throttle_probe(_KEY, "probe-one")
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED), "other-request")
+    registry.succeeded(_KEY, "probe-one")
+    assert not registry.claim(_KEY)
+
+
+def test_probe_pacing_is_shared_by_revisions_of_one_lane() -> None:
+    """Two catalog revisions of one physical lane share one probe pace."""
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: 100.0)
+    old: DeploymentHealthKey = ("revision-one", "deployment", "connection")
+    new: DeploymentHealthKey = ("revision-two", "deployment", "connection")
+    for key in (old, new):
+        registry.failed(key, _failure(GatewayFailureClass.THROTTLED))
+    assert registry.claim_throttle_probe(old)
+    assert not registry.claim_throttle_probe(new)
+
+
+def test_a_success_without_a_probe_leaves_the_throttle_window() -> None:
+    """Only a probed window lifts on success, so unprobed suppression is unchanged."""
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: 100.0)
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+    registry.succeeded(_KEY)
+    assert not registry.claim(_KEY)
+    assert not registry.claim_forced(_KEY)
+
+
+@pytest.mark.parametrize("retry_after", [2, 60])
+def test_a_provider_stated_retry_after_is_never_probed(retry_after: int) -> None:
+    """A wait the provider stated keeps the typed refusal for its whole window."""
+    now = [100.0]
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
+    registry.failed(
+        _KEY,
+        GatewayFailure(
+            failure_class=GatewayFailureClass.THROTTLED,
+            safe_message="scripted throttle",
+            retry_after_seconds=retry_after,
+        ),
+    )
+    window = max(float(retry_after), 5.0)
+    now[0] = 100.0 + window - 0.5
+    assert claim_route_from(registry, (_KEY,), 0, throttle_probe=True) is None
+    remaining = registry.throttled_remaining_seconds((_KEY,))
+    assert remaining is not None and remaining > 0
+    now[0] = 100.0 + window + 0.5
+    assert claim_route_from(registry, (_KEY,), 0, throttle_probe=True) == 0
+
+
+def test_a_plan_reset_window_is_never_probed() -> None:
+    """A usage window the provider reported exhausted stays suppressed until reset."""
+    now = [100.0]
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
+    registry.exhausted(_KEY, 3_600.0)
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+    assert not registry.claim_throttle_probe(_KEY)
+
+
+def test_a_multi_lane_route_still_skips_the_throttled_rung() -> None:
+    """A hintless 429 on one rung still moves traffic to its unthrottled sibling."""
+    now = [100.0]
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
+    throttled: DeploymentHealthKey = ("catalog", "deployment-a", "connection")
+    sibling: DeploymentHealthKey = ("catalog", "deployment-b", "connection")
+    keys = (throttled, sibling)
+    registry.failed(throttled, _failure(GatewayFailureClass.THROTTLED))
+
+    for _ in range(5):
+        assert claim_route_from(registry, keys, 0, throttle_probe=True) == 1
+        now[0] += 1.0
+    # No probe was spent on the throttled rung, so its window still stands.
+    registry.succeeded(throttled, "sibling-era-request")
+    assert not registry.claim(throttled)
 
 
 def test_suppressed_is_a_read_only_probe() -> None:
@@ -504,3 +666,26 @@ def test_a_hung_lane_is_ejected_on_header_timeouts_and_a_byok_variant_is_not() -
     health.failed(hung, timeout)
     assert health.order((hung, live), [0, 1]) == [1, 0]
     assert not health.lane_ejected(variant)
+
+
+def test_a_sideways_spill_keeps_the_probe_permission() -> None:
+    """A probed rung shed before reservation spills to another lane's own probe."""
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: 100.0)
+    first: DeploymentHealthKey = ("catalog", "deployment-a", "connection-a")
+    second: DeploymentHealthKey = ("catalog", "deployment-b", "connection-b")
+    keys = (first, second)
+    for key in keys:
+        registry.failed(key, _failure(GatewayFailureClass.THROTTLED))
+    assert no_failure_claim(registry, keys, (0, 1), selected_first=False, start=0) == 0
+    registry.release_probe(first)
+    assert sideways_claim(None, registry, keys, (0, 1), 0) is None
+    assert sideways_claim(None, registry, keys, (0, 1), 0, throttle_probe=True) == 1
+
+
+def test_a_throttle_redial_reservation_is_not_bound_as_a_probe() -> None:
+    """Only a dial with no failure of its own binds; a redial keeps prior behavior."""
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: 100.0)
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+    registry.bind_throttle_probe(_KEY, "redial", probe=False)
+    registry.succeeded(_KEY, "redial")
+    assert not registry.claim(_KEY)

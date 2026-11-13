@@ -34,7 +34,11 @@ from exp.runtime.gateway.execution_resolution import (
 )
 from exp.runtime.gateway.execution_resolution import alias_native_blockers as alias_native_blockers
 from exp.runtime.gateway.guardrails.session import GuardrailSession
-from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
+from exp.runtime.gateway.health import (
+    DeploymentHealthKey,
+    DeploymentHealthRegistry,
+    claim_route_from,
+)
 from exp.runtime.gateway.model_plan import project_stage_selection
 from exp.runtime.gateway.native_capture import PendingCapture
 from exp.runtime.gateway.native_dead_rungs import ADMISSION_DEAD_ERRORS, DeadRung, dead_rung
@@ -394,45 +398,6 @@ def dispatch_disclosure(
     if target_depth == candidate:
         return reason, None
     return reason, route.deployments[target_depth]
-
-
-def claim_route_from(
-    health: DeploymentHealthRegistry,
-    keys: tuple[DeploymentHealthKey, ...],
-    start: int,
-    depths: Sequence[int] | None = None,
-) -> int | None:
-    """Claim the first healthy later route, a bounded probe, or a forced dispatch.
-
-    A request skipping an exhausted or failed route can still probe a
-    suppressed fallback instead of failing
-    for the whole circuit cooldown after the provider has recovered. When
-    every healthy claim and bounded probe is unavailable, the first
-    non-throttled route is dispatched anyway, subject only to the request
-    deadline and to throttle windows the provider explicitly requested.
-    A lane this worker ejected as a dead box (``lane_ejection``) is walked
-    last in every pass, never dropped: a route with nothing else still dials it.
-
-    Args:
-        health: Revision-isolated circuit and throttle registry.
-        keys: One health key per ordered route deployment.
-        start: First route index eligible for this claim.
-        depths: The route indexes this dial may claim at all (the
-            ``failover_only_on`` eligibility, ``native_fallback_rules``);
-            ``None`` admits every index. Indexes below ``start`` are skipped.
-
-    Returns:
-        The claimed route index, or ``None`` when nothing is claimable.
-    """
-    candidates = health.order(
-        keys,
-        [index for index in (range(len(keys)) if depths is None else depths) if index >= start],
-    )
-    for claim in (health.claim, health.claim_last_resort, health.claim_forced):
-        for route_index in candidates:
-            if claim(keys[route_index]):
-                return route_index
-    return None
 
 
 def next_route_candidate(

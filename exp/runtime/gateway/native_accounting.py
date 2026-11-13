@@ -8,6 +8,7 @@ import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
+from functools import partial
 from typing import Final
 
 from exp.common.core.artifacts import JsonObject
@@ -31,6 +32,7 @@ from exp.runtime.gateway.failover_pass import (
     FailoverPass,
     failover_refusal,
     forced_failover_target,
+    no_failure_claim,
     sideways_claim,
 )
 from exp.runtime.gateway.guardrails.session import discard_guardrails
@@ -59,7 +61,6 @@ from exp.runtime.gateway.native_execution import (
     THROTTLE_SURFACED_CACHE_PRESERVING,
     InflightRequest,
     ThrottleDisposition,
-    claim_route_from,
     deployment_health_key,
     dispatch_disclosure,
 )
@@ -440,6 +441,7 @@ class NativeAttemptAccounting:
         tool_search_round = False
         reasoning_repair = data.get("reasoning_repair") is True and isinstance(current_depth, int)
         failover = FailoverPass.begin(entry, failure, current_depth)
+        probe = failure is None or not isinstance(current_depth, int)  # may probe a throttle
         if failure is not None and isinstance(current_depth, int):
             candidate, disposition = failed_dispatch_candidate(
                 health=self._health,
@@ -467,18 +469,17 @@ class NativeAttemptAccounting:
             tool_search_round = data.get("tool_search_round") is True and isinstance(
                 current_depth, int
             )
-            if selected_first:
-                candidate = 0 if self._health.claim(keys[0]) else None
-            else:
-                candidate = claim_route_from(
-                    self._health,
-                    keys,
-                    current_depth if tool_search_round or reasoning_repair else 0,
-                    (current_depth,) if reasoning_repair else ladder,
-                )
+            candidate = no_failure_claim(
+                self._health,
+                keys,
+                (current_depth,) if reasoning_repair else ladder,
+                selected_first=selected_first,
+                start=current_depth if tool_search_round or reasoning_repair else 0,
+            )
             if reasoning_repair:
                 ladder = (current_depth,)
             last_failure = None
+        spill = partial(sideways_claim, failover, self._health, keys, ladder, throttle_probe=probe)
         forced_overflow = False
         capacity_refused = False
         shed_records: dict[int, RungShed] = {}
@@ -528,7 +529,7 @@ class NativeAttemptAccounting:
                     forced_overflow = True
             if route.snapshot.stage_for_depth(candidate).pool_id in entry.denied_destination_pools:
                 self._health.release_probe(keys[candidate])
-                candidate = sideways_claim(failover, self._health, keys, ladder, candidate)
+                candidate = spill(candidate)
                 continue
             if not entry.attempt_policy.permits(
                 entry.total_attempts, entry.attempt_counts[candidate]
@@ -596,7 +597,7 @@ class NativeAttemptAccounting:
                         self._rung_saturation_refusals += 1
                     break
                 if not forced_overflow:
-                    candidate = sideways_claim(failover, self._health, keys, ladder, candidate)
+                    candidate = spill(candidate)
                 continue
             throttle_backoff = candidate == redial_depth
             dispatch_reason, preferred_deployment = dispatch_disclosure(
@@ -649,7 +650,7 @@ class NativeAttemptAccounting:
                     entry.denied_destination_pools.add(denied_pool)
                     last_failure = budget_quota_failure()
                     forced_overflow = False
-                    candidate = sideways_claim(failover, self._health, keys, ladder, candidate)
+                    candidate = spill(candidate)
                     continue
                 if exc.scope_kind is not BudgetScopeKind.DEPLOYMENT:
                     error = (
@@ -671,7 +672,7 @@ class NativeAttemptAccounting:
                 # A forced reservation belongs only to the selected rung, never
                 # a later destination reached after this one's budget rejection.
                 forced_overflow = False
-                candidate = sideways_claim(failover, self._health, keys, ladder, candidate)
+                candidate = spill(candidate)
                 continue
             except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
                 # A reservation that raised before returning an attempt id
@@ -700,6 +701,7 @@ class NativeAttemptAccounting:
                 self._count_throttle_disposition(disposition)
             elif throttle_backoff:
                 self._count_throttle_disposition(THROTTLE_BACKOFF)
+            self._health.bind_throttle_probe(keys[candidate], attempt_id, probe=probe)
             if self.recovery_host is None:
                 bind_sticky_dispatch(self._sticky, entry, deployment)
             observe_reserved_attempt(self.recovery_host, entry, attempt_id, deployment)
