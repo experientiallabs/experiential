@@ -151,8 +151,9 @@ const PUBLIC_KEY_PREFIX_LENGTH = 11;
  * endpoint's entry: a local gateway serves one listing.
  */
 export function cacheKey(config: GatewayConfig): string {
-  const prefix = config.apiKey.startsWith("xpl_") ? config.apiKey.slice(0, PUBLIC_KEY_PREFIX_LENGTH) : "";
-  return createHash("sha256").update(`${config.baseUrl}\n${prefix}`).digest("hex").slice(0, 24);
+  const endpoint = createHash("sha256").update(config.baseUrl).digest("hex").slice(0, 16);
+  const prefix = config.apiKey.startsWith("xpl_") ? config.apiKey.slice(0, PUBLIC_KEY_PREFIX_LENGTH).replace(/[^A-Za-z0-9_]/g, "") : "";
+  return prefix === "" ? endpoint : `${endpoint}-${prefix}`;
 }
 
 async function readDiskCache(path: string): Promise<CachedListing | undefined> {
