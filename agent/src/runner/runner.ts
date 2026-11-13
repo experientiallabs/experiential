@@ -35,7 +35,7 @@ import { normalizeTodos } from "../extension/todo.js";
 import { createWebFetchTool } from "../extension/web-fetch.js";
 import { createWebSearchTool } from "../extension/web-search.js";
 import { GATEWAY_PROVIDER_ID, type GatewayConfig, trimBaseUrl } from "../gateway/config.js";
-import { DEFAULT_MAX_TOKENS, type ListedModel } from "../gateway/models.js";
+import { DEFAULT_MAX_TOKENS, fetchGatewayModels, type ListedModel } from "../gateway/models.js";
 import { gatewayProviderConfig, gatewayProviderModels, messageBilling } from "../gateway/provider.js";
 import { INTERRUPTED_LIMIT_MESSAGE, modelErrorEvent, RESTART_LIMIT_MESSAGE, RUN_LIMIT_MESSAGE } from "./errors.js";
 import { currentRun, EventLog, readEventLog } from "./event-log.js";
@@ -80,6 +80,23 @@ export interface RunnerOptions {
   fetch?: typeof globalThis.fetch;
   /** Clock, for tests. */
   now?: () => number;
+}
+
+/**
+ * Whether the run's model reasons, from the gateway's listing (`supports_reasoning`), cached
+ * under the session's agent directory. When the listing cannot be read, a chosen reasoning effort
+ * stands in for it; otherwise the model is treated as not reasoning, so no reasoning parameter is
+ * sent to a route that might refuse one.
+ */
+async function modelReasons(spec: RunSpec, gateway: GatewayConfig, fetch: typeof globalThis.fetch | undefined, cacheDir: string): Promise<boolean> {
+  try {
+    const listed = await fetchGatewayModels(gateway, { fetch, cacheDir });
+    const model = listed.find((entry) => entry.id === spec.model);
+    if (model?.reasoning !== undefined) return model.reasoning;
+  } catch {
+    // Fall through to the spec.
+  }
+  return spec.reasoningEffort !== null && spec.reasoningEffort !== "none";
 }
 
 function tail(text: string, limit: number): string {
@@ -202,7 +219,8 @@ export async function runOnce(options: RunnerOptions): Promise<RunEndStatus> {
   }
 
   const agentDir = join(options.sessionDir, "agent");
-  const runnerModels: ListedModel[] = [{ id: spec.model, vision: spec.vision, reasoning: false, maxTokens: DEFAULT_MAX_TOKENS }];
+  const reasons = await modelReasons(spec, gateway, options.fetch, agentDir);
+  const runnerModels: ListedModel[] = [{ id: spec.model, vision: spec.vision, reasoning: reasons, maxTokens: DEFAULT_MAX_TOKENS }];
   const settingsManager = SettingsManager.inMemory(
     { compaction: { enabled: true } },
     { projectTrusted: false }
@@ -210,10 +228,13 @@ export async function runOnce(options: RunnerOptions): Promise<RunEndStatus> {
   const runnerExtension: ExtensionFactory = (pi) => {
     // Pi's own file tools run with the runner's privileges; replace every one with the account's.
     if (options.account) for (const name of ["read", "bash", "write", "edit"]) pi.registerTool(tools.get(name)!);
-    if (spec.reasoningEffort !== null) {
-      const effort = spec.reasoningEffort;
-      pi.on("before_provider_request", (event) => ({ ...(event.payload as Record<string, unknown>), reasoning_effort: effort }));
-    }
+    // The run's own reasoning parameters: the chosen effort, and for a reasoning model the request
+    // to stream its reasoning text (Chat Completions returns it as `reasoning`/`reasoning_content`
+    // only when asked, except on routes that always send it), which the log records as thinking.
+    const extra: Record<string, unknown> = {};
+    if (spec.reasoningEffort !== null) extra.reasoning_effort = spec.reasoningEffort;
+    if (reasons) extra.include_reasoning = true;
+    if (Object.keys(extra).length > 0) pi.on("before_provider_request", (event) => ({ ...(event.payload as Record<string, unknown>), ...extra }));
   };
   const resourceLoader = new DefaultResourceLoader({
     cwd: options.workDir,

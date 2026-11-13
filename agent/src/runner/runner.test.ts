@@ -245,6 +245,44 @@ describe("runner", () => {
     expect(thinking).toBe("Checking divisors of 91.");
   });
 
+  it("asks a reasoning model for its reasoning text and keeps it out of the answer", async () => {
+    gateway.setModels([{ id: "fake-model", object: "model", created: 0, owned_by: "exp", supports_reasoning: true }]);
+    writeSpec();
+    await run([
+      { reasoning: "I should look at the files first.", calls: [{ name: "bash", arguments: { command: "ls" } }] },
+      { reasoning: "Nothing there, so the answer is short.", reasoningField: "reasoning_content", text: "The folder is empty." }
+    ]);
+    for (const body of gateway.completions()) {
+      expect(body.include_reasoning).toBe(true);
+      expect(body).not.toHaveProperty("reasoning_effort");
+    }
+    const sequence = events()
+      .filter((event) => event.type === "thinking" || event.type === "text" || event.type === "tool_start")
+      .map((event) => event.type);
+    // One thinking block before the call, one before the answer, never interleaved with the text.
+    expect(sequence.filter((type, i) => type !== sequence[i - 1])).toEqual(["thinking", "tool_start", "thinking", "text"]);
+    const joined = (type: string) =>
+      events()
+        .filter((event) => event.type === type)
+        .map((event) => (event as { delta: string }).delta)
+        .join("");
+    expect(joined("thinking")).toBe("I should look at the files first.Nothing there, so the answer is short.");
+    expect(joined("text")).toBe("The folder is empty.");
+  });
+
+  it("asks a model the listing does not mark as reasoning for no reasoning text", async () => {
+    writeSpec();
+    await run([{ text: "ok" }]);
+    expect(gateway.completions()[0]).not.toHaveProperty("include_reasoning");
+  });
+
+  it("reads a chosen effort as a reasoning model when the listing does not say", async () => {
+    gateway.setModels([]);
+    writeSpec({ reasoningEffort: "high" });
+    await run([{ text: "ok" }]);
+    expect(gateway.completions()[0]).toMatchObject({ reasoning_effort: "high", include_reasoning: true });
+  });
+
   it("exposes web_search only when the spec enables it", async () => {
     writeSpec({ webSearch: false });
     await run([{ text: "ok" }]);

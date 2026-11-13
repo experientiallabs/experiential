@@ -1,6 +1,6 @@
 {
   "name": "exp-code",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Experiential's open-source coding and cowork agent, built on Pi's coding agent and served through the Experiential gateway.",
   "type": "module",
   "license": "Apache-2.0",

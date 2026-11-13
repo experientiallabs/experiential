@@ -9,9 +9,12 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
+/** The delta field a route streams reasoning in: OpenAI-style summaries or DeepSeek-style raw text. */
+export type ReasoningField = "reasoning" | "reasoning_content";
+
 export type FakeTurn =
-  | { text: string; reasoning?: string; delayMs?: number; cost?: number; byokListUsd?: number; listUsd?: number }
-  | { calls: { name: string; arguments: Record<string, unknown> }[]; delayMs?: number }
+  | { text: string; reasoning?: string; reasoningField?: ReasoningField; delayMs?: number; cost?: number; byokListUsd?: number; listUsd?: number }
+  | { calls: { name: string; arguments: Record<string, unknown> }[]; reasoning?: string; reasoningField?: ReasoningField; delayMs?: number }
   | { status: number; error: string };
 
 export interface RecordedRequest {
@@ -30,6 +33,8 @@ export interface FakeGateway {
   requests: RecordedRequest[];
   /** Bodies of chat completion requests, in order. */
   completions: () => Record<string, unknown>[];
+  /** Replace the `GET /v1/models` entries. */
+  setModels: (models: unknown[]) => void;
   /** Replace the queued turns. */
   script: (turns: FakeTurn[]) => void;
   /** Handle POSTs to any path other than chat completions. */
@@ -58,8 +63,13 @@ function sse(response: ServerResponse, chunks: unknown[]): void {
 function turnChunks(turn: Exclude<FakeTurn, { status: number }>, index: number): unknown[] {
   const base = { id: `chatcmpl-${index}`, object: "chat.completion.chunk", created: 0, model: "fake" };
   const chunks: unknown[] = [];
+  // Reasoning streams in a few deltas ahead of the answer or the calls, as the hosted gateway does.
+  if (turn.reasoning) {
+    const field = turn.reasoningField ?? "reasoning";
+    const words = turn.reasoning.split(/(?<= )/);
+    for (const word of words) chunks.push({ ...base, choices: [{ index: 0, delta: { role: "assistant", [field]: word } }] });
+  }
   if ("text" in turn) {
-    if (turn.reasoning) chunks.push({ ...base, choices: [{ index: 0, delta: { role: "assistant", reasoning: turn.reasoning } }] });
     chunks.push({ ...base, choices: [{ index: 0, delta: { role: "assistant", content: turn.text } }] });
     chunks.push({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
   } else {
@@ -89,8 +99,9 @@ function turnChunks(turn: Exclude<FakeTurn, { status: number }>, index: number):
 }
 
 /** Start a fake gateway serving the given turns (more can be queued with `script`). */
-export async function startFakeGateway(initial: FakeTurn[] = [], models: unknown[] = [{ id: "fake-model", object: "model", created: 0, owned_by: "exp" }]): Promise<FakeGateway> {
+export async function startFakeGateway(initial: FakeTurn[] = [], initialModels: unknown[] = [{ id: "fake-model", object: "model", created: 0, owned_by: "exp" }]): Promise<FakeGateway> {
   let turns = [...initial];
+  let models = [...initialModels];
   let served = 0;
   const requests: RecordedRequest[] = [];
   let postHandler: (request: RecordedRequest) => { status: number; body?: unknown } = () => ({ status: 200, body: {} });
@@ -142,6 +153,9 @@ export async function startFakeGateway(initial: FakeTurn[] = [], models: unknown
     origin,
     requests,
     completions: () => requests.filter((r) => r.path === "/v1/chat/completions").map((r) => r.body as Record<string, unknown>),
+    setModels: (next) => {
+      models = [...next];
+    },
     script: (next) => {
       turns = [...next];
     },
