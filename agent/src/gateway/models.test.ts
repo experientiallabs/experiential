@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { GatewayConfig } from "./config.js";
-import { chooseWireApi, clearModelCache, DEFAULT_CONTEXT_WINDOW, fetchGatewayModels, parseModelListing, parseWireApi, toProviderModel } from "./models.js";
+import { cacheKey, chooseWireApi, clearModelCache, DEFAULT_CONTEXT_WINDOW, fetchGatewayModels, parseModelListing, parseWireApi, toProviderModel } from "./models.js";
 
 const hosted: GatewayConfig = { kind: "hosted", baseUrl: "https://gw.example/v1", apiKey: "xpl_secret" };
 
@@ -75,5 +75,16 @@ describe("gateway models", () => {
   it("explains a refused listing", async () => {
     const fetch = (async () => new Response(JSON.stringify({ error: { message: "bad key" } }), { status: 401 })) as typeof globalThis.fetch;
     await expect(fetchGatewayModels(hosted, { fetch })).rejects.toThrow(/refused the model listing \(401\): bad key\. Check EXP_API_KEY/);
+  });
+});
+
+describe("listing cache key", () => {
+  it("uses only the key's public prefix, never the secret", () => {
+    const base = { kind: "hosted" as const, baseUrl: "https://gw.example/v1" };
+    const a = cacheKey({ ...base, apiKey: "xpl_abcdefgSECRET-1" });
+    expect(cacheKey({ ...base, apiKey: "xpl_abcdefgSECRET-2" })).toBe(a);
+    expect(cacheKey({ ...base, apiKey: "xpl_zzzzzzzSECRET-1" })).not.toBe(a);
+    expect(cacheKey({ ...base, apiKey: "local-virtual-key" })).toBe(cacheKey({ ...base, apiKey: "another-local-key" }));
+    expect(cacheKey({ ...base, baseUrl: "http://127.0.0.1:8080/v1", apiKey: "xpl_abcdefgSECRET-1" })).not.toBe(a);
   });
 });
