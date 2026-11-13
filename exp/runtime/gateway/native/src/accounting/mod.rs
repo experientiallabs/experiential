@@ -97,6 +97,9 @@ mod inspection_recording_tests;
 #[cfg(test)]
 mod input_tests;
 
+#[cfg(test)]
+mod input_reporting_tests;
+
 mod session_recovery;
 pub use session_recovery::python::NativeSessionRecovery;
 
