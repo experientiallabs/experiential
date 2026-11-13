@@ -435,6 +435,7 @@ def cross_tier_studies(
                 tier.judge,
                 configuration=job.configuration,
                 code_revision=code_revision,
+                concurrency=admitted_concurrency(project, tier.judge.settings.model_alias),
             )
         except (ValueError, RuntimeError, OSError) as error:
             logger.warning(

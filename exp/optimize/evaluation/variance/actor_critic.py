@@ -1060,6 +1060,7 @@ def _continue(
         spec.episode_judge,
         configuration=job.configuration,
         code_revision=code_revision,
+        concurrency=admitted_concurrency(project, spec.episode_judge.settings.model_alias),
     )
     rewards = slot_rewards(project, judged.branches, judged.judge)
     labels = [int(reward) for reward in rewards if reward is not None]
