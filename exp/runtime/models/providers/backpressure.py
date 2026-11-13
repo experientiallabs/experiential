@@ -305,8 +305,13 @@ class HostProviderAdmission:
         self._pid = os.getpid()
         self._start = process_start(self._pid)
         path.parent.mkdir(parents=True, exist_ok=True)
-        connection = connect_database(path)
+        connection = connect_database(path, busy_timeout_ms=ADMISSION_BUSY_TIMEOUT_MS)
         try:
+            # Every client opens the shared database; an initialized one needs no write lock,
+            # which many concurrent clients would otherwise contend for.
+            ready = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if ready == SCHEMA_VERSION:
+                return
             connection.execute("BEGIN IMMEDIATE")
             try:
                 version = int(connection.execute("PRAGMA user_version").fetchone()[0])
