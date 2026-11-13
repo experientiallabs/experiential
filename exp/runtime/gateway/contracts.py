@@ -80,6 +80,7 @@ from exp.runtime.gateway.stream_contracts import (
 from exp.runtime.gateway.stream_contracts import (
     TokenLogprob as TokenLogprob,
 )
+from exp.runtime.gateway.surfaces import JSON_OBJECT_OUTPUT_SURFACES, ReasoningEffortParameter
 from exp.runtime.gateway.surfaces import GatewayApiSurface as GatewayApiSurface
 from exp.runtime.gateway.tool_contracts import (
     GatewayNamedToolChoice as GatewayNamedToolChoice,
@@ -488,12 +489,11 @@ class GatewayRequest(ContractModel):
     include_output_text_logprobs: bool = Field(default=False, exclude=True)
     include_web_search_sources: bool = Field(default=False, exclude=True)
     reasoning_effort: ReasoningEffort | None = None
-    reasoning_effort_parameter: (
-        Literal["reasoning_effort", "reasoning.effort", "output_config.effort"] | None
-    ) = Field(default=None, exclude=True)
+    reasoning_effort_parameter: ReasoningEffortParameter | None = Field(default=None, exclude=True)
     # Level-less enable-thinking; the route seam resolves the concrete effort.
     thinking_budget: int | None = Field(default=None, ge=-1, strict=True, exclude=True)
     thinking_default_enable: bool = False
+    include_thoughts: bool = Field(default=False, exclude=True)  # Google includeThoughts
     reasoning_summary: Literal["auto", "concise", "detailed"] | None = None
     reasoning_summary_parameters: tuple[
         Literal["reasoning.generate_summary", "reasoning.summary"], ...
@@ -781,16 +781,12 @@ class GatewayRequest(ContractModel):
         return value
 
     @property
-    def caller_effort_parameter(
-        self,
-    ) -> Literal["reasoning_effort", "reasoning.effort", "output_config.effort"]:
+    def caller_effort_parameter(self) -> ReasoningEffortParameter:
         """The public field an unservable effort is rejected under.
 
-        The recorded caller field when the decoder knows it; otherwise the
-        surface's one effort field. The name matters: Claude Code carries its
-        effort as Messages ``output_config.effort`` and auto-recovers (drops
-        the field and retries) only when the 400 names that channel, so naming
-        a translated internal field wedges every turn instead.
+        The recorded caller field when the decoder knows it; otherwise the surface's one
+        effort field. The name matters: Claude Code carries its effort as Messages
+        ``output_config.effort`` and auto-recovers only when the 400 names that channel.
         """
         if self.reasoning_effort_parameter is not None:
             return self.reasoning_effort_parameter
@@ -799,6 +795,8 @@ class GatewayRequest(ContractModel):
                 return "reasoning.effort"
             case GatewayApiSurface.MESSAGES:
                 return "output_config.effort"
+            case GatewayApiSurface.GENERATE_CONTENT:
+                return "generationConfig.thinkingConfig.thinkingLevel"
             case _:
                 return "reasoning_effort"
 
@@ -834,8 +832,10 @@ class GatewayRequest(ContractModel):
             raise ValueError("include_usage is valid only for streaming requests")
         if self.json_object_output and self.structured_text is not None:
             raise ValueError("json_object_output and structured_text are mutually exclusive")
-        if self.json_object_output and self.surface not in ("chat_completions", "responses"):
-            raise ValueError("json_object_output is valid only for Chat and Responses requests")
+        if self.json_object_output and self.surface not in JSON_OBJECT_OUTPUT_SURFACES:
+            raise ValueError(
+                "json_object_output is valid only for Chat, Responses or generateContent"
+            )
         parts = (part for message in self.messages for part in message.content_parts)
         require_attachment_ceilings(parts)
         if len({handle.provider for handle in self.media_handles}) > 1:

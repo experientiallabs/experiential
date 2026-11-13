@@ -194,7 +194,7 @@ class CaptureRequest(ContractModel):
 
     request_id: Identifier
     scope: CaptureScope
-    protocol: Literal["chat_completions", "responses", "messages"]
+    protocol: Literal["chat_completions", "responses", "messages", "generate_content"]
     model_id: Identifier | None
     context: JsonObject
 
@@ -366,6 +366,7 @@ class CaptureController:
             "chat_completions",
             "responses",
             "messages",
+            "generate_content",
         }:
             return True
         context = capture_context_document(request, session_id=session_id)

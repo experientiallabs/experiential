@@ -605,7 +605,7 @@ created, in-progress, output, and exactly one terminal lifecycle. Provider tool-
 are accumulated in original order and validated only at the complete-call boundary.
 
 `exp/runtime/anthropic_protocol` is the only Anthropic Messages wire implementation, serving
-`POST /v1/messages`; its contract is in [Anthropic Messages protocol](gateway-anthropic-protocol.md).
+`POST /v1/messages` ([Anthropic Messages protocol](gateway-anthropic-protocol.md)); `exp/runtime/google_protocol` serves Gemini ([generateContent](gateway-google-protocol.md)).
 
 Gateway-executed web search is documented in [gateway-web-search.md](gateway-web-search.md);
 gateway-executed tool search in [gateway-tool-search.md](gateway-tool-search.md).

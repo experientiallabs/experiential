@@ -43,7 +43,12 @@ def open_local_capture(configuration: CaptureConfiguration | None) -> CaptureCon
 
     def application_for(authorization: AuthorizationSnapshot) -> str | None:
         """Use exact authenticated identifiers, never parsed caller-controlled metadata."""
-        if authorization.surface.value not in {"chat_completions", "responses", "messages"}:
+        if authorization.surface.value not in {
+            "chat_completions",
+            "responses",
+            "messages",
+            "generate_content",
+        }:
             return None
         return bindings.get((authorization.identity_id, authorization.alias))
 

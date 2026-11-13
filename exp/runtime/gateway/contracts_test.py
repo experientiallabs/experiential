@@ -1172,7 +1172,7 @@ def test_json_object_output_is_serialization_inert_but_binds_replay_identity() -
             json_object_output=True,
             structured_text=StructuredTextFormat(name="out", json_schema={"type": "object"}),
         )
-    with pytest.raises(ValidationError, match="valid only for Chat and Responses"):
+    with pytest.raises(ValidationError, match="valid only for Chat, Responses or generateContent"):
         GatewayRequest(
             surface=GatewayApiSurface.MESSAGES,
             messages=messages,

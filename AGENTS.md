@@ -103,7 +103,9 @@ uv run pytest -q
   authenticated multi-alias gateway on loopback, running first-time setup when no gateway exists,
   while `exp --project PROJECT --root ROOT --port
   PORT [--ghost]` retains the single-project compatibility server. Both expose OpenAI Chat
-  Completions, Responses, and Models routes. Public request and
+  Completions, Responses, and Models routes, the Anthropic Messages route, and the Google Gemini
+  API (`/v1beta/models/{model}:generateContent`; decoding in `exp/runtime/google_protocol`,
+  encoding in the native data plane, `docs/reference/gateway-google-protocol.md`). Public request and
   response types come
   from the official OpenAI SDK. Chat retries use the standard `Idempotency-Key`; Responses
   continuations use `previous_response_id`. Experiential never joins unrelated Chat callers by transcript

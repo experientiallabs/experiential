@@ -4,6 +4,7 @@ mod bounds;
 pub(crate) mod budget;
 pub(crate) mod collector;
 pub(crate) mod delivery;
+mod gemini;
 mod local;
 mod local_payload;
 mod local_store;

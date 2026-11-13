@@ -12,6 +12,10 @@ from exp.runtime.gateway.lone_surrogates import (
     refuse_lone_surrogates,
     replace_lone_surrogates,
 )
+from exp.runtime.google_protocol.requests import (
+    decode_generate_content,
+    decode_generate_content_count_tokens,
+)
 from exp.runtime.models.providers.json_prefix import incomplete_json_object_prefix
 from exp.runtime.openai_protocol.audio_requests import (
     DecodedSpeechRequest,
@@ -51,12 +55,14 @@ def decode_native_body(
     idempotency_key: str | None = None,
     client_request_id: str | None = None,
     anthropic_beta: str | None = None,
+    model: str | None = None,
 ) -> DecodedGatewayRequest:
     """Decode one raw request body with the shared surface decoder.
 
     Args:
         body: Raw request body text.
-        surface: Public surface, ``chat``, ``responses``, or ``messages``.
+        surface: Public surface, ``chat``, ``responses``, ``messages``,
+            ``generate_content`` or ``stream_generate_content``.
         idempotency_key: Optional raw ``Idempotency-Key`` header value.
             Ignored on the Anthropic Messages surface, which defines no
             idempotency header.
@@ -65,6 +71,8 @@ def decode_native_body(
         anthropic_beta: Optional raw caller ``anthropic-beta`` header value.
             Meaningful only on the Messages surface, where allowlisted
             tokens are retained for Anthropic dispatch.
+        model: The alias named in the request path, on the Gemini surfaces
+            (their body carries no model field).
 
     Returns:
         The public alias and canonical request.
@@ -77,6 +85,10 @@ def decode_native_body(
     try:
         if surface == "messages":
             decoded = decode_messages(payload, anthropic_beta=anthropic_beta)
+        elif surface in {"generate_content", "stream_generate_content"}:
+            decoded = decode_generate_content(
+                payload, model=model or "", stream=surface == "stream_generate_content"
+            )
         else:
             decoder = decode_responses if surface == "responses" else decode_chat
             decoded = decoder(
@@ -93,15 +105,21 @@ def decode_native_count_tokens_body(
     body: str,
     *,
     anthropic_beta: str | None = None,
+    surface: str = "messages",
+    model: str | None = None,
 ) -> DecodedGatewayRequest:
-    """Decode one raw ``/v1/messages/count_tokens`` body for prompt counting.
+    """Decode one raw count body for prompt counting.
 
-    Anthropic's count body carries no ``max_tokens``, so it decodes through
-    the count-specific Messages entrypoint rather than the generation one.
+    Anthropic's count body (``/v1/messages/count_tokens``) carries no
+    ``max_tokens``, and Google's (``:countTokens``) only ``contents`` or a
+    wrapped ``generateContentRequest``, so each decodes through its
+    count-specific entrypoint rather than the generation one.
 
     Args:
         body: Raw request body text.
         anthropic_beta: Optional raw caller ``anthropic-beta`` header value.
+        surface: ``messages`` (default) or ``generate_content``.
+        model: The alias named in the request path on the Gemini surface.
 
     Returns:
         The public alias and the canonical request to count.
@@ -112,7 +130,10 @@ def decode_native_count_tokens_body(
     """
     payload, repairs = _load_repaired_body(body)
     try:
-        decoded = decode_messages_count_tokens(payload, anthropic_beta=anthropic_beta)
+        if surface == "generate_content":
+            decoded = decode_generate_content_count_tokens(payload, model=model or "")
+        else:
+            decoded = decode_messages_count_tokens(payload, anthropic_beta=anthropic_beta)
     except OpenAIProtocolError as exc:
         raise NativeDecodeError(exc) from exc
     return _disclosed(decoded, repairs)

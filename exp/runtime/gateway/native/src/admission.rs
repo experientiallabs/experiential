@@ -82,6 +82,12 @@ pub(crate) struct Admission {
     /// reports nothing before its final chunk; display-only, never settled.
     #[serde(default)]
     pub input_token_estimate: Option<u64>,
+    /// The caller asked for thought summaries
+    /// (`generationConfig.thinkingConfig.includeThoughts`); generateContent
+    /// admissions carry it so the encoder renders `thought: true` parts
+    /// only when asked, as Google does. Absent everywhere else.
+    #[serde(default)]
+    pub include_thoughts: bool,
     /// The caller's own output cap (`max_tokens`, `max_completion_tokens`
     /// or `max_output_tokens`, normalized by the control plane), absent when
     /// the request is uncapped. The waterfall reads it to classify a `stop`

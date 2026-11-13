@@ -964,6 +964,30 @@ def test_v31_admits_the_azure_responses_surface(tmp_path: Path) -> None:
         connection.close()
 
 
+def test_v33_admits_the_generate_content_surface(tmp_path: Path) -> None:
+    """A migrated database stores the Gemini surface and still refuses unknown ones."""
+    path = tmp_path / "gateway.db"
+    initialize_database(path)
+    connection = connect_database(path)
+    try:
+        definition = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'gateway_requests'"
+        ).fetchone()[0]
+        assert "'speech', 'transcription', 'video', 'generate_content'" in definition
+        # Only the surface CHECK is under test; the row's foreign keys are not.
+        connection.execute("PRAGMA foreign_keys = OFF")
+        insert = (
+            "INSERT INTO gateway_requests (request_id, organization_id, identity_id, key_id, "
+            "alias_id, alias_revision_id, api_surface, canonical_request_sha256, accepted_at, "
+            "deadline_at) VALUES (?, 'org', 'id', 'key', 'alias', 'rev', ?, ?, 't', 't')"
+        )
+        connection.execute(insert, ("req-gc", "generate_content", "a" * 64))
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(insert, ("req-bogus", "bogus", "b" * 64))
+    finally:
+        connection.close()
+
+
 def test_v12_adds_bedrock_auth_locators_and_preserves_ambient_authority(
     tmp_path: Path,
 ) -> None:

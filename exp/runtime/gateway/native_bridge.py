@@ -295,8 +295,7 @@ class NativeControlPlane(
         """Decode, authorize, inspect, route, and durably accept one request.
 
         Args:
-            argument: JSON object with ``raw_key``, ``body`` (raw request body text), optional
-                ``surface`` (``"chat"`` or ``"responses"``, default chat), and caller app headers.
+            argument: JSON with raw_key, body, surface (see decode_native_body), model, app headers.
 
         Returns:
             The ordered certified ``route`` with dispatch and retry configuration,
@@ -315,6 +314,7 @@ class NativeControlPlane(
             idempotency_key=optional_text(data.get("idempotency_key")),
             client_request_id=optional_text(data.get("client_request_id")),
             anthropic_beta=optional_text(data.get("anthropic_beta")),
+            model=optional_text(data.get("model")),
         )
         request = decoded.request
         deadline = time.monotonic() + self._request_timeout_seconds
@@ -818,9 +818,9 @@ class NativeControlPlane(
             response["web_search"] = web_search_admission
         if tool_search_admission is not None:
             response["tool_search"] = tool_search_admission
-        if request.surface == GatewayApiSurface.MESSAGES:
-            # Display-only `message_start` input; the ledger never reads it.
+        if request.surface == GatewayApiSurface.MESSAGES:  # display-only message_start input
             response["input_token_estimate"] = counted_input_tokens(public_request)
+        response["include_thoughts"] = request.include_thoughts
         if public_request.maximum_output_tokens is not None:
             # The caller's cap: classifies an output-less, usage-less `stop` (capped -> length).
             response["maximum_output_tokens"] = public_request.maximum_output_tokens

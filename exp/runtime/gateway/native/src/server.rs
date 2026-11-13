@@ -39,6 +39,7 @@ use crate::route_batches::{
 use crate::route_chat::chat;
 use crate::route_decisions::{decisions, openai_decisions};
 use crate::route_embeddings::embeddings;
+use crate::route_generate_content::{generate_content_model_action, generate_content_models};
 use crate::route_image_edits::{image_edits, image_edits_body_limit};
 use crate::route_images::images;
 use crate::route_messages::{messages, messages_count_tokens};
@@ -291,6 +292,14 @@ pub async fn run(
         .route("/v1/responses", post(responses).get(responses_ws))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(messages_count_tokens))
+        // Google's Gemini API: the action rides the last path segment as
+        // `{model}:{action}` (matchit has no suffix parameters), so one
+        // route takes the segment and the handler splits it.
+        .route("/v1beta/models", get(generate_content_models))
+        .route(
+            "/v1beta/models/{model_action}",
+            get(generate_content_model_action).post(generate_content_model_action),
+        )
         .route("/v1/batches", post(batches_create).get(batches_list))
         .route("/v1/batches/{batch_id}", get(batches_retrieve))
         .route("/v1/batches/{batch_id}/cancel", post(batches_cancel))
