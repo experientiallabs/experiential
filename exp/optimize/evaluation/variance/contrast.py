@@ -66,6 +66,7 @@ from exp.optimize.evaluation.continuations.job import (
     preflight_continuation_job,
 )
 from exp.optimize.evaluation.continuations.study import restore_continuation_world
+from exp.optimize.evaluation.variance.actor_critic import admitted_concurrency
 from exp.optimize.evaluation.variance.contracts import (
     DecisionState,
     Scenario,
@@ -715,8 +716,11 @@ def run_option_contrast(
         artifact_input(store.read(spec.identity(code_revision) + "-result").manifest)
         for spec in specs
     )
+    concurrency = admitted_concurrency(project, judge.settings.model_alias)
     judged = [
-        judge_cells(project, report, reference, judge, code_revision=code_revision)
+        judge_cells(
+            project, report, reference, judge, code_revision=code_revision, concurrency=concurrency
+        )
         for report, reference in zip(reports, references, strict=True)
     ]
     result = _option_contrast(

@@ -1,5 +1,7 @@
 """Executed witnesses, forced-option contrasts and family flips on a restored native workbook."""
 
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -9,9 +11,11 @@ from exp.common.evaluations.uncertainty import wilson_interval
 from exp.common.models import ToolCall
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations import action_contrast
+from exp.optimize.evaluation.continuations.action_contrast import ActionContrast
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.continuations.study import ContinuationStudy
+from exp.optimize.evaluation.variance import judged as judged_module
 from exp.optimize.evaluation.variance.contracts import (
     Criterion,
     DecisionOption,
@@ -32,6 +36,7 @@ from exp.optimize.evaluation.variance.contrast import (
     states_action,
     witness_reference,
 )
+from exp.optimize.evaluation.variance.judged import judge_cells
 from exp.optimize.evaluation.variance.judged_test import (
     JudgeRouter,
     episode_judge,
@@ -353,6 +358,56 @@ def test_forced_options_separate_under_one_frozen_job_and_replay(
     scenario = _scenario().model_copy(update={"correct_option": "delete-1"})
     verdict = family_flip({"gold": contrast}, [scenario])
     assert verdict.variants[0].status == "separated_matches" and not verdict.qualifies
+
+
+def test_cells_are_judged_at_once_in_plan_order_with_the_serial_slots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Judging a contrast's cells concurrently overlaps them and keeps each cell's slot."""
+    project, job, _ = job_fixture(tmp_path, monkeypatch)
+    _finish_transport(monkeypatch, 4)
+    _one_row_judge(monkeypatch)
+    judge = episode_judge(
+        project,
+        judge_settings(project),
+        **run_digests(project, job.study.checkpoint, job.configuration),
+    )
+    contrast = run_option_contrast(
+        project,
+        checkpoint=job.study.checkpoint,
+        decision=_row_decision(1, 2),
+        actions={"delete-1": _deletion(1), "delete-2": _deletion(2)},
+        job=job,
+        repeats=2,
+        judge=judge,
+        code_revision="test",
+    )
+    reference = contrast.contrasts[0]
+    report = ActionContrast.model_validate_json(
+        project.artifacts.read_bytes(reference.artifact_id, "report.json")
+    )
+    judge_one = judged_module._judge
+    lock, state = threading.Lock(), {"now": 0, "peak": 0}
+
+    def overlapping(*args: object) -> object:
+        with lock:
+            state["now"] += 1
+            state["peak"] = max(state["peak"], state["now"])
+        time.sleep(0.2)
+        try:
+            return judge_one(*args)  # type: ignore[arg-type]
+        finally:
+            with lock:
+                state["now"] -= 1
+
+    serial = judge_cells(project, report, reference, judge, code_revision="test")
+    monkeypatch.setattr(judged_module, "_judge", overlapping)
+    together = judge_cells(project, report, reference, judge, code_revision="test", concurrency=4)
+    assert together == serial and len(together) == 4
+    assert state["peak"] == 4
+    assert [(cell.pair, cell.arm) for cell in together] == [
+        (cell.pair, cell.arm) for cell in report.cells
+    ]
 
 
 def test_three_options_pool_the_reference_and_keep_unknowns(
