@@ -23,6 +23,8 @@ export interface GatewayConfig {
   baseUrl: string;
   /** `xpl_` key for the hosted gateway, or a virtual key issued by the local gateway. */
   apiKey: string;
+  /** Headers sent with every call (a hosted run's conversation trace, see trace.ts). */
+  headers?: Readonly<Record<string, string>>;
 }
 
 /** The outcome of reading the environment: a config, or the reason there is none. */

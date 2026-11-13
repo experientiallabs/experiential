@@ -21,7 +21,7 @@ export interface GatewayProviderOptions extends FetchModelsOptions {
   onListingError?: (error: Error) => void;
 }
 
-/** Escape a literal key so Pi never reads it as `$ENV` or `!command` syntax. */
+/** Escape a literal key or header value so Pi never reads it as `$ENV` or `!command` syntax. */
 export function literalApiKey(key: string): string {
   const escaped = key.replaceAll("$", () => "$$");
   return escaped.startsWith("!") ? `$${escaped}` : escaped;
@@ -84,6 +84,9 @@ export function gatewayProviderConfig(
     name: config.kind === "hosted" ? "Experiential" : "Experiential (local gateway)",
     baseUrl: config.baseUrl,
     apiKey: literalApiKey(config.apiKey),
+    ...(config.headers === undefined
+      ? {}
+      : { headers: Object.fromEntries(Object.entries(config.headers).map(([name, value]) => [name, literalApiKey(value)])) }),
     api: "openai-completions",
     models,
     refreshModels

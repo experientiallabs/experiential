@@ -283,6 +283,20 @@ describe("runner", () => {
     expect(gateway.completions()[0]).toMatchObject({ reasoning_effort: "high", include_reasoning: true });
   });
 
+  it("names the conversation and the run on every model call, never on the model listing", async () => {
+    writeSpec({ sessionId: "conv-1" });
+    await run([{ calls: [{ name: "todo_write", arguments: { todos: [{ content: "a", status: "pending" }] } }] }, { text: "ok" }]);
+    const calls = gateway.requests.filter((request) => request.path === "/v1/chat/completions");
+    expect(calls.length).toBe(2);
+    for (const call of calls) {
+      expect(call.headers["x-explabs-session-id"]).toBe("conv-1");
+      expect(JSON.parse(String(call.headers["x-explabs-tags"]))).toEqual({ conversation: "conv-1", turn: runId });
+    }
+    for (const listing of gateway.requests.filter((request) => request.path === "/v1/models")) {
+      expect(listing.headers["x-explabs-tags"]).toBeUndefined();
+    }
+  });
+
   it("exposes web_search only when the spec enables it", async () => {
     writeSpec({ webSearch: false });
     await run([{ text: "ok" }]);

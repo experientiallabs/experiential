@@ -67,7 +67,7 @@ export function createWebSearchTool(options: WebSearchOptions) {
       const response = await (options.fetch ?? globalThis.fetch)(`${options.gateway.baseUrl}/chat/completions`, {
         method: "POST",
         signal,
-        headers: { "content-type": "application/json", authorization: `Bearer ${options.gateway.apiKey}` },
+        headers: { ...options.gateway.headers, "content-type": "application/json", authorization: `Bearer ${options.gateway.apiKey}` },
         body: JSON.stringify({
           model,
           messages: [
