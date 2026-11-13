@@ -99,11 +99,10 @@ async fn one(
         );
         return inspection::uncertain(check).map_or_else(|| Ok(subject.clone()), Err);
     }
-    let check_for_input = prepare(check, subject).map_err(|_| coverage(id))?;
-    let result = if budget.is_zero() {
-        Err(())
-    } else {
-        input::inspect(&check_for_input, budget).await
+    let check_for_input = prepare(check, subject).ok();
+    let result = match &check_for_input {
+        Some(prepared) => input::inspect(prepared, budget).await,
+        None => Err(()),
     };
     let result = result.and_then(|mut verdict| {
         if started.elapsed() > budget {
@@ -120,7 +119,9 @@ async fn one(
         }
         Ok(verdict)
     });
-    if check_for_input.adapter["kind"] == "decision_model" {
+    if let Some(check_for_input) =
+        check_for_input.filter(|check| check.adapter["kind"] == "decision_model")
+    {
         *classification = json!({"classifier_kind":"decision_model",
             "subject_sha256":check_for_input.adapter["subject_sha256"]});
         if let Ok(verdict) = &result {
@@ -220,6 +221,48 @@ pub(super) async fn enforce(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn prepare_failure_uses_the_same_uncertainty_rule_for_both_execution_modes() {
+        let subject: Subject = crate::lossless_json::from_value(json!({
+            "request": {"messages": [{"role": "user", "content": "fixture"}]},
+            "visible": {}, "message_default": {}, "call_default": {},
+            "message_keys": [], "call_keys": [], "tool_keys": [], "definitions": {}
+        }))
+        .unwrap();
+        for protected in [false, true] {
+            let check: Check = crate::lossless_json::from_value(json!({
+                "policy": {"protected": protected, "mode": "enforce"},
+                "check": {"check_id": "check", "action": "block", "timeout_ms": 1000},
+                "adapter": {"kind": "decision_model", "window": {}}
+            }))
+            .unwrap();
+            assert!(prepare(&check, &subject).is_err());
+            let mut observed = Value::Null;
+            let mut classification = Value::Null;
+            let result = one(
+                &check,
+                &subject,
+                Instant::now() + Duration::from_secs(1),
+                &mut observed,
+                &mut classification,
+            )
+            .await;
+            assert_eq!(result.is_err(), protected);
+            assert_eq!(observed["failure"]["failure_class"], "unavailable");
+            assert!(
+                classification.is_null(),
+                "preparation is not a classifier attempt"
+            );
+            let parallel = input::InputGate::start(read_only(&[check], &subject), 1.0)
+                .unwrap()
+                .wait();
+            assert_eq!(parallel["action"] == "error", protected);
+            if let Err(error) = result {
+                assert_eq!(error["failure"]["failure_class"], "unavailable");
+            }
+        }
+    }
 
     #[test]
     fn evolving_input_programs_match_python_including_final_revalidation() {

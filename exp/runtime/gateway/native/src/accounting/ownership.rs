@@ -23,6 +23,7 @@ struct State {
     abandon: Option<Value>,
     finished: bool,
     failed_write: bool,
+    failed_quote: bool,
     /// A meter observed after the request finished whose write failed. The
     /// data plane hands a finalizing write's retry to this owner, so it stays
     /// owned until recovery delivers it.
@@ -72,7 +73,8 @@ impl Owner {
 
     pub fn fenced(&self) -> bool {
         self.state.lock().map_or(true, |state| {
-            (!state.finished && (state.failed_write || state.abandon.is_some()))
+            (!state.finished
+                && (state.failed_write || state.failed_quote || state.abandon.is_some()))
                 || state.late.is_some()
         })
     }
@@ -81,6 +83,7 @@ impl Owner {
         self.state.lock().map_or(true, |state| {
             (!state.finished
                 && (state.failed_write
+                    || state.failed_quote
                     || state.abandon.is_some()
                     || now >= self.deadline + Duration::from_secs(5)))
                 || state.late.is_some()
@@ -235,10 +238,9 @@ impl Owner {
         }
         let result = self.driver.call(method, &pending);
         if method == "price" {
-            // Even a failed quote leaves the original meter for settlement.
-            if result.is_err() {
-                self.state()?.failed_write = true;
-            }
+            // A successful quote retry waits for delivery, but cannot acknowledge
+            // a failed committing write. Keep the original meter in either case.
+            self.state()?.failed_quote = result.is_err();
             return result;
         }
         self.committed(&pending, &result)?;
@@ -264,6 +266,7 @@ impl Owner {
         {
             state.pending = None;
             state.failed_write = false;
+            state.failed_quote = false;
             state.finished = pending["finalize"].as_bool().unwrap_or(true);
         }
         Ok(())

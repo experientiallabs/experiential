@@ -169,6 +169,36 @@ fn a_healthy_quote_waits_for_delivery_but_failed_quotes_and_expiry_recover() {
 }
 
 #[test]
+fn a_retried_quote_clears_only_quote_failure_debt() {
+    for failed_settle in [false, true] {
+        let driver = Arc::new(Recording::default());
+        let owner = owner(driver.clone());
+        *driver.fail_price.lock().unwrap() = true;
+        assert!(owner.call("price", terminal(37)).is_err());
+        assert!(owner.needs_recovery(Instant::now()));
+        if failed_settle {
+            *driver.fail_settle.lock().unwrap() = true;
+            assert!(owner.call("settle", terminal(999)).is_err());
+        }
+        *driver.fail_price.lock().unwrap() = false;
+        owner.call("price", terminal(999)).unwrap();
+        assert_eq!(owner.needs_recovery(Instant::now()), failed_settle);
+        assert_eq!(owner.fenced(), failed_settle);
+        *driver.fail_settle.lock().unwrap() = false;
+        assert_eq!(owner.recover(Instant::now()).unwrap(), failed_settle);
+        if !failed_settle {
+            assert_eq!(driver.calls.lock().unwrap().len(), 2);
+            assert!(!owner.finished());
+            owner.call("settle", terminal(999)).unwrap();
+        }
+        assert!(owner.retired());
+        let calls = driver.calls.lock().unwrap();
+        assert!(calls.iter().all(|(_, input)| input == &terminal(37)));
+        assert_eq!(calls.last().unwrap().0, "settle");
+    }
+}
+
+#[test]
 fn a_stale_recovery_claim_cannot_settle_a_fresh_quote() {
     let driver = Arc::new(Recording::default());
     let owner = owner(driver.clone());
