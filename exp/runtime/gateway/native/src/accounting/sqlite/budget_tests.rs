@@ -140,3 +140,33 @@ fn destination_refusal_is_scoped_and_successful_holds_settle_exactly_once() {
         (0, 38)
     );
 }
+
+#[test]
+fn deployment_refusal_bindings_preserve_root_and_destination_scope() {
+    for (pool, application) in [("root", "shared"), ("child", "destination")] {
+        let db = database();
+        budget(&db, "lane-budget", "deployment", Some(pool), 0);
+        db.execute(
+            "UPDATE gateway_monthly_budgets SET deployment_id='lane'",
+            [],
+        )
+        .unwrap();
+        let mut r = reservation();
+        r.pool = pool;
+        r.deployment = "lane";
+        let refusal = budgets::reserve(&db, &r).unwrap().unwrap();
+        assert_eq!(refusal["application"], application);
+        // A deployment limit stays local to its lane; the pool limit is the shared cap.
+        assert_eq!(refusal["scope_kind"], "deployment");
+        assert_eq!(refusal["scope_id"], "lane");
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM gateway_attempt_budget_charges",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+}

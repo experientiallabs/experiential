@@ -42,11 +42,20 @@ pub(super) fn reserve(db: &Connection, r: &Reservation<'_>) -> Result<Option<Val
         {
             let scoped = matches!(b["scope_kind"].as_str(), Some("pool" | "deployment"))
                 && !(b["scope_kind"] == "pool" && b["pool_id"] == r.root_pool);
+            let application = if !matches!(b["scope_kind"].as_str(), Some("pool" | "deployment"))
+                || r.pool == r.root_pool
+            {
+                "shared"
+            } else if b["pool_id"] == r.root_pool {
+                "root"
+            } else {
+                "destination"
+            };
             return Ok(Some(json!({
                 "scope_kind": if scoped { b["scope_kind"].clone() } else { json!("request") },
                 "scope_id": if b["scope_kind"] == "deployment" { &b["deployment_id"] } else { &b["pool_id"] },
                 "budget_scope": {"kind":b["scope_kind"],"identity_id":b["identity_id"],"alias_id":b["alias_id"],"pool_id":b["pool_id"],"deployment_id":b["deployment_id"]},
-                "application": if scoped {"destination"} else if b["scope_kind"]=="pool" && r.pool != r.root_pool {"root"} else {"shared"},
+                "application": application,
                 "error": PublicError::new(429, "insufficient_quota", if strict && r.maximum.is_none() {
                     "This allocation requires a known maximum attempt cost."
                 } else if strict && b["unknown_cost_attempts"].as_i64().unwrap_or(0) > 0 {

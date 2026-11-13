@@ -238,3 +238,52 @@ fn a_meter_after_deadline_recovery_still_reaches_settlement() {
     );
     assert_eq!(calls[1].1, terminal(42));
 }
+
+#[test]
+fn recovered_nonfinal_quote_and_later_delivery_commit_the_attempt_once() {
+    use super::dispatch_tests::{config, setup, terminal as dispatched_terminal};
+    use std::sync::atomic::Ordering;
+
+    let (owner, _, ledger) = setup(config());
+    owner
+        .call(
+            "start_attempt",
+            json!({"request_id": "request", "attempt_ordinal": 0}),
+        )
+        .unwrap();
+    ledger.fail_price.store(true, Ordering::SeqCst);
+    assert!(owner.call("price", dispatched_terminal(37, false)).is_err());
+    assert!(owner.needs_recovery(Instant::now()));
+    assert!(!owner.recover(Instant::now()).unwrap());
+    assert!(!owner.needs_recovery(Instant::now()));
+    ledger.fail_price.store(false, Ordering::SeqCst);
+    assert_eq!(
+        owner
+            .call("price", dispatched_terminal(999, false))
+            .unwrap()["charge"],
+        37
+    );
+    assert_eq!(
+        owner
+            .call("settle", dispatched_terminal(999, false))
+            .unwrap()["charge"],
+        37
+    );
+    {
+        let calls = ledger.calls.lock().unwrap();
+        let settlements: Vec<_> = calls
+            .iter()
+            .filter(|(method, _)| method == "settle")
+            .collect();
+        assert_eq!(settlements.len(), 1);
+        assert_eq!(settlements[0].1["terminal"]["usage"]["input_tokens"], 37);
+        assert_eq!(
+            calls.iter().filter(|(method, _)| method == "price").count(),
+            1
+        );
+    }
+    owner
+        .call("abandon", json!({"request_id": "request"}))
+        .unwrap();
+    assert!(owner.retired());
+}
