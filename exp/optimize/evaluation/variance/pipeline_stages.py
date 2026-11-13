@@ -15,9 +15,12 @@ from __future__ import annotations
 import contextvars
 import logging
 import math
+import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+
+from filelock import Timeout
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject, JsonValue, sha256_json
 from exp.common.core.locks import CoordinationLock
@@ -161,6 +164,11 @@ from exp.simulation.retrieval.embedding import RAGEmbedderBinding
 from exp.simulation.rules.recall import RecallPolicy
 
 __all__ = ["MINING_STAGE", "RULES_STAGE", "TRACEML_STAGE"]
+
+TIER_LOCK_RETRIES = 30
+"""Retries of a tier whose start collided with a shared non-blocking lock."""
+TIER_LOCK_BACKOFF_SECONDS = 2.0
+"""Backoff step between those retries."""
 
 logger = logging.getLogger(__name__)
 
@@ -856,6 +864,24 @@ class _MiningStage:
         references: list[ArtifactInput] = [rubric, *(() if packet is None else (packet,))]
 
         def mine(alias: str) -> TierMining:
+            # Tiers start together, so two may race for a shared non-blocking lock (timeout=0)
+            # that a serial loop never contended; retry that collision instead of losing the
+            # tier, and log any other failure as it happens rather than after every tier ends.
+            for attempt in range(TIER_LOCK_RETRIES + 1):
+                try:
+                    return mine_once(alias)
+                except Timeout:
+                    if attempt == TIER_LOCK_RETRIES:
+                        logger.exception("tier %s: shared lock still held; giving up", alias)
+                        raise
+                    logger.warning("tier %s: shared lock busy; retrying", alias)
+                    time.sleep(TIER_LOCK_BACKOFF_SECONDS * (attempt + 1))
+                except Exception:
+                    logger.exception("tier %s failed", alias)
+                    raise
+            raise AssertionError("unreachable")
+
+        def mine_once(alias: str) -> TierMining:
             return self._tier(
                 context,
                 _Tier(
