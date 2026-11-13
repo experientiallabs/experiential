@@ -61,6 +61,7 @@ from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
 from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle import (
@@ -3786,10 +3787,16 @@ def test_encrypted_reasoning_pins_winning_fallback_and_rejects_credential_drift(
         failure: GatewayFailure,
         *,
         web_search_requests: int = 0,
+        input_session: GuardrailSession | None = None,
     ) -> bool:
-        """Record the verdict while preserving the complete current meter contract."""
+        """Record the verdict while retaining metering and input observations."""
         recorded.append(failure)
-        return original_finish(authorization, failure, web_search_requests=web_search_requests)
+        return original_finish(
+            authorization,
+            failure,
+            web_search_requests=web_search_requests,
+            input_session=input_session,
+        )
 
     monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture_finish)  # noqa: SLF001
     with pytest.raises(NativeBridgeError) as rejected:
@@ -3828,10 +3835,16 @@ def test_admission_maps_a_route_build_failure_to_a_retryable_unavailable(
         failure: GatewayFailure,
         *,
         web_search_requests: int = 0,
+        input_session: GuardrailSession | None = None,
     ) -> bool:
-        """Record the verdict while preserving the complete current meter contract."""
+        """Record the verdict while retaining metering and input observations."""
         recorded.append(failure)
-        return original_finish(authorization, failure, web_search_requests=web_search_requests)
+        return original_finish(
+            authorization,
+            failure,
+            web_search_requests=web_search_requests,
+            input_session=input_session,
+        )
 
     monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture)  # noqa: SLF001
 
@@ -3908,10 +3921,16 @@ def test_admit_escalates_when_every_rung_is_dead(
         failure: GatewayFailure,
         *,
         web_search_requests: int = 0,
+        input_session: GuardrailSession | None = None,
     ) -> bool:
-        """Record the verdict while preserving the complete current meter contract."""
+        """Record the verdict while retaining metering and input observations."""
         recorded.append(failure)
-        return original_finish(authorization, failure, web_search_requests=web_search_requests)
+        return original_finish(
+            authorization,
+            failure,
+            web_search_requests=web_search_requests,
+            input_session=input_session,
+        )
 
     monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture)  # noqa: SLF001
 
@@ -6173,10 +6192,16 @@ def test_capability_rejection_names_the_public_request_field(
         failure: GatewayFailure,
         *,
         web_search_requests: int = 0,
+        input_session: GuardrailSession | None = None,
     ) -> bool:
-        """Record the verdict while preserving the complete current meter contract."""
+        """Record the verdict while retaining metering and input observations."""
         recorded.append(failure)
-        return original_finish(authorization, failure, web_search_requests=web_search_requests)
+        return original_finish(
+            authorization,
+            failure,
+            web_search_requests=web_search_requests,
+            input_session=input_session,
+        )
 
     monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture_finish)  # noqa: SLF001
     body = json.dumps(
