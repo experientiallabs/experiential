@@ -53,6 +53,39 @@ async fn a_resellers_flat_lane_limitation_400_fails_over() {
 }
 
 #[tokio::test]
+async fn a_relayed_bedrock_tool_pairing_400_fails_over() {
+    // Novita relaying Claude through Bedrock refused a well-formed tool loop
+    // that the same lane served on retry (2026-11-12); another rung carries it.
+    let failure = open_against_body(
+        "400 Bad Request",
+        "{\"code\":400,\"reason\":\"INVALID_REQUEST_BODY\",\
+         \"message\":\"InvokeModelWithResponseStream: operation error Bedrock Runtime: \
+         ValidationException: messages.12.content.0: unexpected `tool_use_id` found in \
+         `tool_result` blocks: toolu_x.\",\"metadata\":{}}",
+        "anthropic/claude-opus-5-5",
+    )
+    .await;
+    assert_eq!(failure.failure_class, FailureClass::InvalidRequest);
+    assert!(
+        failure.failover_eligible,
+        "another rung can carry the request"
+    );
+}
+
+#[tokio::test]
+async fn a_tool_pairing_sentence_echoed_outside_the_message_never_fails_over() {
+    // The phrase is read only from the dialect's message field.
+    let failure = open_against_body(
+        "400 Bad Request",
+        "{\"code\":400,\"reason\":\"INVALID_REQUEST_BODY\",\"message\":\"max_tokens too large\",\
+         \"metadata\":{\"echo\":\"unexpected `tool_use_id` found in `tool_result` blocks\"}}",
+        "anthropic/claude-opus-5-5",
+    )
+    .await;
+    assert!(!failure.failover_eligible);
+}
+
+#[tokio::test]
 async fn a_resellers_flat_403_balance_verdict_is_provider_quota() {
     // Novita answers an unfunded account with 403 NOT_ENOUGH_BALANCE; a
     // status-only read filed it as a credential failure, which the house

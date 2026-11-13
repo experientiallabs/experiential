@@ -56,10 +56,14 @@ pub fn rejected_gemini_credential(dialect: Dialect, body: &str) -> bool {
 /// template that only accepts a leading system turn). They are lane
 /// limitations, not caller errors: the request fails over to the next rung and
 /// only a route with no other rung surfaces the sentence.
+/// Novita's Bedrock relay of Claude drops a valid tool_use/tool_result pairing
+/// on ~7% of tool loops (2026-11-12; the identical retry succeeded), so that
+/// Bedrock sentence is a lane limitation too.
 const LANE_LIMITATION_PHRASES: &[&str] = &[
     "system message must be at the beginning",
     "system message should be at the beginning",
     "only the first message can be a system message",
+    "unexpected `tool_use_id` found in `tool_result` blocks",
 ];
 
 /// Whether a 4xx body's error SENTENCE describes a limitation of the lane
