@@ -180,6 +180,11 @@ class NativeAttemptAccounting:
             target = self._native_factory.admission(authorization)
             if input_session is not None:
                 try:
+                    if input_session.native_input is not None:
+                        self.native.record_input(
+                            input_session.native_input, target, str(authorization.request_id)
+                        )
+                        input_session.native_input = None
                     if input_session.native_observation is not None:
                         self.native.record_input(
                             input_session.native_observation, target, str(authorization.request_id)
@@ -188,7 +193,7 @@ class NativeAttemptAccounting:
                     for inspection in input_session.native_completed:
                         self.native.record_input(inspection, target, str(authorization.request_id))
                     input_session.native_completed.clear()
-                except Exception:  # noqa: BLE001 - observation cannot prevent financial cleanup.
+                except Exception:  # noqa: BLE001 - reporting cannot prevent financial cleanup.
                     pass
             return self.native.finish_admission(
                 authorization.organization_id,
