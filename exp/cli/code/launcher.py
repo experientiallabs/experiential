@@ -37,7 +37,7 @@ from exp.common.auth import ProviderAuthStore, ProviderAuthStoreError
 
 # The exp-code release this CLI launches. It must equal "version" in agent/package.json;
 # launcher_test.py enforces that, so a release bumps both in one change.
-EXP_CODE_VERSION = "0.1.2"
+EXP_CODE_VERSION = "0.1.3"
 EXP_CODE_PACKAGE = "exp-code"
 MINIMUM_NODE_VERSION = (22, 19, 0)
 LOCAL_PROBE_TIMEOUT_SECONDS = 1.5
