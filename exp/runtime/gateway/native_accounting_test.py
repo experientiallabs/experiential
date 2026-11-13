@@ -172,6 +172,7 @@ def test_native_local_price_defers_durable_terminal_until_settlement(
     }
     try:
         owner.price(json.dumps(terminal))
+        owner.sweep_expired()
         with connect(ledger.database_path) as db:
             assert db.execute(
                 "SELECT state,input_tokens,output_tokens,budget_settled_nano_usd "

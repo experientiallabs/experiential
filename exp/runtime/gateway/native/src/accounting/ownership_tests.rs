@@ -12,6 +12,7 @@ struct Recording {
     hold: Mutex<(bool, bool)>,
     wake: Condvar,
     fail_settle: Mutex<bool>,
+    fail_price: Mutex<bool>,
 }
 
 impl Driver for Recording {
@@ -29,6 +30,9 @@ impl Driver for Recording {
             }
         }
         if method == "settle" && *self.fail_settle.lock().unwrap() {
+            return Err(PublicError::internal());
+        }
+        if method == "price" && *self.fail_price.lock().unwrap() {
             return Err(PublicError::internal());
         }
         Ok(json!({"terminalized": true, "attempt_id": "attempt"}))
@@ -121,8 +125,68 @@ fn mismatched_requests_and_attempts_cannot_replace_retained_evidence() {
     let mut input = terminal(5);
     input["attempt_id"] = json!("other-attempt");
     assert!(owner.call("settle", input).is_err());
-    assert!(owner.recover(Instant::now()).unwrap());
+    assert!(!owner.recover(Instant::now()).unwrap());
+    owner
+        .call("abandon", json!({"request_id":"request"}))
+        .unwrap();
     assert_eq!(driver.calls.lock().unwrap().last().unwrap().1, terminal(37));
+}
+
+#[test]
+fn a_healthy_quote_waits_for_delivery_but_failed_quotes_and_expiry_recover() {
+    for trigger in ["settle", "cancel", "expiry", "failed_price"] {
+        let driver = Arc::new(Recording::default());
+        let owner = owner(driver.clone());
+        owner.call("price", terminal(37)).unwrap();
+        assert!(!owner.needs_recovery(Instant::now()));
+        assert!(!owner.recover(Instant::now()).unwrap());
+        assert_eq!(driver.calls.lock().unwrap().len(), 1);
+        match trigger {
+            "settle" => {
+                owner.call("settle", terminal(37)).unwrap();
+            }
+            "cancel" => {
+                owner
+                    .call("abandon", json!({"request_id":"request"}))
+                    .unwrap();
+            }
+            "expiry" => {
+                assert!(owner
+                    .recover(owner.deadline + Duration::from_secs(5))
+                    .unwrap());
+            }
+            _ => {
+                *driver.fail_price.lock().unwrap() = true;
+                assert!(owner.call("price", terminal(999)).is_err());
+                assert!(owner.needs_recovery(Instant::now()));
+                assert!(owner.recover(Instant::now()).unwrap());
+            }
+        }
+        assert!(owner.retired());
+        let calls = driver.calls.lock().unwrap();
+        assert_eq!(calls.last().unwrap(), &("settle".into(), terminal(37)));
+    }
+}
+
+#[test]
+fn a_stale_recovery_claim_cannot_settle_a_fresh_quote() {
+    let driver = Arc::new(Recording::default());
+    let owner = owner(driver.clone());
+    let mut first = terminal(37);
+    first["finalize"] = json!(false);
+    *driver.fail_settle.lock().unwrap() = true;
+    assert!(owner.call("settle", first.clone()).is_err());
+    assert!(owner.needs_recovery(Instant::now()));
+    *driver.fail_settle.lock().unwrap() = false;
+    owner.call("settle", first).unwrap();
+    let mut next = terminal(42);
+    next["attempt_id"] = json!("next");
+    owner.call("price", next.clone()).unwrap();
+    assert!(!owner.recover(Instant::now()).unwrap());
+    assert_eq!(driver.calls.lock().unwrap().len(), 3);
+    assert!(!owner.finished());
+    owner.call("settle", next).unwrap();
+    assert!(owner.retired());
 }
 
 #[test]

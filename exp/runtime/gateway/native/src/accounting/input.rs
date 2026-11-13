@@ -326,6 +326,7 @@ async fn run(checks: Vec<Check>, deadline: Instant, progress: Arc<Mutex<Vec<Valu
             "check_id": c.check["check_id"], "adapter_id": c.check["adapter_id"],
             "capability": c.check["capability"], "stage": c.check["stage"], "action": action,
             "mode": if observe {"observe"} else {"enforce"},
+            "would_action": c.check["action"], "classifier_kind": c.adapter["kind"],
             "outcome": outcome, "latency_ms": started.elapsed().as_secs_f64() * 1000.0,
             "scores": verdict.map(|v| &v["scores"]), "cached": verdict.map(|v| &v["cached"]),
             "subject_sha256": verdict.map(|v| &v["subject_sha256"])}),

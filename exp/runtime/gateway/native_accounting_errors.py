@@ -9,19 +9,24 @@ from __future__ import annotations
 import json
 
 from exp.runtime.gateway.boundary import boundary_protocol_error
+from exp.runtime.gateway.contracts import GatewayFailure
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 
 class NativeBridgeError(Exception):
     """One sanitized boundary failure delivered to the native data plane."""
 
-    def __init__(self, error: OpenAIProtocolError) -> None:
+    def __init__(
+        self, error: OpenAIProtocolError, *, failure: GatewayFailure | None = None
+    ) -> None:
         """Retain the public error as the JSON payload the data plane returns.
 
         Args:
             error: Sanitized protocol error carrying its HTTP representation.
+            failure: Precise admission terminal for the owner, or None for a generic failure.
         """
         super().__init__(error.detail.message)
+        self.failure = failure
         self.public_error_json = json.dumps(
             {
                 "status_code": error.status_code,

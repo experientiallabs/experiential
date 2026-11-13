@@ -35,15 +35,13 @@ if TYPE_CHECKING:
 
 def require_capture(
     controller: CaptureController | None,
-    accounting: NativeAttemptAccounting,
     authorization: AuthorizationSnapshot,
     pending: PendingCapture | None,
 ) -> None:
-    """Register approved input or terminalize unavailable synchronous capture admission.
+    """Register approved input or return its exact failure to the admission owner.
 
     Args:
         controller: Optional host-configured capture collector and policy.
-        accounting: Owner of the already accepted request's durable terminal write.
         authorization: Exact authenticated request identity.
         pending: Approved public context, or None when capture is disabled.
 
@@ -51,19 +49,19 @@ def require_capture(
         None once capture is registered or does not apply.
 
     Raises:
-        NativeBridgeError: Capture is unavailable; accounting retains the failed request
-            before the sanitized 503 is raised, without dispatching a provider.
+        NativeBridgeError: Capture is unavailable; the caller must retain the attached
+            failure before returning the sanitized 503 without dispatching a provider.
     """
     if pending is None or begin_capture(
         controller, authorization, pending.request, session_id=pending.session_id
     ):
         return
     failure = capture_unavailable_failure()
-    accounting.finish_request_quietly(authorization, failure)
     raise NativeBridgeError(
         OpenAIProtocolError(
             status_code=503, code="capture_unavailable", message=failure.safe_message
-        )
+        ),
+        failure=failure,
     )
 
 

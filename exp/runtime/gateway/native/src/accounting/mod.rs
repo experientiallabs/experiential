@@ -18,6 +18,7 @@ mod input;
 mod input_decisions;
 mod input_reports;
 mod inspection;
+mod moderation_telemetry;
 mod signing;
 mod signing_credentials;
 pub(crate) use input::NativeInputInspection;

@@ -110,7 +110,7 @@ class NativeAttemptAccounting:
                 entry.guardrails.native_completed.clear()
             if isinstance(handoff, NativeRequestHandoff):
                 handoff.registered()
-        except Exception:
+        except Exception as exc:
             discard_guardrails(entry)
             if transferred:
                 try:
@@ -122,7 +122,9 @@ class NativeAttemptAccounting:
             else:
                 self.finish_request_quietly(
                     entry.authorization,
-                    GatewayFailure(
+                    exc.failure
+                    if isinstance(exc, NativeBridgeError) and exc.failure is not None
+                    else GatewayFailure(
                         failure_class=GatewayFailureClass.INTERNAL,
                         safe_message="gateway could not hand off admitted request accounting",
                     ),
@@ -177,6 +179,11 @@ class NativeAttemptAccounting:
             target = self._native_factory.admission(authorization)
             if input_session is not None:
                 try:
+                    if input_session.native_observation is not None:
+                        self.native.record_input(
+                            input_session.native_observation, target, str(authorization.request_id)
+                        )
+                        input_session.native_observation = None
                     for inspection in input_session.native_completed:
                         self.native.record_input(inspection, target, str(authorization.request_id))
                     input_session.native_completed.clear()

@@ -372,12 +372,7 @@ class GuardrailEngine:
         observed: ObservedSubjects | None = None,
         request_id: str | None = None,
     ) -> None:
-        """Prepare one bounded complete subject under the shared nonblocking permit.
-
-        A free permit preserves exact deduplication for known session subjects even
-        when inspection capacity is full. Preparation contention ends this session's
-        optional coverage without claiming that an unknown subject was distinct.
-        """
+        """Deduplicate bounded subjects; preparation contention ends optional coverage."""
         if any(policy.mode != "observe" for policy in policies):
             raise ValueError("observation requires observe policies")
         if not policies or (observed is not None and observed.closed):

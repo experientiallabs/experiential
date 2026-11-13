@@ -80,7 +80,7 @@ impl Owner {
     pub fn needs_recovery(&self, now: Instant) -> bool {
         self.state.lock().map_or(true, |state| {
             (!state.finished
-                && (state.pending.is_some()
+                && (state.failed_write
                     || state.abandon.is_some()
                     || now >= self.deadline + Duration::from_secs(5)))
                 || state.late.is_some()
@@ -236,6 +236,9 @@ impl Owner {
         let result = self.driver.call(method, &pending);
         if method == "price" {
             // Even a failed quote leaves the original meter for settlement.
+            if result.is_err() {
+                self.state()?.failed_write = true;
+            }
             return result;
         }
         self.committed(&pending, &result)?;
@@ -327,6 +330,10 @@ impl Owner {
         }
         match self.execution.try_lock() {
             Ok(_execution) => {
+                // Selection can race a completed retry and the next healthy quote.
+                if !self.needs_recovery(now) {
+                    return Ok(self.retired());
+                }
                 self.drain()?;
                 Ok(self.retired())
             }

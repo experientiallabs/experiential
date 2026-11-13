@@ -8,12 +8,14 @@ import threading
 import time
 from concurrent.futures import Future
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 import pytest
 from websockets.sync.client import connect
 
 from exp.common.models import BillingSource
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.contracts import GatewayFailureClass, GatewayRequest
 from exp.runtime.gateway.guardrails.bounded import _NATIVE_RUNNER, BoundedInspect
 from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry, ScriptedClassifier
@@ -702,6 +704,68 @@ def test_native_tool_search_observes_expanded_context_without_output_enforcement
         classifier.release.set()
         engine.close(timeout_seconds=2)
         provider.close()
+
+
+@pytest.mark.parametrize("execution", ["before_dispatch", "parallel"])
+def test_native_serial_rejection_retains_one_observation_without_dispatch(
+    tmp_path: Path, execution: str
+) -> None:
+    """A serial refusal cannot erase a concurrent observer or dispatch the provider."""
+    classifier = _Classifier(GuardrailOutcome.FLAGGED)
+    observer = _policy(timeout_ms=5000)
+    blocker = observer.model_copy(
+        update={
+            "policy_id": "serial-blocker",
+            "mode": "enforce",
+            "input_execution": execution,
+            "checks": (observer.checks[0].model_copy(update={"adapter_id": "blocker"}),),
+        }
+    )
+    engine = _Engine(classifier, observer, enforcing=blocker)
+    try:
+        with _provider(_content_chunk("unreachable") + _terminal_frames()) as (url, received):
+            manager, key = _configured_gateway(tmp_path, base_url=url)
+            components = load_gateway_components(
+                tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"}
+            )
+            control = NativeControlPlane(components, guardrails=engine)
+            with (
+                _serving(control) as gateway,
+                patch.object(
+                    control._accounting,
+                    "finish_request_quietly",
+                    wraps=control._accounting.finish_request_quietly,
+                ) as finish,
+            ):
+                route, body = _body("chat", False)
+                response = httpx.post(
+                    gateway + route,
+                    headers={"authorization": f"Bearer {key}"},
+                    json=body,
+                    timeout=5,
+                )
+                assert response.status_code == 400, response.text
+                assert response.json()["error"]["code"] == "content_filter"
+                assert finish.call_count == 1
+                assert finish.call_args.args[1].failure_class is GatewayFailureClass.GUARDRAIL
+                assert not received
+                assert classifier.started.wait(2)
+                classifier.release.set()
+                assert control.close(timeout_seconds=2)
+            with connect_sqlite(manager.database_path) as db:
+                reports = db.execute("SELECT result FROM gateway_input_moderation").fetchall()
+            observed = [
+                record
+                for report in reports
+                for record in json.loads(report[0])["observations"]
+                if record["mode"] == "observe"
+            ]
+            assert [(r["policy_id"], r["outcome"]) for r in observed] == [
+                ("platform-observer", "flagged")
+            ]
+    finally:
+        classifier.release.set()
+        engine.close(timeout_seconds=2)
 
 
 @pytest.mark.parametrize("outcome", [GuardrailOutcome.ALLOW, GuardrailOutcome.FLAGGED])

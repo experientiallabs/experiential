@@ -450,7 +450,14 @@ class NativeControlPlane(
             else None
         )
         if not parallel_guardrail:
-            require_capture(self._capture, self._accounting, authorization, pending_capture)
+            try:
+                require_capture(self._capture, authorization, pending_capture)
+            except NativeBridgeError as exc:
+                assert exc.failure is not None
+                self._accounting.finish_request_quietly(
+                    authorization, exc.failure, input_session=guardrails
+                )
+                raise
             pending_capture = None
         # Escalation is accounted without content or billing; probe routing
         # failures are raised against the accepted request below.
@@ -788,32 +795,17 @@ class NativeControlPlane(
                     )
                 except GuardrailRejected as exc:
                     discard_capture(self._capture, authorization.request_id)
-                    self._accounting.finish_request_quietly(
-                        authorization,
-                        exc.failure,
-                        web_search_requests=1 if web_search_admission is not None else 0,
-                        input_session=guardrails,
-                    )
-                    raise NativeBridgeError(public_failure_error(exc.failure)) from None
+                    raise NativeBridgeError(
+                        public_failure_error(exc.failure), failure=exc.failure
+                    ) from None
                 except Exception:
                     guardrails.cancel()
                     discard_capture(self._capture, authorization.request_id)
-                    self._accounting.finish_request_quietly(
-                        authorization,
-                        GatewayFailure(
-                            failure_class=GatewayFailureClass.INTERNAL,
-                            safe_message="gateway could not prepare input inspection",
-                        ),
-                        web_search_requests=int(web_search_admission is not None),
-                        input_session=guardrails,
-                    )
                     raise
             if entry.pending_capture is not None and not (
                 guardrails is not None and guardrails.input_pending
             ):
-                require_capture(
-                    self._capture, self._accounting, authorization, entry.pending_capture
-                )
+                require_capture(self._capture, authorization, entry.pending_capture)
                 entry.pending_capture = None
 
         register_admitted_request(self._accounting, entry, prepare_request)

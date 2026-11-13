@@ -16,9 +16,16 @@ pub(super) struct Reports {
     changed: Condvar,
     dropped: AtomicU64,
     failed: AtomicU64,
+    telemetry: Mutex<super::moderation_telemetry::Telemetry>,
 }
 
 impl Reports {
+    pub fn drain_telemetry(&self) -> Value {
+        self.telemetry
+            .lock()
+            .map(|mut state| state.drain())
+            .unwrap_or_else(|_| json!({"aggregates":[],"dropped":1}))
+    }
     /// Shutdown never waits for another worker's requests or enters a response task.
     pub fn drain(&self, deadline: Instant) -> bool {
         let Ok(pending) = self.pending.lock() else {
@@ -173,6 +180,9 @@ impl Reporter {
     }
     pub fn submit(&self, decision: &Value) {
         let reports = &self.inspection.reports;
+        if let Ok(mut telemetry) = reports.telemetry.lock() {
+            telemetry.record(&decision["moderation"]);
+        }
         let argument = json!({"request_id": self.request_id, "inspection_id": self.inspection_id,
             "moderation": decision["moderation"]})
         .to_string();

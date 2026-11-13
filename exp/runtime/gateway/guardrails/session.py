@@ -8,6 +8,7 @@ import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+from hashlib import sha256
 from typing import TYPE_CHECKING
 
 from exp_gateway_native import NativeInputInspection
@@ -104,10 +105,24 @@ class GuardrailSession:
 
     def _observe_input(self, request: GatewayRequest) -> None:
         """Submit each complete context once without retaining its text in the session."""
-        if self.native_execution:
-            return
         observers = tuple(p for p in self.policies if p.mode == "observe" and p.input_checks)
         if not observers:
+            return
+        if self.native_execution:
+            configuration = json.dumps(
+                input_registration(self, (request,), policies=observers), ensure_ascii=False
+            )
+            fingerprint = sha256(configuration.encode()).digest()
+            if fingerprint in self._observed.fingerprints:
+                return
+            self._observed.fingerprints.add(fingerprint)
+            inspection = NativeInputInspection(
+                configuration, max(0.0, self.deadline_monotonic - time.monotonic())
+            )
+            if self.native_observation is None:
+                self.native_observation = inspection
+            else:
+                self.native_completed.append(inspection)
             return
         self.engine.observe_inputs(
             policies=observers,
@@ -237,22 +252,10 @@ class GuardrailSession:
                 raise GuardrailRejected(denied_input_failure())
             return
         remaining: list[GatewayRequest] = []
-        distinct: list[GatewayRequest] = []
         for subject in subjects:
-            if subject not in distinct:
-                distinct.append(subject)
             self._observe_input(subject)
             if subject not in remaining and not any(subject == old for old, _ in self._inspected):
                 remaining.append(subject)
-        observers = tuple(p for p in self.policies if p.mode == "observe" and p.input_checks)
-        if self.native_execution and observers and self.native_observation is None:
-            self.native_observation = NativeInputInspection(
-                json.dumps(
-                    input_registration(self, tuple(distinct), policies=observers),
-                    ensure_ascii=False,
-                ),
-                max(0.0, self.deadline_monotonic - time.monotonic()),
-            )
         if not remaining or not any(p.input_checks for p in self.enforcing_policies):
             return
         if self._input is not None or self.native_input is not None:

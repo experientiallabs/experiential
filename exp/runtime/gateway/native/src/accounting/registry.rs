@@ -492,6 +492,10 @@ impl NativeAccounting {
         self.inner.reports.counters().to_string()
     }
 
+    fn drain_moderation_telemetry_json(&self) -> String {
+        self.inner.reports.drain_telemetry().to_string()
+    }
+
     fn recover(&self, py: Python<'_>) -> usize {
         py.detach(|| {
             let mut visited = HashSet::new();
