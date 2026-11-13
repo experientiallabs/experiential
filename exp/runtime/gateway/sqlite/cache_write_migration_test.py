@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from exp.common.sqlite.connection import connect_database
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.sqlite import migrations
 from exp.runtime.gateway.sqlite.cache_write_migration import (
     CACHE_WRITE_COLUMNS,
@@ -88,7 +89,7 @@ def test_both_published_v22_layouts_preserve_attempt_evidence(
 
     backup = initialize_database(path)
     assert backup is not None
-    with sqlite3.connect(backup) as original:
+    with connect_sqlite(backup) as original:
         original.row_factory = sqlite3.Row
         assert original.execute("PRAGMA user_version").fetchone()[0] == 22
         assert dict(original.execute("SELECT * FROM gateway_attempts").fetchone()) == before
@@ -106,7 +107,11 @@ def test_both_published_v22_layouts_preserve_attempt_evidence(
             "billed_quantity_milli",
             "billed_unit_rate",
         }
-        assert after.keys() - before.keys() == added | {"accounting_recovery"}
+        assert after.keys() - before.keys() == added | {
+            "accounting_recovery",
+            "native_accounting_terms",
+            "native_accounting_terminal",
+        }
         assert all(after[column] is None for column in added)
         assert after["accounting_recovery"] == 0
         assert after["service_tier_admission"] is None

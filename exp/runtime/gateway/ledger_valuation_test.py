@@ -1,11 +1,13 @@
 """Tests for the pure ledger cost-attribution helpers."""
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 
 from exp.common.models.catalog import MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
 from exp.common.models.catalog_prices import BilledUnitKind, GatewayUnitPrices
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.contracts import (
     GatewayEvent,
     GatewayEventKind,
@@ -46,7 +48,7 @@ def test_budget_settlement_keeps_unknown_and_unmetered_liability(
     expected: int | None,
 ) -> None:
     """Pure settlement preserves conservative bounds and releases only proven decision rejection."""
-    connection = sqlite3.connect(":memory:")
+    connection = connect_sqlite(Path(":memory:"))
     try:
         connection.row_factory = sqlite3.Row
         row = connection.execute(
@@ -501,7 +503,7 @@ def test_unit_cost_rounds_thousandths_half_up_and_fails_closed() -> None:
 
 def test_units_beside_a_partial_token_report_leave_the_cost_unknown() -> None:
     """Units price alone only when no token evidence exists at all."""
-    connection = sqlite3.connect(":memory:")
+    connection = connect_sqlite(Path(":memory:"))
     connection.row_factory = sqlite3.Row
     row = connection.execute(
         "SELECT 1 AS input_rate, NULL AS cached_input_rate, NULL AS cache_creation_input_rate, "

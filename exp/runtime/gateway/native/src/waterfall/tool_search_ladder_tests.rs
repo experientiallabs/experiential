@@ -192,7 +192,7 @@ struct SearchHarness {
 impl SearchHarness {
     fn new() -> Self {
         Self {
-            bridge: Arc::new(Bridge::new(plane(), 2).expect("bridge starts")),
+            bridge: Arc::new(Bridge::scripted(plane(), 2).expect("bridge starts")),
             http: build_client(Duration::from_secs(2), false).expect("client"),
         }
     }
@@ -253,7 +253,7 @@ impl SearchHarness {
             .call("dump", "{}".to_string())
             .await
             .expect("dump succeeds");
-        serde_json::from_str(&text).expect("story parses")
+        crate::lossless_json::from_str(&text).expect("story parses")
     }
 }
 

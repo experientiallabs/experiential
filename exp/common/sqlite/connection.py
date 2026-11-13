@@ -9,6 +9,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from exp.common.sqlite.native import connect
+
+_MAX_IDLE_CONNECTIONS = 32
+
 
 def connect_database(
     path: Path, *, busy_timeout_ms: int = 5_000, enable_wal: bool = True
@@ -23,7 +27,7 @@ def connect_database(
     Returns:
         Configured connection with row-name access.
     """
-    connection = sqlite3.connect(path, timeout=busy_timeout_ms / 1_000, isolation_level=None)
+    connection = connect(path, busy_timeout_ms=busy_timeout_ms)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
@@ -80,6 +84,9 @@ def persistent_connection(
         connection.close()
         return
     _connection_cache.idle[key] = connection
+    while len(_connection_cache.idle) > _MAX_IDLE_CONNECTIONS:
+        oldest = next(iter(_connection_cache.idle))
+        _connection_cache.idle.pop(oldest).close()
 
 
 def close_idle_connections() -> int:

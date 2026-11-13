@@ -303,7 +303,7 @@ async fn parse_json_upload(
     request: axum::extract::Request,
 ) -> Result<(Map<String, Value>, AudioUpload), PublicError> {
     let body = read_bounded_upload(request.into_body()).await?;
-    let mut fields = match serde_json::from_slice::<Value>(&body) {
+    let mut fields = match crate::lossless_json::from_slice::<Value>(&body) {
         Ok(Value::Object(fields)) => fields,
         _ => return Err(PublicError::invalid_json()),
     };

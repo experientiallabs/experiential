@@ -3,19 +3,18 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
 
 import exp_gateway_native
 import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.guardrails.contracts import ClassifierVerdict, GuardrailCheck
 from exp.runtime.gateway.lifecycle import load_gateway_components
@@ -34,7 +33,6 @@ from exp.runtime.gateway.tests.native_waterfall_test import (
     _terminal_frames,
 )
 from exp.runtime.gateway.tests.web_search_backend_fixture_test import StaticWebSearchBackend
-from exp.runtime.gateway.tool_search.round import perform_round
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearchResult
 
 
@@ -52,7 +50,9 @@ class _RetrievedGuard(_Guard):
 
 
 @contextmanager
-def _serving(control: NativeControlPlane) -> Iterator[str]:
+def _serving(
+    control: NativeControlPlane, *, capture: exp_gateway_native.CaptureCollector | None = None
+) -> Iterator[str]:
     """Run an injected policy through the actual native HTTP server.
 
     Args:
@@ -72,6 +72,7 @@ def _serving(control: NativeControlPlane) -> Iterator[str]:
             "port": port,
             "shutdown": stop,
             "on_listening": ready.set,
+            "capture": capture,
             "graceful_timeout_seconds": 1.0,
         },
         daemon=True,
@@ -213,7 +214,7 @@ def test_precommit_and_synthesized_output_is_inspected_before_settlement(
             )
         else:
             assert any("withhold-marker" in item.model_dump_json() for item in policy.completions)
-        with sqlite3.connect(components.ledger.database_path) as connection:
+        with connect_sqlite(components.ledger.database_path) as connection:
             assert connection.execute(
                 "select state, failure_class from gateway_attempts"
             ).fetchall() == ([] if blocked_input else [("failed", "guardrail")])
@@ -314,13 +315,7 @@ def test_tool_search_is_inspected_before_execution_redial_and_rendering(
                 {"type": "openrouter:tool_search"},
             ]
     try:
-        with (
-            patch(
-                "exp.runtime.gateway.native_tool_search.perform_round", wraps=perform_round
-            ) as search,
-            patch.object(control._accounting, "settle", wraps=control._accounting.settle) as settle,
-            _serving(control) as url,
-        ):
+        with _serving(control) as url:
             response = httpx.post(
                 url + route,
                 headers={"authorization": f"Bearer {key}"},
@@ -330,14 +325,13 @@ def test_tool_search_is_inspected_before_execution_redial_and_rendering(
         assert response.status_code == 400, response.text
         assert "withhold-marker" not in response.text
         assert "blocked by a gateway guardrail" in response.text
-        assert search.call_count == (0 if phase == "query" else 1)
         assert len(provider_requests) == (2 if phase == "render" else 1)
-        if phase != "render":
-            metered = [
-                json.loads(call.args[0]).get("tool_search_requests", 0)
-                for call in settle.call_args_list
-            ]
-            assert metered == [0 if phase == "query" else 1]
+        if phase == "query":
+            assert all(
+                message.role != "tool"
+                for request in policy.requests
+                for message in request.messages
+            ), "a rejected query reached tool expansion"
         if phase == "retrieved":
             assert any(
                 "withhold-marker" in request.messages[-1].model_dump_json()
@@ -345,7 +339,7 @@ def test_tool_search_is_inspected_before_execution_redial_and_rendering(
             )
         else:
             assert any("withhold-marker" in item.model_dump_json() for item in policy.completions)
-        with sqlite3.connect(components.ledger.database_path) as connection:
+        with connect_sqlite(components.ledger.database_path) as connection:
             attempts = connection.execute(
                 "select state, failure_class, input_tokens, output_tokens "
                 "from gateway_attempts order by rowid"

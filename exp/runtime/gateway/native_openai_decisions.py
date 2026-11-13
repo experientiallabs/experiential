@@ -37,11 +37,8 @@ from exp.runtime.gateway.guardrails.client import assert_not_internal_classifica
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import require_unguarded_surface
 from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
-from exp.runtime.gateway.native_accounting import (
-    NativeAttemptAccounting,
-    NativeBridgeError,
-    authority_error,
-)
+from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+from exp.runtime.gateway.native_accounting_errors import NativeBridgeError, authority_error
 from exp.runtime.gateway.native_admission import (
     record_dead_admission_rungs,
 )
@@ -61,6 +58,7 @@ from exp.runtime.gateway.native_execution import (
     dispatchable_route_profiles,
     select_route_deployments,
 )
+from exp.runtime.gateway.native_handoff import uses_native
 from exp.runtime.gateway.native_settlement import gateway_updating_failure, optional_text
 from exp.runtime.gateway.openai_decisions_contracts import (
     OpenAIDecisionRequest,
@@ -371,7 +369,7 @@ def _admit_accepted(
         "maximum_same_deployment_attempts": 1,
         "ignored_parameters": list(ignored_parameters),
     }
-    serialized = json.dumps(response, separators=(",", ":"))
+    json.dumps(response, separators=(",", ":"))  # Validate before transferring ownership.
     plane._accounting.register(  # noqa: SLF001
         InflightRequest(
             authorization=authorization,
@@ -385,7 +383,8 @@ def _admit_accepted(
             throttle_redial_budgets=(0,) * depth,
         )
     )
-    return serialized
+    response["native_accounting"] = uses_native(plane._accounting, str(authorization.request_id))  # noqa: SLF001
+    return json.dumps(response, separators=(",", ":"))
 
 
 def _finish_unsupported(

@@ -2,7 +2,6 @@
 
 import dataclasses
 import json
-import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
 from unittest.mock import patch
@@ -21,6 +20,7 @@ from exp.common.models.gateway_chains import (
     GatewayModelChain,
     GatewayModelReferenceRung,
 )
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.affinity import affinity_fingerprint
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -53,6 +53,7 @@ from exp.runtime.gateway.tests.chain_authority_fixture_test import (
     chain_components,
     publish_authored_chain_fixture,
 )
+from exp.runtime.gateway.tests.native_admission_fixture_test import AdmissionRecords
 from exp.runtime.gateway.tests.web_search_backend_fixture_test import StaticWebSearchBackend
 from exp.runtime.gateway.web_search.backend import WebSearchBackend
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearchResult
@@ -163,7 +164,7 @@ def test_request_policy_cannot_widen_staged_authority_or_physical_budget(
         else:
             assert successor["route_depth"] == 1
             plane.abandon(json.dumps({"request_id": admitted["request_id"]}))
-        with sqlite3.connect(manager.database_path) as connection:
+        with connect_sqlite(manager.database_path) as connection:
             assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone() == (
                 1 if no_fallback or attempt_cap == 1 else 2,
             )
@@ -336,7 +337,9 @@ def test_no_fallback_skips_incapable_lead_before_search(tmp_path: Path) -> None:
     assert [wire["deployment_id"] for wire in admitted["route"]] == ["beta"]
 
 
-def test_no_fallback_preserves_sticky_placement_with_one_lookup(tmp_path: Path) -> None:
+def test_no_fallback_preserves_sticky_placement_with_one_lookup(
+    tmp_path: Path, admission_records: AdmissionRecords
+) -> None:
     """Pure eligibility does not double-record ordering or lose sticky attribution."""
     plane, key = _pool_control_plane(tmp_path)
     components = plane._components  # noqa: SLF001
@@ -383,7 +386,7 @@ def test_no_fallback_preserves_sticky_placement_with_one_lookup(tmp_path: Path) 
         ) as order,
     ):
         admitted = json.loads(plane.admit(json.dumps({"raw_key": key, "body": json.dumps(body)})))
-    entry = plane._accounting.entry(admitted["request_id"])  # noqa: SLF001
+    entry = admission_records.get(plane._accounting, admitted["request_id"])  # noqa: SLF001
     assert entry is not None and entry.sticky_preferred
     assert [wire["deployment_id"] for wire in admitted["route"]] == ["beta"]
     assert order.call_count == 1
@@ -491,7 +494,7 @@ def test_no_fallback_freezes_route_before_effectful_search_growth(
         assert error["code"] == "invalid_request"
         assert "context" in error["message"].lower()
     assert backend.queries == ["hi"]
-    with sqlite3.connect(manager.database_path) as connection:
+    with connect_sqlite(manager.database_path) as connection:
         assert connection.execute("select count(*) from gateway_attempts").fetchone() == (0,)
 
 

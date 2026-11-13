@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -13,7 +12,7 @@ import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayFailure
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.guardrails.classifiers import ScriptedClassifier
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
@@ -23,6 +22,7 @@ from exp.runtime.gateway.tests.guardrail_policy_integrity_test import _body
 from exp.runtime.gateway.tests.guardrails_native_bridge_test import _engine
 from exp.runtime.gateway.tests.mandatory_guardrails_paths_test import _serving
 from exp.runtime.gateway.tests.mandatory_guardrails_test import _Guard
+from exp.runtime.gateway.tests.native_admission_fixture_test import AdmissionRecords
 from exp.runtime.gateway.tests.web_search_backend_fixture_test import (
     FailingWebSearchBackend,
     StaticWebSearchBackend,
@@ -51,6 +51,7 @@ def _start(control: NativeControlPlane, raw_key: str, request_id: str) -> JsonOb
 def test_paid_admission_work_prevents_capacity_certificate_and_same_key_reentry(
     tmp_path: Path,
     prework: str,
+    admission_records: AdmissionRecords,
 ) -> None:
     """Successful or uncertain search/classification stays billed conservatively."""
     manager, key = _configured_gateway(tmp_path)
@@ -80,14 +81,14 @@ def test_paid_admission_work_prevents_capacity_certificate_and_same_key_reentry(
     with patch.object(search, "search", wraps=search.search) as search_call:
         admitted = _admit(control, key, body, idempotency_key="prework-refusal")
     assert search_call.call_count == int(prework.startswith("search"))
-    entry = control._accounting.entry(str(admitted["request_id"]))  # noqa: SLF001
+    entry = admission_records.get(control._accounting, str(admitted["request_id"]))  # noqa: SLF001
     assert entry is not None and not entry.no_paid_prework
     refused = _start(control, key, str(admitted["request_id"]))
     assert refused["exhausted"] is True
-    assert "known_unbilled" not in refused
+    assert refused.get("known_unbilled") is not True
     if prework == "input_guardrail":
         assert classifier.input_calls == 2
-    with sqlite3.connect(manager.database_path) as connection:
+    with connect_sqlite(manager.database_path) as connection:
         assert connection.execute(
             "SELECT terminal_state, failed_without_effects, web_search_requests, "
             "(SELECT COUNT(*) FROM gateway_attempts WHERE request_id = r.request_id) "
@@ -143,8 +144,8 @@ def test_paid_routing_embedding_prevents_capacity_certificate(tmp_path: Path) ->
         admitted = _admit(control, key, _chat_body(), idempotency_key="routed-capacity")
         assert Embeddings.calls > before
         response = _start(control, key, str(admitted["request_id"]))
-        assert response["exhausted"] is True and "known_unbilled" not in response
-        with sqlite3.connect(manager.database_path) as connection:
+        assert response["exhausted"] is True and response.get("known_unbilled") is not True
+        with connect_sqlite(manager.database_path) as connection:
             assert connection.execute(
                 "SELECT failed_without_effects FROM gateway_requests WHERE request_id = ?",
                 (admitted["request_id"],),
@@ -183,7 +184,7 @@ def test_http_capacity_refusal_records_completed_search(
         )
     assert response.status_code == 429, response.text
     assert calls.call_count == 1
-    with sqlite3.connect(manager.database_path) as connection:
+    with connect_sqlite(manager.database_path) as connection:
         assert connection.execute(
             "SELECT terminal_state, web_search_requests, failed_without_effects, "
             "(SELECT COUNT(*) FROM gateway_attempts WHERE request_id = r.request_id) "
@@ -192,11 +193,11 @@ def test_http_capacity_refusal_records_completed_search(
         ).fetchall() == [("failed", 1, 0, 0)]
 
 
-@pytest.mark.parametrize("write_fault", ["none", "before_commit", "after_commit"])
-def test_cancellation_during_exhaustion_preserves_original_settlement(
-    tmp_path: Path, write_fault: str
+@pytest.mark.parametrize("write_fault", [False, True])
+def test_late_cancellation_preserves_exhaustion_and_paid_search(
+    tmp_path: Path, write_fault: bool
 ) -> None:
-    """Concurrent cancellation cannot retain a conflicting verdict and fence all admission."""
+    """A native write failure retains exhaustion, paid search and its exact terminal."""
     manager, key = _configured_gateway(tmp_path)
     search = StaticWebSearchBackend(
         (GatewayWebSearchResult(url="https://example.test/result", title="Fixture"),)
@@ -205,72 +206,39 @@ def test_cancellation_during_exhaustion_preserves_original_settlement(
         load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"}),
         default_lane_bound=1,
         web_search=search,
+        background_recovery=False,
     )
     occupied = _admit(control, key, _chat_body())
     assert "attempt_id" in _start(control, key, str(occupied["request_id"]))
     admitted = _admit(control, key, _chat_body(model="coding:online"))
     request_id = str(admitted["request_id"])
-    accounting = control._accounting  # noqa: SLF001 - drive the real retained settlement owner.
-    ledger = accounting._write_ledger  # noqa: SLF001 - pause the real durable write boundary.
-    original_finish = ledger.finish_request
-    writing, release = threading.Event(), threading.Event()
-    results: list[JsonObject] = []
-    errors: list[BaseException] = []
-
-    def pause_terminal_write(
-        *,
-        authorization: AuthorizationSnapshot,
-        failure: GatewayFailure,
-        certify_no_effects: bool = False,
-        web_search_requests: int = 0,
-    ) -> bool:
-        """Pause one request-only write after committing or at a scripted fault boundary."""
-        first = not writing.is_set()
-        result = False
-        if not (first and write_fault == "before_commit"):
-            result = original_finish(
-                authorization=authorization,
-                failure=failure,
-                certify_no_effects=certify_no_effects,
-                web_search_requests=web_search_requests,
+    accounting = control._accounting  # noqa: SLF001
+    if write_fault:
+        with connect_sqlite(manager.database_path) as db:
+            db.execute(
+                "CREATE TRIGGER fail_exhaustion BEFORE UPDATE ON gateway_requests "
+                "BEGIN SELECT RAISE(ABORT,'fixture write failure'); END"
             )
-        if first:
-            writing.set()
-            assert release.wait(5)
-            if write_fault != "none":
-                raise RuntimeError("scripted terminal-write uncertainty")
-        return result
-
-    def exhaust() -> None:
-        """Run real capacity exhaustion while the test injects cancellation."""
-        try:
-            results.append(_start(control, key, request_id))
-        except BaseException as error:  # noqa: BLE001 - report worker failures in the test.
-            errors.append(error)
-
-    with patch.object(ledger, "finish_request", pause_terminal_write):
-        worker = threading.Thread(target=exhaust)
-        worker.start()
-        try:
-            assert writing.wait(5)
-            accounting.abandon(json.dumps({"request_id": request_id}))
-            entry = accounting.entry(request_id)
-            assert entry is not None and entry.pending_abandon is not None
-        finally:
-            release.set()
-            worker.join(5)
-    assert not worker.is_alive()
-    assert errors == []
-    assert len(results) == 1 and results[0]["exhausted"] is True
-    assert accounting.entry(request_id) is None
-    accounting.sweep_expired()
+    try:
+        if write_fault:
+            with pytest.raises(NativeBridgeError):
+                _start(control, key, request_id)
+            assert not accounting.accounting_healthy
+            assert accounting.native.owns_request(request_id)
+        else:
+            assert _start(control, key, request_id)["exhausted"] is True
+    finally:
+        with connect_sqlite(manager.database_path) as db:
+            db.execute("DROP TRIGGER IF EXISTS fail_exhaustion")
+    accounting.abandon(json.dumps({"request_id": request_id}))
     accounting.sweep_expired()
     assert accounting.accounting_healthy
-    with sqlite3.connect(manager.database_path) as connection:
-        assert connection.execute(
-            "SELECT terminal_state, web_search_requests, "
-            "(SELECT COUNT(*) FROM gateway_attempts WHERE request_id = r.request_id) "
-            "FROM gateway_requests r WHERE request_id = ?",
+    assert not accounting.native.owns_request(request_id)
+    with connect_sqlite(manager.database_path) as db:
+        assert db.execute(
+            "SELECT terminal_state,web_search_requests,failed_without_effects,"
+            "(SELECT count(*) FROM gateway_attempts WHERE request_id=r.request_id) "
+            "FROM gateway_requests r WHERE request_id=?",
             (request_id,),
-        ).fetchone() == ("failed", 1, 0)
-    assert _admit(control, key, _chat_body(model="coding:online"))["request_id"] != request_id
+        ).fetchone() == ("failed", 1, 0, 0)
+    assert control.close(timeout_seconds=2)

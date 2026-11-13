@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol, cast
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
+from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayFailure, GatewayRequest
 from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
     GuardrailCompletion,
@@ -23,8 +24,8 @@ from exp.runtime.gateway.native_capture import (
     PendingCapture,
     begin_capture,
     capture_unavailable_failure,
-    discard_capture,
 )
+from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 if TYPE_CHECKING:
@@ -34,15 +35,13 @@ if TYPE_CHECKING:
 
 def require_capture(
     controller: CaptureController | None,
-    accounting: NativeAttemptAccounting,
     authorization: AuthorizationSnapshot,
     pending: PendingCapture | None,
 ) -> None:
-    """Register approved input or terminalize unavailable synchronous capture admission.
+    """Register approved input or return its exact failure to the admission owner.
 
     Args:
         controller: Optional host-configured capture collector and policy.
-        accounting: Owner of the already accepted request's durable terminal write.
         authorization: Exact authenticated request identity.
         pending: Approved public context, or None when capture is disabled.
 
@@ -50,19 +49,19 @@ def require_capture(
         None once capture is registered or does not apply.
 
     Raises:
-        NativeBridgeError: Capture is unavailable; accounting retains the failed request
-            before the sanitized 503 is raised, without dispatching a provider.
+        NativeBridgeError: Capture is unavailable; the caller must retain the attached
+            failure before returning the sanitized 503 without dispatching a provider.
     """
     if pending is None or begin_capture(
         controller, authorization, pending.request, session_id=pending.session_id
     ):
         return
     failure = capture_unavailable_failure()
-    accounting.finish_request_quietly(authorization, failure)
     raise NativeBridgeError(
         OpenAIProtocolError(
             status_code=503, code="capture_unavailable", message=failure.safe_message
-        )
+        ),
+        failure=failure,
     )
 
 
@@ -92,6 +91,8 @@ def open_admission_guardrails(
         if engine is None
         else engine.open_request(authorization, deadline_monotonic=deadline_monotonic)
     )
+    if session is not None:
+        session.native_execution = True
     if request.idempotency_key is not None:
         revision = None if session is None else session.engine.policy_revision(session.policies)
         if (
@@ -267,6 +268,29 @@ def upstream_requests_reasoning(wire_route: Sequence[JsonObject]) -> bool:
     return False
 
 
+def discard_unaccepted_input(session: GuardrailSession | None) -> None:
+    """Cancel unowned inspections and record bounded loss without a financial admission."""
+    if session is None:
+        return
+    inspections = list(session.native_completed)
+    if session.native_observation is not None:
+        inspections.append(session.native_observation)
+    session.cancel()
+    for inspection in inspections:
+        inspection.cancel()
+    session.native_observation = None
+    session.native_completed.clear()
+    if inspections:
+        logging.getLogger(__name__).warning(
+            "moderation records dropped before request acceptance",
+            extra={
+                "operation": "native_moderation_unaccepted",
+                "samples": len(inspections),
+                "outcome": "dropped",
+            },
+        )
+
+
 class _GuardrailPlane(Protocol):
     """Services used by each admitted request's sole guardrail session.
 
@@ -280,83 +304,35 @@ class _GuardrailPlane(Protocol):
 
 
 class NativeGuardrailsMixin:
-    """Resolve native operations to one frozen session, independent of policy scope."""
+    """Administrative inspection calls use the request's native resources."""
 
-    def guardrail_input_status(self: _GuardrailPlane, argument: str) -> str:
-        """Poll the shared input session and register capture once before allowing release.
+    _accounting: NativeAttemptAccounting
 
-        An occupied request lock returns pending rather than blocking a bridge worker.
-        Capture failure is retained in the same session for zero-charge settlement;
-        cancellation discards capture registered while its owner was closing.
+    _write_ledger: SyncWriteLedger
 
-        Args:
-            argument: JSON object containing the authenticated admission's request_id.
+    def record_rejected_input(
+        self,
+        authorization: AuthorizationSnapshot,
+        session: GuardrailSession,
+        failure: GatewayFailure,
+    ) -> None:
+        """Retain a serial denial without dispatching or replacing the public refusal."""
+        try:
+            self._write_ledger.accept_request(authorization=authorization)
+        except Exception:  # noqa: BLE001 - diagnostic storage cannot change a decided refusal.
+            logging.getLogger(__name__).warning("could not record rejected input admission")
+            discard_unaccepted_input(session)
+            return
+        self._accounting.finish_request_quietly(authorization, failure, input_session=session)
 
-        Returns:
-            A JSON pending, allow, error, or closed decision. Allow requires both current
-            session approval and successful required capture registration.
+    def guardrail_input_status(self, argument: str) -> str:
+        """Read one immediate native status; serving awaits its asynchronous signal."""
+        return self._accounting.call("guardrail_input_status", argument)
 
-        Raises:
-            NativeBridgeError: A concurrent abandonment's durable terminal write failed;
-                accounting keeps the request for retry and the native gate fails closed.
-        """
-        request_id = str(json.loads(argument).get("request_id") or "")
-        entry = self._accounting.entry(request_id)
-        if entry is None or entry.pending_abandon is not None:
-            return '{"action":"closed"}'
-        decision = (
-            {"action": "error", "failure": denied_input_failure().model_dump(mode="json")}
-            if entry.guardrails is None
-            else entry.guardrails.input_decision()
-        )
-        if decision["action"] == "allow":
-            # Reservation owns this same lock during ledger I/O. Poll without
-            # waiting so unrelated dispatch and settlement workers remain available.
-            if not entry.execution_lock.acquire(blocking=False):
-                return '{"action":"pending"}'
-            began = False
-            try:
-                if self._accounting.entry(request_id) is not entry or entry.pending_abandon:
-                    return '{"action":"closed"}'
-                session = entry.guardrails
-                assert session is not None  # Only the same session's approval reaches capture.
-                decision = session.input_decision()
-                pending = entry.pending_capture
-                if decision["action"] == "allow" and pending is not None:
-                    began = begin_capture(
-                        self._capture,
-                        entry.authorization,
-                        pending.request,
-                        entry.route.snapshot.exact_model_id,
-                        session_id=pending.session_id,
-                    )
-                    if not began:
-                        session.cancel(capture_unavailable_failure())
-                    entry.pending_capture = None
-                    decision = session.input_decision()
-            finally:
-                entry.execution_lock.release()
-                try:
-                    if entry.pending_abandon is not None:
-                        self._accounting.abandon(argument)
-                finally:
-                    if began and (
-                        entry.pending_abandon is not None
-                        or self._accounting.entry(request_id) is not entry
-                    ):
-                        discard_capture(self._capture, request_id)
-        return (
-            json.dumps(decision)
-            if self._accounting.entry(request_id) is entry and entry.pending_abandon is None
-            else '{"action":"closed"}'
-        )
+    def enforce_output_segment(self, argument: str) -> str:
+        """Inspect a deterministic segment with the admitted native policy."""
+        return self._accounting.call("enforce_output_segment", argument)
 
-    def enforce_output_segment(self: _GuardrailPlane, argument: str) -> str:
-        """Release one deterministic segment through the admitted session."""
-        entry = self._accounting.entry(str(json.loads(argument).get("request_id") or ""))
-        return enforce_native_output_segment(None if entry is None else entry.guardrails, argument)
-
-    def enforce_output(self: _GuardrailPlane, argument: str) -> str:
-        """Inspect one complete output through the admitted session."""
-        entry = self._accounting.entry(str(json.loads(argument).get("request_id") or ""))
-        return enforce_native_output(None if entry is None else entry.guardrails, argument)
+    def enforce_output(self, argument: str) -> str:
+        """Inspect complete output with the admitted native policy."""
+        return self._accounting.call("enforce_output", argument)

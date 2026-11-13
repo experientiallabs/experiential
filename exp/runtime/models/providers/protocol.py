@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelCapabilities, ModelClient, ModelRequest, ModelResponse
 from exp.common.models.catalog import GatewayDeploymentCapabilities
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
@@ -179,6 +180,15 @@ class GatewayDispatchSigner(Protocol):
 
     def sign_gateway_dispatch(self, *, url: str, body: str) -> Mapping[str, str]:
         """Return per-request headers covering the exact body bytes."""
+        ...
+
+
+@runtime_checkable
+class NativeGatewayDispatchSigner(Protocol):
+    """Admission-only export of a body signer's native authority."""
+
+    def native_gateway_signing(self, *, url: str) -> JsonObject:
+        """Return sensitive signing material for the exact admitted endpoint."""
         ...
 
 

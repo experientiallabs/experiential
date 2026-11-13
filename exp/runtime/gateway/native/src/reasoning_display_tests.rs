@@ -38,7 +38,7 @@ fn payloads(frames: &[String]) -> Vec<Value> {
         .iter()
         .flat_map(|frame| frame.lines())
         .filter_map(|line| line.strip_prefix("data: "))
-        .filter_map(|data| serde_json::from_str(data).ok())
+        .filter_map(|data| crate::lossless_json::from_str(data).ok())
         .collect()
 }
 

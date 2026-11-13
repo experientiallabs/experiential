@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 import json
-import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -17,6 +16,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.catalog import GatewayDeploymentCapabilities
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.tests import native_waterfall_test as waterfall
 from exp.runtime.gateway.tests.native_waterfall_test import _ServingEngine, _sse_frame
@@ -270,7 +270,9 @@ def test_actual_root_responses_translated_custom_and_namespace(
         timeout=30,
     )
     assert _ToolUpstream.calls == 1, "Never replay a committed custom tool on another deployment"
-    with sqlite3.connect(engine.database_path) as db:
+    if response.status_code == 200:
+        waterfall._attempt_rows(engine, response.headers["x-request-id"])
+    with connect_sqlite(engine.database_path) as db:
         rows = db.execute(
             "SELECT deployment_id,state FROM gateway_attempts ORDER BY attempt_ordinal"
         ).fetchall()

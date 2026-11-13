@@ -17,6 +17,7 @@ results, and plans do not live here.
 | `reference/model-chains.md` | Ordered cross-model stages, mandatory hosted authority, bounded recovery and unsupported local-chain serving. |
 | `reference/chat-logprobs.md` | Verified Chat probability admission, token records, and guardrail boundaries. |
 | `reference/responses-logprobs.md` | Native Responses probability selectors, lifecycle phases, and continuation behavior. |
+| `reference/gateway-native-transactions.md` | Native request ownership after admission: the `native_request_factory` composition contract, what the Rust owner does, its callback boundary, and recovery. |
 | `reference/gateway-request-policy.md` | Per-request retry bounds, backoff, opaque route selection, replay and physical-attempt accounting. |
 | `reference/gateway-history-tool-arguments.md` | Replayed tool calls whose arguments are not one JSON object: the decoder's stand-in, what each wire receives, and the disclosures. |
 | `reference/gateway-failover-rules.md` | Per-rung conditional failover (`failover_only_on`): the token vocabulary, first-dial and successor rules, the ledger `fallback_reason`, and the fail-closed cases. |

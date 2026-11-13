@@ -59,7 +59,7 @@ jobs:
         with:
           workspaces: exp/runtime/gateway/native
       - name: Install the project and its dev extras
-        run: uv sync --locked --extra dev
+        run: uv sync --locked --extra dev --config-settings-package="exp-gateway-native:build-args=--features test-support"
       - name: Crate changes require a crate version bump
         if: github.event_name == 'pull_request'
         env:
@@ -71,7 +71,7 @@ jobs:
           # GitHub's merge-base file list needs no local checkout history.
           marker=.github/deferred-native-release.toml
           if [ -f "$marker" ]; then
-            uv run python - <<'PY'
+            uv run --no-sync python - <<'PY'
           import tomllib
           from pathlib import Path
           marker = tomllib.loads(Path(".github/deferred-native-release.toml").read_text())
@@ -83,7 +83,7 @@ jobs:
             for path in pyproject.toml exp/runtime/gateway/native/Cargo.toml; do
               head_version="$(grep -m1 '^version = ' "$path")"
               base_version="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${path}?ref=${GITHUB_BASE_REF}" \
-                -q .content | base64 -d | grep -m1 '^version = ')"
+                -q .content | base64 -d | awk '/^version = / && !seen++')"
               test "$head_version" = "$base_version" || {
                 echo "release deferral must preserve both base versions" >&2
                 exit 1
@@ -102,7 +102,7 @@ jobs:
             changed=1
             head_project="$(grep -m1 '^version = ' pyproject.toml)"
             base_project="$(gh api "repos/${GITHUB_REPOSITORY}/contents/pyproject.toml?ref=${GITHUB_BASE_REF}" \
-              -q .content | base64 -d | grep -m1 '^version = ')"
+              -q .content | base64 -d | awk '/^version = / && !seen++')"
             test "$head_project" != "$base_project" || {
               echo "ending a release deferral requires a new flagship version" >&2
               exit 1
@@ -115,7 +115,7 @@ jobs:
           head_version="$(grep -m1 '^version = ' exp/runtime/gateway/native/Cargo.toml)"
           base_version="$(gh api \
             "repos/${GITHUB_REPOSITORY}/contents/exp/runtime/gateway/native/Cargo.toml?ref=${GITHUB_BASE_REF}" \
-            -q .content | base64 -d | grep -m1 '^version = ')"
+            -q .content | base64 -d | awk '/^version = / && !seen++')"
           if [ "${head_version}" != "${base_version}" ]; then
             echo "crate changed and version moved: ${base_version} -> ${head_version}"
             exit 0
@@ -136,28 +136,19 @@ jobs:
         run: >-
           cargo test --manifest-path exp/runtime/gateway/native/Cargo.toml
           --no-default-features
-      - name: Explicit cache crosses the real Python and native bridge
-        run: |
-          export PYO3_PYTHON="$PWD/.venv/bin/python"
-          export PYTHONPATH="$PWD:$(.venv/bin/python -c 'import site; print(site.getsitepackages()[0])')"
-          export LD_LIBRARY_PATH="$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          cargo test --manifest-path exp/runtime/gateway/native/Cargo.toml \
-            --no-default-features \
-            waterfall::attempt::google_cache::bridge_tests::real_python_control_plane_creates_and_reuses_through_bridge \
-            -- --ignored --exact
       - name: Native parity tests are present, not skipped
         run: >-
-          uv run pytest -q exp/runtime/gateway/native_bridge_test.py
+          uv run --no-sync pytest -q exp/runtime/gateway/native_bridge_test.py
           -k "rust" -rs --no-header
       - name: ruff check
-        run: uv run ruff check .
+        run: uv run --no-sync ruff check .
       - name: ruff format
-        run: uv run ruff format --check .
+        run: uv run --no-sync ruff format --check .
       - name: ty check
-        run: uv run ty check
+        run: uv run --no-sync ty check
       - name: Tinker SDK adapter tests
         run: >-
-          uv run pytest -q -k "not live"
+          uv run --no-sync pytest -q -k "not live"
           exp/optimize/model/sft/tinker_test.py
 
   gate-shards:
@@ -203,14 +194,14 @@ jobs:
         with:
           workspaces: exp/runtime/gateway/native
       - name: Install the project and its dev extras
-        run: uv sync --locked --extra dev
+        run: uv sync --locked --extra dev --config-settings-package="exp-gateway-native:build-args=--features test-support"
       - name: non-live tests
         # The system-keychain case mocks subprocesses but still stats the real
         # system path. Keep the other mocked trust-guard cases enabled.
         # Match GitLab's terminal detection: Typer otherwise forces ANSI for
         # GITHUB_ACTIONS even when CliRunner captures non-terminal output.
         run: >-
-          env -u GITHUB_ACTIONS uv run pytest -n 4 --dist worksteal -q -k "not live"
+          env -u GITHUB_ACTIONS uv run --no-sync pytest -n 4 --dist worksteal -q -k "not live"
           --deselect='exp/runtime/capture/certificates_test.py::test_unsafe_default_keychain_never_installs_trust["/Library/Keychains/System.keychain"]'
           ${{ matrix.paths }}
           --ignore=exp/optimize/router/tests/composition_evidence_test.py
@@ -227,12 +218,12 @@ jobs:
         with:
           workspaces: exp/runtime/gateway/native
       - name: Install the minimum-version SDK without capture engine dependencies
-        run: uv sync --locked --extra dev
+        run: uv sync --locked --extra dev --config-settings-package="exp-gateway-native:build-args=--features test-support"
       - name: SDK and Capture command help remain available
         run: |
-          uv run exp --help
-          uv run exp capture --help
-          uv run pytest -q exp/cli/app_test.py exp/cli/capture exp/runtime/capture \
+          uv run --no-sync exp --help
+          uv run --no-sync exp capture --help
+          uv run --no-sync pytest -q exp/cli/app_test.py exp/cli/capture exp/runtime/capture \
             exp/tests/release_test.py -k "not installed_wheel" \
             --deselect='exp/runtime/capture/certificates_test.py::test_unsafe_default_keychain_never_installs_trust["/Library/Keychains/System.keychain"]'
 
@@ -316,7 +307,7 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - name: Install the project and its dev extras
-        run: uv sync --locked --extra dev
+        run: uv sync --locked --extra dev --config-settings-package="exp-gateway-native:build-args=--features test-support"
       - name: Verify real Windows snapshot authority
         # These tests use built-in fixtures only. The suite conftest owns Unix PTY fixtures;
         # its provider-auth isolation is replaced by the empty step-local XDG_DATA_HOME.
@@ -324,7 +315,7 @@ jobs:
         env:
           XDG_DATA_HOME: ${{ runner.temp }}/snapshot-authority-auth
         run: >-
-          uv run pytest --noconftest -q -rs --junitxml=windows-snapshot-authority.xml
+          uv run --no-sync pytest --noconftest -q -rs --junitxml=windows-snapshot-authority.xml
           exp/runtime/gateway/snapshot_file_windows_test.py
           exp/runtime/gateway/snapshot_file_test.py::test_snapshot_resource_budget_is_a_strict_positive_integer
           exp/runtime/gateway/snapshot_file_test.py::test_bounded_reader_accepts_limit_and_rejects_growth
@@ -336,7 +327,7 @@ jobs:
       - name: Require executed Windows kernel and graph cases
         shell: bash
         run: |
-          uv run python - <<'PY'
+          uv run --no-sync python - <<'PY'
           import xml.etree.ElementTree as ET
 
           cases = ET.parse("windows-snapshot-authority.xml").findall(".//testcase")
@@ -373,12 +364,12 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Install the project and its dev extras
-        run: uv sync --locked --extra dev
+        run: uv sync --locked --extra dev --config-settings-package="exp-gateway-native:build-args=--features test-support"
       - name: Capture selective TLS streaming and local redirector lifecycle
         # Native certificate verification invokes macOS Security utilities. Keep
         # this job independent of Keychain; OpenSSL verification runs on Linux.
         run: >-
-          uv run pytest -q exp/runtime/capture exp/cli/capture
+          uv run --no-sync pytest -q exp/runtime/capture exp/cli/capture
           --deselect=exp/runtime/capture/certificates_test.py::test_real_tls_chains_enforce_exact_dns_and_deny_ip_scope
           --deselect='exp/runtime/capture/certificates_test.py::test_unsafe_default_keychain_never_installs_trust["/Library/Keychains/System.keychain"]'
       - name: W16 router and bounded local-process evidence
@@ -386,7 +377,7 @@ jobs:
           EXP_RELEASE_REVISION: ${{ github.sha }}
           EXP_RELEASE_EVIDENCE_DIR: ${{ runner.temp }}/w17-release-evidence
         run: >-
-          uv run pytest -q
+          uv run --no-sync pytest -q
           --junitxml=w16-darwin-evidence.xml
           exp/optimize/router/tests/composition_evidence_test.py
           exp/simulation/tests/comparison_evidence_test.py

@@ -16,7 +16,7 @@ impl<'a> CapturedResponse<'a> {
     pub fn decode(protocol: Protocol, bytes: &[u8], sse: bool) -> (String, bool, Option<String>) {
         if !sse {
             let source = std::str::from_utf8(bytes).unwrap_or("");
-            return match serde_json::from_str::<Value>(source)
+            return match crate::lossless_json::from_str::<Value>(source)
                 .ok()
                 .filter(Value::is_object)
             {
@@ -122,7 +122,7 @@ impl<'a> CapturedResponse<'a> {
                 protocol,
                 source_json
                     .as_ref()
-                    .and_then(|s| serde_json::from_str(s).ok())
+                    .and_then(|s| crate::lossless_json::from_str(s).ok())
                     .map(Cow::Owned)
                     .unwrap_or(Cow::Borrowed(body)),
             ),
@@ -135,7 +135,7 @@ impl<'a> CapturedResponse<'a> {
             } => {
                 if let Some(frames) = source_json
                     .as_ref()
-                    .and_then(|s| serde_json::from_str::<Vec<Value>>(s).ok())
+                    .and_then(|s| crate::lossless_json::from_str::<Vec<Value>>(s).ok())
                 {
                     let captured = CapturedResponse::sse(protocol, &frames, false);
                     return captured
@@ -282,7 +282,7 @@ mod tests {
     use super::*;
 
     fn record(response: Value) -> Record {
-        serde_json::from_value(json!({
+        crate::lossless_json::from_value(json!({
             "schema_version": 1, "request": {
                 "request_id": "request", "scope": {"organization_id":"org",
                     "identity_id":"identity", "application_id":"app"},

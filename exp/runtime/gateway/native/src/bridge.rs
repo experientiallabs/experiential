@@ -24,6 +24,7 @@ use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 use crate::errors::PublicError;
 use crate::execution_binding::ExecutionLease;
+use crate::native_callbacks::NativeTarget;
 
 /// One queued control-plane call and the responder that hands its outcome
 /// back to the awaiting request task.
@@ -45,6 +46,10 @@ struct Job {
 pub struct Bridge {
     pool: Arc<WorkerPool>,
     pub(crate) execution: Option<Arc<ExecutionLease>>,
+    native: Option<Arc<NativeTarget>>,
+    request_owner: Option<Arc<dyn Send + Sync>>,
+    #[cfg(test)]
+    scripted_fixture: bool,
 }
 
 /// One process owns the workers; bound request views share them without adding threads.
@@ -97,6 +102,69 @@ impl Bridge {
                 permits: Arc::new(Semaphore::new(worker_count)),
             }),
             execution: None,
+            native: None,
+            request_owner: None,
+            #[cfg(test)]
+            scripted_fixture: false,
+        })
+    }
+
+    /// Script a control-plane boundary in unit tests only. The extension build
+    /// cannot enable this: real admitted requests always require native callbacks.
+    #[cfg(test)]
+    pub(crate) fn scripted(object: Py<PyAny>, maximum: usize) -> Result<Self, String> {
+        let mut bridge = Self::new(object, maximum)?;
+        bridge.scripted_fixture = true;
+        Ok(bridge)
+    }
+
+    /// Install an explicitly supplied native target for this process bridge.
+    pub(crate) fn with_native(mut self, native: Option<Arc<NativeTarget>>) -> Self {
+        self.native = native;
+        self
+    }
+
+    pub(crate) fn retain_native_request(&self, request_id: &str) -> Option<Arc<dyn Send + Sync>> {
+        self.request_owner.clone().or_else(|| {
+            self.native
+                .as_ref()
+                .and_then(|target| target.retain_request(request_id))
+        })
+    }
+
+    /// The admitted contract selects its owner once. Missing native ownership
+    /// fails closed; a failed callback never changes the selected backend.
+    pub(crate) fn admitted(&self, value: &serde_json::Value) -> Result<Self, PublicError> {
+        let selected = match value.get("native_accounting") {
+            Some(value) => value.as_bool().ok_or_else(PublicError::internal)?,
+            None if self.native.is_none() => false,
+            None => return Err(PublicError::internal()),
+        };
+        let request_id = value["request_id"]
+            .as_str()
+            .ok_or_else(PublicError::internal)?;
+        let request_owner = self
+            .native
+            .as_ref()
+            .and_then(|target| target.retain_request(request_id));
+        if (!selected && request_owner.is_some())
+            || (selected && self.native.is_none())
+            || (selected
+                && request_owner.is_none()
+                && self
+                    .native
+                    .as_ref()
+                    .is_some_and(|n| n.requires_request_owner()))
+        {
+            return Err(PublicError::internal());
+        }
+        Ok(Self {
+            pool: self.pool.clone(),
+            execution: self.execution.clone(),
+            native: selected.then(|| self.native.clone()).flatten(),
+            request_owner,
+            #[cfg(test)]
+            scripted_fixture: self.scripted_fixture,
         })
     }
 
@@ -104,7 +172,12 @@ impl Bridge {
     pub(crate) fn bind(&self, execution: Arc<ExecutionLease>) -> Self {
         Self {
             pool: self.pool.clone(),
+            // A bound owner never inherits the process owner's native context.
+            native: execution.resources.native.clone(),
+            request_owner: None,
             execution: Some(execution),
+            #[cfg(test)]
+            scripted_fixture: self.scripted_fixture,
         }
     }
 
@@ -162,6 +235,29 @@ impl Bridge {
         // Latency is measured from permit grant so it reflects the python
         // callback itself, not queueing behind other bridge calls.
         let call_started = std::time::Instant::now();
+        if let Some(native) = self.native.as_ref().filter(|native| native.handles(method)) {
+            let native = native.clone();
+            let execution = self.execution.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                // These leases outlive a cancelled waiter, just as queued Python
+                // jobs do. No interpreter attachment occurs on this path.
+                let _ownership = (permit, execution_permit, execution);
+                native.call(method, &argument)
+            })
+            .await
+            .unwrap_or_else(|_| Err(PublicError::internal()));
+            crate::metrics::METRICS
+                .bridge_call_ms
+                .record(call_started.elapsed());
+            return result;
+        }
+        #[cfg(test)]
+        let scripted_fixture = self.scripted_fixture;
+        #[cfg(not(test))]
+        let scripted_fixture = false;
+        if crate::native_callbacks::post_admission(method) && !scripted_fixture {
+            return Err(PublicError::internal());
+        }
         let (responder, outcome) = oneshot::channel();
         let submitted = match queue.lock() {
             Ok(guard) => match guard.as_ref() {
@@ -302,7 +398,7 @@ fn public_error_from_pyerr(py: Python<'_>, error: &PyErr) -> PublicError {
     let value = error.value(py);
     if let Ok(payload) = value.getattr("public_error_json") {
         if let Ok(text) = payload.extract::<String>() {
-            if let Ok(public) = serde_json::from_str::<PublicError>(&text) {
+            if let Ok(public) = crate::lossless_json::from_str::<PublicError>(&text) {
                 return public;
             }
         }
@@ -399,7 +495,7 @@ class Plane:
     fn calls_stay_on_a_fixed_set_of_worker_threads() {
         let object = plane();
         let observer = Python::attach(|py| object.clone_ref(py));
-        let bridge = Bridge::new(object, 2).expect("bridge starts");
+        let bridge = Bridge::scripted(object, 2).expect("bridge starts");
         block_on(async {
             for index in 0..32 {
                 let result = bridge.call("echo", format!("payload-{index}")).await;
@@ -413,7 +509,7 @@ class Plane:
     #[test]
     fn workers_serve_calls_concurrently() {
         let object = plane();
-        let bridge = Arc::new(Bridge::new(object, 4).expect("bridge starts"));
+        let bridge = Arc::new(Bridge::scripted(object, 4).expect("bridge starts"));
         // Both calls block on a two-party barrier inside python, so they can
         // only complete if two workers run them at the same time.
         let (first, second) = block_on(async {
@@ -432,7 +528,7 @@ class Plane:
     fn cancelled_waiter_keeps_capacity_until_its_callback_finishes() {
         let object = plane();
         let observer = Python::attach(|py| object.clone_ref(py));
-        let bridge = Arc::new(Bridge::new(object, 1).expect("bridge starts"));
+        let bridge = Arc::new(Bridge::scripted(object, 1).expect("bridge starts"));
         block_on(async {
             let caller = bridge.clone();
             let task = tokio::spawn(async move { caller.call("block", "first".into()).await });
@@ -491,13 +587,13 @@ class Plane:
         let target = plane();
         let observer = Python::attach(|py| target.clone_ref(py));
         let handle = Python::attach(|py| {
-            ExecutionHandle::new(target, 128, 1, 1, &pyo3::types::PyDict::new(py), None)
+            ExecutionHandle::new(target, 128, 1, 1, &pyo3::types::PyDict::new(py), None, None)
         })
         .unwrap();
         let bindings = ExecutionBindings::new(1).unwrap();
         let token = "x".repeat(32);
         bindings.register(token.clone(), &handle).unwrap();
-        let bridge = Bridge::new(process, 2).unwrap();
+        let bridge = Bridge::scripted(process, 2).unwrap();
         let bound = bridge.bind(bindings.claim(&token).unwrap());
         block_on(async {
             let request = tokio::spawn(async move { bound.call("block", "accepted".into()).await });
@@ -593,7 +689,7 @@ class DatabasePlane:
             raise AssertionError("database descriptor remains usable")
         return "{}"
 "#;
-        let bridge = Bridge::new(plane(), 2).unwrap();
+        let bridge = Bridge::scripted(plane(), 2).unwrap();
         let bindings = ExecutionBindings::new(1).unwrap();
         for index in 0..16 {
             let target = Python::attach(|py| {
@@ -607,7 +703,7 @@ class DatabasePlane:
             });
             let observer = Python::attach(|py| target.clone_ref(py));
             let handle = Python::attach(|py| {
-                ExecutionHandle::new(target, 128, 1, 1, &pyo3::types::PyDict::new(py), None)
+                ExecutionHandle::new(target, 128, 1, 1, &pyo3::types::PyDict::new(py), None, None)
             })
             .unwrap();
             let token = format!("{index:032}");
@@ -653,13 +749,13 @@ class DatabasePlane:
         Python::attach(|py| target.bind(py).setattr("fail_close", true).unwrap());
         let observer = Python::attach(|py| target.clone_ref(py));
         let handle = Python::attach(|py| {
-            ExecutionHandle::new(target, 128, 1, 1, &pyo3::types::PyDict::new(py), None)
+            ExecutionHandle::new(target, 128, 1, 1, &pyo3::types::PyDict::new(py), None, None)
         })
         .unwrap();
         let bindings = ExecutionBindings::new(1).unwrap();
         let token = "c".repeat(32);
         bindings.register(token.clone(), &handle).unwrap();
-        let bridge = Bridge::new(plane(), 2).unwrap();
+        let bridge = Bridge::scripted(plane(), 2).unwrap();
         let bound = bridge.bind(bindings.claim(&token).unwrap());
         assert_eq!(
             block_on(bound.call("settle", "durable receipt".into())).unwrap(),
@@ -674,7 +770,7 @@ class DatabasePlane:
     fn dropping_the_bridge_releases_every_worker_thread() {
         let object = plane();
         let observer = Python::attach(|py| object.clone_ref(py));
-        let bridge = Bridge::new(object, 3).expect("bridge starts");
+        let bridge = Bridge::scripted(object, 3).expect("bridge starts");
         block_on(async {
             bridge
                 .call("echo", "warm".to_string())
@@ -690,7 +786,7 @@ class DatabasePlane:
     #[test]
     fn an_unsanitized_python_failure_maps_to_the_internal_error() {
         let object = plane();
-        let bridge = Bridge::new(object, 1).expect("bridge starts");
+        let bridge = Bridge::scripted(object, 1).expect("bridge starts");
         let outcome = block_on(bridge.call("boom", "{}".to_string()));
         let error = outcome.expect_err("boom fails");
         assert_eq!(

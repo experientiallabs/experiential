@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 import unittest.mock
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,6 +23,7 @@ from exp.common.models.gateway_catalog import (
 from exp.common.models.gateway_chains_test import chain
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.common.models.model import ModelCapabilities
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway import model_plan
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -189,7 +189,7 @@ def test_forwarding_resolver_preserves_actual_serving_authority(
         if operation == "admit":
             assert result["route"]
     assert wrapper.classifications == 1
-    with sqlite3.connect(manager.database_path) as connection:
+    with connect_sqlite(manager.database_path) as connection:
         requests = connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0]
         attempts = connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0]
     assert requests == int(target_kind != "chain" and operation == "admit")

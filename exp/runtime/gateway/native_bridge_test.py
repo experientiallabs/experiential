@@ -5,14 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import sqlite3
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Literal, cast
 from unittest import mock
 from uuid import uuid4
@@ -22,6 +21,7 @@ import pytest
 import exp.runtime.gateway.native_bridge as native_bridge_module
 from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.common.models import (
+    BillingSource,
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
     ModelCapabilities,
@@ -36,7 +36,12 @@ from exp.common.models.gateway_chains import (
     GatewayModelChain,
     GatewayModelReferenceRung,
 )
-from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
+from exp.common.sqlite.native import connect as connect_sqlite
+from exp.runtime.gateway.budgets import (
+    BudgetScope,
+    BudgetScopeKind,
+    SQLiteBudgetStore,
+)
 from exp.runtime.gateway.catalog_authority import (
     snapshot_current_catalog,
     upsert_singleton_deployment,
@@ -52,11 +57,11 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
-from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
 from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle import (
@@ -66,6 +71,7 @@ from exp.runtime.gateway.lifecycle import (
 )
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_bridge import (
     NativeBridgeError,
     NativeControlPlane,
@@ -87,6 +93,7 @@ from exp.runtime.gateway.tests.chain_authority_fixture_test import (
     chain_components,
     publish_authored_chain_fixture,
 )
+from exp.runtime.gateway.tests.native_admission_fixture_test import AdmissionRecords
 from exp.runtime.models.credentials import CredentialResolution, DispatchCredentialReceipt
 from exp.runtime.models.credentials_test import AtomicEnvironment
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -376,6 +383,7 @@ def _control_plane(
     root: Path,
     *,
     request_timeout_seconds: float = 120.0,
+    background_recovery: bool = True,
 ) -> tuple[NativeControlPlane, str]:
     """Seed one direct alias and load the native control plane over it."""
     _manager, raw_key = _configured_gateway(root)
@@ -383,8 +391,28 @@ def _control_plane(
         root,
         environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
     )
-    control = NativeControlPlane(components, request_timeout_seconds=request_timeout_seconds)
+    control = NativeControlPlane(
+        components,
+        request_timeout_seconds=request_timeout_seconds,
+        background_recovery=background_recovery,
+    )
     return control, raw_key
+
+
+@contextmanager
+def _blocked_terminal(control: NativeControlPlane) -> Iterator[None]:
+    """Fail the actual native write without replacing the financial callback owner."""
+    ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
+    with connect_sqlite(ledger.database_path) as connection:
+        connection.execute(
+            "CREATE TRIGGER fail_native_terminal BEFORE UPDATE ON gateway_attempts "
+            "BEGIN SELECT RAISE(ABORT,'synthetic terminal failure'); END"
+        )
+    try:
+        yield
+    finally:
+        with connect_sqlite(ledger.database_path) as connection:
+            connection.execute("DROP TRIGGER fail_native_terminal")
 
 
 def _chat_body(*, model: str = "coding", stream: bool = False) -> str:
@@ -411,6 +439,18 @@ def test_failed_control_plane_initialization_leaves_no_background_owner(
     )
     started: list[threading.Thread] = []
     original_start = threading.Thread.start
+    closed: list[NativeAttemptAccounting] = []
+    original_close = NativeAttemptAccounting.close
+
+    def track_close(owner: NativeAttemptAccounting, timeout_seconds: float = 10.0) -> bool:
+        """Observe real native shutdown, including the independent video terminal owner."""
+        result = original_close(owner, timeout_seconds)
+        closed.append(owner)
+        assert result and owner.native.drained()
+        assert not owner.native.is_clear()
+        return result
+
+    monkeypatch.setattr(NativeAttemptAccounting, "close", track_close)
 
     def track_start(thread: threading.Thread) -> None:
         """Observe real owned workers and inject a video thread creation failure."""
@@ -437,9 +477,8 @@ def test_failed_control_plane_initialization_leaves_no_background_owner(
                 NativeControlPlane(components, background_recovery=background_recovery)
             assert not any(thread.is_alive() for thread in started)
         if failure_point == "video_poller":
-            assert sum(thread.name == "exp-native-settlement-sweep" for thread in started) == (
-                2 if background_recovery else 0
-            )
+            assert len(closed) == 4
+            assert len({id(owner) for owner in closed}) == 4
         else:
             assert not started
     finally:
@@ -763,7 +802,7 @@ def test_a_plain_priority_tier_never_jumps_the_permit_queue(tmp_path: Path) -> N
 @pytest.mark.parametrize("provider", ("anthropic", "openai-compatible"))
 @pytest.mark.parametrize("maximum", (2_048, 128_000))
 def test_omitted_cap_admission_freezes_provider_maximum_without_public_rewrite(
-    tmp_path: Path, provider: str, maximum: int
+    admission_records: AdmissionRecords, tmp_path: Path, provider: str, maximum: int
 ) -> None:
     """The real admission bridge reserves the same bound its per-rung payload permits."""
     _manager, key = _configured_gateway(
@@ -788,7 +827,7 @@ def test_omitted_cap_admission_freezes_provider_maximum_without_public_rewrite(
     else:
         assert "max_tokens" not in payload
         assert admission["ignored_parameters"] == []
-    entry = control._accounting.entry(str(admission["request_id"]))
+    entry = admission_records.get(control._accounting, str(admission["request_id"]))
     assert entry is not None
     assert entry.reserved_output_tokens_by_depth == (maximum,)
     assert isinstance(entry.request, GatewayRequest)
@@ -809,7 +848,7 @@ def test_omitted_cap_with_unknown_model_bounds_is_rejected_before_an_attempt(
     )
     with pytest.raises(NativeBridgeError, match="Supply an explicit max_tokens"):
         _admit(control, key, _chat_body())
-    with sqlite3.connect(manager.database_path) as connection:
+    with connect_sqlite(manager.database_path) as connection:
         assert connection.execute("select count(*) from gateway_attempts").fetchone() == (0,)
     body = json.loads(_chat_body())
     body["max_tokens"] = 128
@@ -820,7 +859,7 @@ def test_omitted_cap_with_unknown_model_bounds_is_rejected_before_an_attempt(
 
 @pytest.mark.parametrize("provider", ("anthropic", "openai-compatible"))
 def test_chat_omission_with_context_only_metadata_preserves_wire_authority(
-    tmp_path: Path, provider: str
+    admission_records: AdmissionRecords, tmp_path: Path, provider: str
 ) -> None:
     """Public Chat refuses to mistake a required provider's context for an output maximum."""
     manager, key = _configured_gateway(
@@ -832,11 +871,11 @@ def test_chat_omission_with_context_only_metadata_preserves_wire_authority(
     if provider == "anthropic":
         with pytest.raises(NativeBridgeError, match="no declared output maximum"):
             _admit(control, key, _chat_body())
-        with sqlite3.connect(manager.database_path) as connection:
+        with connect_sqlite(manager.database_path) as connection:
             assert connection.execute("select count(*) from gateway_attempts").fetchone() == (0,)
     else:
         admission = _admit(control, key, _chat_body())
-        entry = control._accounting.entry(str(admission["request_id"]))
+        entry = admission_records.get(control._accounting, str(admission["request_id"]))
         assert entry is not None
         assert entry.reserved_output_tokens_by_depth == (200_000,)
         assert "maximum_output_tokens" not in admission
@@ -1750,7 +1789,7 @@ def test_authenticated_child_reasoning_start_requires_fresh_host_authorization(
         "message": "'messages.reasoning_content' must be an authentic continuation for this route.",
         "retry_after_seconds": None,
     }
-    with sqlite3.connect(manager.database_path) as database:
+    with connect_sqlite(manager.database_path) as database:
         assert database.execute("SELECT count(*) FROM gateway_requests").fetchone() == (1,)
         assert database.execute("SELECT count(*) FROM gateway_attempts").fetchone() == (2,)
         assert database.execute(
@@ -1801,7 +1840,7 @@ def test_authenticated_child_reasoning_start_requires_fresh_host_authorization(
             }
         )
     )
-    with sqlite3.connect(manager.database_path) as database:
+    with connect_sqlite(manager.database_path) as database:
         assert database.execute("SELECT count(*) FROM gateway_attempts").fetchone() == (3,)
         assert database.execute(
             "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched','running')"
@@ -1999,7 +2038,7 @@ def test_carrier_whose_issuing_rung_left_the_route_drops_instead_of_refusing(
 def _attempt_route_reasons(control: NativeControlPlane, request_id: str) -> list[tuple[int, str]]:
     """Return each reserved attempt's ``(route_depth, route_reason)`` for one request."""
     ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         rows = connection.execute(
             "select route_depth, route_reason from gateway_attempts "
             "where request_id = ? order by attempt_ordinal",
@@ -2011,7 +2050,7 @@ def _attempt_route_reasons(control: NativeControlPlane, request_id: str) -> list
 def _attempt_dispatch_reasons(control: NativeControlPlane, request_id: str) -> list[str | None]:
     """Return each reserved attempt's ``dispatch_reason`` for one request, in order."""
     ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         rows = connection.execute(
             "select dispatch_reason from gateway_attempts where request_id = ? "
             "order by attempt_ordinal",
@@ -2381,7 +2420,7 @@ def test_local_admit_persists_route_context_in_the_attempt(tmp_path: Path) -> No
     admission = _admit_started(control, raw_key, _chat_body())
 
     ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         row = connection.execute(
             "select route_reason, fallback_reason from gateway_attempts where attempt_id = ?",
             (admission["attempt_id"],),
@@ -2410,7 +2449,7 @@ def test_admit_rejects_invalid_bodies_with_python_parity(tmp_path: Path) -> None
 
 def test_failed_settlement_keeps_the_attempt_retryable(tmp_path: Path) -> None:
     """A lost terminal write fences its organization, not readiness, and stays settleable."""
-    control, raw_key = _control_plane(tmp_path)
+    control, raw_key = _control_plane(tmp_path, background_recovery=False)
     admission = _admit_started(control, raw_key, _chat_body())
     settlement = json.dumps(
         {
@@ -2422,12 +2461,7 @@ def test_failed_settlement_keeps_the_attempt_retryable(tmp_path: Path) -> None:
             "failure": None,
         }
     )
-    ledger = control._components.ledger  # noqa: SLF001 - fault injection for the test.
-    with mock.patch.object(
-        ledger,
-        "apply_finish_attempt",
-        side_effect=RuntimeError("simulated terminal write loss"),
-    ):
+    with _blocked_terminal(control):
         with pytest.raises(NativeBridgeError):
             control.settle(settlement)
         # One organization's retained write never takes the worker out of rotation.
@@ -2480,38 +2514,35 @@ def test_bridge_writes_route_through_the_group_commit_writer(tmp_path: Path) -> 
     assert report["totals"]["input_tokens"] == 7
 
 
-def test_closed_writer_makes_settle_raise_and_keeps_the_entry_retryable(
-    tmp_path: Path,
-) -> None:
-    """A settle against a closed group-commit writer raises the sanitized
-    boundary error and retains the exact settlement for later replay."""
+def test_closed_python_writer_does_not_own_native_settlement(tmp_path: Path) -> None:
+    """Closing the legacy administration facade cannot disable the native serving ledger."""
     control, raw_key = _control_plane(tmp_path)
     admission = _admit_started(control, raw_key, _chat_body())
-    writer = control._components.write_ledger  # noqa: SLF001 - shutdown-ordering fault injection.
+    writer = control._components.write_ledger  # noqa: SLF001
     assert writer is not None
     writer.close()
-    settlement = json.dumps(
-        {
-            "request_id": admission["request_id"],
-            "attempt_id": admission["attempt_id"],
-            "outcome": "completed",
-            "usage": {"input_tokens": 4, "output_tokens": 1},
-            "tool_names": [],
-            "failure": None,
-        }
+    assert (
+        control.settle(
+            json.dumps(
+                {
+                    "request_id": admission["request_id"],
+                    "attempt_id": admission["attempt_id"],
+                    "outcome": "completed",
+                    "usage": {"input_tokens": 4, "output_tokens": 1},
+                }
+            )
+        )
+        == "{}"
     )
-    with pytest.raises(NativeBridgeError):
-        control.settle(settlement)
-    entry = control._accounting.entry(str(admission["request_id"]))  # noqa: SLF001
-    assert entry is not None
-    assert entry.pending_settlement is not None
-    assert entry.pending_settlement["outcome"] == "completed"
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["input_tokens"] == 4
+    assert not control._accounting.native.owns_request(str(admission["request_id"]))  # noqa: SLF001
 
 
 def test_sweep_replays_the_original_completed_settlement(tmp_path: Path) -> None:
     """A retained settlement lands its completed outcome and usage, never a
     downgraded cancellation."""
-    control, raw_key = _control_plane(tmp_path)
+    control, raw_key = _control_plane(tmp_path, background_recovery=False)
     admission = _admit_started(control, raw_key, _chat_body())
     settlement = json.dumps(
         {
@@ -2523,108 +2554,42 @@ def test_sweep_replays_the_original_completed_settlement(tmp_path: Path) -> None
             "failure": None,
         }
     )
-    ledger = control._components.ledger  # noqa: SLF001 - fault injection for the test.
-    with mock.patch.object(
-        ledger,
-        "apply_finish_attempt",
-        side_effect=RuntimeError("simulated terminal write loss"),
-    ):
+    with _blocked_terminal(control):
         with pytest.raises(NativeBridgeError):
             control.settle(settlement)
     control._accounting.sweep_expired()  # noqa: SLF001 - the timer normally drives this.
-    assert control._accounting.entry(str(admission["request_id"])) is None  # noqa: SLF001
+    assert not control._accounting.native.owns_request(str(admission["request_id"]))  # noqa: SLF001
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
     assert report["totals"]["input_tokens"] == 9
     assert report["totals"]["terminal_counts"] == [{"state": "completed", "attempts": 1}]
 
 
-@pytest.mark.parametrize("setup_elapsed", [0.0, 60.0])
-def test_abandoned_inflight_attempts_are_swept_after_the_deadline(
-    tmp_path: Path, setup_elapsed: float, request: pytest.FixtureRequest
-) -> None:
-    """Share one clock across authority, ledger and native deadlines, including late setup."""
-
-    class DeadlineClock:
-        """Advance both time domains together without changing shared system time or sleeping."""
-
-        elapsed = 0.0
-        epoch = datetime(2026, 9, 19, tzinfo=UTC)
-
-        def now(self) -> datetime:
-            """Return the deterministic wall time paired with the current monotonic instant."""
-            return self.epoch + timedelta(seconds=self.elapsed)
-
-        def monotonic(self) -> float:
-            """Use a distinct epoch so any accidental system-clock comparison fails immediately."""
-            return 100.0 + self.elapsed
-
-    clock = DeadlineClock()
-    manager, raw_key = _configured_gateway(tmp_path)
-    loaded = load_gateway_components(
-        tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+def test_abandoned_inflight_attempts_are_swept_after_the_native_deadline(tmp_path: Path) -> None:
+    """Native recovery observes its own monotonic deadline and preserves the original usage."""
+    control, raw_key = _control_plane(
+        tmp_path, request_timeout_seconds=0.5, background_recovery=False
     )
-    ledger = SQLiteAttemptLedger(manager.database_path, clock=clock)
-    writer = GroupCommitAttemptLedger(ledger)
-    request.addfinalizer(writer.close)
-    request.addfinalizer(loaded.write_ledger.close)
-    components = cast(
-        NativeGatewayComponents,
-        SimpleNamespace(
-            store=SQLiteGatewayStore(manager.database_path, clock=clock),
-            ledger=ledger,
-            write_ledger=writer,
-            routes=loaded.routes,
-            runtime_catalogs=loaded.runtime_catalogs,
-            organization_id=manager.organization_id,
-            reconciled_expired_requests=loaded.reconciled_expired_requests,
-            reconciled_unknown_attempts=loaded.reconciled_unknown_attempts,
-        ),
-    )
-    control = NativeControlPlane(components, request_timeout_seconds=0.01)
-    native_time = mock.Mock(wraps=time)
-    native_time.monotonic.side_effect = clock.monotonic
-    # Only these module references are replaced. SQLite auth and settlement use
-    # their constructor clock; shared timer, health and group-commit time stays real.
-    with (
-        mock.patch("exp.runtime.gateway.native_bridge.time", native_time),
-        mock.patch("exp.runtime.gateway.native_accounting.time", native_time),
-        mock.patch("exp.runtime.gateway.native_accounting_recovery.time", native_time),
-        mock.patch("exp.runtime.gateway.native_accounting_recovery._SWEEP_GRACE_SECONDS", 0.0),
-    ):
-        clock.elapsed += setup_elapsed
-        abandoned = _admit_started(control, raw_key, _chat_body())
-        request_id = str(abandoned["request_id"])
-        entry = control._accounting.entry(request_id)  # noqa: SLF001
-        assert entry is not None and entry.active_attempt_id == abandoned["attempt_id"]
-        assert clock.monotonic() < entry.deadline_monotonic
-        clock.elapsed += 0.009
-        control._accounting.sweep_expired()  # noqa: SLF001
-        assert control._accounting.entry(request_id) is entry  # noqa: SLF001
-        clock.elapsed += 0.002 + setup_elapsed
-        assert clock.monotonic() > entry.deadline_monotonic
-        second = _admit(control, raw_key, _chat_body())
-        # Admission does not sweep another request on its critical path.
-        assert control._accounting.entry(request_id) is entry  # noqa: SLF001
-        control._accounting.sweep_expired()  # noqa: SLF001 - the timer drives recovery.
-        assert control._accounting.entry(request_id) is None  # noqa: SLF001
-        assert control._accounting.entry(str(second["request_id"])) is not None  # noqa: SLF001
-        control._accounting.sweep_expired()  # noqa: SLF001
-        report = json.loads(control.usage_json("{}"))
-        assert report["totals"]["requests"] == 2
-        assert report["totals"]["terminal_counts"] == [{"state": "cancelled", "attempts": 1}]
-        metrics = control.metrics_snapshot()["control_plane"]
-        assert isinstance(metrics, dict)
-        assert metrics["sweep_abandoned_attempts_cancelled"] == 1
-        with sqlite3.connect(manager.database_path) as connection:
-            rows = connection.execute(
-                "SELECT accepted_at,deadline_at FROM gateway_requests ORDER BY accepted_at"
-            ).fetchall()
-        assert len(rows) == 2
-        for accepted_at, deadline_at in rows:
-            assert (datetime.fromisoformat(deadline_at) - datetime.fromisoformat(accepted_at)) == (
-                timedelta(milliseconds=10)
-            )
+    admitted = _admit_started(control, raw_key, _chat_body())
+    request_id = str(admitted["request_id"])
+    owner = control._accounting  # noqa: SLF001
+    owner.sweep_expired()
+    assert owner.native.owns_request(request_id)
+    time.sleep(5.6)  # The native deadline includes a five-second transport cleanup grace.
+    owner.sweep_expired()
+    assert not owner.native.owns_request(request_id)
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["terminal_counts"] == [{"state": "failed", "attempts": 1}]
+    metrics = control.metrics_snapshot()["control_plane"]
+    assert isinstance(metrics, dict)
+    assert metrics["sweep_abandoned_attempts_cancelled"] == 1
+    ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
+    with connect_sqlite(ledger.database_path) as connection:
+        accepted, deadline = connection.execute(
+            "SELECT accepted_at,deadline_at FROM gateway_requests"
+        ).fetchone()
+    remaining = datetime.fromisoformat(deadline) - datetime.fromisoformat(accepted)
+    assert timedelta(0) < remaining <= timedelta(milliseconds=500)
 
 
 def test_admit_sends_adaptive_thinking_to_a_reasoning_bedrock_claude_rung(
@@ -2912,7 +2877,9 @@ def test_admit_serves_bedrock_natively_with_a_signed_frozen_body(
         assert authorization.startswith(f"AWS4-HMAC-SHA256 Credential={expected_key}/")
         assert "/us-east-1/bedrock/aws4_request" in authorization
         if auth_mode == "ambient_pair":
-            assert headers["X-Amz-Security-Token"] == "session-token-canary"
+            assert {key.lower(): value for key, value in headers.items()}[
+                "x-amz-security-token"
+            ] == "session-token-canary"
     for secret in (
         "sigv4-secret-canary",
         "ambient-bearer-canary",
@@ -3215,7 +3182,11 @@ def _pool_control_plane(
 @pytest.mark.parametrize("staged", [False, True])
 @pytest.mark.parametrize("native_root", [False, True])
 def test_responses_native_tools_use_released_adaptation_on_stage_and_root_wires(
-    tmp_path: Path, staged: bool, native_root: bool, monkeypatch: pytest.MonkeyPatch
+    admission_records: AdmissionRecords,
+    tmp_path: Path,
+    staged: bool,
+    native_root: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Actual admission freezes tool inversion alongside unchanged stage and replay authority."""
 
@@ -3300,7 +3271,7 @@ def test_responses_native_tools_use_released_adaptation_on_stage_and_root_wires(
     canonical = decode_responses(body).request
     digest = canonical_request_sha256(canonical)
     admission = _admit(control, raw_key, json.dumps(body), surface="responses")
-    entry = control._accounting.entry(str(admission["request_id"]))
+    entry = admission_records.get(control._accounting, str(admission["request_id"]))
     assert entry is not None
     assert entry.authorization.canonical_request_sha256 == digest
     assert canonical_request_sha256(canonical) == digest
@@ -3348,12 +3319,12 @@ def test_admit_returns_the_full_ordered_route_without_starting_attempts(
     assert first["upstream_payload"] != second["upstream_payload"]
 
     ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         assert connection.execute("select count(*) from gateway_attempts").fetchone() == (0,)
 
     started = _start_first(control, admission)
     assert started["route_depth"] == 0
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         rows = connection.execute(
             "select attempt_ordinal, route_depth, state from gateway_attempts"
         ).fetchall()
@@ -3698,6 +3669,7 @@ def _openai_responses_pool_control_plane(
 
 @pytest.mark.parametrize("rotated_beta", (None, "beta-secret-rotated"))
 def test_encrypted_reasoning_pins_winning_fallback_and_rejects_credential_drift(
+    admission_records: AdmissionRecords,
     tmp_path: Path,
     rotated_beta: str | None,
     monkeypatch: pytest.MonkeyPatch,
@@ -3746,7 +3718,7 @@ def test_encrypted_reasoning_pins_winning_fallback_and_rejects_credential_drift(
         )
     )
     assert fallback["route_depth"] == 1
-    entry = control._accounting.entry(_admitted_request_id(first))  # noqa: SLF001
+    entry = admission_records.get(control._accounting, _admitted_request_id(first))  # noqa: SLF001
     assert entry is not None and entry.continuation is not None
     namespace = entry.continuation.namespace
     control.remember(
@@ -3815,10 +3787,16 @@ def test_encrypted_reasoning_pins_winning_fallback_and_rejects_credential_drift(
         failure: GatewayFailure,
         *,
         web_search_requests: int = 0,
+        input_session: GuardrailSession | None = None,
     ) -> bool:
-        """Record the verdict while preserving the complete current meter contract."""
+        """Record the verdict while retaining metering and input observations."""
         recorded.append(failure)
-        return original_finish(authorization, failure, web_search_requests=web_search_requests)
+        return original_finish(
+            authorization,
+            failure,
+            web_search_requests=web_search_requests,
+            input_session=input_session,
+        )
 
     monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture_finish)  # noqa: SLF001
     with pytest.raises(NativeBridgeError) as rejected:
@@ -3857,10 +3835,16 @@ def test_admission_maps_a_route_build_failure_to_a_retryable_unavailable(
         failure: GatewayFailure,
         *,
         web_search_requests: int = 0,
+        input_session: GuardrailSession | None = None,
     ) -> bool:
-        """Record the verdict while preserving the complete current meter contract."""
+        """Record the verdict while retaining metering and input observations."""
         recorded.append(failure)
-        return original_finish(authorization, failure, web_search_requests=web_search_requests)
+        return original_finish(
+            authorization,
+            failure,
+            web_search_requests=web_search_requests,
+            input_session=input_session,
+        )
 
     monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture)  # noqa: SLF001
 
@@ -3896,10 +3880,7 @@ def test_admit_skips_a_dead_lead_rung_and_serves_the_fallback(tmp_path: Path) ->
     # The skip fed the SAME deployment health circuit runtime failures feed:
     # exactly the dead lead's circuit is open (a cooldown, never a blacklist),
     # and admission never claims the fallback so no other circuit was touched.
-    states = control._accounting.health._states  # noqa: SLF001 - assert the circuit state.
-    assert len(states) == 1
-    (dead_state,) = states.values()
-    assert dead_state.open_until > time.monotonic()
+    assert control._accounting.health.state.native is control._accounting.native  # noqa: SLF001
 
     # The narrowed route is what serves and anchors accounting.
     started = _start_first(control, admission)
@@ -3940,10 +3921,16 @@ def test_admit_escalates_when_every_rung_is_dead(
         failure: GatewayFailure,
         *,
         web_search_requests: int = 0,
+        input_session: GuardrailSession | None = None,
     ) -> bool:
-        """Record the verdict while preserving the complete current meter contract."""
+        """Record the verdict while retaining metering and input observations."""
         recorded.append(failure)
-        return original_finish(authorization, failure, web_search_requests=web_search_requests)
+        return original_finish(
+            authorization,
+            failure,
+            web_search_requests=web_search_requests,
+            input_session=input_session,
+        )
 
     monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture)  # noqa: SLF001
 
@@ -4087,7 +4074,7 @@ def test_pool_failover_records_ordinals_depths_and_one_finalize(tmp_path: Path) 
         == "{}"
     )
     ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         rows = connection.execute(
             "select attempt_ordinal, route_depth, state"
             " from gateway_attempts order by attempt_ordinal"
@@ -4255,29 +4242,37 @@ def test_admit_rejects_an_ungranted_alias(tmp_path: Path) -> None:
     assert payload["code"] == "model_not_granted"
 
 
-def test_budget_rejection_uses_host_error_factory(tmp_path: Path) -> None:
-    """Hosted policy can refine a quota rejection without moving accounting."""
-    control, raw_key = _control_plane(tmp_path)
-    customized = NativeBridgeError(
-        OpenAIProtocolError(
-            status_code=429,
-            code="email_unverified",
-            message="verify your email",
-            error_type="insufficient_quota",
-        )
+def test_native_budget_rejection_preserves_the_public_error_and_releases_admission(
+    tmp_path: Path,
+) -> None:
+    """A real local quota rejection needs no Python error or settlement callback."""
+    _, raw_key = _configured_gateway(
+        tmp_path,
+        billing_source=BillingSource.HOST_MANAGED,
+        prices=GatewayTokenPrices(
+            input_nano_usd_per_million_tokens=1_000_000_000,
+            output_nano_usd_per_million_tokens=1_000_000_000,
+        ),
     )
-    control._accounting._budget_error_factory = lambda key: customized  # noqa: SLF001
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"})
+    )
+    ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
+    SQLiteBudgetStore(ledger.database_path).set_limit(
+        organization_id=control._components.organization_id,  # noqa: SLF001
+        period=datetime.now(UTC).strftime("%Y-%m"),
+        scope=BudgetScope(kind=BudgetScopeKind.TEAM),
+        limit_nano_usd=0,
+    )
     admission = _admit(control, raw_key, _chat_body())
-    with mock.patch.object(
-        control._write_ledger,  # noqa: SLF001
-        "start_attempt",
-        side_effect=BudgetReservationRejected(scope_kind=BudgetScopeKind.TEAM, reason="blocked"),
-    ):
-        with pytest.raises(NativeBridgeError) as excinfo:
-            _start_first(control, admission)
-    assert excinfo.value is customized
-    # The rejected request is finalized with no attempt row remaining open.
-    assert control._accounting.entry(str(admission["request_id"])) is None  # noqa: SLF001
+    with pytest.raises(NativeBridgeError) as rejected:
+        _start_first(control, admission)
+    failure = json.loads(rejected.value.public_error_json)
+    assert failure["status_code"] == 429
+    assert failure["error_type"] == "insufficient_quota"
+    assert not control._accounting.native.owns_request(str(admission["request_id"]))  # noqa: SLF001
+    with connect_sqlite(ledger.database_path) as connection:
+        assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone() == (0,)
 
 
 def test_authenticate_rejects_an_invalid_key(tmp_path: Path) -> None:
@@ -4414,7 +4409,7 @@ def test_metrics_expose_actual_observation_sink_failures_and_saturation(
 
 def test_metrics_snapshot_counts_a_replayed_retained_settlement(tmp_path: Path) -> None:
     """A sweep that lands a retained settlement moves the recovery counter."""
-    control, raw_key = _control_plane(tmp_path)
+    control, raw_key = _control_plane(tmp_path, background_recovery=False)
     admission = _admit_started(control, raw_key, _chat_body())
     settlement = json.dumps(
         {
@@ -4426,12 +4421,7 @@ def test_metrics_snapshot_counts_a_replayed_retained_settlement(tmp_path: Path) 
             "failure": None,
         }
     )
-    ledger = control._components.ledger  # noqa: SLF001 - fault injection for the test.
-    with mock.patch.object(
-        ledger,
-        "apply_finish_attempt",
-        side_effect=RuntimeError("simulated terminal write loss"),
-    ):
+    with _blocked_terminal(control):
         with pytest.raises(NativeBridgeError):
             control.settle(settlement)
     control._accounting.sweep_expired()  # noqa: SLF001 - the timer normally drives this.
@@ -4449,11 +4439,12 @@ def test_metrics_snapshot_counts_a_swept_abandoned_attempt(tmp_path: Path) -> No
     """An abandoned admission closed by the sweep moves the cancellation counter."""
     # The deadline must outlast admission itself (a 10 ms budget raced local
     # snapshot preparation on a loaded CI runner) and then lapse before the sweep.
-    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.5)
+    control, raw_key = _control_plane(
+        tmp_path, request_timeout_seconds=0.5, background_recovery=False
+    )
     _admit(control, raw_key, _chat_body())
-    time.sleep(0.6)
-    with mock.patch("exp.runtime.gateway.native_accounting_recovery._SWEEP_GRACE_SECONDS", 0.0):
-        control._accounting.sweep_expired()  # noqa: SLF001 - the timer normally drives this.
+    time.sleep(5.6)
+    control._accounting.sweep_expired()  # noqa: SLF001 - the timer normally drives this.
 
     snapshot = control.metrics_snapshot()
 
@@ -4775,44 +4766,6 @@ def _settle_one_completed_chat(control: NativeControlPlane, raw_key: str) -> Non
         )
     )
     assert settled == "{}"
-
-
-def test_cache_sample_gate_reaches_accounting_through_the_control_plane(tmp_path: Path) -> None:
-    """A hosted gate forwarded at construction vets settled cache samples.
-
-    The hosted composition builds only ``NativeControlPlane``, never the
-    accounting registry directly, so the gate must ride the control plane's
-    constructor; a dropped kwarg would silently let promo-funded replay feed
-    the cache-priority EWMA.
-    """
-    gated: list[str] = []
-
-    def _gate(attempt_id: str) -> bool:
-        """Record the consulted attempt and veto its sample."""
-        gated.append(attempt_id)
-        return False
-
-    _manager, raw_key = _configured_gateway(tmp_path)
-    components = load_gateway_components(
-        tmp_path,
-        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
-    )
-    control = NativeControlPlane(components, cache_sample_gate=_gate)
-    admission = _admit_started(control, raw_key, _chat_body())
-    settled = control.settle(
-        json.dumps(
-            {
-                "request_id": admission["request_id"],
-                "attempt_id": admission["attempt_id"],
-                "outcome": "completed",
-                "usage": {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 2},
-                "tool_names": [],
-                "failure": None,
-            }
-        )
-    )
-    assert settled == "{}"
-    assert gated == [admission["attempt_id"]]
 
 
 def test_usage_callbacks_scope_reports_to_the_presented_key(tmp_path: Path) -> None:
@@ -5396,7 +5349,9 @@ def test_responses_tool_call_retention_survives_continuation(tmp_path: Path) -> 
     assert first_call["function"] == {"name": "search", "arguments": '{"q":"x"}'}
 
 
-def test_fireworks_multihop_responses_retention_stays_sealed(tmp_path: Path) -> None:
+def test_fireworks_multihop_responses_retention_stays_sealed(
+    admission_records: AdmissionRecords, tmp_path: Path
+) -> None:
     """Executing a retained carrier never stores its decrypted plaintext copy."""
     _manager, raw_key = _configured_gateway(
         tmp_path,
@@ -5471,7 +5426,7 @@ def test_fireworks_multihop_responses_retention_stays_sealed(tmp_path: Path) -> 
         )
         == "{}"
     )
-    accounting = control._accounting.entry(_admitted_request_id(second))  # noqa: SLF001
+    accounting = admission_records.get(control._accounting, _admitted_request_id(second))  # noqa: SLF001
     assert accounting is not None and accounting.continuation is not None
     retained = control._continuations.resolve_now(  # noqa: SLF001
         namespace=accounting.continuation.namespace,
@@ -5621,7 +5576,6 @@ def test_project_alias_embedding_failure_serves_the_frozen_baseline_natively(
     the frozen conservative baseline serves the request with content-free
     accounting instead of failing the admission.
     """
-    import sqlite3
 
     manager, control, raw_key = _project_control_plane(tmp_path)
     body = json.dumps(
@@ -5654,7 +5608,7 @@ def test_project_alias_embedding_failure_serves_the_frozen_baseline_natively(
     )
     report = json.loads(control.usage_json("{}"))
     assert report["totals"]["requests"] == 1
-    with sqlite3.connect(manager.database_path) as connection:
+    with connect_sqlite(manager.database_path) as connection:
         rows = connection.execute(
             """
             SELECT route_reason, fallback_reason, exact_model_id, state, content_retained
@@ -5847,7 +5801,7 @@ def test_admit_persists_caller_app_identity_for_attribution(tmp_path: Path) -> N
     admission = _flatten_started(control, admission)
 
     ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         row = connection.execute(
             """
             SELECT r.app_referer, r.app_title
@@ -5877,7 +5831,7 @@ def test_admit_classifies_and_persists_the_calling_app(tmp_path: Path) -> None:
         attempt_ids[label] = str(_flatten_started(control, admission)["attempt_id"])
 
     ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         rows = {
             label: connection.execute(
                 """
@@ -6096,7 +6050,9 @@ def test_encrypted_content_bytes_survive_the_responses_encoder_exactly() -> None
     assert reasoning_items[0]["encrypted_content"].encode() == encrypted.encode()
 
 
-def test_keyed_store_false_never_reaches_the_continuation_store(tmp_path: Path) -> None:
+def test_keyed_store_false_never_reaches_the_continuation_store(
+    admission_records: AdmissionRecords, tmp_path: Path
+) -> None:
     """An Idempotency-Key on a store:false request opens no side door into
     continuation state: the retention callback stays a no-op, the response ID
     resolves to previous_response_not_found in its own namespace, and keyed
@@ -6131,9 +6087,7 @@ def test_keyed_store_false_never_reaches_the_continuation_store(tmp_path: Path) 
     )
     response_id = stable_public_id("resp", _admitted_request_id(admission))
     # Direct store probe in the exact tenant namespace: nothing was retained.
-    entry = control._accounting.entry(  # noqa: SLF001 - namespace extraction for the probe.
-        _admitted_request_id(admission)
-    )
+    entry = admission_records.get(control._accounting, _admitted_request_id(admission))
     assert entry is not None and entry.continuation is not None
     assert entry.continuation.retain is False
     with pytest.raises(OpenAIProtocolError) as direct:
@@ -6238,10 +6192,16 @@ def test_capability_rejection_names_the_public_request_field(
         failure: GatewayFailure,
         *,
         web_search_requests: int = 0,
+        input_session: GuardrailSession | None = None,
     ) -> bool:
-        """Record the verdict while preserving the complete current meter contract."""
+        """Record the verdict while retaining metering and input observations."""
         recorded.append(failure)
-        return original_finish(authorization, failure, web_search_requests=web_search_requests)
+        return original_finish(
+            authorization,
+            failure,
+            web_search_requests=web_search_requests,
+            input_session=input_session,
+        )
 
     monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture_finish)  # noqa: SLF001
     body = json.dumps(
@@ -6711,7 +6671,6 @@ def test_affinity_pool_routes_each_session_deterministically(tmp_path: Path) -> 
     by fingerprint), the 6x-weighted rung carries the clear majority, and the
     reserved first dispatch lands durable ``dispatch_reason='affinity'``.
     """
-    import sqlite3
 
     control, raw_key, database_path = _affinity_pool_control_plane(tmp_path)
     body = json.dumps({"model": "coding", "messages": [{"role": "user", "content": "hi"}]})
@@ -6731,7 +6690,7 @@ def test_affinity_pool_routes_each_session_deterministically(tmp_path: Path) -> 
     admission = _admit(control, raw_key, body, client_request_id="session-disclosed")
     started = _start_first(control, admission)
     assert started["route_depth"] == 0
-    with sqlite3.connect(database_path) as connection:
+    with connect_sqlite(database_path) as connection:
         row = connection.execute(
             "SELECT dispatch_reason, preferred_deployment_id FROM gateway_attempts"
             " WHERE attempt_id = ?",
@@ -6743,7 +6702,11 @@ def test_affinity_pool_routes_each_session_deterministically(tmp_path: Path) -> 
 @pytest.mark.parametrize("trial", [False, True], ids=["retained", "trial"])
 @pytest.mark.parametrize("known_region", [False, True], ids=["unknown-region", "known-region"])
 def test_bridge_carries_scoped_verified_warmth_to_registered_request(
-    tmp_path: Path, trial: bool, known_region: bool, monkeypatch: pytest.MonkeyPatch
+    admission_records: AdmissionRecords,
+    tmp_path: Path,
+    trial: bool,
+    known_region: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Real admission preserves proven warmth but unknown geography only serves normally."""
 
@@ -6766,7 +6729,7 @@ def test_bridge_carries_scoped_verified_warmth_to_registered_request(
     accounting.recovery_host = host
     body = _chat_body()
     initial = _admit(control, raw_key, body, client_request_id="warm-session")
-    original = accounting.entry(str(initial["request_id"]))
+    original = admission_records.get(accounting, str(initial["request_id"]))
     assert original is not None
     key = session_cache_key(original)
     assert key is not None
@@ -6784,7 +6747,7 @@ def test_bridge_carries_scoped_verified_warmth_to_registered_request(
             sticky_seconds=60,
         )
         admission = _admit(control, raw_key, body, client_request_id="warm-session")
-        entry = accounting.entry(str(admission["request_id"]))
+        entry = admission_records.get(accounting, str(admission["request_id"]))
         assert entry is not None and entry.recovery_scoped
         assert entry.route.deployments == original.route.deployments
         assert not entry.recovery_bindings
@@ -6815,7 +6778,7 @@ def test_bridge_carries_scoped_verified_warmth_to_registered_request(
         # Expire only the registry's local trial cooldown, not cache evidence.
         accounting.recovery._clock = lambda: time.time() + 6  # noqa: SLF001
     admission = _admit(control, raw_key, body, client_request_id="warm-session")
-    entry = accounting.entry(str(admission["request_id"]))
+    entry = admission_records.get(accounting, str(admission["request_id"]))
     assert entry is not None and entry.recovery_scoped
     expected = lead if trial else fallback
     assert entry.route.deployment == expected
@@ -6831,6 +6794,7 @@ def test_bridge_carries_scoped_verified_warmth_to_registered_request(
 
 
 def test_mutable_host_scope_without_atomic_credential_receipt_cannot_recover(
+    admission_records: AdmissionRecords,
     tmp_path: Path,
 ) -> None:
     """An uninstrumented environment serves normally but cannot borrow fabricated warmth."""
@@ -6839,7 +6803,7 @@ def test_mutable_host_scope_without_atomic_credential_receipt_cannot_recover(
     host = Host()
     accounting.recovery_host = host
     first = _admit(control, raw_key, _chat_body(), client_request_id="unbound-session")
-    entry = accounting.entry(str(first["request_id"]))
+    entry = admission_records.get(accounting, str(first["request_id"]))
     assert entry is not None
     assert not entry.recovery_bindings
     key = session_cache_key(entry)
@@ -6855,7 +6819,7 @@ def test_mutable_host_scope_without_atomic_credential_receipt_cannot_recover(
         sticky_seconds=60,
     )
     second = _admit(control, raw_key, _chat_body(), client_request_id="unbound-session")
-    next_entry = accounting.entry(str(second["request_id"]))
+    next_entry = admission_records.get(accounting, str(second["request_id"]))
     assert next_entry is not None
     assert next_entry.route.deployment == entry.route.deployment
     assert next_entry.verified_warm_deployment_id is None and next_entry.recovery_reason is None

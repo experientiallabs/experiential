@@ -119,6 +119,11 @@ _CONTROL_PLANE_COUNTERS: tuple[tuple[str, str], ...] = (
         "observation_recording_failed",
         "Observation sink calls that failed.",
     ),
+    ("moderation_samples", "Native moderation observations across all checks."),
+    ("classifier_cache_hits", "Native decision-model results served from cache."),
+    ("classifier_cache_misses", "Native decision-model calls not served from cache."),
+    ("classifier_errors", "Native decision-model calls without a valid score."),
+    ("classifier_latency_seconds", "Decision-model time excluding cache hits."),
 )
 
 

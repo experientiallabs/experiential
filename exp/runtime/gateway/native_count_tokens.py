@@ -20,10 +20,8 @@ import json
 
 from exp.runtime.gateway.attempt_tokens import counted_input_tokens
 from exp.runtime.gateway.discovery import require_granted_authority
-from exp.runtime.gateway.native_accounting import NativeBridgeError
-from exp.runtime.gateway.native_accounting import (
-    authority_error as _authority_error,
-)
+from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
+from exp.runtime.gateway.native_accounting_errors import authority_error as _authority_error
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_count_tokens_body
 from exp.runtime.gateway.native_settlement import optional_text

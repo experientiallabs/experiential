@@ -268,7 +268,7 @@ pub(crate) fn remember_argument(
         "reasoning_content_carrier": reasoning_content_carrier,
         "hosted_items": retention.hosted.iter().map(|(output_index, hosted)| json!({
             "output_index": output_index,
-            "item": serde_json::from_str::<Value>(&hosted.item).unwrap_or(Value::Null),
+            "item": crate::lossless_json::from_str::<Value>(&hosted.item).unwrap_or(Value::Null),
         })).collect::<Vec<Value>>(),
         "encrypted_reasoning": retention.reasoning.iter()
             .filter(|(_, reasoning)| !reasoning.encrypted_content.is_empty())
@@ -430,7 +430,7 @@ mod tests {
             retention.track(event);
         }
         let payload: Value =
-            serde_json::from_str(&remember_argument("request-1", &retention, None))
+            crate::lossless_json::from_str(&remember_argument("request-1", &retention, None))
                 .expect("retention payload is JSON");
         assert_eq!(payload["encrypted_reasoning"][0]["status"], "incomplete");
         assert_eq!(payload["message_outputs"][0]["status"], "incomplete");
@@ -465,7 +465,7 @@ mod tests {
             retention.track(event);
         }
         let payload: Value =
-            serde_json::from_str(&remember_argument("request-ns", &retention, None))
+            crate::lossless_json::from_str(&remember_argument("request-ns", &retention, None))
                 .expect("retention payload is JSON");
         assert_eq!(payload["tool_calls"][0]["namespace"], "collaboration");
         assert_eq!(payload["tool_calls"][0]["name"], "spawn_agent");
@@ -497,7 +497,7 @@ mod tests {
             retention.track(event);
         }
         let payload: Value =
-            serde_json::from_str(&remember_argument("request-sig", &retention, None))
+            crate::lossless_json::from_str(&remember_argument("request-sig", &retention, None))
                 .expect("retention payload is JSON");
         assert_eq!(
             payload["tool_calls"][0]["thought_signature"],
@@ -543,7 +543,7 @@ mod tests {
             retention.track(event);
         }
         let payload: Value =
-            serde_json::from_str(&remember_argument("request-ws", &retention, None))
+            crate::lossless_json::from_str(&remember_argument("request-ws", &retention, None))
                 .expect("retention payload is JSON");
         assert_eq!(payload["hosted_items"][0]["output_index"], 0);
         // The done-frame item (not the added one) is what a continuation replays.
@@ -575,7 +575,7 @@ mod tests {
             retention.track(event);
         }
         let payload: Value =
-            serde_json::from_str(&remember_argument("request-caller", &retention, None))
+            crate::lossless_json::from_str(&remember_argument("request-caller", &retention, None))
                 .expect("retention payload is JSON");
         assert_eq!(payload["tool_calls"][0]["caller"]["id"], "prog_1");
         assert_eq!(payload["tool_calls"][0]["caller"]["type"], "program");
@@ -606,7 +606,7 @@ mod tests {
         }
 
         let payload: Value =
-            serde_json::from_str(&remember_argument("request-1", &retention, None))
+            crate::lossless_json::from_str(&remember_argument("request-1", &retention, None))
                 .expect("retention payload is JSON");
         assert_eq!(payload["message_outputs"][0]["item_id"], "msg-empty");
         assert_eq!(payload["message_outputs"][0]["text"], "");

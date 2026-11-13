@@ -35,7 +35,8 @@ fn upstream_results(stream: &str) -> Value {
         .lines()
         .find(|line| line.starts_with("data: ") && line.contains("\"message_delta\""))
         .expect("capture has a message_delta");
-    let payload: Value = serde_json::from_str(&line["data: ".len()..]).expect("JSON frame");
+    let payload: Value =
+        crate::lossless_json::from_str(&line["data: ".len()..]).expect("JSON frame");
     payload["delta"]["safeguard_results"].clone()
 }
 
@@ -60,7 +61,7 @@ fn frame_payload(frames: &[String], name: &str) -> Value {
         .lines()
         .find_map(|line| line.strip_prefix("data: "))
         .expect("frame data");
-    serde_json::from_str(data).expect("JSON frame")
+    crate::lossless_json::from_str(data).expect("JSON frame")
 }
 
 #[test]
@@ -105,7 +106,7 @@ fn an_upstream_without_safeguard_results_adds_no_key() {
         .lines()
         .map(|line| match line.strip_prefix("data: ") {
             Some(data) if data.contains("\"message_delta\"") => {
-                let mut payload: Value = serde_json::from_str(data).unwrap();
+                let mut payload: Value = crate::lossless_json::from_str(data).unwrap();
                 payload["delta"]
                     .as_object_mut()
                     .unwrap()

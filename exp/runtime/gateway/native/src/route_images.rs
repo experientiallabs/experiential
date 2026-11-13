@@ -173,7 +173,7 @@ pub(crate) async fn serve_images(
         Ok(text) => text,
         Err(error) => return error_response(&error),
     };
-    let admission_value: Value = match serde_json::from_str(&admission_text) {
+    let admission_value: Value = match crate::lossless_json::from_str(&admission_text) {
         Ok(value) => value,
         Err(_) => return error_response(&PublicError::internal()),
     };
@@ -181,7 +181,14 @@ pub(crate) async fn serve_images(
         METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
         return error_response(&escalation_error(reason.as_str().unwrap_or_default()));
     }
-    let admission: ImagesAdmission = match serde_json::from_value(admission_value.clone()) {
+    let bound_state = match crate::admission::bind_owner(state, &admission_value) {
+        Ok(state) => state,
+        Err(error) => return error_response(&error),
+    };
+    let state = &bound_state;
+
+    let admission: ImagesAdmission = match crate::lossless_json::from_value(admission_value.clone())
+    {
         Ok(admission) => admission,
         Err(_) => return wire_drift_response(state, &admission_value, started).await,
     };
@@ -250,7 +257,7 @@ async fn run_ladder(
                 return Err(error);
             }
         };
-        let started: StartResponse = match serde_json::from_str(&started_text) {
+        let started: StartResponse = match crate::lossless_json::from_str(&started_text) {
             Ok(started) => started,
             Err(_) => {
                 guard
@@ -410,7 +417,7 @@ async fn dispatch(
     let bytes = read_bounded_body(response, deadline, phase_timeout)
         .await
         .map_err(|failure| (failure, true))?;
-    let payload: Value = match serde_json::from_slice(&bytes) {
+    let payload: Value = match crate::lossless_json::from_slice(&bytes) {
         Ok(payload) => payload,
         Err(_) => return Err((malformed("images response is not JSON"), true)),
     };
@@ -885,7 +892,7 @@ mod tests {
 
     #[test]
     fn admission_wire_shapes_default_to_the_openai_answer() {
-        let without: ImagesAdmission = serde_json::from_value(json!({
+        let without: ImagesAdmission = crate::lossless_json::from_value(json!({
             "request_id": "r", "alias": "a", "alias_revision_id": "v",
             "exact_model_id": "m", "route_reason": "direct", "route": [],
             "image_count": 1, "maximum_total_attempts": 1,
@@ -893,7 +900,7 @@ mod tests {
         }))
         .expect("older admission shape");
         assert!(without.wire_shapes.is_empty());
-        let with: ImagesAdmission = serde_json::from_value(json!({
+        let with: ImagesAdmission = crate::lossless_json::from_value(json!({
             "request_id": "r", "alias": "a", "alias_revision_id": "v",
             "exact_model_id": "m", "route_reason": "direct", "route": [],
             "image_count": 1, "maximum_total_attempts": 1,

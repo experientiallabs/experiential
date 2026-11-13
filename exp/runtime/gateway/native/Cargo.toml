@@ -1,6 +1,6 @@
 [package]
 name = "exp-gateway-native"
-version = "0.3.188"
+version = "0.3.189"
 edition = "2021"
 description = "Rust data plane for the Experiential local gateway (PoC), embedded as a PyO3 extension."
 license = "Apache-2.0"
@@ -15,6 +15,8 @@ crate-type = ["cdylib", "rlib"]
 # host libpython; the shipped wheel keeps the extension-module link mode.
 default = ["extension-module"]
 extension-module = ["pyo3/extension-module"]
+# Native authority fixture for integration tests. Release wheels never enable this.
+test-support = []
 
 [dependencies]
 pyo3 = { version = "0.29", features = ["abi3-py312"] }
@@ -32,13 +34,30 @@ futures-util = "0.3"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value", "float_roundtrip", "arbitrary_precision"] }
+indexmap = { version = "2", features = ["serde"] }
+hashlink = "0.11"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
+tiktoken-rs = { version = "0.12.1", default-features = false }
 sha2 = "0.10"
+ring = "0.17"
+aws-config = "1.13"
+aws-credential-types = "1.2"
+aws-types = "1.3"
 # Demux-only (no decoding): measures an uploaded audio file's duration from its
 # codec frame lengths so a transcription reservation bounds what the provider meters.
 symphonia = { version = "0.6.1", default-features = false, features = ["wav", "ogg", "mkv", "isomp4", "mp3", "flac", "id3v2"] }
 thiserror = "2"
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
+regex-syntax = "0.8.11"
+jsonschema = { version = "0.58.3", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
 
 [profile.release]
 lto = "thin"

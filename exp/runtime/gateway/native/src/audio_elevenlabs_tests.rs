@@ -33,7 +33,7 @@ fn json_bills_audio_duration_and_carries_an_openai_duration_usage() {
     let (body, content_type, usage) =
         elevenlabs_transcription(answer(), None, seconds_meter).expect("valid");
     assert_eq!(content_type, "application/json");
-    let rendered: Value = serde_json::from_slice(&body).expect("json");
+    let rendered: Value = crate::lossless_json::from_slice(&body).expect("json");
     assert_eq!(
         rendered,
         json!({"text": "Hello there.", "usage": {"type": "duration", "seconds": 2.25}})
@@ -49,7 +49,7 @@ fn text_and_verbose_json_render_from_the_one_answer() {
     assert!(content_type.starts_with("text/plain"));
     let (verbose, _, _) =
         elevenlabs_transcription(answer(), Some("verbose_json"), seconds_meter).expect("valid");
-    let rendered: Value = serde_json::from_slice(&verbose).expect("json");
+    let rendered: Value = crate::lossless_json::from_slice(&verbose).expect("json");
     assert_eq!(rendered["task"], "transcribe");
     assert_eq!(rendered["language"], "eng");
     assert_eq!(rendered["duration"], 2.25);

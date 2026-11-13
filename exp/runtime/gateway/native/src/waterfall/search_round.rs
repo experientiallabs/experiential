@@ -57,7 +57,7 @@ pub(super) async fn negotiate(
     // the searches are never lost to an attempt-less abandon.
     let argument = round_argument(ctx.request_id, depth, round, calls, usage);
     let reply: Option<RoundReply> = match ctx.bridge.call("tool_search_round", argument).await {
-        Ok(text) => serde_json::from_str(&text).ok(),
+        Ok(text) => crate::lossless_json::from_str(&text).ok(),
         Err(_) => None,
     };
     let Some(reply) = reply else {

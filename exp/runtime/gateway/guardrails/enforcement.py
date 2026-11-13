@@ -7,7 +7,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from hashlib import sha256
 
-from exp.common.core.artifacts import canonical_json_bytes
+from exp.common.core.artifacts import JsonObject, canonical_json_bytes
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayFailure,
@@ -31,6 +31,11 @@ from exp.runtime.gateway.guardrails.contracts import (
     coverage_failure,
     guardrail_failure,
     request_exceeds_inspection_limit,
+)
+from exp.runtime.gateway.guardrails.native_owner import (
+    NativeClassifierClient,
+    NativeInputClient,
+    NativeInputTemplate,
 )
 from exp.runtime.gateway.guardrails.observation import (
     ObservationAdmission,
@@ -89,11 +94,8 @@ class GuardrailEngine:
             monotonic: Process-local clock in seconds.
             inspects: Optional async inflight limiter. ``None`` uses the
                 default shared cap.
-            deterministic_specifications: Content-free native rules for the
-                registered deterministic adapters, keyed by adapter. A host
-                that runs the Rust data plane compiles these once and lets
-                matching chains run in plane. Omitting them keeps every
-                chain on this engine.
+            deterministic_specifications: Native rules keyed by adapter. Hosts compile
+                them once for matching chains; omission keeps checks on this engine.
             max_observations: Maximum retained asynchronous observation jobs, default 8.
             max_observation_bytes: Maximum complete subject bytes retained, default 8 MiB.
             max_observation_records: Maximum queued plus active metadata records, default 128.
@@ -131,6 +133,71 @@ class GuardrailEngine:
     def policies_for(self, authorization: AuthorizationSnapshot) -> tuple[GuardrailPolicy, ...]:
         """Resolve all applicable scopes through the single policy store contract."""
         return self._store.policies_for(authorization)
+
+    def native_output_configuration(self, *, check: GuardrailCheck) -> JsonObject:
+        """Export adapter availability so Rust applies the admitted uncertainty policy."""
+        if not isinstance(self._client, NativeClassifierClient):
+            return {"kind": "unavailable"}
+        try:
+            return self._client.native_output_configuration(check=check)
+        except ClassifierCoverageError:
+            return {"kind": "coverage_error"}
+        except Exception:  # noqa: BLE001 - detector setup cannot bypass uncertainty policy.
+            return {"kind": "unavailable"}
+
+    def native_output_registration(
+        self, *, policy: GuardrailPolicy, check: GuardrailCheck
+    ) -> JsonObject:
+        """Freeze output authority and recording identity together at admission."""
+        return {
+            "policy": policy.model_dump(mode="json"),
+            "check": check.model_dump(mode="json"),
+            "adapter": self.native_output_configuration(check=check),
+        }
+
+    def native_input_configuration(
+        self, *, policy: GuardrailPolicy, check: GuardrailCheck, request: GatewayRequest
+    ) -> JsonObject:
+        """Freeze the exact bounded subject before native overlapping execution starts."""
+
+        native = isinstance(self._client, NativeInputClient)
+        # Ordered execution evaluates a single check with its original scope.
+        bound = self._input_limit(policy.model_copy(update={"checks": (check,)}))
+        if not native:
+            adapter: JsonObject = {"kind": "unavailable"}
+        elif bound is not None and request_exceeds_inspection_limit(request, bound):
+            adapter = {"kind": "coverage_error", "oversized": True}
+        else:
+            try:
+                adapter = self._client.native_input_configuration(request=request, check=check)
+            except ClassifierCoverageError:
+                adapter = {"kind": "coverage_error"}
+            except Exception:  # noqa: BLE001 - Rust applies the admitted uncertainty policy.
+                adapter = {"kind": "unavailable"}
+        return {
+            "policy": policy.model_dump(mode="json"),
+            "check": check.model_dump(mode="json"),
+            "adapter": adapter,
+        }
+
+    def native_input_template(
+        self, *, policy: GuardrailPolicy, check: GuardrailCheck
+    ) -> JsonObject:
+        """Freeze scoped adapter authority and the bound for one ordered native check."""
+
+        try:
+            if not isinstance(self._client, NativeInputTemplate):
+                message = "The classifier client has no native input contract"
+                raise ValueError(message)
+            adapter = self._client.native_input_template(check=check)
+        except Exception:  # noqa: BLE001 - Rust applies the same policy on every tool round.
+            adapter = {"kind": "unavailable"}
+        adapter["input_limit"] = self._input_limit(policy.model_copy(update={"checks": (check,)}))
+        return {
+            "policy": policy.model_dump(mode="json"),
+            "check": check.model_dump(mode="json"),
+            "adapter": adapter,
+        }
 
     def open_request(
         self, authorization: AuthorizationSnapshot, *, deadline_monotonic: float
@@ -305,12 +372,7 @@ class GuardrailEngine:
         observed: ObservedSubjects | None = None,
         request_id: str | None = None,
     ) -> None:
-        """Prepare one bounded complete subject under the shared nonblocking permit.
-
-        A free permit preserves exact deduplication for known session subjects even
-        when inspection capacity is full. Preparation contention ends this session's
-        optional coverage without claiming that an unknown subject was distinct.
-        """
+        """Deduplicate bounded subjects; preparation contention ends optional coverage."""
         if any(policy.mode != "observe" for policy in policies):
             raise ValueError("observation requires observe policies")
         if not policies or (observed is not None and observed.closed):

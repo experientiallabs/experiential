@@ -1,8 +1,8 @@
 """Scoped streaming imports preserve gateway evidence, exclusions and retention independence."""
 
-import sqlite3
 from pathlib import Path
 
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.common.traces.ingest.persistence import read_ingested_traces
 from exp.common.traces.sqlite import SQLiteTraceStore
 from exp.common.traces.sqlite_schema import trace_database_path
@@ -33,7 +33,7 @@ def test_gateway_snapshot_exceeds_one_page_and_survives_retention(tmp_path: Path
     assert result.trace_count == 1001 and not result.issues
     assert receipt is not None and receipt.new_records == 1001
     assert all(trace.initial_context["identity_id"] == "developer" for trace in expected.traces)
-    with sqlite3.connect(path) as connection:
+    with connect_sqlite(path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM gateway_captures").fetchone() == (1002,)
         connection.execute("DELETE FROM gateway_captures WHERE user_id='developer'")
     assert read_ingested_traces(tmp_path, receipt.import_id) == expected

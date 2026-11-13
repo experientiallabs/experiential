@@ -56,14 +56,14 @@ impl Sink for SplitSink {
     fn write(&mut self, prepared: &Prepared) -> Result<(), ()> {
         let delivered = match prepared {
             Prepared::Whole(encoded) => Delivered {
-                record: Some(serde_json::from_str(encoded).map_err(|_| ())?),
+                record: Some(crate::lossless_json::from_str(encoded).map_err(|_| ())?),
                 skeleton: None,
                 parts: Vec::new(),
                 reassembled: None,
             },
             Prepared::Split(split) => Delivered {
                 record: None,
-                skeleton: serde_json::from_str(&split.skeleton).ok(),
+                skeleton: crate::lossless_json::from_str(&split.skeleton).ok(),
                 parts: split
                     .parts
                     .iter()

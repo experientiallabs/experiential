@@ -283,7 +283,7 @@ impl Normalizer {
 }
 
 fn parse_object(data: &str) -> Result<Map<String, Value>, Failure> {
-    match serde_json::from_str::<Value>(data) {
+    match crate::lossless_json::from_str::<Value>(data) {
         Ok(Value::Object(object)) => Ok(object),
         Ok(_) => Err(malformed("provider stream event must be a JSON object")),
         Err(error) => {

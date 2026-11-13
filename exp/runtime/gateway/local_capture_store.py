@@ -1,10 +1,10 @@
 """Read-only identity-scoped consumption of the native gateway capture database."""
 
-import sqlite3
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
 
+from exp.common.sqlite.native import connect
 from exp.runtime.gateway.local_capture_contracts import CapturedExchange, LocalCaptureScope
 
 
@@ -65,7 +65,7 @@ class LocalCaptureStore:
 
     def _iter_read(self, *, sequence: int, limit: int | None) -> Generator[CaptureRow]:
         """Own one snapshot and validate every payload against its durable partition."""
-        connection = sqlite3.connect(f"{self._path.as_uri()}?mode=ro", uri=True, timeout=1.0)
+        connection = connect(self._path, mode="ro", busy_timeout_ms=1000)
         try:
             connection.execute("BEGIN")
             cursor = connection.execute(

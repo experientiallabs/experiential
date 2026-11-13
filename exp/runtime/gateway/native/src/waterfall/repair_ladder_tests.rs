@@ -38,7 +38,7 @@ fn learned_repair_cannot_cross_execution_handles_or_reach_the_process_owner() {
             .map(|_| {
                 let target = plane();
                 Python::attach(|py| {
-                    ExecutionHandle::new(target, 8, 2, 2, &PyDict::new(py), None).unwrap()
+                    ExecutionHandle::new(target, 8, 2, 2, &PyDict::new(py), None, None).unwrap()
                 })
             })
             .collect();
@@ -96,7 +96,7 @@ fn learned_repair_cannot_cross_execution_handles_or_reach_the_process_owner() {
             }
             let bodies = rung.bodies.lock().unwrap();
             assert_eq!(bodies.len(), 1);
-            let sent: Value = serde_json::from_str(&bodies[0]).unwrap();
+            let sent: Value = crate::lossless_json::from_str(&bodies[0]).unwrap();
             let payloads: Vec<_> = sent["input"]
                 .as_array()
                 .unwrap()
@@ -207,8 +207,8 @@ fn a_refused_encrypted_reasoning_item_is_stripped_and_the_same_rung_redialed() {
         // refused item; the visible turns and tool items travel both times.
         let bodies = rung_a.bodies.lock().expect("lock").clone();
         assert_eq!(bodies.len(), 2);
-        let sent: Value = serde_json::from_str(&bodies[0]).expect("first body");
-        let repaired: Value = serde_json::from_str(&bodies[1]).expect("second body");
+        let sent: Value = crate::lossless_json::from_str(&bodies[0]).expect("first body");
+        let repaired: Value = crate::lossless_json::from_str(&bodies[1]).expect("second body");
         assert_eq!(sent["input"].as_array().expect("input").len(), 5);
         let repaired_input = repaired["input"].as_array().expect("input");
         assert_eq!(repaired_input.len(), 4);
@@ -340,7 +340,7 @@ fn a_remembered_repair_is_redialed_without_earning_the_refusal_again() {
         let bodies = rung_a.bodies.lock().expect("lock").clone();
         assert_eq!(bodies.len(), 3);
         let has_encrypted = |body: &str| {
-            let value: Value = serde_json::from_str(body).expect("body");
+            let value: Value = crate::lossless_json::from_str(body).expect("body");
             value["input"]
                 .as_array()
                 .expect("input")
@@ -426,7 +426,7 @@ fn a_remembered_refused_payload_is_stripped_before_the_first_dial() {
         drop(committed);
         let bodies = rung.bodies.lock().expect("lock").clone();
         assert_eq!(bodies.len(), 1);
-        let sent: Value = serde_json::from_str(&bodies[0]).expect("body");
+        let sent: Value = crate::lossless_json::from_str(&bodies[0]).expect("body");
         let payloads: Vec<&str> = sent["input"]
             .as_array()
             .expect("input")
@@ -459,7 +459,7 @@ fn a_remembered_refused_payload_is_stripped_before_the_first_dial() {
         assert!(!committed.encrypted_reasoning_stripped);
         drop(committed);
         let body: Value =
-            serde_json::from_str(&rung.bodies.lock().expect("lock")[0]).expect("body");
+            crate::lossless_json::from_str(&rung.bodies.lock().expect("lock")[0]).expect("body");
         assert_eq!(body["input"].as_array().expect("input").len(), 6);
 
         // An admission that names no caller identity (an older control
@@ -607,8 +607,8 @@ fn an_in_stream_refusal_of_encrypted_reasoning_is_repaired_like_a_pre_stream_one
         drop(won);
         let bodies = rung.bodies.lock().expect("lock").clone();
         assert_eq!(bodies.len(), 2);
-        let sent: Value = serde_json::from_str(&bodies[0]).expect("first body");
-        let repaired: Value = serde_json::from_str(&bodies[1]).expect("second body");
+        let sent: Value = crate::lossless_json::from_str(&bodies[0]).expect("first body");
+        let repaired: Value = crate::lossless_json::from_str(&bodies[1]).expect("second body");
         assert_eq!(sent["input"].as_array().expect("input").len(), 5);
         let repaired_input = repaired["input"].as_array().expect("input");
         assert_eq!(repaired_input.len(), 4);

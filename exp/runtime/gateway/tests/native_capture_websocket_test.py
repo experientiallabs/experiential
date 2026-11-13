@@ -44,12 +44,14 @@ def test_response_capture_completes_on_its_own_transport(
             response_stored.set()
 
     collector = native.CaptureCollector(
-        CaptureConfiguration(relay_metadata=relay_metadata, ttl_seconds=2).model_dump_json(),
+        CaptureConfiguration(
+            relay_metadata=relay_metadata, ttl_seconds=2, settlement_required=False
+        ).model_dump_json(),
         persist,
     )
     controller = CaptureController(collector, application_for=lambda _: "local-diagnostic")
     control = NativeControlPlane(load_gateway_components(tmp_path), capture=controller)
-    original_admit, original_settle = control.admit, control.settle
+    original_admit = control.admit
 
     def admit(argument: str) -> str:
         """Make the local provider eligible for the hosted checkpoint lifecycle."""
@@ -58,14 +60,7 @@ def test_response_capture_completes_on_its_own_transport(
             wire["billing_customer_managed"] = False
         return json.dumps(result)
 
-    def settle(argument: str) -> str:
-        """Grant final response retention after real request settlement."""
-        result = original_settle(argument)
-        collector.settle(json.loads(argument)["request_id"], True, True)
-        return result
-
     monkeypatch.setattr(control, "admit", admit)
-    monkeypatch.setattr(control, "settle", settle)
     port, shutdown = _unused_port(), native.shutdown_handle()
     worker = threading.Thread(
         target=lambda: serve_native_gateway(

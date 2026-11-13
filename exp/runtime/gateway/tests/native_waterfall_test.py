@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 import os
 import signal
-import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -35,6 +34,7 @@ import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.native_bridge_test import _configured_pool_gateway
 
 pytest.importorskip("exp_gateway_native")
@@ -67,11 +67,18 @@ _DRIVER_SOURCE = textwrap.dedent(
         )
         pace = config.get("output_tokens_per_second")
         if pace is not None:
-            # Every reserved attempt is paced, as class_throttles would pace a
-            # self-hosted rung (output pacing scenarios).
-            import exp.runtime.gateway.native_accounting as accounting
+            import exp.runtime.gateway.native_registration as registration
+            registration.is_self_hosted_rung = lambda _deployment: True
+            original_authorize = components.store.authorize_request
 
-            accounting.attempt_output_pace = lambda *_args: pace
+            def authorize_with_pace(self, **kwargs):
+                """Freeze the per-request pace before the native handoff."""
+                del self
+                return original_authorize(**kwargs).model_copy(
+                    update={"output_tokens_per_second": pace}
+                )
+
+            type(components.store).authorize_request = authorize_with_pace
         control_plane = NativeControlPlane(
             components,
             request_timeout_seconds=config["request_timeout_seconds"],
@@ -107,6 +114,7 @@ _DRIVER_SOURCE = textwrap.dedent(
                             ),
                         }
                     ),
+                    native_callbacks=control_plane._accounting.native.callbacks(),
                 )
                 return
             except RuntimeError as error:
@@ -118,7 +126,7 @@ _DRIVER_SOURCE = textwrap.dedent(
 
     if __name__ == "__main__":
         main()
-    '''
+'''
 ).strip()
 
 
@@ -378,7 +386,7 @@ def _attempt_rows(engine: _ServingEngine, request_id: str) -> list[tuple[int, in
     """Read one request's durable attempt rows in dispatch order."""
     deadline = time.monotonic() + 10.0
     while True:
-        with sqlite3.connect(engine.database_path) as connection:
+        with connect_sqlite(engine.database_path) as connection:
             rows = connection.execute(
                 "SELECT attempt_ordinal, route_depth, state FROM gateway_attempts"
                 " WHERE request_id = ? ORDER BY attempt_ordinal",
@@ -555,7 +563,7 @@ def _assert_billed_empty_stop_redials_instead_of_settling_an_empty_success(
     assert response.headers["x-gateway-route-depth"] == "0"
     request_id = response.headers["x-request-id"]
     assert _attempt_rows(engine, request_id) == [(0, 0, "failed"), (1, 0, "completed")]
-    with sqlite3.connect(engine.database_path) as connection:
+    with connect_sqlite(engine.database_path) as connection:
         failed = connection.execute(
             "SELECT failure_class, output_tokens FROM gateway_attempts"
             " WHERE request_id = ? AND attempt_ordinal = 0",
@@ -829,7 +837,7 @@ def _assert_ledger_conserves_every_admitted_request(engine: _ServingEngine) -> N
     # continuations), and this probe.
     assert report["totals"]["requests"] == 15
     terminal_attempts = sum(int(count["attempts"]) for count in report["totals"]["terminal_counts"])
-    with sqlite3.connect(engine.database_path) as connection:
+    with connect_sqlite(engine.database_path) as connection:
         (total_attempts,) = connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()
         (open_attempts,) = connection.execute(
             "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched', 'running')"

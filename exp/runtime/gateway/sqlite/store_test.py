@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from exp.common.models import ConnectionConfig
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.contracts import (
     DirectTarget,
     GatewayApiSurface,
@@ -197,13 +198,22 @@ def test_decisions_authorize_and_accept_without_keyed_replay_or_content_retentio
     )
     ledger.accept_request(authorization=first)
     ledger.accept_request(authorization=second)
-    with sqlite3.connect(store.database_path) as connection:
+    with connect_sqlite(store.database_path) as connection:
         rows = connection.execute(
             "SELECT api_surface, caller_operation_sha256, content_retained FROM gateway_requests"
         ).fetchall()
         assert rows == [("decisions", None, 0), ("decisions", None, 0)]
         assert connection.execute("SELECT COUNT(*) FROM operation_receipts").fetchone() == (0,)
-        persisted = "\n".join(connection.iterdump())
+        tables = connection.execute(
+            "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name"
+        ).fetchall()
+        persisted = repr(
+            [
+                tuple(row)
+                for (name,) in tables
+                for row in connection.execute('SELECT * FROM "' + name.replace('"', '""') + '"')
+            ]
+        )
     assert raw_key not in persisted
     assert "decision-state-canary" not in persisted
     assert "decision-instruction-canary" not in persisted
@@ -471,7 +481,7 @@ def test_failed_transactional_key_delivery_rolls_back_key_and_receipt(
             secret_delivery=fail_delivery,
         )
 
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         assert connection.execute("SELECT COUNT(*) FROM virtual_keys").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM operation_receipts").fetchone()[0] == 0
@@ -555,7 +565,7 @@ def test_failed_key_receipt_commit_invokes_delivery_cleanup(
             )
 
     assert delivered == []
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         assert connection.execute("SELECT COUNT(*) FROM virtual_keys").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM operation_receipts").fetchone()[0] == 0
@@ -628,7 +638,7 @@ def test_precommit_hard_interruption_cleans_delivery_and_permits_retry(
             )
 
     assert delivered == []
-    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+    with connect_sqlite(tmp_path / "gateway.db") as connection:
         assert connection.execute("SELECT COUNT(*) FROM virtual_keys").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM operation_receipts").fetchone()[0] == 0
 
@@ -705,7 +715,7 @@ def test_commit_error_after_effect_reconciles_success_and_retains_delivery(
     )
 
     assert delivered == [issued.raw_key]
-    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+    with connect_sqlite(tmp_path / "gateway.db") as connection:
         assert connection.execute("SELECT COUNT(*) FROM virtual_keys").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM operation_receipts").fetchone()[0] == 1
     durable = (tmp_path / "gateway.db").read_bytes()
@@ -822,7 +832,7 @@ def test_project_activation_binding_is_unique_per_tenant_and_revisions_are_immut
         snapshot_ref="snapshot-one",
         catalog_sha256=_DIGEST,
     )
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         assert (
             connection.execute(
@@ -889,7 +899,7 @@ def test_alias_activation_reconciles_lost_commit_acknowledgement_after_supersess
         catalog_sha256=_DIGEST,
     )
 
-    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+    with connect_sqlite(tmp_path / "gateway.db") as connection:
         row = connection.execute(
             "SELECT active_revision_id FROM gateway_aliases WHERE alias_id = 'alias-one'"
         ).fetchone()
@@ -968,7 +978,7 @@ def test_alias_activation_reconciles_teardown_interruption_after_commit(
     )
 
     assert connect_calls == 2
-    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+    with connect_sqlite(tmp_path / "gateway.db") as connection:
         row = connection.execute(
             "SELECT active_revision_id FROM gateway_aliases WHERE alias_id = 'alias-one'"
         ).fetchone()
@@ -1021,7 +1031,7 @@ def test_alias_activation_types_unreadable_postcommit_teardown_as_unknown(
         )
 
     assert connect_calls == 2
-    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+    with connect_sqlite(tmp_path / "gateway.db") as connection:
         row = connection.execute(
             "SELECT active_revision_id FROM gateway_aliases WHERE alias_id = 'alias-one'"
         ).fetchone()
@@ -1063,7 +1073,7 @@ def test_alias_activation_keeps_precommit_teardown_failure_definite(
             catalog_sha256=_DIGEST,
         )
 
-    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+    with connect_sqlite(tmp_path / "gateway.db") as connection:
         count = connection.execute("SELECT COUNT(*) FROM alias_revisions").fetchone()[0]
     assert count == 0
 
@@ -1291,7 +1301,7 @@ def test_alias_activation_rejects_stale_provider_binding_atomically(tmp_path: Pa
                 ),
             ),
         )
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         assert connection.execute("SELECT COUNT(*) FROM gateway_aliases").fetchone()[0] == 0
         assert (

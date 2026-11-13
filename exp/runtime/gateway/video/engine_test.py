@@ -33,6 +33,7 @@ from exp.common.models import (
     ModelCapabilities,
     NormalizedGatewayCatalog,
 )
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind, SQLiteBudgetStore
 from exp.runtime.gateway.catalog_authority import upsert_connection, upsert_singleton_deployment
 from exp.runtime.gateway.ledger import GatewayLedgerError, SQLiteAttemptLedger
@@ -41,6 +42,7 @@ from exp.runtime.gateway.lifecycle import LocalGatewayComponents, load_gateway_c
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
 from exp.runtime.gateway.native_bridge import NativeControlPlane
+from exp.runtime.gateway.native_continuation_store import NativeContinuationStore
 from exp.runtime.gateway.stream_contracts import (
     BilledUnits,
     GatewayEvent,
@@ -280,6 +282,7 @@ def _setup(tmp_path: Path) -> Iterator[_Setup]:
     engine = VideoEngine(
         components=components,
         ledger=components.ledger,
+        native_request_factory=components.ledger.native_request_factory(NativeContinuationStore()),
         jobs=components.video_jobs,
         clients={"veo": VeoVideoClient(http=http), "xai_videos": XaiVideoClient(http=http)},
         clock=clock,
@@ -393,7 +396,7 @@ def test_process_close_preserves_open_video_for_a_fresh_polling_owner(setup: _Se
 
 def _attempts(setup: _Setup) -> list[sqlite3.Row]:
     """Read every ledger attempt in dispatch order."""
-    with sqlite3.connect(setup.database) as connection:
+    with connect_sqlite(setup.database) as connection:
         connection.row_factory = sqlite3.Row
         return connection.execute(
             """
@@ -470,7 +473,7 @@ def test_a_job_still_running_at_its_bound_preserves_unknown_usage(
     assert setup.engine.refresh(job).status is VideoStatus.IN_PROGRESS
     setup.clock.now += timedelta(seconds=VIDEO_JOB_SETTLEMENT_SECONDS)
     if crashed:
-        with sqlite3.connect(setup.database) as connection:
+        with connect_sqlite(setup.database) as connection:
             (deadline,) = connection.execute(
                 "SELECT deadline_at FROM gateway_requests WHERE request_id = ?", (job.request_id,)
             ).fetchone()
@@ -889,7 +892,7 @@ def test_retained_timeout_waiver_outlives_a_competing_exact_job(
             failure=failure,
         )
     elif provenance == "crash":
-        with sqlite3.connect(setup.database) as connection:
+        with connect_sqlite(setup.database) as connection:
             (deadline,) = connection.execute(
                 "SELECT deadline_at FROM gateway_requests WHERE request_id = ?", (job.request_id,)
             ).fetchone()
@@ -1010,7 +1013,7 @@ def test_actual_provider_zero_remains_an_immutable_settlement(
     assert before["billed_quantity_milli"] == 0
     assert before["estimated_cost_nano_usd"] == 0
     assert before["budget_settled_nano_usd"] == 0
-    with sqlite3.connect(setup.database) as connection:
+    with connect_sqlite(setup.database) as connection:
         (attempt_id,) = connection.execute("SELECT attempt_id FROM gateway_attempts").fetchone()
     with pytest.raises(GatewayLedgerError, match="differs from durable accounting evidence"):
         setup.components.ledger.finish_attempt(
@@ -1060,26 +1063,27 @@ def test_failed_create_settlement_retains_exact_rejection_or_unknown_usage(
 
 
 def test_failed_create_request_finish_is_owned_by_shutdown(setup: _Setup) -> None:
-    """An admitted unsupported duration retains its no-effects certificate until committed."""
-    finish = setup.components.ledger.finish_request
-    with patch.object(
-        setup.components.ledger, "finish_request", side_effect=RuntimeError("offline")
-    ) as failed:
+    """A native write failure retains admission until shutdown observes a durable certificate."""
+    with connect_sqlite(setup.database) as connection:
+        connection.execute(
+            "CREATE TRIGGER fail_request_terminal BEFORE UPDATE ON gateway_requests "
+            "BEGIN SELECT RAISE(ABORT,'fixture storage unavailable'); END"
+        )
+    try:
         with pytest.raises(NativeBridgeError):
             _create(setup, alias="grok-video", seconds=16)
         assert not setup.engine.idle
         assert not setup.engine.close(0.01)
-    original = failed.call_args.kwargs
-    with patch.object(setup.components.ledger, "finish_request", wraps=finish) as recovered:
-        assert setup.engine.close(5)
+    finally:
+        with connect_sqlite(setup.database) as connection:
+            connection.execute("DROP TRIGGER fail_request_terminal")
+    assert setup.engine.close(5)
     assert setup.engine.idle
-    assert recovered.call_args.kwargs == original
-    assert original["certify_no_effects"] is True
     assert not _attempts(setup) and not setup.provider.posts
-    with sqlite3.connect(setup.database) as connection:
-        assert connection.execute("SELECT terminal_state FROM gateway_requests").fetchall() == [
-            ("failed",)
-        ]
+    with connect_sqlite(setup.database) as connection:
+        assert connection.execute(
+            "SELECT terminal_state,failed_without_effects FROM gateway_requests"
+        ).fetchall() == [("failed", 1)]
 
 
 def test_retained_rejection_cannot_finalize_the_next_video_rung(setup: _Setup) -> None:
@@ -1577,6 +1581,9 @@ def _stored_engine(
     return VideoEngine(
         components=setup.components,
         ledger=setup.components.ledger,
+        native_request_factory=setup.components.ledger.native_request_factory(
+            NativeContinuationStore()
+        ),
         jobs=setup.components.video_jobs,
         clients={"veo": VeoVideoClient(http=http), "xai_videos": XaiVideoClient(http=http)},
         clock=setup.clock,

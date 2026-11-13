@@ -73,9 +73,6 @@ from exp.runtime.gateway.sqlite.platform_records import (
     provider_binding as _provider_binding,
 )
 from exp.runtime.gateway.sqlite.platform_records import (
-    require_reservation_replay as _require_reservation_replay,
-)
-from exp.runtime.gateway.sqlite.platform_records import (
     required_datetime as _datetime,
 )
 from exp.runtime.gateway.sqlite.platform_records import (
@@ -590,22 +587,13 @@ class SQLiteGatewayPlatform:
         request: AttemptReservationRequest,
     ) -> AttemptReservationRecord:
         """Reserve once or replay the exact natural request-ordinal identity."""
-        existing = self._attempt_for_reservation(request)
-        if existing is not None:
-            return _require_reservation_replay(existing, request=request)
-        try:
-            attempt_id = self.attempts.start_attempt(
-                snapshot=request.snapshot,
-                deployment=request.deployment,
-                attempt_ordinal=request.attempt_ordinal,
-                route_depth=request.route_depth,
-                maximum_cost_nano_usd=request.maximum_cost_nano_usd,
-            )
-        except sqlite3.IntegrityError:
-            concurrent = self._attempt_for_reservation(request)
-            if concurrent is None:
-                raise
-            return _require_reservation_replay(concurrent, request=request)
+        attempt_id = self.attempts.start_attempt(
+            snapshot=request.snapshot,
+            deployment=request.deployment,
+            attempt_ordinal=request.attempt_ordinal,
+            route_depth=request.route_depth,
+            maximum_cost_nano_usd=request.maximum_cost_nano_usd,
+        )
         return self._reservation(
             organization_id=request.organization_id,
             attempt_id=attempt_id,
@@ -873,32 +861,6 @@ class SQLiteGatewayPlatform:
         if len(rows) != 1:
             raise ValueError("attempt does not belong to the requested organization")
         return rows[0]
-
-    def _attempt_for_reservation(
-        self,
-        request: AttemptReservationRequest,
-    ) -> sqlite3.Row | None:
-        """Read one attempt by its tenant, request, and physical ordinal."""
-        rows = self._rows(
-            """
-            SELECT a.*, r.identity_id, r.key_id, r.alias_id, r.alias_revision_id,
-                   r.api_surface, r.canonical_request_sha256,
-                   r.caller_operation_sha256,
-                   r.terminal_state AS request_terminal_state
-            FROM gateway_attempts AS a
-            JOIN gateway_requests AS r
-              ON r.organization_id = a.organization_id AND r.request_id = a.request_id
-            WHERE a.organization_id = ? AND a.request_id = ? AND a.attempt_ordinal = ?
-            """,
-            (
-                request.organization_id,
-                request.snapshot.authorization.request_id,
-                str(request.attempt_ordinal),
-            ),
-        )
-        if len(rows) > 1:
-            raise RuntimeError("attempt reservation natural key is not unique")
-        return None if not rows else rows[0]
 
     def _reservation(
         self,

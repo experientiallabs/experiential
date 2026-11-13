@@ -89,7 +89,7 @@ mod tests {
             mapping
                 .set_item("same-adapter", Py::new(py, detector).unwrap())
                 .unwrap();
-            let handle = ExecutionHandle::new(py.None(), 2, 2, 1, &mapping, None).unwrap();
+            let handle = ExecutionHandle::new(py.None(), 2, 2, 1, &mapping, None, None).unwrap();
             // The handle owns a snapshot, not the caller's mutable Python dictionary.
             mapping.clear();
             handle
@@ -163,7 +163,7 @@ mod tests {
                 let first = handle("alpha", "[first]");
                 let second = handle("beta", "[second]");
                 let empty = Python::attach(|py| {
-                    ExecutionHandle::new(py.None(), 2, 2, 1, &PyDict::new(py), None).unwrap()
+                    ExecutionHandle::new(py.None(), 2, 2, 1, &PyDict::new(py), None, None).unwrap()
                 });
                 let server = server_state(&process);
                 let bindings = ExecutionBindings::new(3).unwrap();
@@ -196,7 +196,7 @@ mod tests {
                     crate::errors::FailureClass::Unavailable
                 ));
                 // Independent control planes can reuse every caller/store-local replay ID.
-                let key: crate::replay::ReplayKey = serde_json::from_value(serde_json::json!({
+                let key: crate::replay::ReplayKey = crate::lossless_json::from_value(serde_json::json!({
                     "organization_id": "local", "identity_id": "key", "alias_revision_id": "rev",
                     "surface": "chat_completions", "caller_operation_sha256": "same-op",
                     "canonical_request_sha256": "same-body"
@@ -270,7 +270,15 @@ mod tests {
             .block_on(async {
                 Python::initialize();
                 let handle = Python::attach(|py| {
-                    ExecutionHandle::new(py.None(), 2, 2, 1, &pyo3::types::PyDict::new(py), None)
+                    ExecutionHandle::new(
+                        py.None(),
+                        2,
+                        2,
+                        1,
+                        &pyo3::types::PyDict::new(py),
+                        None,
+                        None,
+                    )
                 })
                 .unwrap();
                 let bindings = ExecutionBindings::new(4).unwrap();

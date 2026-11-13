@@ -61,6 +61,11 @@ def _control_plane() -> JsonObject:
         "accounting_fenced_organizations": 1,
         "observation_recording_dropped": 3,
         "observation_recording_failed": 2,
+        "moderation_samples": 8,
+        "classifier_cache_hits": 2,
+        "classifier_cache_misses": 6,
+        "classifier_errors": 1,
+        "classifier_latency_seconds": 0.125,
     }
 
 
@@ -164,6 +169,21 @@ exp_gateway_observation_recording_dropped_total 3
 # HELP exp_gateway_observation_recording_failed_total Observation sink calls that failed.
 # TYPE exp_gateway_observation_recording_failed_total counter
 exp_gateway_observation_recording_failed_total 2
+# HELP exp_gateway_moderation_samples_total Native moderation observations across all checks.
+# TYPE exp_gateway_moderation_samples_total counter
+exp_gateway_moderation_samples_total 8
+# HELP exp_gateway_classifier_cache_hits_total Native decision-model results served from cache.
+# TYPE exp_gateway_classifier_cache_hits_total counter
+exp_gateway_classifier_cache_hits_total 2
+# HELP exp_gateway_classifier_cache_misses_total Native decision-model calls not served from cache.
+# TYPE exp_gateway_classifier_cache_misses_total counter
+exp_gateway_classifier_cache_misses_total 6
+# HELP exp_gateway_classifier_errors_total Native decision-model calls without a valid score.
+# TYPE exp_gateway_classifier_errors_total counter
+exp_gateway_classifier_errors_total 1
+# HELP exp_gateway_classifier_latency_seconds_total Decision-model time excluding cache hits.
+# TYPE exp_gateway_classifier_latency_seconds_total counter
+exp_gateway_classifier_latency_seconds_total 0.125
 # HELP exp_gateway_inflight_attempts In-flight attempt reservations on the control plane.
 # TYPE exp_gateway_inflight_attempts gauge
 exp_gateway_inflight_attempts 2

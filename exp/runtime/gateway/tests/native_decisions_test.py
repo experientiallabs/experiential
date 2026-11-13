@@ -38,6 +38,7 @@ from exp.common.models import (
     ModelCapabilities,
 )
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind, SQLiteBudgetStore
 from exp.runtime.gateway.catalog_authority import (
     upsert_connection,
@@ -494,7 +495,7 @@ def _post(engine: _ServingEngine, body: JsonObject, **headers: str) -> httpx.Res
 
 def _request_ids(engine: _ServingEngine) -> set[str]:
     """Snapshot accepted IDs directly from the real SQLite request ledger."""
-    with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+    with connect_sqlite(GatewayManagement(engine.root).database_path) as connection:
         return {
             str(row[0]) for row in connection.execute("SELECT request_id FROM gateway_requests")
         }
@@ -520,7 +521,7 @@ def _settled(
     """
     deadline = time.monotonic() + timeout
     while True:
-        with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+        with connect_sqlite(GatewayManagement(engine.root).database_path) as connection:
             connection.row_factory = sqlite3.Row
             rows = [
                 (
@@ -548,7 +549,7 @@ def _settled(
 
 def _assert_budget_accounted(engine: _ServingEngine) -> None:
     """Reconcile terminal attempt charges, keeping unknown liability held, not spent."""
-    with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+    with connect_sqlite(GatewayManagement(engine.root).database_path) as connection:
         [(held, spent, unknown)] = connection.execute(
             "SELECT reserved_nano_usd, settled_nano_usd, unknown_cost_attempts "
             "FROM gateway_monthly_budgets"
@@ -580,7 +581,7 @@ def _assert_unknown_liability(engine: _ServingEngine, attempt: sqlite3.Row) -> N
     assert attempt["estimated_cost_nano_usd"] is None
     assert attempt["budget_settled_nano_usd"] is None
     assert attempt["budget_reserved_nano_usd"] > 0
-    with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+    with connect_sqlite(GatewayManagement(engine.root).database_path) as connection:
         assert connection.execute(
             "SELECT reserved_nano_usd, settled_nano_usd FROM gateway_attempt_budget_charges "
             "WHERE attempt_id = ?",
@@ -808,7 +809,7 @@ def test_missing_usage_and_invalid_typed_answers_fail_closed(engine: _ServingEng
             assert attempt["usage_source"] == "observed"
             assert attempt["estimated_cost_nano_usd"] == _COST_NANO_USD
             assert attempt["budget_settled_nano_usd"] == _COST_NANO_USD
-            with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+            with connect_sqlite(GatewayManagement(engine.root).database_path) as connection:
                 assert connection.execute(
                     "SELECT settled_nano_usd FROM gateway_attempt_budget_charges "
                     "WHERE attempt_id = ?",
@@ -952,7 +953,7 @@ def test_disconnect_settles_before_deadline_and_holds_unknown_liability(
             + encoded
         )
         assert _DecisionsUpstream.stall_started.wait(timeout=2.0)
-        with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+        with connect_sqlite(GatewayManagement(engine.root).database_path) as connection:
             assert (
                 connection.execute(
                     "SELECT reserved_nano_usd FROM gateway_monthly_budgets"
@@ -992,7 +993,7 @@ def test_systemone_capacity_refusal_preserves_committed_unbilled_proof(
     assert retried.status_code == 200, retried.text
     requests = _settled(engine, before, expected=3)
     assert sorted(len(attempts) for _request, attempts in requests) == [0, 1, 1]
-    with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+    with connect_sqlite(GatewayManagement(engine.root).database_path) as connection:
         certified = connection.execute(
             "SELECT request_id FROM gateway_requests WHERE failed_without_effects = 1"
         ).fetchall()
@@ -1018,7 +1019,7 @@ def test_timeout_retains_unknown_liability_and_exhausts_budget(engine: _ServingE
     _assert_unknown_liability(engine, attempt)
 
     manager = GatewayManagement(engine.root)
-    with sqlite3.connect(manager.database_path) as connection:
+    with connect_sqlite(manager.database_path) as connection:
         [(limit, held, spent)] = connection.execute(
             "SELECT limit_nano_usd, reserved_nano_usd, settled_nano_usd "
             "FROM gateway_monthly_budgets"
@@ -1043,7 +1044,7 @@ def test_timeout_retains_unknown_liability_and_exhausts_budget(engine: _ServingE
         [(request, attempts)] = _settled(engine, before)
         assert request["terminal_state"] == "failed"
         assert attempts == []
-        with sqlite3.connect(manager.database_path) as connection:
+        with connect_sqlite(manager.database_path) as connection:
             assert connection.execute(
                 "SELECT reserved_nano_usd, settled_nano_usd FROM gateway_monthly_budgets"
             ).fetchall() == [(held, spent)]

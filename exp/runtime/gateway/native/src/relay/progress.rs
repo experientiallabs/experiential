@@ -28,7 +28,8 @@ impl ProviderTools {
             // Closing the argument block is NOT completion of server work.
             // The result arrives later under another content-block index.
             Event::ServerToolResult { block, .. } => {
-                if let Ok(serde_json::Value::Object(result)) = serde_json::from_str(block) {
+                if let Ok(serde_json::Value::Object(result)) = crate::lossless_json::from_str(block)
+                {
                     if let Some(id) = result.get("tool_use_id").and_then(|id| id.as_str()) {
                         self.server_calls.remove(id);
                     }

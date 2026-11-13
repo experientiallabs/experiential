@@ -1,9 +1,9 @@
 """Scoped durable gateway capture reader regressions."""
 
-import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.local_capture_contracts import (
     CapturedExchange,
     CaptureProvenance,
@@ -26,7 +26,7 @@ def test_reader_filters_scope_and_retention_and_resumes_cursor(tmp_path: Path) -
         response={"choices": []},
         provenance=CaptureProvenance(source_id="one", model_id="model"),
     )
-    connection = sqlite3.connect(path)
+    connection = connect_sqlite(path)
     connection.execute(
         "CREATE TABLE gateway_captures (sequence INTEGER PRIMARY KEY, "
         "user_id TEXT, application_id TEXT, expires_at INTEGER, payload TEXT)"

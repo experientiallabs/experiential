@@ -15,7 +15,6 @@ import base64
 import json
 import os
 import signal
-import sqlite3
 import subprocess
 import sys
 import threading
@@ -35,6 +34,7 @@ from exp.common.models import (
     GatewayUnitPrices,
     ModelCapabilities,
 )
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.catalog_authority import upsert_singleton_deployment
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
@@ -285,7 +285,7 @@ def _upstream_count() -> int:
 
 
 def _last_attempt(engine: _ServingEngine) -> tuple[object, ...]:
-    with sqlite3.connect(engine.root / "gateway" / "gateway.db") as connection:
+    with connect_sqlite(engine.root / "gateway" / "gateway.db") as connection:
         row = connection.execute(
             """
             SELECT state, estimated_cost_nano_usd, billed_unit_kind, billed_quantity_milli,

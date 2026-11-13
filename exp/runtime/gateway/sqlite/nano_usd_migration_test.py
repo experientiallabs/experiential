@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from exp.common.sqlite.connection import connect_database
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.sqlite import migrations
 from exp.runtime.gateway.sqlite.migrations import (
     SCHEMA_VERSION,
@@ -218,7 +219,7 @@ def test_v20_migration_renames_every_money_column_to_nano_usd_and_scales_rows(
             )
     finally:
         migrated.close()
-    prior = sqlite3.connect(backup)
+    prior = connect_sqlite(backup)
     try:
         assert prior.execute("PRAGMA user_version").fetchone() == (19,)
         assert prior.execute(
@@ -240,7 +241,7 @@ def test_v20_migration_refuses_a_micro_usd_amount_that_overflows_int64_at_nano(
     with pytest.raises(GatewaySchemaError, match="nano-USD"):
         initialize_database(path)
 
-    connection = sqlite3.connect(path)
+    connection = connect_sqlite(path)
     try:
         assert connection.execute("PRAGMA user_version").fetchone() == (19,)
         assert connection.execute(

@@ -165,6 +165,7 @@ pub(crate) struct StartResponse {
     /// The reserved attempt's output pace; absent unless a self-hosted rung
     /// is paced for this request's class (`output_pacing`).
     #[serde(default)]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub(crate) output_tokens_per_second: Option<f64>,
 }
 
@@ -303,7 +304,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 return Won::Failed(error);
             }
         };
-        let started: StartResponse = match serde_json::from_str(&started_text) {
+        let started: StartResponse = match crate::lossless_json::from_str(&started_text) {
             Ok(started) => started,
             Err(_) => {
                 guard
@@ -683,7 +684,7 @@ use attempt::run_attempt;
 
 mod commit;
 pub(crate) use commit::is_semantic;
-mod fallback_rules;
+pub(crate) mod fallback_rules;
 mod wire;
 pub(crate) use wire::{
     approximate_input_tokens, attribute_header_timeout, first_byte_allowance,

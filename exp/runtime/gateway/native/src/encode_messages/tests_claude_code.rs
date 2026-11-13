@@ -59,7 +59,7 @@ fn start_frame_carries_the_upstream_start_usage_when_known() {
         image_output_tokens: None,
     }));
     let frames = encoder.start().expect("starts");
-    let start: Value = serde_json::from_str(
+    let start: Value = crate::lossless_json::from_str(
         frames[0]
             .lines()
             .nth(1)
@@ -80,7 +80,7 @@ fn start_frame_carries_the_upstream_start_usage_when_known() {
     let mut bare = MessagesSseEncoder::new("request-abc", "coding");
     bare.set_initial_usage(None);
     let frames = bare.start().expect("starts");
-    let start: Value = serde_json::from_str(
+    let start: Value = crate::lossless_json::from_str(
         frames[0]
             .lines()
             .nth(1)
@@ -158,7 +158,7 @@ fn start_frame_carries_the_pre_dispatch_estimate_when_the_upstream_reports_nothi
     encoder.set_initial_usage(None);
     encoder.set_pre_dispatch_input_estimate(Some(1234));
     let frames = encoder.start().expect("starts");
-    let start: Value = serde_json::from_str(
+    let start: Value = crate::lossless_json::from_str(
         frames[0]
             .lines()
             .nth(1)
@@ -196,7 +196,7 @@ fn upstream_start_usage_outranks_the_pre_dispatch_estimate() {
         image_output_tokens: None,
     }));
     let frames = encoder.start().expect("starts");
-    let start: Value = serde_json::from_str(
+    let start: Value = crate::lossless_json::from_str(
         frames[0]
             .lines()
             .nth(1)

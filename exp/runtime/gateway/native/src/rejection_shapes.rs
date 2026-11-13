@@ -374,7 +374,7 @@ pub fn upstream_relayed_message(error: &Value, message: &str) -> Option<String> 
     let metadata = error.get("metadata")?;
     let raw = metadata.get("raw")?;
     let upstream = match raw {
-        Value::String(text) => match serde_json::from_str::<Value>(text) {
+        Value::String(text) => match crate::lossless_json::from_str::<Value>(text) {
             Ok(document) => json_error_sentence(&document)?,
             Err(_) => text.trim().to_string(),
         },
@@ -511,7 +511,7 @@ pub fn content_filtered_completion(dialect: Dialect, body: &str) -> Option<Filte
     }
     body.lines()
         .filter_map(|line| line.trim_start().strip_prefix("data:"))
-        .filter_map(|frame| serde_json::from_str::<Value>(frame.trim()).ok())
+        .filter_map(|frame| crate::lossless_json::from_str::<Value>(frame.trim()).ok())
         .find_map(|chunk| filtered_choice(&chunk))
 }
 

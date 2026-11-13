@@ -1,368 +1,81 @@
-"""Paid admission work survives a failed terminal write without a synthetic model attempt."""
+"""Native admission recovery retains exact content-free evidence across storage failures."""
 
 from __future__ import annotations
 
-import json
-import threading
-import time
-from unittest.mock import patch
+from pathlib import Path
 
 import pytest
 
-from exp.runtime.gateway.budgets import BudgetScopeKind
-from exp.runtime.gateway.contracts import (
-    AuthorizationSnapshot,
-    GatewayFailure,
-    GatewayFailureClass,
-)
-from exp.runtime.gateway.ledger_errors import (
-    AccountingRecoveryUnresolvedTerminalError,
-    AccountingRefusedError,
-    AttemptRejectedError,
-    GatewayLedgerError,
-)
-from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
-from exp.runtime.gateway.native_accounting_test import (
-    _RecordingLedger,
-    _registry,
-    _retryable_failure,
-    _settle,
-    _start,
-)
-from exp.runtime.gateway.native_request_settlement import (
-    RequestSettlements,
-    permanently_refused,
-)
+from exp.common.sqlite.native import connect
+from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.gateway.native_handoff_test import _prepared
+from exp.runtime.gateway.native_request_settlement import RequestSettlements
 
 
-def test_pre_dispatch_search_meter_is_retried_by_the_accounting_sweep() -> None:
-    """Block further paid work until the original verdict and exact meter commit."""
-    accounting, ledger, entry = _registry()
-    ledger.fail_request_finishes = 2
-    failure = GatewayFailure(
-        failure_class=GatewayFailureClass.GUARDRAIL,
-        safe_message="blocked",
-        safe_details={"input_guardrail_denied": True},
-    )
-    assert not accounting.finish_request_quietly(
-        entry.authorization,
-        failure,
-        web_search_requests=1,
-    )
-    assert not accounting.accounting_healthy
-    organization_id = entry.authorization.organization_id
-    assert accounting.request_settlements.fenced_organizations() == {organization_id}
-    with pytest.raises(NativeBridgeError, match="accounting is recovering"):
-        accounting.require_clear(organization_id)
-    accounting.sweep_expired()
-    assert not accounting.accounting_healthy
-    accounting.sweep_expired()
-    assert accounting.accounting_healthy
-    accounting.require_clear(organization_id)
-    accounting.sweep_expired()
-    assert ledger.finished_requests == [failure]
-    assert ledger.request_search_meters == [1]
-    assert ledger.started == []
-
-
-def test_ledger_without_unattempted_search_contract_is_rejected_at_startup() -> None:
-    """A host must support the hard cutover before the gateway can spend on a search."""
-    ledger = _RecordingLedger()
-
-    def incomplete_contract(
-        *,
-        authorization: AuthorizationSnapshot,
-        failure: GatewayFailure,
-        certify_no_effects: bool = False,
-    ) -> bool:
-        """Expose an incomplete ledger signature without allowing a write."""
-        raise AssertionError("startup validation must not execute the ledger")
-
-    with patch.object(ledger, "finish_request", incomplete_contract):
-        with pytest.raises(ValueError, match="persist unattempted search expense"):
-            RequestSettlements(ledger)
-
-
-def test_normal_in_progress_terminal_write_does_not_block_unrelated_admission() -> None:
-    """Only failed writes close admission; a normal commit may still be in flight."""
-    accounting, ledger, entry = _registry()
-    entered, release = threading.Event(), threading.Event()
-    calls: list[int] = []
-
-    def commit(
-        *,
-        authorization: AuthorizationSnapshot,
-        failure: GatewayFailure,
-        certify_no_effects: bool = False,
-        web_search_requests: int = 0,
-    ) -> bool:
-        """Hold a successful terminal write open while another request checks admission."""
-        calls.append(1)
-        entered.set()
-        assert release.wait(3)
-        return True
-
-    failure = GatewayFailure(failure_class=GatewayFailureClass.GUARDRAIL, safe_message="blocked")
-    results: list[bool] = []
-    worker = threading.Thread(
-        target=lambda: results.append(
-            accounting.finish_request_quietly(entry.authorization, failure)
-        )
-    )
-    with patch.object(ledger, "finish_request", commit):
-        worker.start()
-        try:
-            assert entered.wait(3)
-            assert accounting.accounting_healthy
-            assert not accounting.request_settlements.fenced_organizations()
-            accounting.request_settlements.retry(16)
-            assert calls == [1]
-        finally:
-            release.set()
-            worker.join(3)
-    assert not worker.is_alive()
-    assert results == [True]
-
-
-def test_concurrent_terminal_callers_share_the_acknowledged_commit() -> None:
-    """A waiter cannot start another write after shutdown observes an empty registry."""
-    from exp.runtime.gateway.native_request_settlement import _Settlement
-
-    accounting, ledger, entry = _registry()
-    pending = accounting.request_settlements
-    entered, second_selected, release = threading.Event(), threading.Event(), threading.Event()
-    original_commit = pending._commit  # noqa: SLF001 - synchronize after identity selection.
-    calls: list[int] = []
-    results: list[bool] = []
-    failure = GatewayFailure(failure_class=GatewayFailureClass.CANCELLED, safe_message="cancelled")
-
-    def commit(settlement: _Settlement) -> bool:
-        """Observe that both callers have selected the same retained identity."""
-        if entered.is_set():
-            second_selected.set()
-        return original_commit(settlement)
-
-    def write(**_kwargs: object) -> bool:
-        """Hold the first durable write while its duplicate selects the same record."""
-        calls.append(1)
-        entered.set()
-        assert release.wait(5)
-        return True
-
-    def finish() -> None:
-        """Request the same terminal disposition from two concurrent callbacks."""
-        results.append(pending.finish(entry.authorization, failure))
-
-    first, second = threading.Thread(target=finish), threading.Thread(target=finish)
-    with patch.object(pending, "_commit", commit), patch.object(ledger, "finish_request", write):
-        first.start()
-        try:
-            assert entered.wait(5)
-            second.start()
-            assert second_selected.wait(5)
-        finally:
-            release.set()
-            first.join(5)
-            if second.ident is not None:
-                second.join(5)
-    assert results == [True, True]
-    assert calls == [1]
-    assert not pending.outstanding
-    # This fixture separately registered an admitted request. The lower-level
-    # RequestSettlements owner cannot remove that native registry entry.
-    accounting.abandon(json.dumps({"request_id": entry.authorization.request_id}))
-    assert accounting.close(5)
-
-
-@pytest.mark.parametrize("termination", ["deadline", "budget", "reservation", "abandon"])
-def test_registered_search_meter_survives_unattempted_termination(termination: str) -> None:
-    """Every registered terminal path preserves paid search with no invented attempt."""
-    accounting, ledger, entry = _registry()
-    entry.web_search_requests = 1
-    if termination == "deadline":
-        entry.deadline_monotonic = time.monotonic() - 1
-    elif termination == "budget":
-        ledger.budget_rejections["deployment-a"] = BudgetScopeKind.TEAM
-    elif termination == "reservation":
-        ledger.typed_rejection = GatewayFailure(
-            failure_class=GatewayFailureClass.UNAVAILABLE, safe_message="unavailable"
-        )
-    if termination == "abandon":
-        accounting.abandon(json.dumps({"request_id": entry.authorization.request_id}))
-    else:
-        with pytest.raises(NativeBridgeError):
-            _start(accounting, ordinal=0)
-    assert ledger.request_search_meters == [1]
-    assert not ledger.started
-    assert accounting.entry(entry.authorization.request_id) is None
-
-
-def test_registered_search_survives_retained_terminal_write() -> None:
-    """The meter outlives removal of the in-flight entry while a terminal write retries."""
-    accounting, ledger, entry = _registry()
-    entry.web_search_requests = 1
-    entry.deadline_monotonic = time.monotonic() - 1
-    ledger.fail_request_finishes = 2
-    with pytest.raises(NativeBridgeError):
-        _start(accounting, ordinal=0)
-    assert accounting.entry(entry.authorization.request_id) is None
-    assert not accounting.accounting_healthy
-    accounting.sweep_expired()
-    assert not accounting.accounting_healthy
-    accounting.sweep_expired()
-    assert accounting.accounting_healthy
-    assert ledger.request_search_meters == [1]
-    assert ledger.finished_requests[0].failure_class is GatewayFailureClass.TIMEOUT
-    assert not ledger.started
-
-
-def test_failed_abandonment_retains_search_meter_and_original_failure() -> None:
-    """Recover the original expense and refusal even if abandonment is delivered again."""
-    accounting, ledger, entry = _registry()
-    entry.web_search_requests = 1
-    ledger.fail_request_finishes = 1
-    failure = GatewayFailure(
-        failure_class=GatewayFailureClass.TIMEOUT, safe_message="permit deadline exceeded"
-    )
-    with pytest.raises(NativeBridgeError):
-        accounting.abandon(
-            json.dumps(
-                {
-                    "request_id": entry.authorization.request_id,
-                    "failure": failure.model_dump(mode="json"),
-                }
-            )
-        )
-    assert not accounting.accounting_healthy
-    with pytest.raises(NativeBridgeError, match="accounting is recovering"):
-        accounting.require_clear(entry.authorization.organization_id)
-    accounting.abandon(json.dumps({"request_id": entry.authorization.request_id}))
-    accounting.sweep_expired()
-    assert accounting.accounting_healthy
-    assert ledger.request_search_meters == [1]
-    assert ledger.finished_requests == [failure]
-    assert not ledger.started
-    assert accounting.entry(entry.authorization.request_id) is None
-
-
-@pytest.mark.parametrize("previous_attempt", [False, True])
-def test_active_abandonment_owns_search_only_on_final_settlement(previous_attempt: bool) -> None:
-    """Search belongs to the final attempt even after a failed fallback rung."""
-    accounting, ledger, entry = _registry()
-    entry.web_search_requests = 1
-    started = _start(accounting, ordinal=0)
-    if previous_attempt:
-        _settle(
-            accounting,
-            attempt_id=str(started["attempt_id"]),
-            outcome="failed",
-            finalize=False,
-            failure=_retryable_failure(),
-        )
-        assert ledger.web_search_requests == [None]
-        _start(
-            accounting,
-            ordinal=1,
-            current_depth=0,
-            failure=_retryable_failure(),
-        )
-    accounting.abandon(json.dumps({"request_id": entry.authorization.request_id}))
-    accounting.sweep_expired()
-    assert ledger.web_search_requests == ([None, 1] if previous_attempt else [1])
-    assert ledger.request_search_meters == []
-    assert len(ledger.finished) == (2 if previous_attempt else 1)
-    assert accounting.entry(entry.authorization.request_id) is None
-
-
-_BLOCKED = GatewayFailure(failure_class=GatewayFailureClass.GUARDRAIL, safe_message="blocked")
-
-
-def test_a_replay_the_ledger_permanently_refuses_is_dropped_and_clears_the_fence(
-    caplog: pytest.LogCaptureFixture,
+@pytest.mark.parametrize("searches", [0, 1, 3])
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_request_terminal_and_certificate_commit_through_rust(
+    tmp_path: Path, searches: int, cancelled: bool
 ) -> None:
-    """A retained write whose replay fails a ledger contract is finalized, not replayed forever.
-
-    The first write fails transiently; the replay meets a deterministic refusal
-    (the request is already terminal with another outcome). No retry can commit
-    it, so it is dropped with a warning, the fence lifts and later sweeps never
-    call the ledger again.
-    """
-    accounting, ledger, entry = _registry()
-    replies: list[Exception] = [
-        RuntimeError("canceling statement due to lock timeout"),
-        GatewayLedgerError("request is already settled with another terminal state"),
-    ]
-    calls = 0
-
-    def finish_request(**_fields: object) -> bool:
-        nonlocal calls
-        calls += 1
-        raise replies.pop(0)
-
-    with patch.object(ledger, "finish_request", finish_request):
-        assert not accounting.finish_request_quietly(entry.authorization, _BLOCKED)
-        with pytest.raises(NativeBridgeError, match="accounting is recovering"):
-            accounting.require_clear(entry.authorization.organization_id)
-        accounting.sweep_expired()
-        assert calls == 2
-        assert accounting.accounting_healthy
-        assert not accounting.request_settlements.outstanding
-        assert accounting.fenced_organizations() == frozenset()
-        accounting.require_clear(entry.authorization.organization_id)
-        accounting.sweep_expired()
-        assert calls == 2
-    assert "permanently refused: GatewayLedgerError" in caplog.text
+    """Only an unsent failed request without paid prework receives a no-effects certificate."""
+    factory, entry, ledger = _prepared(tmp_path)
+    owner = RequestSettlements(factory)
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.CANCELLED
+        if cancelled
+        else GatewayFailureClass.INVALID_REQUEST,
+        safe_message="synthetic admission failure",
+    )
+    try:
+        assert owner.finish(
+            entry.authorization, failure, certify_no_effects=True, web_search_requests=searches
+        )
+        assert not owner.pending and not owner.outstanding
+        with connect(ledger.database_path) as connection:
+            assert connection.execute(
+                "SELECT terminal_state,web_search_requests,failed_without_effects "
+                "FROM gateway_requests"
+            ).fetchall() == [
+                (
+                    "cancelled" if cancelled else "failed",
+                    searches,
+                    int(not cancelled and not searches),
+                )
+            ]
+            assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone() == (0,)
+    finally:
+        assert owner.close()
 
 
-def test_a_first_write_the_ledger_permanently_refuses_is_never_retained() -> None:
-    """A deterministic refusal on the first write returns uncommitted with no fence."""
-    accounting, ledger, entry = _registry()
-
-    def refuse(**_fields: object) -> bool:
-        raise GatewayLedgerError("request was not durably accepted")
-
-    with patch.object(ledger, "finish_request", refuse):
-        assert not accounting.request_settlements.finish(entry.authorization, _BLOCKED)
-    assert accounting.accounting_healthy
-    assert not accounting.request_settlements.outstanding
-    accounting.require_clear(entry.authorization.organization_id)
-
-
-@pytest.mark.parametrize(
-    "error",
-    [
-        AccountingRecoveryUnresolvedTerminalError("liability remains unresolved"),
-        AttemptRejectedError(
-            "another ledger owns the organization",
-            failure=GatewayFailure(
-                failure_class=GatewayFailureClass.INTERNAL, safe_message="owned elsewhere"
-            ),
-        ),
-        RuntimeError("connection lost"),
-    ],
-    ids=["recovery_owner", "attempt_rejected", "transport"],
-)
-def test_replayable_failures_stay_retained_and_fence(error: Exception) -> None:
-    """Only a plain contract refusal is dropped; every replayable outcome keeps its owner."""
-    assert not permanently_refused(error)
-    accounting, ledger, entry = _registry()
-
-    def fail(**_fields: object) -> bool:
-        raise error
-
-    with patch.object(ledger, "finish_request", fail):
-        with pytest.raises(type(error)):
-            accounting.request_settlements.finish(entry.authorization, _BLOCKED)
-        assert not accounting.accounting_healthy
-        with pytest.raises(NativeBridgeError, match="accounting is recovering"):
-            accounting.require_clear(entry.authorization.organization_id)
-    accounting.sweep_expired()
-    assert accounting.accounting_healthy
-    assert accounting.fenced_organizations() == frozenset()
-
-
-def test_a_deliberate_refusal_is_never_classified_permanent() -> None:
-    """``AccountingRefusedError`` (another ledger owns the money for now) is replayed."""
-    assert not permanently_refused(AccountingRefusedError("owned elsewhere"))
-    assert permanently_refused(GatewayLedgerError("request authority differs"))
-    assert not permanently_refused(ValueError("not a ledger error"))
+@pytest.mark.parametrize("searches", [0, 2])
+def test_storage_failure_keeps_original_admission_until_shutdown_acknowledges_it(
+    tmp_path: Path, searches: int
+) -> None:
+    """A native retry survives failed close and cannot replace the original financial evidence."""
+    factory, entry, ledger = _prepared(tmp_path)
+    owner = RequestSettlements(factory)
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.INVALID_REQUEST, safe_message="initial refusal"
+    )
+    with connect(ledger.database_path) as connection:
+        connection.execute(
+            "CREATE TRIGGER unavailable BEFORE UPDATE ON gateway_requests "
+            "BEGIN SELECT RAISE(ABORT,'fixture unavailable'); END"
+        )
+    try:
+        assert not owner.finish(
+            entry.authorization, failure, certify_no_effects=True, web_search_requests=searches
+        )
+        assert owner.pending and owner.outstanding
+        assert owner.fenced(entry.authorization.organization_id)
+        assert owner.fenced_organizations() == frozenset({entry.authorization.organization_id})
+        assert not owner.close(0.01)
+    finally:
+        with connect(ledger.database_path) as connection:
+            connection.execute("DROP TRIGGER unavailable")
+    assert owner.close(2)
+    assert not owner.pending and not owner.outstanding
+    with connect(ledger.database_path) as connection:
+        assert connection.execute(
+            "SELECT terminal_state,web_search_requests,failed_without_effects FROM gateway_requests"
+        ).fetchall() == [("failed", searches, int(not searches))]

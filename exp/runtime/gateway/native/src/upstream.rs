@@ -17,7 +17,20 @@ use crate::param_attribution::{
 use crate::rate_limit_headers::{harvest_rate_limit_headers, retry_after_seconds};
 
 mod network;
+pub(crate) use network::classifier_url;
 pub(crate) use network::UpstreamClient;
+
+pub(crate) fn build_classifier_client(public_only: bool) -> Result<reqwest::Client, ()> {
+    let builder = client_builder(Duration::from_secs(10))
+        .no_proxy()
+        .pool_max_idle_per_host(16);
+    let builder = if public_only {
+        network::classifier_restrict(builder)
+    } else {
+        builder
+    };
+    builder.build().map_err(|_| ())
+}
 
 /// Build the shared pooled upstream client, mirroring the pooling constants in
 /// `providers.async_transport` (64 keep-alive) and its no-redirect policy so a

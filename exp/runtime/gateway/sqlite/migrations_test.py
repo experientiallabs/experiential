@@ -17,6 +17,7 @@ from exp.common.sqlite.connection import (
     connect_database,
     persistent_connection,
 )
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.sqlite import migrations
 from exp.runtime.gateway.sqlite.migrations import (
     _MIGRATION_1,
@@ -192,7 +193,7 @@ def test_forward_migration_creates_consistent_private_backup(tmp_path: Path) -> 
     assert backup is not None
     assert backup.exists()
     assert stat.S_IMODE(backup.stat().st_mode) == 0o600
-    backup_connection = sqlite3.connect(backup)
+    backup_connection = connect_sqlite(backup)
     try:
         assert backup_connection.execute("PRAGMA user_version").fetchone()[0] == 1
         assert (
@@ -331,7 +332,7 @@ def test_attempt_billing_migration_is_explicit_and_preserves_v2_backup(tmp_path:
     backup = initialize_database(path)
 
     assert backup is not None
-    backup_connection = sqlite3.connect(backup)
+    backup_connection = connect_sqlite(backup)
     current = connect_database(path)
     try:
         backup_columns = {
@@ -379,7 +380,7 @@ def test_provider_authority_migration_preserves_v3_backup(tmp_path: Path) -> Non
     backup = initialize_database(path)
 
     assert backup is not None
-    backup_connection = sqlite3.connect(backup)
+    backup_connection = connect_sqlite(backup)
     current = connect_database(path)
     try:
         assert backup_connection.execute("PRAGMA user_version").fetchone()[0] == 3
@@ -413,7 +414,7 @@ def test_v6_migration_preserves_billing_and_adds_physical_ordinal(tmp_path: Path
     path = tmp_path / "gateway.db"
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(descriptor)
-    connection = sqlite3.connect(path)
+    connection = connect_sqlite(path)
     try:
         connection.execute("BEGIN EXCLUSIVE")
         for migration in (
@@ -477,7 +478,7 @@ def test_v6_migration_preserves_billing_and_adds_physical_ordinal(tmp_path: Path
     backup = initialize_database(path)
 
     assert backup is not None
-    migrated = sqlite3.connect(path)
+    migrated = connect_sqlite(path)
     try:
         row = migrated.execute(
             """
@@ -488,7 +489,7 @@ def test_v6_migration_preserves_billing_and_adds_physical_ordinal(tmp_path: Path
         assert row == ("attempt-one", 0, 3, "host_managed")
     finally:
         migrated.close()
-    prior = sqlite3.connect(backup)
+    prior = connect_sqlite(backup)
     try:
         assert prior.execute("PRAGMA user_version").fetchone()[0] == 5
         columns = {str(row[1]) for row in prior.execute("PRAGMA table_info(gateway_attempts)")}
@@ -513,7 +514,7 @@ def test_v7_migration_assigns_immutable_period_and_preserves_prior_cost(tmp_path
     path = tmp_path / "gateway.db"
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(descriptor)
-    connection = sqlite3.connect(path)
+    connection = connect_sqlite(path)
     try:
         connection.execute("BEGIN EXCLUSIVE")
         for migration in (
@@ -577,7 +578,7 @@ def test_v7_migration_assigns_immutable_period_and_preserves_prior_cost(tmp_path
     backup = initialize_database(path)
 
     assert backup is not None
-    current = sqlite3.connect(path)
+    current = connect_sqlite(path)
     try:
         row = current.execute(
             """
@@ -591,7 +592,7 @@ def test_v7_migration_assigns_immutable_period_and_preserves_prior_cost(tmp_path
         assert current.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
     finally:
         current.close()
-    prior = sqlite3.connect(backup)
+    prior = connect_sqlite(backup)
     try:
         columns = {str(row[1]) for row in prior.execute("PRAGMA table_info(gateway_attempts)")}
         assert "budget_period_start" not in columns
@@ -605,7 +606,7 @@ def test_v8_migration_adds_default_off_strict_unknown_cost(tmp_path: Path) -> No
     path = tmp_path / "gateway.db"
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(descriptor)
-    connection = sqlite3.connect(path)
+    connection = connect_sqlite(path)
     try:
         connection.execute("BEGIN EXCLUSIVE")
         for migration in (
@@ -643,7 +644,7 @@ def test_v8_migration_adds_default_off_strict_unknown_cost(tmp_path: Path) -> No
     backup = initialize_database(path)
 
     assert backup is not None
-    current = sqlite3.connect(path)
+    current = connect_sqlite(path)
     try:
         row = current.execute(
             "SELECT strict_unknown_cost FROM gateway_monthly_budgets WHERE budget_id = 'budget-one'"
@@ -652,7 +653,7 @@ def test_v8_migration_adds_default_off_strict_unknown_cost(tmp_path: Path) -> No
         assert current.execute("PRAGMA user_version").fetchone() == (SCHEMA_VERSION,)
     finally:
         current.close()
-    prior = sqlite3.connect(backup)
+    prior = connect_sqlite(backup)
     try:
         columns = {
             str(row[1]) for row in prior.execute("PRAGMA table_info(gateway_monthly_budgets)")
@@ -671,7 +672,7 @@ def test_failed_legacy_migration_rolls_back_the_live_database(
     path = tmp_path / "gateway.db"
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(descriptor)
-    connection = sqlite3.connect(path)
+    connection = connect_sqlite(path)
     try:
         connection.execute("BEGIN EXCLUSIVE")
         for migration in (_MIGRATION_1, _MIGRATION_2, _MIGRATION_3):
@@ -693,7 +694,7 @@ def test_failed_legacy_migration_rolls_back_the_live_database(
     with pytest.raises(GatewaySchemaError, match="migration failed"):
         initialize_database(path)
 
-    connection = sqlite3.connect(path)
+    connection = connect_sqlite(path)
     try:
         assert connection.execute("PRAGMA user_version").fetchone() == (3,)
         tables = {
@@ -706,7 +707,7 @@ def test_failed_legacy_migration_rolls_back_the_live_database(
     assert "gateway_attempts_v3" not in tables
     backups = tuple(tmp_path.glob("gateway.db.backup-v3-*"))
     assert len(backups) == 1
-    with sqlite3.connect(backups[0]) as backup:
+    with connect_sqlite(backups[0]) as backup:
         assert backup.execute("PRAGMA user_version").fetchone() == (3,)
 
 
@@ -750,14 +751,14 @@ def test_newer_and_marker_only_schemas_refuse_without_deleting_state(tmp_path: P
     newer = tmp_path / "newer.db"
     descriptor = os.open(newer, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(descriptor)
-    connection = sqlite3.connect(newer)
+    connection = connect_sqlite(newer)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
     connection.close()
 
     with pytest.raises(GatewaySchemaError, match="newer"):
         initialize_database(newer)
     assert newer.exists()
-    connection = sqlite3.connect(newer)
+    connection = connect_sqlite(newer)
     try:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
     finally:
@@ -766,7 +767,7 @@ def test_newer_and_marker_only_schemas_refuse_without_deleting_state(tmp_path: P
     marker_only = tmp_path / "marker-only.db"
     descriptor = os.open(marker_only, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(descriptor)
-    connection = sqlite3.connect(marker_only)
+    connection = connect_sqlite(marker_only)
     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     connection.close()
     with pytest.raises(GatewaySchemaError, match="marker"):
@@ -1191,7 +1192,7 @@ def test_surface_migration_preserves_requests_attempts_and_constraints(
 
     assert backup is not None and backup.exists()
     if source_version >= 20:
-        with sqlite3.connect(backup) as original:
+        with connect_sqlite(backup) as original:
             assert original.execute("PRAGMA user_version").fetchone() == (source_version,)
             assert original.execute("SELECT * FROM gateway_requests").fetchone() == before_request
             assert original.execute("SELECT * FROM gateway_attempts").fetchone() == before_attempt
@@ -1209,11 +1210,13 @@ def test_surface_migration_preserves_requests_attempts_and_constraints(
                 None,
                 0,
             )
-            # Frozen media units (v29) and default-false recovery provenance (v32).
+            # Frozen media units (v29), recovery (v32), native accounting facts (v33).
             assert tuple(migrated.execute("SELECT * FROM gateway_attempts").fetchone()) == (
                 *before_attempt,
                 *(None for _ in range(16)),
                 0,
+                None,
+                None,
             )
         surviving = migrated.execute(
             "SELECT api_surface FROM gateway_requests WHERE request_id = 'req-1'"
@@ -1338,7 +1341,7 @@ def test_v17_migration_adds_null_dispatch_disclosures_to_existing_attempts(
         )
     finally:
         migrated.close()
-    prior = sqlite3.connect(backup)
+    prior = connect_sqlite(backup)
     try:
         columns = {str(entry[1]) for entry in prior.execute("PRAGMA table_info(gateway_attempts)")}
         assert not columns.intersection(disclosure_columns)

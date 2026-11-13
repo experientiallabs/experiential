@@ -2,7 +2,6 @@
 
 import json
 import socket
-import sqlite3
 import sys
 import threading
 import time
@@ -16,6 +15,7 @@ from pydantic import ValidationError
 from websockets.sync.client import ClientConnection, connect
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.capture_context import capture_context_document, restore_capture_context
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayApiSurface
 from exp.runtime.gateway.lifecycle import load_gateway_components
@@ -775,7 +775,7 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     provider = ThreadingHTTPServer(("127.0.0.1", 0), _LoopbackProvider)
     provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
     provider_thread.start()
-    _manager, raw_key = _configure_gateway(
+    manager, raw_key = _configure_gateway(
         tmp_path, base_url=f"http://127.0.0.1:{provider.server_port}/v1"
     )
     components = load_gateway_components(tmp_path)
@@ -853,6 +853,7 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
             settlement_permits=2,
             guardrail_detectors=control.guardrail_detectors,
             capture=control.capture_collector,
+            native_callbacks=control.native_callbacks,
         )
         if bound
         else None
@@ -879,19 +880,6 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
         return json.dumps(result)
 
     monkeypatch.setattr(control, "admit", funding_admit)
-    settlements: list[dict[str, object]] = []
-    settle = control.settle
-
-    def observed_settle(argument: str) -> str:
-        """Run real accounting and explicitly exclude a rejected capture in this test."""
-        result = settle(argument)
-        value = json.loads(argument)
-        settlements.append(value)
-        if policy.startswith("hosted-checkpoint-"):
-            collector.settle(value["request_id"], False, False)
-        return result
-
-    monkeypatch.setattr(control, "settle", observed_settle)
 
     def run() -> None:
         """Serve the real data plane and preserve startup failures for assertions."""
@@ -945,18 +933,18 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
                 if policy == "hosted-checkpoint-failed":
                     assert response.status_code == 500, response.text
                     assert "hello " not in response.text
-                    assert len(settlements) == _LoopbackProvider.calls
-                    assert settlements[-1]["attempt_id"]
-                    assert settlements[-1]["outcome"] == "failed"
-                    assert settlements[-1]["finalize"] is True
-                    assert settlements[-1]["opened"] is True
+                    rows = _await_terminal_attempts(manager.database_path, _LoopbackProvider.calls)
+                    assert rows[-1][1] and rows[-1][2] == "failed"
+                    collector.settle(str(rows[-1][0]), False, False)
                     continue
                 assert response.status_code == 200, response.text
                 assert "hello " in response.text and "world" in response.text
                 if policy == "hosted-checkpoint-discard":
                     # The checkpoint could not be delivered: the capture is
                     # dropped and counted, and the caller gets the answer.
-                    assert settlements[-1]["outcome"] != "failed"
+                    rows = _await_terminal_attempts(manager.database_path, _LoopbackProvider.calls)
+                    assert rows[-1][2] != "failed"
+                    collector.settle(str(rows[-1][0]), False, False)
                     continue
                 if policy == "hosted":
                     collector.settle(response.headers["x-request-id"], True, True)
@@ -1076,7 +1064,7 @@ def test_pending_checkpoint_does_not_pin_transport_or_settlement(
     blocked: bool,
 ) -> None:
     """A refused sink keeps capture ownership, not the request's transport or reserved attempt."""
-    provider_closed, write_attempted, allow_write, settled = (threading.Event() for _ in range(4))
+    provider_closed, write_attempted, allow_write = (threading.Event() for _ in range(3))
     if not blocked:
         # Control arm: asynchronous deadline behavior must match a healthy sink.
         allow_write.set()
@@ -1131,8 +1119,7 @@ def test_pending_checkpoint_does_not_pin_transport_or_settlement(
         assert write_attempted.wait(2)
     capture = CaptureController(collector, application_for=lambda _auth: "checkpoint-test")
     control = NativeControlPlane(components, capture=capture, request_timeout_seconds=1.5)
-    admit, settle = control.admit, control.settle
-    settlements: list[JsonObject] = []
+    admit = control.admit
 
     def funded_admit(argument: str) -> str:
         """Mark only this loopback fixture host-funded, leaving exact admission facts intact."""
@@ -1141,17 +1128,7 @@ def test_pending_checkpoint_does_not_pin_transport_or_settlement(
             wire["billing_customer_managed"] = False
         return json.dumps(value)
 
-    def record_settlement(argument: str) -> str:
-        """Observe real durable completion then deny response capture without blocking the sink."""
-        result = settle(argument)
-        value = json.loads(argument)
-        settlements.append(value)
-        collector.settle(value["request_id"], retention != "discard", retention == "response")
-        settled.set()
-        return result
-
     monkeypatch.setattr(control, "admit", funded_admit)
-    monkeypatch.setattr(control, "settle", record_settlement)
     port, shutdown = _unused_port(), native.shutdown_handle()
     errors: list[BaseException] = []
 
@@ -1234,16 +1211,15 @@ def test_pending_checkpoint_does_not_pin_transport_or_settlement(
                 client.close()
                 client = None
         assert provider_closed.wait(4), "capture acknowledgement pinned the upstream transport"
-        assert settled.wait(4), "capture acknowledgement pinned durable attempt settlement"
-        assert len(calls) == 1 and settlements
-        # Cancellation may interrupt a delivered callback and replay its identical decision.
-        assert all(value == settlements[0] for value in settlements)
-        assert settlements[0]["attempt_id"] and settlements[0]["opened"] is True
+        terminals = _await_terminal_attempts(manager.database_path, 1)
+        request_id, attempt_id = str(terminals[0][0]), str(terminals[0][1])
+        assert len(calls) == 1
+        collector.settle(request_id, retention != "discard", retention == "response")
         columns = (
             "attempt_id, state, input_tokens, output_tokens, usage_source, "
             "estimated_cost_nano_usd, budget_settled_nano_usd"
         )
-        with sqlite3.connect(manager.database_path) as connection:
+        with connect_sqlite(manager.database_path) as connection:
             rows = connection.execute(f"SELECT {columns} FROM gateway_attempts").fetchall()
         # With output flowing, provider timeout and request cancellation race.
         # Both also occur with healthy storage. Pin each existing accounting
@@ -1251,7 +1227,7 @@ def test_pending_checkpoint_does_not_pin_transport_or_settlement(
         expected_states = (
             {"failed", "cancelled"} if asynchronous and ending == "deadline" else {"cancelled"}
         )
-        assert len(rows) == 1 and rows[0][0] == settlements[0]["attempt_id"]
+        assert len(rows) == 1 and rows[0][0] == attempt_id
         assert rows[0][1] in expected_states
         if rows[0][1] == "failed":
             assert rows[0][2:5] == (None, None, "unknown")
@@ -1266,14 +1242,12 @@ def test_pending_checkpoint_does_not_pin_transport_or_settlement(
         allow_write.set()
         assert collector.close(3)
         own_records = [
-            value
-            for value in records
-            if json.loads(value)["request"]["request_id"] == settlements[0]["request_id"]
+            value for value in records if json.loads(value)["request"]["request_id"] == request_id
         ]
         assert len(own_records) == (1 if retention == "discard" else 2)
         assert len(records) == len(own_records) + int(asynchronous)
-        assert all(value == settlements[0] for value in settlements) and len(calls) == 1
-        with sqlite3.connect(manager.database_path) as connection:
+        assert len(calls) == 1
+        with connect_sqlite(manager.database_path) as connection:
             assert connection.execute(f"SELECT {columns} FROM gateway_attempts").fetchall() == rows
         saved = CaptureRecord.model_validate_json(own_records[0])
         assert saved.schema_version == 1 and saved.response is None
@@ -1447,3 +1421,19 @@ def test_capture_metrics_admit_the_twelve_hour_write_subset() -> None:
     )
     assert metrics.usage is not None
     assert metrics.usage.cache_creation_12h_input_tokens == 3247
+
+
+def _await_terminal_attempts(database: Path, count: int) -> list[tuple[object, ...]]:
+    """Observe committed native writes without intercepting the financial callback path."""
+    until = time.monotonic() + 4
+    while True:
+        with connect_sqlite(database) as connection:
+            rows = connection.execute(
+                "SELECT request_id, attempt_id, state FROM gateway_attempts "
+                "WHERE state != 'dispatched' ORDER BY started_at, attempt_id"
+            ).fetchall()
+        if len(rows) == count:
+            return rows
+        if time.monotonic() >= until:
+            pytest.fail(f"Expected {count} native terminal writes; observed {len(rows)}")
+        time.sleep(0.01)

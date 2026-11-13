@@ -10,8 +10,8 @@ fn update(content: Option<Value>, refusal: Option<Value>) -> Event {
     Event::ChoiceLogprobsDelta(ChoiceLogprobsDelta {
         choice_index: 0,
         logprobs: Some(crate::events::ChoiceLogprobs {
-            content: content.map(|value| serde_json::from_value(value).unwrap()),
-            refusal: refusal.map(|value| serde_json::from_value(value).unwrap()),
+            content: content.map(|value| crate::lossless_json::from_value(value).unwrap()),
+            refusal: refusal.map(|value| crate::lossless_json::from_value(value).unwrap()),
         }),
     })
 }
@@ -31,8 +31,8 @@ fn encoder_does_not_repeat_probability_records_on_text_or_finish_chunks() {
         .remove(0);
     let finish = encoder.feed(&Event::Completed).unwrap();
     let probability: Value =
-        serde_json::from_str(probability.trim_start_matches("data: ")).unwrap();
-    let text: Value = serde_json::from_str(text.trim_start_matches("data: ")).unwrap();
+        crate::lossless_json::from_str(probability.trim_start_matches("data: ")).unwrap();
+    let text: Value = crate::lossless_json::from_str(text.trim_start_matches("data: ")).unwrap();
     assert!(probability["choices"][0]["logprobs"]["content"].is_array());
     assert!(text["choices"][0]["logprobs"].is_null());
     assert!(finish[0].contains("\"logprobs\":null"));
@@ -226,7 +226,7 @@ fn novita_coerced_logprobs_encode_as_numbers_streaming_and_not() {
     for event in &events {
         for chunk in encoder.feed(event).unwrap() {
             let Ok(chunk) =
-                serde_json::from_str::<Value>(chunk.trim().trim_start_matches("data: "))
+                crate::lossless_json::from_str::<Value>(chunk.trim().trim_start_matches("data: "))
             else {
                 continue;
             };

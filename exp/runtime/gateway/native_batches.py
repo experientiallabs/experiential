@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from typing import Protocol
 
-from exp.runtime.gateway.native_accounting import NativeBridgeError
+from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 

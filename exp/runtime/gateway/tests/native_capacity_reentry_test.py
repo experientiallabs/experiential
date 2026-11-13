@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,6 +11,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.tests.launch_test import _provider_frame, _ServedGateway, _unused_port
 
@@ -117,7 +117,7 @@ def test_capacity_refusal_retries_same_key_without_replaying_or_losing_paid_work
             assert ambiguous.status_code == 409, ambiguous.text
             assert "x-gateway-admission-refused" not in ambiguous.headers
             assert Provider.calls == 3
-        with sqlite3.connect(tmp_path / "gateway" / "gateway.db") as connection:
+        with connect_sqlite(tmp_path / "gateway" / "gateway.db") as connection:
             failed = connection.execute(
                 """SELECT COUNT(a.attempt_id) FROM gateway_requests AS r
                    LEFT JOIN gateway_attempts AS a ON a.request_id = r.request_id

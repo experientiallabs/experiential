@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import signal
-import sqlite3
 import subprocess
 import sys
 import threading
@@ -26,6 +25,7 @@ from exp.common.models.gateway_chains import (
     GatewayModelChain,
     GatewayModelReferenceRung,
 )
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.native_bridge_test import _configured_pool_gateway
 from exp.runtime.gateway.tests.chain_authority_fixture_test import publish_authored_chain_fixture
 from exp.runtime.gateway.tests.native_responses_tool_translation_test import (
@@ -311,23 +311,18 @@ def stage_engine(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[_Se
         )
         source = source.replace(
             "    last_error = None",
-            "    original_admit, original_settle = control_plane.admit, control_plane.settle\n"
+            "    original_admit = control_plane.admit\n"
             "    def funded(argument):\n"
             "        result = json.loads(original_admit(argument))\n"
             "        for wire in result.get('route', []):\n"
             "            wire['billing_customer_managed'] = False\n"
             "        return json.dumps(result)\n"
-            "    def settled(argument):\n"
-            "        result = original_settle(argument)\n"
-            "        payload = json.loads(argument)\n"
-            "        if payload.get('finalize', True):\n"
-            "            collector.settle(payload['request_id'], True, True)\n"
-            "        return result\n"
-            "    control_plane.admit, control_plane.settle = funded, settled\n"
+            "    control_plane.admit = funded\n"
             "    last_error = None",
         ).replace(
-            "                ),\n            )",
-            "                ), capture=collector,\n            )",
+            "                native_callbacks=control_plane._accounting.native.callbacks(),",
+            "                capture=collector,\n"
+            "                native_callbacks=control_plane._accounting.native.callbacks(),",
         )
     driver.write_text(source + "\n")
     log_path = tmp_path / "driver.log"
@@ -406,7 +401,7 @@ def test_unavailable_child_has_no_attempt_and_parent_suffix_still_serves(
     assert response.headers["x-gateway-deployment"] == "beta"
     assert "from-secondary" in response.text
     request_id = response.headers["x-request-id"]
-    with sqlite3.connect(engine.database_path) as db:
+    with connect_sqlite(engine.database_path) as db:
         rows = db.execute(
             "SELECT exact_model_id,pool_id,deployment_id,state FROM gateway_attempts "
             "WHERE request_id=? ORDER BY attempt_ordinal",
@@ -467,7 +462,7 @@ def test_capture_keeps_root_request_model_and_actual_winning_deployment(
         assert "context" not in terminal_request
     else:
         assert "context" in terminal_request
-    with sqlite3.connect(engine.database_path) as db:
+    with connect_sqlite(engine.database_path) as db:
         row = db.execute(
             "SELECT exact_model_id,deployment_id FROM gateway_attempts WHERE state='completed'"
         ).fetchone()
@@ -535,7 +530,9 @@ def test_actual_responses_tool_translation_survives_conditional_child_stage(
         },
         timeout=30,
     )
-    with sqlite3.connect(engine.database_path) as db:
+    if response.status_code == 200:
+        _attempt_rows(engine, response.headers["x-request-id"])
+    with connect_sqlite(engine.database_path) as db:
         rows = db.execute(
             "SELECT deployment_id,exact_model_id,state,fallback_reason "
             "FROM gateway_attempts ORDER BY attempt_ordinal"
@@ -595,7 +592,7 @@ def test_actual_child_zdr_constraint_and_upstream_identity_survive_fallback(
         "metadata": "enabled",
         "provider": {"zdr": True, "data_collection": "deny"},
     }
-    with sqlite3.connect(engine.database_path) as db:
+    with connect_sqlite(engine.database_path) as db:
         assert db.execute(
             "SELECT exact_model_id,upstream_provider,state FROM gateway_attempts "
             "ORDER BY attempt_ordinal"
@@ -619,7 +616,7 @@ def test_native_child_stage_honors_conditional_failover(
         json={"model": "coding", "messages": [{"role": "user", "content": "always-500"}]},
         timeout=30,
     )
-    with sqlite3.connect(engine.database_path) as db:
+    with connect_sqlite(engine.database_path) as db:
         attempts = db.execute(
             "SELECT deployment_id,state,fallback_reason FROM gateway_attempts "
             "ORDER BY attempt_ordinal"
@@ -693,7 +690,7 @@ def test_actual_stage_header_alias_and_single_request_ledger(
         (1, 0, "failed"),
         (2, 1, "completed"),
     ]
-    with sqlite3.connect(engine.database_path) as db:
+    with connect_sqlite(engine.database_path) as db:
         rows = db.execute(
             "SELECT exact_model_id,pool_id FROM gateway_attempts "
             "WHERE request_id=? ORDER BY attempt_ordinal",
@@ -749,7 +746,7 @@ def test_actual_child_custom_start_disconnect_settles_once(engine: _ServingEngin
         (1, 0, "failed"),
         (2, 1, "cancelled"),
     ]
-    with sqlite3.connect(engine.database_path) as db:
+    with connect_sqlite(engine.database_path) as db:
         assert db.execute("SELECT count(*) FROM gateway_requests").fetchone() == (1,)
         assert db.execute(
             "SELECT count(*) FROM gateway_attempts WHERE state IN ('dispatched','running')"

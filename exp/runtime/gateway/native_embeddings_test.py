@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 from typing import cast
 
@@ -11,6 +10,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.common.models import ModelCapabilities
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
@@ -42,7 +42,7 @@ def _public_error(exc: NativeBridgeError) -> JsonObject:
 def _request_row(control: NativeControlPlane, request_id: str) -> tuple[str, str | None]:
     """Read the durable surface and terminal state of one request row."""
     ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         row = connection.execute(
             "select api_surface, terminal_state from gateway_requests where request_id = ?",
             (request_id,),
@@ -171,6 +171,6 @@ def test_admit_attributes_the_calling_app(tmp_path: Path) -> None:
     }
     control.admit_embeddings(json.dumps(argument))
     ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         rows = connection.execute("select client_app, user_agent from gateway_requests").fetchall()
     assert rows == [("claude_code", "claude-cli/2.1.278 (external, cli)")]

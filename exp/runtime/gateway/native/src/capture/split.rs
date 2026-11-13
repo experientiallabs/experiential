@@ -320,7 +320,7 @@ fn write_frames(path: &std::path::Path, out: &mut dyn Write) -> std::io::Result<
         let trimmed = trimmed.strip_suffix(b"\r").unwrap_or(trimmed);
         if trimmed.is_empty() {
             if has_data {
-                let value = serde_json::from_slice::<Value>(&data)
+                let value = crate::lossless_json::from_slice::<Value>(&data)
                     .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&data).into_owned()));
                 serde_json::to_writer(&mut *out, &value).map_err(std::io::Error::other)?;
                 out.write_all(b"\n")?;
@@ -426,7 +426,13 @@ impl<'de> Visitor<'de> for PartSeed<'_, '_> {
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
         let mut object = Map::new();
-        while let Some(key) = map.next_key::<String>()? {
+        while let Some(key) = map.next_key::<crate::lossless_json::ObjectKey>()? {
+            let crate::lossless_json::ObjectKey::Key(key) = key else {
+                let raw: String = map.next_value()?;
+                return crate::lossless_json::number(&raw)
+                    .map(Value::Number)
+                    .map_err(serde::de::Error::custom);
+            };
             let value = map.next_value_seed(PartSeed {
                 builder: &mut *self.builder,
             })?;

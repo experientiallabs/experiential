@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 import os
 import signal
-import sqlite3
 import subprocess
 import sys
 import threading
@@ -37,6 +36,7 @@ from exp.common.models.catalog import (
     load_model_catalog,
     write_model_catalog,
 )
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.catalog_authority import snapshot_current_catalog
 from exp.runtime.gateway.native_bridge_test import _configured_pool_gateway
 from exp.runtime.gateway.tests.native_waterfall_test import (
@@ -345,7 +345,7 @@ def test_bounded_rung_spills_the_burst_with_zero_deadline_deaths(
     assert [response.status_code for response in responses] == [200] * _BURST_REQUESTS
     contents = [response.json()["choices"][0]["message"]["content"] for response in responses]
     assert contents.count("from-spill") >= _BURST_REQUESTS - 2
-    with sqlite3.connect(spill_engine.database_path) as connection:
+    with connect_sqlite(spill_engine.database_path) as connection:
         sheds = connection.execute(
             "SELECT dispatch_reason, preferred_deployment_id FROM gateway_attempts"
             " WHERE dispatch_reason IS NOT NULL"
@@ -375,7 +375,7 @@ def test_rate_limited_rung_spills_the_burst_before_any_provider_429(
     contents = [response.json()["choices"][0]["message"]["content"] for response in responses]
     assert contents.count("from-house") == 1
     assert contents.count("from-spill") == _BURST_REQUESTS - 1
-    with sqlite3.connect(rate_limited_engine.database_path) as connection:
+    with connect_sqlite(rate_limited_engine.database_path) as connection:
         sheds = connection.execute(
             "SELECT dispatch_reason, preferred_deployment_id FROM gateway_attempts"
             " WHERE dispatch_reason IS NOT NULL"
@@ -410,7 +410,7 @@ def test_unbounded_rung_queues_the_burst_into_deadline_deaths(
     responses = _burst(baseline_engine)
     statuses = [response.status_code for response in responses]
     assert any(status != 200 for status in statuses), statuses
-    with sqlite3.connect(baseline_engine.database_path) as connection:
+    with connect_sqlite(baseline_engine.database_path) as connection:
         (disclosures,) = connection.execute(
             "SELECT count(*) FROM gateway_attempts WHERE dispatch_reason IS NOT NULL"
         ).fetchone()

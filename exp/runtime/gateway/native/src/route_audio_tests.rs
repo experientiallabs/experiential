@@ -72,7 +72,7 @@ fn transcription_bills_metered_seconds_and_renders_text_on_request() {
     let (json_body, json_type, _) =
         public_transcription(payload.clone(), &admission(&["units"], None), 0).expect("valid");
     assert_eq!(
-        serde_json::from_slice::<Value>(&json_body).unwrap(),
+        crate::lossless_json::from_slice::<Value>(&json_body).unwrap(),
         payload
     );
     assert_eq!(json_type, "application/json");

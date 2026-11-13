@@ -208,11 +208,12 @@ async fn connection_time_rebinding_is_rejected_without_contacting_target_or_prox
 #[test]
 fn serve_configuration_requires_an_explicit_hosted_opt_in() {
     let local: crate::server::ServeConfig =
-        serde_json::from_str(r#"{"host":"127.0.0.1","port":8080}"#).unwrap();
+        crate::lossless_json::from_str(r#"{"host":"127.0.0.1","port":8080}"#).unwrap();
     assert!(!local.public_upstreams_only);
-    let hosted: crate::server::ServeConfig =
-        serde_json::from_str(r#"{"host":"127.0.0.1","port":8080,"public_upstreams_only":true}"#)
-            .unwrap();
+    let hosted: crate::server::ServeConfig = crate::lossless_json::from_str(
+        r#"{"host":"127.0.0.1","port":8080,"public_upstreams_only":true}"#,
+    )
+    .unwrap();
     assert!(hosted.public_upstreams_only);
 }
 

@@ -28,6 +28,13 @@ use crate::tool_search::{ToolSearchAdmission, ToolSearchRound};
 use crate::waterfall::{DeploymentWire, RoutePolicy, Served};
 use crate::web_search::{WebSearchAdmission, WebSearchMeter};
 
+/// Pin the admitted transaction owner before parsing the remaining wire contract.
+pub(crate) fn bind_owner(state: &AppState, value: &Value) -> Result<AppState, PublicError> {
+    let mut state = state.clone();
+    state.bridge = std::sync::Arc::new(state.bridge.admitted(value)?);
+    Ok(state)
+}
+
 /// The wire configuration returned by one successful admission: the full
 /// ordered certified route (one wire configuration per deployment, each with
 /// its payload fully built by the shared python dialect builders) plus the
@@ -470,7 +477,7 @@ mod tests {
     use super::*;
 
     fn admission(zdr_constrained: bool) -> Admission {
-        serde_json::from_value(serde_json::json!({
+        crate::lossless_json::from_value(serde_json::json!({
             "request_id": "req",
             "alias": "public-model",
             "alias_revision_id": "rev",

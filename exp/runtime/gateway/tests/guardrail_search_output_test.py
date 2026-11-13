@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
 from pathlib import Path
 from typing import Literal, cast
@@ -12,6 +11,7 @@ import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
@@ -32,6 +32,7 @@ from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.tests.guardrail_policy_integrity_test import _body, _provider
 from exp.runtime.gateway.tests.mandatory_guardrails_paths_test import _serving
+from exp.runtime.gateway.tests.native_classifier_fixture_test import NativeClassifierFixture
 from exp.runtime.gateway.tests.native_tool_search_test import _configure, _Provider
 from exp.runtime.gateway.tests.native_waterfall_test import (
     _content_chunk,
@@ -105,7 +106,9 @@ def _context_engine(
                 ),
             )
         ),
-        client=DirectClassifierClient(ClassifierRegistry({"context": classifier})),
+        client=DirectClassifierClient(
+            ClassifierRegistry({"context": NativeClassifierFixture(classifier)})
+        ),
         monotonic=time.monotonic,
     )
 
@@ -195,7 +198,7 @@ def _web_response(
 
 def _assert_guardrail_settlement(database_path: Path, *, attempts: int = 1) -> None:
     """Require a terminal guardrail failure without an unfinished accepted request."""
-    with sqlite3.connect(database_path) as connection:
+    with connect_sqlite(database_path) as connection:
         rows = connection.execute(
             "select state, failure_class from gateway_attempts order by rowid"
         ).fetchall()

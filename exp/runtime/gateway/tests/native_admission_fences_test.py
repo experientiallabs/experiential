@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -11,6 +10,7 @@ import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayFailure, GatewayFailureClass
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 from exp.runtime.gateway.lifecycle import LocalGatewayComponents, load_gateway_components
@@ -20,10 +20,10 @@ from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_decisions_test import _body as _decision_body
 from exp.runtime.gateway.native_execution import NativeDialectUnavailableError
 from exp.runtime.gateway.routing import GatewayRoutingError
+from exp.runtime.gateway.tests.guardrail_fixture_test import _Classifier, _engine
 from exp.runtime.gateway.tests.guardrail_policy_integrity_test import _provider
 from exp.runtime.gateway.tests.mandatory_guardrails_paths_test import _serving
 from exp.runtime.gateway.tests.native_waterfall_test import _content_chunk, _terminal_frames
-from exp.runtime.gateway.tests.parallel_input_guardrails_test import _Classifier, _engine
 from exp.runtime.gateway.tests.web_search_backend_fixture_test import StaticWebSearchBackend
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearchResult
 from exp.runtime.models.providers.errors import ProviderParameterError
@@ -90,7 +90,7 @@ def test_guarded_uninspectable_surfaces_refuse_before_acceptance(
         assert "Guardrail policies" in response.text
         assert received == []
         assert not detector.requests
-        with sqlite3.connect(components.ledger.database_path) as connection:
+        with connect_sqlite(components.ledger.database_path) as connection:
             assert connection.execute("select count(*) from gateway_requests").fetchone() == (0,)
             assert connection.execute("select count(*) from gateway_attempts").fetchone() == (0,)
 
@@ -110,9 +110,12 @@ def test_retained_request_write_blocks_every_paid_http_surface(
             failure_class=GatewayFailureClass.GUARDRAIL, safe_message="blocked"
         )
         route, body = _request(surface)
-        with patch.object(
-            control._write_ledger, "finish_request", side_effect=OSError("unavailable")
-        ):
+        with connect_sqlite(components.ledger.database_path) as connection:
+            connection.execute(
+                "CREATE TRIGGER unavailable BEFORE UPDATE ON gateway_requests "
+                "BEGIN SELECT RAISE(ABORT,'fixture unavailable'); END"
+            )
+        try:
             assert not control._accounting.finish_request_quietly(
                 authorization, failure, web_search_requests=1
             )
@@ -123,16 +126,20 @@ def test_retained_request_write_blocks_every_paid_http_surface(
             assert response.status_code == 503, response.text
             assert response.json()["error"]["code"] == "accounting_unavailable"
             assert received == []
-            with sqlite3.connect(components.ledger.database_path) as connection:
+            with connect_sqlite(components.ledger.database_path) as connection:
                 assert connection.execute("select count(*) from gateway_requests").fetchone() == (
                     1,
                 )
                 assert connection.execute("select count(*) from gateway_attempts").fetchone() == (
                     0,
                 )
+        finally:
+            with connect_sqlite(components.ledger.database_path) as connection:
+                connection.execute("DROP TRIGGER unavailable")
         control._accounting.sweep_expired()
+        assert control.close(2)
         assert control._accounting.accounting_healthy
-        with sqlite3.connect(components.ledger.database_path) as connection:
+        with connect_sqlite(components.ledger.database_path) as connection:
             assert connection.execute(
                 "select terminal_state, web_search_requests from gateway_requests"
             ).fetchall() == [("failed", 1)]
@@ -181,7 +188,7 @@ def test_every_post_search_admission_exit_preserves_completed_search_meter(
         assert response.status_code >= 400, response.text
         assert len(search.queries) == 1
         assert received == []
-        with sqlite3.connect(components.ledger.database_path) as connection:
+        with connect_sqlite(components.ledger.database_path) as connection:
             assert connection.execute("select count(*) from gateway_attempts").fetchone() == (0,)
             assert connection.execute(
                 "select terminal_state, web_search_requests from gateway_requests"

@@ -69,7 +69,7 @@ config = json.dumps(
         "graceful_timeout_seconds": 1.0,
     }
 )
-exp_gateway_native.serve(control, config)
+exp_gateway_native.serve(control, config, native_callbacks=control.native_callbacks)
 """
 
 

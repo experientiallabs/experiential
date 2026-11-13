@@ -111,7 +111,7 @@ impl InputGate {
                     .map_err(|_| unavailable())?
                     .map_err(|_| unavailable())?;
                     let decision: Decision =
-                        serde_json::from_str(&response).map_err(|_| unavailable())?;
+                        crate::lossless_json::from_str(&response).map_err(|_| unavailable())?;
                     match decision.action.as_str() {
                         "allow" => return Ok(InputDecision::Allowed),
                         "closed" => return Ok(InputDecision::AdmissionClosed),
@@ -200,7 +200,7 @@ mod tests {
                     .unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
             });
             let bridge =
-                Arc::new(Bridge::new(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
+                Arc::new(Bridge::scripted(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
             let gate = Arc::new(InputGate {
                 request_id: "request".into(),
                 deadline: Instant::now() + Duration::from_secs(2),
@@ -270,7 +270,7 @@ mod tests {
                     .extract()
                     .unwrap()
             });
-            let writes: Vec<serde_json::Value> = serde_json::from_str(&writes).unwrap();
+            let writes: Vec<serde_json::Value> = crate::lossless_json::from_str(&writes).unwrap();
             assert_eq!(writes.len(), 1);
             assert_eq!(writes[0]["failure"]["failure_class"], "throttled");
             assert_eq!(writes[0]["failure"]["retry_after_seconds"], 120);
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn capture_error_keeps_its_code_and_underlying_settlement_failure() {
-        let decision: Decision = serde_json::from_value(json!({
+        let decision: Decision = crate::lossless_json::from_value(json!({
             "action": "error",
             "failure": {
                 "failure_class": "unavailable",
@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn ordinary_classifier_failure_keeps_gateway_unavailable() {
-        let decision: Decision = serde_json::from_value(json!({
+        let decision: Decision = crate::lossless_json::from_value(json!({
             "action": "error",
             "failure": {
                 "failure_class": "unavailable",
@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn unknown_public_code_rejects_the_input_decision() {
-        let decision = serde_json::from_value::<Decision>(json!({
+        let decision = crate::lossless_json::from_value::<Decision>(json!({
             "action": "error",
             "failure": {
                 "failure_class": "unavailable",

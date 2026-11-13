@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import os
 import signal
-import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -35,6 +34,7 @@ from websockets.sync.client import connect
 
 from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.common.models import ModelCapabilities
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
 
@@ -111,6 +111,7 @@ _DRIVER_SOURCE = textwrap.dedent(
                             "graceful_timeout_seconds": 2.0,
                         }
                     ),
+                    native_callbacks=control_plane._accounting.native.callbacks(),
                 )
                 return
             except RuntimeError as error:
@@ -122,7 +123,7 @@ _DRIVER_SOURCE = textwrap.dedent(
 
     if __name__ == "__main__":
         main()
-    '''
+'''
 ).strip()
 
 
@@ -2223,7 +2224,7 @@ def _latest_attempt_states(engine: _ServingEngine) -> list[tuple[int, str, str |
     database_path = GatewayManagement(engine.root).database_path
     deadline = time.monotonic() + 10.0
     while True:
-        with sqlite3.connect(database_path) as connection:
+        with connect_sqlite(database_path) as connection:
             latest = connection.execute(
                 "SELECT request_id FROM gateway_requests ORDER BY accepted_at DESC, rowid DESC"
                 " LIMIT 1"

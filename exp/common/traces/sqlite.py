@@ -22,6 +22,7 @@ from exp.common.core.artifacts import (
     stable_id,
     validate_artifact_id,
 )
+from exp.common.sqlite.native import connect
 from exp.common.traces.sqlite_import import ImportRecord, PreparedImport, prepare_import
 from exp.common.traces.sqlite_schema import TraceStoreError, initialize_schema, validate_schema
 from exp.common.traces.trace import Trace, TraceSource
@@ -183,7 +184,7 @@ class SQLiteTraceStore:
                     os.close(descriptor)
             _require_private_file(self.path)
             mode = "rw" if write else "ro"
-            connection = sqlite3.connect(f"{self.path.as_uri()}?mode={mode}", uri=True, timeout=5)
+            connection = connect(self.path, mode=mode)
             try:
                 connection.execute("PRAGMA foreign_keys=ON")
                 validate_schema(connection)

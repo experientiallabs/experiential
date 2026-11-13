@@ -17,7 +17,6 @@ import base64
 import json
 import os
 import signal
-import sqlite3
 import subprocess
 import sys
 import threading
@@ -38,6 +37,7 @@ from exp.common.models import (
     GatewayUnitPrices,
     ModelCapabilities,
 )
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.catalog_authority import upsert_singleton_deployment
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.tests.native_messages_test import (
@@ -363,7 +363,7 @@ def test_unbillable_or_failing_provider_answers_fail_closed(
 
 def _last_attempt(engine: _ServingEngine) -> tuple[object, ...]:
     """Read the newest attempt's state, reservation, settlement, cost, and units."""
-    with sqlite3.connect(engine.root / "gateway" / "gateway.db") as connection:
+    with connect_sqlite(engine.root / "gateway" / "gateway.db") as connection:
         row = connection.execute(
             """
             SELECT state, budget_reserved_nano_usd, budget_settled_nano_usd,

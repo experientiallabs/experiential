@@ -2,27 +2,29 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
-import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from exp_gateway_native import NativeSQLiteLedger
+from pydantic import JsonValue
+
+from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.common.sqlite.connection import persistent_connection
+from exp.common.sqlite.native import native_connection
 from exp.runtime.gateway.auth import utc_text
 from exp.runtime.gateway.budgets import (
-    MAXIMUM_NANO_USD,
-    budget_period_start,
-    current_budget_period,
-    require_attempt_budget,
-    settle_attempt_budgets,
+    BudgetRefusalBinding,
+    BudgetReservationRejected,
+    BudgetScope,
 )
 from exp.runtime.gateway.contracts import (
     AttemptId,
     AuthorizationSnapshot,
-    GatewayApiSurface,
     GatewayEvent,
     GatewayFailure,
     GatewayServiceTierAdmission,
@@ -30,6 +32,10 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.interfaces import GatewayClock
+from exp.runtime.gateway.ledger_errors import (
+    AccountingRecoverySupersededError,
+    AccountingRecoveryUnresolvedTerminalError,
+)
 from exp.runtime.gateway.ledger_errors import (
     AttemptRejectedError as AttemptRejectedError,
 )
@@ -42,14 +48,6 @@ from exp.runtime.gateway.ledger_errors import (
 from exp.runtime.gateway.ledger_errors import (
     IdempotencyReplayUnavailableError as IdempotencyReplayUnavailableError,
 )
-from exp.runtime.gateway.ledger_reconciliation import reconcile_terminal_attempt, record_recovery
-from exp.runtime.gateway.ledger_requests import finish_request
-from exp.runtime.gateway.ledger_service_tiers import (
-    long_context_values,
-    record_tier_admission,
-    settle_tier,
-    tier_usage_cost,
-)
 from exp.runtime.gateway.ledger_usage import (
     BillingSourceUsage,
     IdentityUsage,
@@ -57,14 +55,6 @@ from exp.runtime.gateway.ledger_usage import (
     billing_source_usage_rows,
     client_app_usage_rows,
     identity_usage_rows,
-)
-from exp.runtime.gateway.ledger_valuation import (
-    billed_unit_columns,
-    budget_settlement_nano_usd,
-    frozen_usage_cost,
-    observed_usage_cost,
-    optional_int,
-    usage_source_label,
 )
 from exp.runtime.gateway.ledger_valuation import terminal_values as _terminal_values
 from exp.runtime.gateway.model_chain_authority import (
@@ -75,8 +65,11 @@ from exp.runtime.gateway.model_chain_authority import (
     prepare_sqlite_chain_authority,
     serving_snapshot_limit,
 )
+from exp.runtime.gateway.native_continuation_store import NativeContinuationStore
+from exp.runtime.gateway.native_sqlite import SQLiteRequestFactory
 from exp.runtime.gateway.sqlite.migrations import initialize_database
 from exp.runtime.gateway.sqlite.store import SystemGatewayClock
+from exp.runtime.openai_protocol.state import BoundedContinuationStore
 
 
 class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
@@ -106,6 +99,47 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         self._clock = SystemGatewayClock() if clock is None else clock
         self._busy_timeout_ms = busy_timeout_ms
         initialize_database(database_path, busy_timeout_ms=busy_timeout_ms)
+        self._native = NativeSQLiteLedger(
+            str(database_path),
+            busy_timeout_ms=busy_timeout_ms,
+            maximum_snapshot_bytes=self.serving_snapshot_max_bytes,
+        )
+
+    def _native_apply(
+        self, connection: sqlite3.Connection, operation: str, payload: JsonObject
+    ) -> JsonValue:
+        """Invoke the native writer inside a cold caller's existing transaction."""
+        payload["now"] = utc_text(self._clock.now())
+        try:
+            return json.loads(
+                self._native.apply(operation, json.dumps(payload), native_connection(connection))
+            )
+        except ValueError as error:
+            detail = json.loads(str(error))
+            if detail.get("code") == "idempotency_conflict":
+                raise IdempotencyConflictError(detail["message"]) from error
+            if detail.get("code") == "idempotency_replay_unavailable":
+                raise IdempotencyReplayUnavailableError(detail["message"]) from error
+            if detail.get("code") == "accounting_recovery_superseded":
+                raise AccountingRecoverySupersededError(detail["message"]) from error
+            if detail.get("code") == "accounting_recovery_unresolved":
+                raise AccountingRecoveryUnresolvedTerminalError(detail["message"]) from error
+            if detail.get("code") == "accounting_integrity":
+                raise sqlite3.IntegrityError(detail["message"]) from error
+            raise GatewayLedgerError(
+                detail.get("message", "Native accounting write failed")
+            ) from error
+
+    def native_request_factory(
+        self, continuations: BoundedContinuationStore
+    ) -> SQLiteRequestFactory:
+        """Bind local serving to native writes and the same native continuation store."""
+        if not isinstance(continuations, NativeContinuationStore):
+            raise TypeError("Local native accounting requires a NativeContinuationStore")
+        return SQLiteRequestFactory(
+            self._native,
+            continuations,
+        )
 
     @contextmanager
     def prepare_chain_authority(
@@ -193,84 +227,15 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
             chain_preflight=chain_preflight,
             operation="accept",
         )
-        now = self._clock.now()
         remaining = max(0.0, authorization.deadline_monotonic - self._clock.monotonic())
-        deadline_at = now + timedelta(seconds=remaining)
-        if authorization.caller_operation_sha256 is not None:
-            prior = connection.execute(
-                """
-                SELECT canonical_request_sha256, terminal_state, failed_without_effects,
-                  NOT EXISTS (SELECT 1 FROM gateway_attempts AS a
-                    WHERE a.request_id = gateway_requests.request_id) AS no_dispatch
-                FROM gateway_requests
-                WHERE organization_id = ? AND identity_id = ?
-                  AND alias_revision_id = ? AND api_surface = ?
-                  AND caller_operation_sha256 = ?
-                ORDER BY rowid DESC LIMIT 1
-                """,
-                (
-                    authorization.organization_id,
-                    authorization.identity_id,
-                    authorization.alias_revision_id,
-                    authorization.surface.value,
-                    authorization.caller_operation_sha256,
-                ),
-            ).fetchone()
-            if prior is not None:
-                if str(prior["canonical_request_sha256"]) != (
-                    authorization.canonical_request_sha256
-                ):
-                    # A failed request never authorizes different content under the same key.
-                    raise IdempotencyConflictError(
-                        "caller operation key was reused with different request content"
-                    )
-                if not (
-                    str(prior["terminal_state"])
-                    in {"expired_before_dispatch", "unknown_after_crash"}
-                    or (
-                        prior["terminal_state"] == "failed"
-                        and prior["failed_without_effects"]
-                        and prior["no_dispatch"]
-                    )
-                ):
-                    raise IdempotencyReplayUnavailableError(
-                        "matching keyed request exists but durable content replay is unavailable"
-                    )
-        alias_row = connection.execute(
-            """
-            SELECT alias_id FROM alias_revisions
-            WHERE organization_id = ? AND revision_id = ?
-            """,
-            (authorization.organization_id, authorization.alias_revision_id),
-        ).fetchone()
-        if alias_row is None:
-            raise GatewayLedgerError("authorized alias revision is not present in the ledger")
-        connection.execute(
-            """
-            INSERT INTO gateway_requests (
-                request_id, organization_id, identity_id, key_id, alias_id,
-                alias_revision_id, api_surface, canonical_request_sha256,
-                caller_operation_sha256, accepted_at, deadline_at,
-                app_referer, app_title, client_app, user_agent
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                authorization.request_id,
-                authorization.organization_id,
-                authorization.identity_id,
-                authorization.virtual_key_id,
-                str(alias_row["alias_id"]),
-                authorization.alias_revision_id,
-                authorization.surface.value,
-                authorization.canonical_request_sha256,
-                authorization.caller_operation_sha256,
-                utc_text(now),
-                utc_text(deadline_at),
-                authorization.app_referer,
-                authorization.app_title,
-                authorization.client_app,
-                authorization.user_agent,
-            ),
+        self._native_apply(
+            connection,
+            "accept",
+            {
+                "authorization": authorization.model_dump(mode="json"),
+                "remaining_seconds": remaining,
+                "deadline_at": utc_text(self._clock.now() + timedelta(seconds=remaining)),
+            },
         )
 
     def start_attempt(
@@ -372,155 +337,75 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         self._require_chain_authority(
             connection,
             authorization=snapshot.authorization,
-            staged=bool(snapshot.model_stages),
             chain_preflight=chain_preflight,
             operation="reserve",
+            staged=bool(snapshot.model_stages),
         )
-        # The in-process SQLite mirror carries no promo / rate-limit token
-        # columns, so the reservations are accepted for Protocol parity and
-        # dropped here; the platform's Postgres ledger stores and counts them.
-        del reserved_input_tokens, reserved_output_tokens
-        for value in (route_reason, fallback_reason, dispatch_reason):
-            if value is not None and (len(value) > 512 or any(ord(char) < 32 for char in value)):
-                raise GatewayLedgerError("route context must be a short display-safe code")
-        if deployment.deployment_id not in snapshot.deployment_ids:
-            raise GatewayLedgerError("attempt deployment is absent from the execution snapshot")
-        stage = snapshot.stage_for_depth(route_depth)
-        if (
-            deployment.deployment_id != snapshot.deployment_ids[route_depth]
-            or deployment.deployment_id not in stage.deployment_ids
-        ):
-            raise GatewayLedgerError("attempt deployment differs from its authorized stage cursor")
-        if deployment.exact_model_id != stage.exact_model_id:
-            raise GatewayLedgerError("attempt deployment changes the selected stage exact model")
-        if (
-            preferred_deployment is not None
-            and preferred_deployment.deployment_id == deployment.deployment_id
-        ):
-            raise GatewayLedgerError("a preferred rung disclosure requires a divergent rung")
-        if maximum_cost_nano_usd is not None and not (
-            0 <= maximum_cost_nano_usd <= MAXIMUM_NANO_USD
-        ):
-            raise GatewayLedgerError("maximum attempt cost must fit a nonnegative SQLite integer")
-        attempt_id = f"attempt-{uuid.uuid4().hex}"
-        prices = deployment.gateway.prices
-        preferred_prices = (
-            None if preferred_deployment is None else preferred_deployment.gateway.prices
-        )
-        now = self._clock.now()
-        period_start = budget_period_start(current_budget_period(now))
-        request = connection.execute(
-            """
-            SELECT organization_id, identity_id, alias_id, alias_revision_id, terminal_state
-            FROM gateway_requests
-            WHERE request_id = ?
-            """,
-            (snapshot.authorization.request_id,),
-        ).fetchone()
-        if request is None:
-            raise GatewayLedgerError("attempt request was not durably accepted")
-        if (
-            str(request["organization_id"]) != snapshot.authorization.organization_id
-            or str(request["identity_id"]) != snapshot.authorization.identity_id
-            or str(request["alias_revision_id"]) != snapshot.authorization.alias_revision_id
-        ):
-            raise GatewayLedgerError("attempt authority differs from accepted request")
-        if request["terminal_state"] is not None:
-            raise GatewayLedgerError("attempt request is already terminal")
-        connection.execute(
-            """
-            INSERT INTO gateway_attempts (
-                attempt_id, request_id, organization_id, attempt_ordinal, route_depth,
-                deployment_id, provider, exact_model_id, pool_id, catalog_sha256,
-                billing_source,
-                pricing_source, pricing_effective_at,
-                input_rate, cached_input_rate, cache_creation_input_rate,
-                cache_creation_1h_input_rate, output_rate, reasoning_rate,
-                long_context_threshold_tokens, long_context_input_rate,
-                long_context_cached_input_rate, long_context_cache_creation_input_rate,
-                long_context_cache_creation_1h_input_rate,
-                long_context_output_rate, long_context_reasoning_rate,
-                route_reason, fallback_reason,
-                dispatch_reason, preferred_deployment_id,
-                preferred_input_rate, preferred_cached_input_rate,
-                preferred_cache_creation_input_rate, preferred_cache_creation_1h_input_rate,
-                preferred_output_rate, preferred_reasoning_rate, unit_prices,
-                state, started_at, budget_period_start, budget_reserved_nano_usd
-            ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                'dispatched', ?, ?, ?
+        lanes: list[JsonObject | None] = [None] * len(snapshot.deployment_ids)
+        lanes[route_depth] = deployment.model_dump(mode="json")
+        if preferred_deployment is not None:
+            lanes[snapshot.deployment_ids.index(preferred_deployment.deployment_id)] = (
+                preferred_deployment.model_dump(mode="json")
             )
-            """,
-            (
-                attempt_id,
-                snapshot.authorization.request_id,
-                snapshot.authorization.organization_id,
-                attempt_ordinal,
-                route_depth,
-                deployment.deployment_id,
-                deployment.provider,
-                stage.exact_model_id,
-                stage.pool_id,
-                snapshot.authorization.catalog_sha256,
-                deployment.billing_source.value,
-                deployment.gateway.pricing_source,
-                (
-                    None
-                    if deployment.gateway.pricing_effective_at is None
-                    else utc_text(deployment.gateway.pricing_effective_at)
-                ),
-                prices.input_nano_usd_per_million_tokens,
-                prices.cached_input_nano_usd_per_million_tokens,
-                prices.cache_creation_input_nano_usd_per_million_tokens,
-                prices.cache_creation_1h_input_nano_usd_per_million_tokens,
-                prices.output_nano_usd_per_million_tokens,
-                prices.reasoning_nano_usd_per_million_tokens,
-                *long_context_values(prices),
-                route_reason,
-                fallback_reason,
-                dispatch_reason,
-                None if preferred_deployment is None else preferred_deployment.deployment_id,
-                None
-                if preferred_prices is None
-                else preferred_prices.input_nano_usd_per_million_tokens,
-                None
-                if preferred_prices is None
-                else preferred_prices.cached_input_nano_usd_per_million_tokens,
-                None
-                if preferred_prices is None
-                else preferred_prices.cache_creation_input_nano_usd_per_million_tokens,
-                None
-                if preferred_prices is None
-                else preferred_prices.cache_creation_1h_input_nano_usd_per_million_tokens,
-                None
-                if preferred_prices is None
-                else preferred_prices.output_nano_usd_per_million_tokens,
-                None
-                if preferred_prices is None
-                else preferred_prices.reasoning_nano_usd_per_million_tokens,
-                None if prices.units is None else prices.units.model_dump_json(),
-                utc_text(now),
-                period_start,
-                maximum_cost_nano_usd,
-            ),
-        )
-        record_tier_admission(connection, attempt_id, service_tier)
-        require_attempt_budget(
+        result = self._native_apply(
             connection,
-            organization_id=snapshot.authorization.organization_id,
-            identity_id=str(request["identity_id"]),
-            alias_id=str(request["alias_id"]),
-            pool_id=stage.pool_id,
-            root_pool_id=snapshot.pool_id,
-            request_id=snapshot.authorization.request_id,
-            alias_revision_id=snapshot.authorization.alias_revision_id,
-            deployment_id=deployment.deployment_id,
-            attempt_id=attempt_id,
-            period_start=period_start,
-            maximum_cost_nano_usd=maximum_cost_nano_usd,
+            "start",
+            {
+                "authorization": snapshot.authorization.model_dump(mode="json"),
+                "snapshot": snapshot.model_dump(mode="json"),
+                "deployments": lanes,
+                "remaining_seconds": max(
+                    0.0, snapshot.authorization.deadline_monotonic - self._clock.monotonic()
+                ),
+                "dispatch": {
+                    "ordinal": attempt_ordinal,
+                    "depth": route_depth,
+                    "prices": (
+                        deployment.gateway.prices
+                        if service_tier is None
+                        else service_tier.requested_prices
+                    ).model_dump(mode="json"),
+                    "maximum_cost_nano": maximum_cost_nano_usd,
+                    "reserved_input_tokens": reserved_input_tokens,
+                    "reserved_output_tokens": reserved_output_tokens,
+                    "route_reason": route_reason,
+                    "fallback_reason": fallback_reason,
+                    "dispatch_reason": dispatch_reason,
+                    "preferred_deployment_id": None
+                    if preferred_deployment is None
+                    else preferred_deployment.deployment_id,
+                    "service_tier": None
+                    if service_tier is None
+                    else service_tier.model_dump(mode="json"),
+                },
+            },
         )
-        return attempt_id
+        if not isinstance(result, dict):
+            raise GatewayLedgerError("Native reservation returned an invalid result")
+        if result.get("refused") is not None:
+            refusal = result["refused"]
+            if not isinstance(refusal, dict) or not isinstance(refusal.get("error"), dict):
+                raise GatewayLedgerError("Native reservation returned an invalid refusal")
+            error = refusal["error"]
+            assert isinstance(error, dict)
+            reason = error.get("message")
+            if not isinstance(reason, str):
+                raise GatewayLedgerError("Native reservation returned an invalid reason")
+            scope = BudgetScope.model_validate(refusal["budget_scope"])
+            raise BudgetReservationRejected(
+                scope_kind=scope.kind,
+                reason=reason,
+                binding=BudgetRefusalBinding.model_validate(
+                    {
+                        "request_id": snapshot.authorization.request_id,
+                        "organization_id": snapshot.authorization.organization_id,
+                        "alias_revision_id": snapshot.authorization.alias_revision_id,
+                        "scope": scope,
+                        "application": refusal["application"],
+                    }
+                ),
+            )
+        return str(result["attempt_id"])
 
     def finish_attempt(
         self,
@@ -614,120 +499,46 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
             web_search_requests: Accepted for the shared settle signature (see ``finish_attempt``).
             tool_search_requests: Accepted alongside ``web_search_requests``; same local status.
         """
-        del web_search_requests, tool_search_requests  # Hosted ledger prices both meters.
-        state, normalized_failure, failure_message, usage = _terminal_values(
-            terminal_event, failure
+        state, _, _, usage = _terminal_values(terminal_event, failure)
+        normalized = failure or (None if terminal_event is None else terminal_event.failure)
+        terminal: JsonObject = (
+            {}
+            if terminal_event is None
+            else {
+                "accounting_recovery": terminal_event.accounting_recovery,
+                "accounting_release_reservation": terminal_event.accounting_release_reservation,
+                "usage_estimated": terminal_event.usage_estimated,
+                "usage_incomplete_due_to_disconnect": (
+                    terminal_event.usage_incomplete_due_to_disconnect
+                ),
+                "decision_provider_rejected": terminal_event.decision_provider_rejected,
+            }
         )
-        row = connection.execute(
-            """
-            SELECT request_id, state, input_rate, cached_input_rate,
-                   cache_creation_input_rate, cache_creation_1h_input_rate,
-                   output_rate, reasoning_rate,
-                   long_context_threshold_tokens, long_context_input_rate,
-                   long_context_cached_input_rate, long_context_cache_creation_input_rate,
-                   long_context_cache_creation_1h_input_rate, long_context_output_rate,
-                   long_context_reasoning_rate, budget_reserved_nano_usd,
-                   preferred_deployment_id, preferred_input_rate,
-                   preferred_cached_input_rate, preferred_output_rate,
-                   preferred_cache_creation_input_rate, preferred_cache_creation_1h_input_rate,
-                   preferred_reasoning_rate, unit_prices,
-                   (SELECT api_surface FROM gateway_requests
-                    WHERE request_id = gateway_attempts.request_id) AS api_surface
-            FROM gateway_attempts WHERE attempt_id = ?
-            """,
-            (attempt_id,),
-        ).fetchone()
-        if row is None:
-            raise GatewayLedgerError("attempt does not exist")
-        current_state = str(row["state"])
-        if current_state != "dispatched":
-            reconcile_terminal_attempt(
-                connection, attempt_id, state, terminal_event, failure, usage, service_tier
-            )
-            return
-        tier = settle_tier(connection, attempt_id, service_tier)
-        cost = (
-            observed_usage_cost(row, usage, terminal_event)
-            if tier is None
-            else tier_usage_cost(tier, usage, terminal_event)
+        terminal.update(
+            {
+                "state": state,
+                "usage": None if usage is None else usage.model_dump(mode="json"),
+                "failure": None if normalized is None else normalized.model_dump(mode="json"),
+                "input_guardrail_denied": normalized is not None
+                and normalized.safe_details.get("input_guardrail_denied") is True,
+                "finalize": finalize_request,
+                "first_token_at": None if first_token_at is None else utc_text(first_token_at),
+                "service_tier": None
+                if service_tier is None
+                else service_tier.model_dump(mode="json"),
+                "observations": {
+                    "retry_after_seconds": retry_after_seconds,
+                    "ratelimit_limit_requests": ratelimit_limit_requests,
+                    "ratelimit_remaining_requests": ratelimit_remaining_requests,
+                    "ratelimit_limit_tokens": ratelimit_limit_tokens,
+                    "ratelimit_remaining_tokens": ratelimit_remaining_tokens,
+                    "upstream_provider": upstream_provider,
+                    "web_search_requests": web_search_requests,
+                    "tool_search_requests": tool_search_requests,
+                },
+            }
         )
-        budget_settlement = (
-            budget_settlement_nano_usd(row, cost, usage, terminal_event) if tier is None else cost
-        )
-        if (failure is not None and failure.safe_details.get("input_guardrail_denied") is True) or (
-            terminal_event is not None and terminal_event.accounting_release_reservation
-        ):
-            # Waive the customer charge without changing provider usage or cost.
-            budget_settlement = 0
-        usage_source = usage_source_label(
-            usage, estimated=terminal_event is not None and terminal_event.usage_estimated
-        )
-        # Price the same observed usage at the preferred rung's frozen base rates.
-        # This is telemetry, not billing; missing rates remain unknown.
-        counterfactual_cost = (
-            None
-            if row["preferred_deployment_id"] is None
-            else frozen_usage_cost(row, usage, prefix="preferred_")
-        )
-        terminal_at = utc_text(self._clock.now())
-        connection.execute(
-            """
-            UPDATE gateway_attempts
-            SET state = ?, terminal_at = ?, first_token_at = ?, failure_class = ?,
-                failure_message = ?,
-                input_tokens = ?, cached_input_tokens = ?,
-                cache_creation_input_tokens = ?, cache_creation_1h_input_tokens = ?,
-                output_tokens = ?,
-                reasoning_tokens = ?, usage_source = ?, estimated_cost_nano_usd = ?,
-                counterfactual_cost_nano_usd = ?,
-                budget_settled_nano_usd = ?,
-                retry_after_seconds = ?, ratelimit_limit_requests = ?,
-                ratelimit_remaining_requests = ?, ratelimit_limit_tokens = ?,
-                ratelimit_remaining_tokens = ?, upstream_provider = ?,
-                billed_unit_kind = ?, billed_unit_variant = ?, billed_quantity_milli = ?,
-                billed_unit_rate = ?
-            WHERE attempt_id = ? AND state = 'dispatched'
-            """,
-            (
-                state,
-                terminal_at,
-                None if first_token_at is None else utc_text(first_token_at),
-                normalized_failure,
-                failure_message,
-                None if usage is None else usage.input_tokens,
-                None if usage is None else usage.cached_input_tokens,
-                None if usage is None else usage.cache_creation_input_tokens,
-                None if usage is None else usage.cache_creation_1h_input_tokens,
-                None if usage is None else usage.output_tokens,
-                None if usage is None else usage.reasoning_tokens,
-                usage_source,
-                cost,
-                counterfactual_cost,
-                budget_settlement,
-                retry_after_seconds,
-                ratelimit_limit_requests,
-                ratelimit_remaining_requests,
-                ratelimit_limit_tokens,
-                ratelimit_remaining_tokens,
-                upstream_provider,
-                *billed_unit_columns(row, usage),
-                attempt_id,
-            ),
-        )
-        record_recovery(connection, attempt_id, terminal_event)
-        settle_attempt_budgets(
-            connection,
-            attempt_id=attempt_id,
-            settled_nano_usd=budget_settlement,
-        )
-        if finalize_request and state in {"completed", "failed", "cancelled", "incomplete"}:
-            connection.execute(
-                """
-                UPDATE gateway_requests SET terminal_state = ?, terminal_at = ?
-                WHERE request_id = ? AND terminal_state IS NULL
-                """,
-                (state, terminal_at, str(row["request_id"])),
-            )
+        self._native_apply(connection, "settle", {"attempt_id": attempt_id, "terminal": terminal})
 
     def reconcile_decision_liability(
         self,
@@ -744,38 +555,14 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         if (
             isinstance(assigned_cost_nano_usd, bool)
             or not isinstance(assigned_cost_nano_usd, int)
-            or not 0 <= assigned_cost_nano_usd <= MAXIMUM_NANO_USD
+            or not 0 <= assigned_cost_nano_usd <= 9_223_372_036_854_775_807
         ):
             raise ValueError("assigned decision cost must fit a nonnegative SQLite integer")
         with self._transaction() as connection:
-            row = connection.execute(
-                "SELECT a.state, a.usage_source, a.budget_reserved_nano_usd, "
-                "a.budget_settled_nano_usd, r.api_surface FROM gateway_attempts AS a "
-                "JOIN gateway_requests AS r ON r.request_id = a.request_id "
-                "WHERE a.attempt_id = ?",
-                (attempt_id,),
-            ).fetchone()
-            if (
-                row is None
-                or row["api_surface"] != GatewayApiSurface.DECISIONS.value
-                or row["state"] == "dispatched"
-                or row["usage_source"] != "unknown"
-                or row["budget_reserved_nano_usd"] is None
-            ):
-                raise GatewayLedgerError("attempt has no terminal decision liability to reconcile")
-            settled = optional_int(row["budget_settled_nano_usd"])
-            if settled is not None:
-                if settled == assigned_cost_nano_usd:
-                    return
-                raise GatewayLedgerError("decision liability already resolved at another cost")
-            settle_attempt_budgets(
+            self._native_apply(
                 connection,
-                attempt_id=attempt_id,
-                settled_nano_usd=assigned_cost_nano_usd,
-            )
-            connection.execute(
-                "UPDATE gateway_attempts SET budget_settled_nano_usd = ? WHERE attempt_id = ?",
-                (assigned_cost_nano_usd, attempt_id),
+                "reconcile_liability",
+                {"attempt_id": attempt_id, "assigned_cost_nano_usd": assigned_cost_nano_usd},
             )
 
     def finish_request(
@@ -813,14 +600,24 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         web_search_requests: int = 0,
     ) -> bool:
         """Apply :meth:`finish_request` inside the caller's serialized write transaction."""
-        return finish_request(
+        result = self._native_apply(
             connection,
-            authorization=authorization,
-            failure=failure,
-            terminal_at=self._clock.now(),
-            certify_no_effects=certify_no_effects,
-            web_search_requests=web_search_requests,
+            "finish",
+            {
+                "authorization": authorization.model_dump(mode="json"),
+                "terminal": {
+                    "state": "cancelled"
+                    if failure.failure_class.value == "cancelled"
+                    else "failed",
+                    "failure": failure.model_dump(mode="json"),
+                },
+                "certify_no_effects": certify_no_effects,
+                "web_search_requests": web_search_requests,
+            },
         )
+        if not isinstance(result, bool):
+            raise GatewayLedgerError("Native accounting returned an invalid certificate")
+        return result
 
     def reconcile_crashed_requests(self, *, cleanup_grace: timedelta) -> tuple[int, int]:
         """Settle expired pre-dispatch and dispatched work after a crash.
@@ -833,62 +630,16 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         """
         if cleanup_grace < timedelta(0):
             raise ValueError("cleanup grace cannot be negative")
-        now = self._clock.now()
-        expired_requests = 0
-        unknown_attempts = 0
         with self._transaction() as connection:
-            request_rows = connection.execute(
-                """
-                SELECT r.request_id, r.deadline_at,
-                       EXISTS(
-                           SELECT 1 FROM gateway_attempts AS a WHERE a.request_id = r.request_id
-                       ) AS has_attempt
-                FROM gateway_requests AS r WHERE r.terminal_state IS NULL
-                """
-            ).fetchall()
-            for request in request_rows:
-                deadline = datetime.fromisoformat(str(request["deadline_at"]))
-                if int(request["has_attempt"]) == 0 and deadline <= now:
-                    connection.execute(
-                        """
-                        UPDATE gateway_requests
-                        SET terminal_state = 'expired_before_dispatch', terminal_at = ?
-                        WHERE request_id = ? AND terminal_state IS NULL
-                        """,
-                        (utc_text(now), str(request["request_id"])),
-                    )
-                    expired_requests += 1
-            attempt_rows = connection.execute(
-                """
-                SELECT a.attempt_id, a.request_id, r.deadline_at
-                FROM gateway_attempts AS a
-                JOIN gateway_requests AS r ON r.request_id = a.request_id
-                WHERE a.state = 'dispatched'
-                """
-            ).fetchall()
-            for attempt in attempt_rows:
-                deadline = datetime.fromisoformat(str(attempt["deadline_at"]))
-                if deadline + cleanup_grace > now:
-                    continue
-                connection.execute(
-                    """
-                    UPDATE gateway_attempts
-                    SET state = 'unknown_after_crash', terminal_at = ?,
-                        usage_source = 'unknown'
-                    WHERE attempt_id = ? AND state = 'dispatched'
-                    """,
-                    (utc_text(now), str(attempt["attempt_id"])),
-                )
-                connection.execute(
-                    """
-                    UPDATE gateway_requests
-                    SET terminal_state = 'unknown_after_crash', terminal_at = ?
-                    WHERE request_id = ? AND terminal_state IS NULL
-                    """,
-                    (utc_text(now), str(attempt["request_id"])),
-                )
-                unknown_attempts += 1
-        return expired_requests, unknown_attempts
+            counts = self._native_apply(
+                connection, "recover", {"cleanup_grace_seconds": int(cleanup_grace.total_seconds())}
+            )
+            if not isinstance(counts, list) or len(counts) != 2:
+                raise GatewayLedgerError("Native recovery returned invalid counts")
+            expired, unknown = counts
+            if not isinstance(expired, int) or not isinstance(unknown, int):
+                raise GatewayLedgerError("Native recovery returned invalid counts")
+            return expired, unknown
 
     def usage(
         self, *, organization_id: str, identity_id: str | None = None

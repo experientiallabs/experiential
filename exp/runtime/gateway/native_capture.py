@@ -360,14 +360,26 @@ class CaptureController:
         *,
         session_id: str | None = None,
     ) -> bool:
-        """Prepare only an allowed identity's post-guardrail, expanded request."""
+        """Register an allowed identity's post-guardrail, expanded request."""
+        record = self.prepare(authorization, request, model_id, session_id=session_id)
+        return record is None or self.native.begin_bytes(record)
+
+    def prepare(
+        self,
+        authorization: AuthorizationSnapshot,
+        request: GatewayRequest,
+        model_id: str | None,
+        *,
+        session_id: str | None = None,
+    ) -> bytes | None:
+        """Freeze capture authority without registering content before input approval."""
         application_id = self._application_for(authorization)
         if application_id is None or request.surface.value not in {
             "chat_completions",
             "responses",
             "messages",
         }:
-            return True
+            return None
         context = capture_context_document(request, session_id=session_id)
         # Authority and effective context are already typed. Serialize that
         # projection once; the native admission boundary validates the envelope.
@@ -383,7 +395,7 @@ class CaptureController:
             "model_id": model_id,
             "context": context,
         }
-        return self.native.begin_bytes(to_json(record, inf_nan_mode="null"))
+        return to_json(record, inf_nan_mode="null")
 
 
 @dataclass(frozen=True)
