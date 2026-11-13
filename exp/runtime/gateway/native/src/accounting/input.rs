@@ -1,5 +1,6 @@
 //! Read-only input inspection that overlaps dispatch without entering Python.
 
+use std::future::Future;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -539,7 +540,8 @@ async fn run(
         let started = Instant::now();
         let budget = Duration::from_millis(c.check["timeout_ms"].as_u64().unwrap_or(0))
             .min(deadline.saturating_duration_since(started));
-        let (result, incomplete) = inspect_until_ready(&c, budget, &mut ready).await;
+        let (result, incomplete) =
+            inspect_until_ready(&c, budget, &mut ready, inspect(&c, budget)).await;
         let outcome = match &result {
             Ok(v) if v["coverage_error"] == true => "unsupported",
             Ok(v) if v["flagged"] == true => "flagged",
@@ -625,7 +627,11 @@ async fn inspect_until_ready(
     check: &Check,
     budget: Duration,
     ready: &mut tokio::sync::watch::Receiver<Option<Instant>>,
+    inspection: impl Future<Output = Result<Value, ()>>,
 ) -> (Result<Value, ()>, &'static str) {
+    if budget.is_zero() {
+        return (Err(()), "timeout");
+    }
     let deadline = Instant::now() + budget;
     let grace = (check.policy["mode"] != "observe" && check.policy["input_fail_open"] == true)
         .then(|| {
@@ -636,7 +642,6 @@ async fn inspect_until_ready(
                     .min(5000),
             )
         });
-    let inspection = inspect(check, budget);
     tokio::pin!(inspection);
     loop {
         let release = (*ready.borrow_and_update())
@@ -648,19 +653,17 @@ async fn inspect_until_ready(
         } else {
             "timeout"
         };
-        if Instant::now() >= until {
-            return (Err(()), reason);
-        }
         tokio::select! {
             biased;
+            // A completed verdict wins the boundary without extending its wait.
+            result = &mut inspection => {
+                let incomplete = if Instant::now() >= until { reason } else { "unavailable" };
+                return (result, incomplete);
+            },
             changed = ready.changed() => {
                 if changed.is_err() { return (Err(()), "cancelled"); }
             },
             _ = tokio::time::sleep_until(until.into()) => return (Err(()), reason),
-            result = &mut inspection => {
-                if Instant::now() >= until { return (Err(()), reason); }
-                return (result, "unavailable");
-            }
         }
     }
 }
@@ -803,6 +806,48 @@ mod interruption_tests {
                 assert_eq!(decision["moderation"]["status"], "denied");
                 assert_eq!(decision["moderation"]["observations"], json!(records));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ready_verdict_wins_expired_grace_without_waiting_for_pending_work() {
+        for grace_ms in [0, 20] {
+            let check = Check {
+                policy: json!({"input_fail_open": true, "input_max_wait_ms": grace_ms}),
+                check: json!({}),
+                adapter: json!({}),
+            };
+            let (_sender, mut ready) = tokio::sync::watch::channel(Some(
+                Instant::now() - Duration::from_millis(grace_ms + 1),
+            ));
+            for flagged in [false, true] {
+                let (verdict, _) = inspect_until_ready(
+                    &check,
+                    Duration::from_secs(1),
+                    &mut ready,
+                    std::future::ready(Ok(json!({"flagged": flagged}))),
+                )
+                .await;
+                assert_eq!(verdict.unwrap()["flagged"], flagged);
+            }
+            let (verdict, reason) = tokio::time::timeout(
+                Duration::from_millis(500),
+                inspect_until_ready(
+                    &check,
+                    Duration::from_secs(1),
+                    &mut ready,
+                    std::future::pending(),
+                ),
+            )
+            .await
+            .expect("expired grace must not wait for a pending classifier");
+            assert!(verdict.is_err());
+            assert_eq!(reason, "response_ready_timeout");
         }
     }
 }
