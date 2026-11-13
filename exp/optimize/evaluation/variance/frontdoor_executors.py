@@ -555,9 +555,7 @@ def fit_decision_request(
     return request.model_copy(update={"state": candidate})
 
 
-def _capped_state(
-    state: JsonObject, leaves: Sequence[_Leaf], maximum_tokens: int
-) -> Any:  # noqa: ANN401
+def _capped_state(state: JsonObject, leaves: Sequence[_Leaf], maximum_tokens: int) -> Any:  # noqa: ANN401
     """Cap every text at the largest shared token ceiling that fits, when one cut is not enough.
 
     Several long texts (four recent actions each inlining a file) share the room evenly instead
@@ -1508,7 +1506,16 @@ class PipelineSlotExecutor:
             starts[task] = tuple(found)
         identity = stable_id(
             SLOT_RECORD_TYPE,
-            {"slot": self.slot, "starts": sha256_json(starts), "code": context.code_revision},
+            {
+                "slot": self.slot,
+                "starts": sha256_json(
+                    {
+                        task: [ref.model_dump(mode="json") for ref in refs]
+                        for task, refs in starts.items()
+                    }
+                ),
+                "code": context.code_revision,
+            },
         )
         record = PipelineCollection(slot=self.slot, starts=starts)
         inputs = tuple(ref for refs in starts.values() for ref in refs)
