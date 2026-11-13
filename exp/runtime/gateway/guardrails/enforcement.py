@@ -780,17 +780,13 @@ class GuardrailEngine:
         retention: ObservationLease | None = None,
         request_id: str | None = None,
     ) -> ClassifierVerdict | None:
-        """Invoke one adapter under the tighter of check timeout and request deadline.
-
-        Inspection runs on an isolation worker within the remaining budget.
-        Decision-model scores use the host's score sink when the request is known.
+        """Inspect on an isolation worker under the remaining check and request budget.
 
         Returns:
-            The verdict, or ``None`` when a non-protected check is skipped.
+            The flagged verdict, or ``None`` for an allow or skipped inspection.
 
         Raises:
-            GuardrailRejected: Protected identities fail closed. Error actions
-                and expired deadlines are always terminal.
+            GuardrailRejected: The enforcing policy requires refusal on unavailable inspection.
         """
         remaining = deadline_monotonic - self._monotonic()
         timeout = min(check.timeout_ms / 1000.0, remaining)
@@ -807,18 +803,15 @@ class GuardrailEngine:
                 retention=retention,
             )
         except ClassifierCoverageError:
-            if check.stage is GuardrailCheckStage.INPUT and policy.input_fail_open:
-                return self._uncertain(
-                    policy, check, GuardrailOutcome.UNSUPPORTED, self._monotonic() - started
-                )
+            fail_open = check.stage is GuardrailCheckStage.INPUT and policy.input_fail_open
             self._decision(
                 policy,
                 check,
-                GuardrailAction.ERROR,
+                GuardrailAction.ALLOW if fail_open else GuardrailAction.ERROR,
                 GuardrailOutcome.UNSUPPORTED,
                 self._monotonic() - started,
             )
-            if policy.mode == "enforce":
+            if policy.mode == "enforce" and not fail_open:
                 raise GuardrailRejected(coverage_failure(check_id=check.check_id)) from None
             return None
         except ClassifierUncertainError:
