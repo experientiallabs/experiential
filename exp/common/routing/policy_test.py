@@ -9,7 +9,13 @@ from pydantic import TypeAdapter, ValidationError
 
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import BillingSource, ModelSnapshot, RoutedCandidateSnapshot
-from exp.common.routing import KnnGuard, KnnRouterPolicy, RouterPolicy, RoutingDecision
+from exp.common.routing import (
+    CacheSwitchGuard,
+    KnnGuard,
+    KnnRouterPolicy,
+    RouterPolicy,
+    RoutingDecision,
+)
 
 _DIGEST = "a" * 64
 
@@ -124,6 +130,80 @@ def test_policy_rejects_unpinned_baseline_and_nonfinite_guard_values() -> None:
             neighbor_count=2,
             paired_count=3,
         )
+
+
+def test_cache_switch_gate_defaults_on_and_stays_out_of_default_guard_bytes() -> None:
+    """The gate is enabled by default and an all-default gate keeps legacy guard digests."""
+    policy = _policy()
+    assert policy.guard.cache_switch == CacheSwitchGuard(
+        enabled=True, switch_gain_per_amortized_usd=10.0
+    )
+
+    legacy_payload = policy.model_dump(mode="json")
+    assert "cache_switch" not in legacy_payload["guard"]
+
+    reloaded = KnnRouterPolicy.model_validate(legacy_payload)
+    assert reloaded.guard.cache_switch.enabled is True
+    assert sha256_json(reloaded) == sha256_json(legacy_payload)
+
+
+def test_configured_cache_switch_gate_serializes_and_round_trips() -> None:
+    """An explicitly disabled or re-priced gate is persisted and reloaded exactly."""
+    policy = _policy()
+    disabled = policy.model_copy(
+        update={
+            "guard": policy.guard.model_copy(
+                update={
+                    "cache_switch": CacheSwitchGuard(
+                        enabled=False, switch_gain_per_amortized_usd=25.0
+                    )
+                }
+            )
+        }
+    )
+    payload = disabled.model_dump(mode="json")
+
+    assert payload["guard"]["cache_switch"] == {
+        "enabled": False,
+        "switch_gain_per_amortized_usd": 25.0,
+    }
+    assert KnnRouterPolicy.model_validate(payload) == disabled
+    assert sha256_json(disabled) != sha256_json(policy)
+
+
+@pytest.mark.parametrize("rate", [0, -1.0, float("inf"), float("nan")])
+def test_cache_switch_gate_rejects_a_nonpositive_or_nonfinite_exchange_rate(
+    rate: float,
+) -> None:
+    """The gain-per-amortized-USD rate must stay a positive finite threshold."""
+    with pytest.raises(ValidationError, match="switch_gain_per_amortized_usd|finite"):
+        CacheSwitchGuard(switch_gain_per_amortized_usd=rate)
+
+
+def test_decision_switch_outcome_is_optional_bounded_and_absent_from_legacy_bytes() -> None:
+    """A recorded outcome round-trips while switch-free decisions keep their exact bytes."""
+    decision = RoutingDecision(
+        decision_id="decision-1",
+        policy_id="router-policy-v1",
+        policy_sha256=_DIGEST,
+        request_sha256=_DIGEST,
+        episode_id_sha256=_DIGEST,
+        selected_alias="candidate-economy",
+        baseline_alias="candidate-incumbent",
+        neighbor_count=2,
+        paired_count=2,
+    )
+    assert decision.switch_outcome is None
+    assert "switch_outcome" not in decision.model_dump(mode="json")
+
+    suppressed = decision.model_copy(update={"switch_outcome": "switch_suppressed_cache"})
+    payload = suppressed.model_dump(mode="json")
+    assert payload["switch_outcome"] == "switch_suppressed_cache"
+    assert RoutingDecision.model_validate(payload) == suppressed
+    assert sha256_json(suppressed) != sha256_json(decision)
+
+    with pytest.raises(ValidationError, match="switch_outcome"):
+        RoutingDecision.model_validate({**payload, "switch_outcome": "maybe"})
 
 
 def test_stored_policy_rejects_a_pre_design_threshold_guard() -> None:

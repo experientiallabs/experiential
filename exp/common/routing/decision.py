@@ -166,6 +166,38 @@ def policy_content_sha256(policy: KnnRouterPolicy) -> Sha256:
     return sha256_json(policy)
 
 
+def fitted_quality_gain(
+    bank: KnnEvidenceBank,
+    *,
+    incumbent_alias: str,
+    challenger_alias: str,
+) -> float | None:
+    """Return the fit-evidence quality gain of one challenger over one incumbent.
+
+    The gain is the workload-weighted mean score difference over fit tasks where
+    both candidates were scored. It is a pure function of the frozen bank, so a
+    sticky-switch comparison never needs a request embedding or provider call.
+
+    Args:
+        bank: Verified fit-only evidence arrays.
+        incumbent_alias: Candidate column currently retained by a sticky episode.
+        challenger_alias: Candidate column proposed by a fresh guarded selection.
+
+    Returns:
+        Weighted mean score gain of the challenger, or ``None`` when the two
+        candidates share no jointly scored fit task.
+    """
+    incumbent_column = bank.candidate_aliases.index(incumbent_alias)
+    challenger_column = bank.candidate_aliases.index(challenger_alias)
+    incumbent_scores = bank.scores[:, incumbent_column].astype(np.float64)
+    challenger_scores = bank.scores[:, challenger_column].astype(np.float64)
+    paired = ~np.isnan(incumbent_scores) & ~np.isnan(challenger_scores)
+    if not bool(np.any(paired)):
+        return None
+    differences = challenger_scores[paired] - incumbent_scores[paired]
+    return float(np.average(differences, weights=bank.workload_weights[paired]))
+
+
 def _require_policy_bank_match(
     policy: KnnRouterPolicy,
     manifest: KnnBankManifest,
