@@ -40,6 +40,11 @@ ignoreUntil = 2026-11-14
 reason = "Same tornado 6.5.10 capture-only exposure as GHSA-pcg2-g6cj-q92c."
 
 [[IgnoredVulns]]
+id = "GHSA-5cjw-f85j-cv6r"
+ignoreUntil = 2026-11-20
+reason = "Tornado 6.5.10 is pinned by exp-mitmproxy. This open redirect requires a Tornado web redirect handler; Capture runs mitmproxy.tools.dump.DumpMaster, not mitmweb or a Tornado web application, and the gateway does not serve Tornado handlers. The fix needs an exp-mitmproxy release allowing Tornado 6.6.1; upgrade it and remove this entry."
+
+[[IgnoredVulns]]
 id = "GHSA-cp25-j9x5-p5xm"
 ignoreUntil = 2026-11-23
 reason = "urwid 3.0.5, capture extra only on Python 3.13+, pulled by exp-mitmproxy. The advisory is in urwid's CGI web display (urwid/display/web.py), which nothing here imports or serves. The fix (4.0.7) needs an exp-mitmproxy release allowing urwid 4; then pin it and delete this entry."
