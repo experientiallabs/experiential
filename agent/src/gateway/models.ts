@@ -107,7 +107,10 @@ export function parseModelListing(body: unknown): ListedModel[] {
 export function toProviderModel(listed: ListedModel, config: GatewayConfig, wireOverride?: GatewayWireApi): ProviderModelConfig {
   const api = chooseWireApi(listed.id, config.kind, wireOverride);
   const contextWindow = listed.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
-  const maxTokens = Math.min(listed.maxTokens ?? DEFAULT_MAX_TOKENS, contextWindow);
+  // The output reservation and the prompt share one window: a small-window model (8K) asked for
+  // its whole window as output can never fit the agent's prompt. Reserve at most half the window,
+  // whatever the listing allows.
+  const maxTokens = Math.max(1, Math.min(listed.maxTokens ?? DEFAULT_MAX_TOKENS, Math.floor(contextWindow / 2)));
   return {
     type: "chat",
     id: listed.id,
@@ -139,9 +142,21 @@ interface CachedListing {
 
 const memoryCache = new Map<string, CachedListing>();
 
-/** A cache key naming the endpoint and a digest of the key, never the key itself. */
-function cacheKey(config: GatewayConfig): string {
-  return createHash("sha256").update(`${config.baseUrl}\n${config.apiKey}`).digest("hex").slice(0, 24);
+/**
+ * The public part of an Experiential key (`xpl_` plus 7 characters, the prefix the API keys page
+ * shows): enough to keep two organizations' listings apart, and never derived from the secret.
+ */
+const PUBLIC_KEY_PREFIX_LENGTH = 11;
+
+/**
+ * A cache key naming the endpoint and the key's public prefix. Nothing secret goes into it, not
+ * even through a hash. A key without the hosted prefix (a local gateway's virtual key) shares the
+ * endpoint's entry: a local gateway serves one listing.
+ */
+export function cacheKey(config: GatewayConfig): string {
+  const endpoint = createHash("sha256").update(config.baseUrl).digest("hex").slice(0, 16);
+  const prefix = config.apiKey.startsWith("xpl_") ? config.apiKey.slice(0, PUBLIC_KEY_PREFIX_LENGTH).replace(/[^A-Za-z0-9_]/g, "") : "";
+  return prefix === "" ? endpoint : `${endpoint}-${prefix}`;
 }
 
 async function readDiskCache(path: string): Promise<CachedListing | undefined> {

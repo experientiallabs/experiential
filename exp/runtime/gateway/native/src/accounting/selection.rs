@@ -84,6 +84,7 @@ pub(super) fn claim(
     keys: &[HealthKey],
     start: usize,
     depths: &[usize],
+    throttle_probe: bool,
     now: f64,
 ) -> Option<usize> {
     let depths: Vec<_> = depths
@@ -92,7 +93,13 @@ pub(super) fn claim(
         .filter(|depth| *depth >= start)
         .collect();
     let ordered = health.order(keys, &depths, now);
-    for mode in [Claim::Normal, Claim::LastResort, Claim::Forced] {
+    let modes = [
+        Claim::Normal,
+        Claim::LastResort,
+        Claim::Forced,
+        Claim::ThrottleProbe,
+    ];
+    for mode in modes.into_iter().take(if throttle_probe { 4 } else { 3 }) {
         for depth in &ordered {
             if health.claim(&keys[*depth], mode, now) {
                 return Some(*depth);
@@ -222,7 +229,7 @@ fn next_depth(
         retry.current,
         unrestricted,
     );
-    claim(health, keys, 0, &depths, now)
+    claim(health, keys, 0, &depths, false, now)
 }
 
 pub(super) struct FailoverPass {
@@ -272,7 +279,7 @@ impl FailoverPass {
             return None;
         }
         self.ladder.retain(|depth| *depth != candidate);
-        claim(health, keys, 0, &self.ladder, now)
+        claim(health, keys, 0, &self.ladder, false, now)
     }
     pub fn forced_target(
         &mut self,
@@ -297,7 +304,7 @@ impl FailoverPass {
                 continue;
             }
             self.forced.insert(*depth);
-            if claim(health, keys, *depth, &[*depth], now) != Some(*depth) {
+            if claim(health, keys, *depth, &[*depth], false, now) != Some(*depth) {
                 continue;
             }
             self.forcing = true;

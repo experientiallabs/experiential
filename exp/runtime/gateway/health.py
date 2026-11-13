@@ -10,7 +10,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
@@ -45,6 +45,12 @@ RETRY_AFTER_WINDOW_MAXIMUM_SECONDS = 6.0 * 3_600.0
 # (the weekly window) can be days away. Suppression follows the stated reset up
 # to one week plus a day of slack; the ceiling only guards a garbage reset.
 PLAN_WINDOW_MAXIMUM_SECONDS = 8.0 * 24.0 * 3_600.0
+# Spacing between paced probes through a hintless throttle window. A window the
+# provider did not size (a 429 with no Retry-After) is the engine's guess, so a
+# route with nothing else to claim may test it with at most one dispatch per
+# interval per physical lane on this worker instead of refusing every caller for
+# the whole default window. An explicit wait or a plan reset is never probed.
+THROTTLE_PROBE_INTERVAL_SECONDS = 1.0
 
 
 def health_failure_cause(
@@ -96,6 +102,13 @@ class _DeploymentHealth:
         newer_throttle_until: Monotonic end of the throttle windows observed after
             ``circuit_failure`` was recorded (zero when none); only these, never an
             older window, outrank the recorded account failure.
+        stated_throttle_until: Monotonic end of the windows the provider sized
+            itself (a parsed ``Retry-After`` or a plan reset). Only the part of
+            ``throttle_until`` past this instant is the engine's own default
+            guess, which a paced probe may test.
+        probe_attempts: Attempts reserved inside a hintless window since it was
+            last armed (``bind_throttle_probe``); only THEIR success lifts it,
+            never an older request's.
     """
 
     consecutive_failures: int = 0
@@ -106,6 +119,8 @@ class _DeploymentHealth:
     refusal_count: int = 0
     circuit_failure: GatewayFailure | None = None
     newer_throttle_until: float = 0.0
+    stated_throttle_until: float = 0.0
+    probe_attempts: set[str] = field(default_factory=set)
 
 
 class DeploymentHealthRegistry:
@@ -143,6 +158,9 @@ class DeploymentHealthRegistry:
         self._clock = clock
         self._states: dict[DeploymentHealthKey, _DeploymentHealth] = {}
         self._lanes = LaneEjections(lane_ejection or LaneEjectionPolicy.from_environ())
+        # Probe pacing is per physical lane, so two catalog revisions sharing a
+        # lane during a rollout never multiply the probe rate.
+        self._probe_paced_at: dict[LaneKey, float] = {}
         self._lock = threading.Lock()
 
     def order(self, keys: tuple[DeploymentHealthKey, ...], candidates: Sequence[int]) -> list[int]:
@@ -267,7 +285,71 @@ class DeploymentHealthRegistry:
             state = self._states.setdefault(key, _DeploymentHealth())
             return state.open_until <= now
 
-    def dispatch_opened(self, key: DeploymentHealthKey) -> None:
+    def claim_throttle_probe(self, key: DeploymentHealthKey) -> bool:
+        """Admit one paced dispatch through a hintless throttle window.
+
+        A 429 that names no wait arms the engine's default window, and on a
+        route with nothing else to claim that guess refuses every caller for
+        the whole window even while the provider is serving. Such a window is tested
+        instead: at most one dispatch per ``THROTTLE_PROBE_INTERVAL_SECONDS``
+        per physical lane on this worker, so concurrent throttles never stampede
+        the provider, and the probe's own success lifts the window
+        (:meth:`bind_throttle_probe`, :meth:`succeeded`). A window the provider
+        sized itself (Retry-After, a plan reset) is never probed: the provider
+        asked for that wait.
+
+        Only a reservation with no failure of its own and every claimable depth
+        inside a throttle window reaches this pass (``claim_route_from`` with
+        ``throttle_probe=True``), so a route with an unthrottled sibling still
+        moves its traffic there.
+
+        Args:
+            key: Catalog, deployment, and connection identity tuple.
+
+        Returns:
+            Whether the caller may dispatch this throttled deployment now.
+        """
+        now = self._clock()
+        with self._lock:
+            state = self._states.setdefault(key, _DeploymentHealth())
+            if state.throttle_until <= now or state.stated_throttle_until > now:
+                return False
+            last = self._probe_paced_at.get(_lane(key))
+            if last is not None and now - last < THROTTLE_PROBE_INTERVAL_SECONDS:
+                return False
+            self._probe_paced_at[_lane(key)] = now
+            self._lanes.claimed(_lane(key), now)
+            return True
+
+    def bind_throttle_probe(
+        self, key: DeploymentHealthKey, attempt_id: str, *, probe: bool = True
+    ) -> None:
+        """Record a no-failure dial's reserved attempt as a probe of its window.
+
+        Ownership is decided at reservation, by the claimant, from the window
+        as it stands then: an attempt reserved while the deployment sits in a
+        hintless window can only have passed it as a probe, so its own success
+        lifts the window. Nothing is shared between claim and reservation, so
+        an unrelated release cannot drop the probe, a probe shed and then
+        force-admitted still counts, and a 429 armed before this reservation
+        is already behind it. A 429 armed after it clears it (:meth:`failed`).
+
+        Args:
+            key: Catalog, deployment, and connection identity tuple.
+            attempt_id: The reserved attempt.
+            probe: Whether the reservation came from a dial with no failure of
+                its own; any other (a throttle redial) is never a probe here.
+        """
+        if not probe:
+            return
+        now = self._clock()
+        with self._lock:
+            state = self._states.get(key)
+            if state is None or state.throttle_until <= now or state.stated_throttle_until > now:
+                return
+            state.probe_attempts.add(attempt_id)
+
+    def dispatch_opened(self, key: DeploymentHealthKey, attempt_id: str | None = None) -> None:
         """Restore admission once one provider dispatch opens successfully.
 
         An opened stream proves the deployment is reachable again, so waiting for
@@ -276,6 +358,8 @@ class DeploymentHealthRegistry:
 
         Args:
             key: Catalog, deployment, and connection identity tuple.
+            attempt_id: The opened attempt; a bound throttle probe lifts its
+                hintless window.
         """
         with self._lock:
             state = self._states.setdefault(key, _DeploymentHealth())
@@ -284,13 +368,16 @@ class DeploymentHealthRegistry:
             state.half_open_probe = False
             state.last_resort_probe = False
             state.circuit_failure = None
+            self._lift_probed_throttle(state, attempt_id)
             self._lanes.succeeded(_lane(key))
 
-    def succeeded(self, key: DeploymentHealthKey) -> None:
+    def succeeded(self, key: DeploymentHealthKey, attempt_id: str | None = None) -> None:
         """Close one circuit after a successful terminal provider result.
 
         Args:
             key: Catalog, deployment, and connection identity tuple.
+            attempt_id: The settled attempt; a bound throttle probe lifts its
+                hintless window.
         """
         with self._lock:
             state = self._states.setdefault(key, _DeploymentHealth())
@@ -299,19 +386,25 @@ class DeploymentHealthRegistry:
             state.half_open_probe = False
             state.last_resort_probe = False
             state.circuit_failure = None
+            self._lift_probed_throttle(state, attempt_id)
             self._lanes.succeeded(_lane(key))
 
-    def failed(self, key: DeploymentHealthKey, failure: GatewayFailure) -> None:
+    def failed(
+        self, key: DeploymentHealthKey, failure: GatewayFailure, attempt_id: str | None = None
+    ) -> None:
         """Apply one normalized provider outcome to circuit or throttle state.
 
         Args:
             key: Catalog, deployment, and connection identity tuple.
             failure: Sanitized provider failure classification.
+            attempt_id: The settled attempt, retired from the bound probes.
         """
         now = self._clock()
         cause = health_failure_cause(failure.failure_class)
         with self._lock:
             state = self._states.setdefault(key, _DeploymentHealth())
+            if attempt_id is not None:
+                state.probe_attempts.discard(attempt_id)
             state.half_open_probe = False
             state.last_resort_probe = False
             self._lanes.failed(_lane(key), failure, now)
@@ -319,6 +412,10 @@ class DeploymentHealthRegistry:
                 window_end = now + self._throttle_window_seconds(failure)
                 state.throttle_until = max(state.throttle_until, window_end)
                 state.newer_throttle_until = max(state.newer_throttle_until, window_end)
+                # A newer 429 outranks every probe dispatched before it.
+                state.probe_attempts.clear()
+                if failure.retry_after_seconds is not None:
+                    state.stated_throttle_until = max(state.stated_throttle_until, window_end)
                 return
             if failure.failure_class == GatewayFailureClass.REFUSAL:
                 state.refusal_count += 1
@@ -365,6 +462,29 @@ class DeploymentHealthRegistry:
             state = self._states.setdefault(key, _DeploymentHealth())
             state.throttle_until = max(state.throttle_until, now + window)
             state.newer_throttle_until = max(state.newer_throttle_until, now + window)
+            state.stated_throttle_until = max(state.stated_throttle_until, now + window)
+
+    def _lift_probed_throttle(self, state: _DeploymentHealth, attempt_id: str | None) -> None:
+        """Lift a hintless throttle window once the provider served the probe itself.
+
+        Only the success of a probe attempt bound since the window was armed
+        lifts it, so an older request finishing, a route that never probed
+        (one with an unthrottled sibling), or a probe shed before dispatch
+        keeps the suppression exactly as before, and a window the provider
+        sized itself stays until its stated end. Caller holds the registry lock.
+
+        Args:
+            state: The deployment's mutable health state.
+            attempt_id: The attempt that succeeded, or ``None`` when unknown.
+        """
+        if attempt_id is None or attempt_id not in state.probe_attempts:
+            return
+        state.probe_attempts.discard(attempt_id)
+        now = self._clock()
+        if state.throttle_until <= now or state.stated_throttle_until > now:
+            return
+        state.throttle_until = state.stated_throttle_until
+        state.newer_throttle_until = min(state.newer_throttle_until, state.stated_throttle_until)
 
     def _throttle_window_seconds(self, failure: GatewayFailure) -> float:
         """Size one throttle window from the provider's own stated wait.
@@ -480,15 +600,68 @@ class DeploymentHealthRegistry:
                 first = first or state.circuit_failure
         return first
 
-    def release_probe(self, key: DeploymentHealthKey) -> None:
+    def release_probe(self, key: DeploymentHealthKey, attempt_id: str | None = None) -> None:
         """Release a claimed half-open probe that never reached provider dispatch.
 
         Args:
             key: Catalog, deployment, and connection identity tuple.
+            attempt_id: The retired attempt, dropped from the bound throttle probes.
         """
         with self._lock:
             state = self._states.get(key)
             if state is not None:
                 state.half_open_probe = False
                 state.last_resort_probe = False
+                if attempt_id is not None:
+                    state.probe_attempts.discard(attempt_id)
             self._lanes.released(_lane(key))
+
+
+def claim_route_from(
+    health: DeploymentHealthRegistry,
+    keys: tuple[DeploymentHealthKey, ...],
+    start: int,
+    depths: Sequence[int] | None = None,
+    *,
+    throttle_probe: bool = False,
+) -> int | None:
+    """Claim the first healthy later route, a bounded probe, or a forced dispatch.
+
+    A request skipping an exhausted or failed route can still probe a
+    suppressed fallback instead of failing
+    for the whole circuit cooldown after the provider has recovered. When
+    every healthy claim and bounded probe is unavailable, the first
+    non-throttled route is dispatched anyway, subject only to the request
+    deadline and to throttle windows the provider explicitly requested.
+    A lane this worker ejected as a dead box (``lane_ejection``) is walked
+    last in every pass, never dropped: a route with nothing else still dials it.
+
+    Args:
+        health: Revision-isolated circuit and throttle registry.
+        keys: One health key per ordered route deployment.
+        start: First route index eligible for this claim.
+        depths: The route indexes this dial may claim at all (the
+            ``failover_only_on`` eligibility, ``native_fallback_rules``);
+            ``None`` admits every index. Indexes below ``start`` are skipped.
+        throttle_probe: Whether a dial that finds every candidate inside a
+            throttle window may take one paced probe through a hintless one
+            (``DeploymentHealthRegistry.claim_throttle_probe``) instead of
+            refusing. Only a reservation with no failure of its own asks (a
+            first dial, a tool-search round, a reasoning repair); a failover
+            pass already holds the provider's answer.
+
+    Returns:
+        The claimed route index, or ``None`` when nothing is claimable.
+    """
+    candidates = health.order(
+        keys,
+        [index for index in (range(len(keys)) if depths is None else depths) if index >= start],
+    )
+    claims = (health.claim, health.claim_last_resort, health.claim_forced)
+    if throttle_probe:
+        claims = (*claims, health.claim_throttle_probe)
+    for claim in claims:
+        for route_index in candidates:
+            if claim(keys[route_index]):
+                return route_index
+    return None
