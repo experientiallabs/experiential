@@ -48,6 +48,8 @@ from exp.common.sqlite.connection import connect_database
 ADMISSION_DATABASE_NAME: Final = "provider-admission.sqlite"
 """Shared host-wide admission database, beside the provider credential file."""
 
+ADMISSION_BUSY_TIMEOUT_MS: Final = 30_000
+"""Lock wait for the shared admission database; contention past it waits for a slot."""
 ADMISSION_LIMITS_NAME: Final = "provider-admission.toml"
 """Optional host-wide registered limits file, beside the admission database."""
 
@@ -348,7 +350,7 @@ class HostProviderAdmission:
         Slots and breaker rows describe in-flight work only, so losing the last commit to a
         power failure costs nothing a reboot does not already reset; WAL keeps it consistent.
         """
-        connection = connect_database(self._path)
+        connection = connect_database(self._path, busy_timeout_ms=ADMISSION_BUSY_TIMEOUT_MS)
         connection.execute("PRAGMA synchronous = NORMAL")
         return connection
 
@@ -504,7 +506,13 @@ class HostProviderAdmission:
         now = self._clock()
         connection = self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as error:
+                if "locked" not in str(error) and "busy" not in str(error):
+                    raise
+                # Another claimant holds the write lock: wait as if no slot were free.
+                return None, False
             try:
                 self._reclaim(connection)
                 probing = self._breaker_admits(connection, route.provider, now)
