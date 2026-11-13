@@ -205,17 +205,20 @@ pub(crate) async fn generate_content_model_action(
     Path(segment): Path<String>,
     request: axum::extract::Request,
 ) -> Response {
+    if request.method() == axum::http::Method::GET {
+        // GET has no action form, so a colon belongs to the alias itself
+        // (`coding:free` is one granted spelling, not an action on `coding`).
+        return model_detail(state, segment, request).await;
+    }
     let (model, action) = split_action(&segment);
-    match (request.method().clone(), action) {
-        (axum::http::Method::GET, None) => model_detail(state, model, request).await,
-        (axum::http::Method::GET, Some(action)) => google_error_response(&unknown_action(&action)),
-        (_, None) => google_error_response(&PublicError::new(
+    match action {
+        None => google_error_response(&PublicError::new(
             404,
             "unknown_route",
             "POST a model action: /v1beta/models/{model}:generateContent.",
             "invalid_request_error",
         )),
-        (_, Some(action)) => match action.as_str() {
+        Some(action) => match action.as_str() {
             "generateContent" => generate(state, model, request, false).await,
             "streamGenerateContent" => {
                 if !asks_for_sse(request.uri()) {

@@ -118,6 +118,15 @@ def test_count_tokens_and_model_listing_answer_googles_shapes(engine: _ServingEn
     with pytest.raises(errors.ClientError) as missing:
         client.models.get(model="not-granted")
     assert missing.value.code == 404
+    # A colon in a GET segment belongs to the alias (`coding:free`), never to an action.
+    free = httpx.get(
+        f"{engine.base}/v1beta/models/coding:free",
+        headers={"x-goog-api-key": engine.raw_key},
+        timeout=10.0,
+    )
+    assert free.status_code == 404
+    assert "Unknown model action" not in free.json()["error"]["message"]
+    assert free.json()["error"]["details"][0]["reason"] != "unknown_route"
 
 
 def test_auth_and_protocol_failures_wear_googles_error_envelope(engine: _ServingEngine) -> None:

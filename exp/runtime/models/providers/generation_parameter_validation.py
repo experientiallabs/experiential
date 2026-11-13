@@ -6,6 +6,7 @@ import re
 from collections.abc import Callable, Sequence
 
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
+from exp.runtime.gateway.surfaces import default_output_limit_parameter, prompt_parameter
 from exp.runtime.models.providers.anthropic_tool_compat import (
     anthropic_input_schema_reshaping,
     anthropic_rejects_assistant_prefill,
@@ -26,8 +27,8 @@ from exp.runtime.models.providers.thinking_budget import thinking_budget_value
 
 def output_limit_parameter(request: GatewayRequest) -> str:
     """Name the caller's output limit, including the remedy for an omitted field."""
-    return request.maximum_output_tokens_parameter or (
-        "max_output_tokens" if request.surface == GatewayApiSurface.RESPONSES else "max_tokens"
+    return request.maximum_output_tokens_parameter or default_output_limit_parameter(
+        request.surface
     )
 
 
@@ -363,7 +364,10 @@ def anthropic_reasoning_disengaged(request: GatewayRequest) -> bool:
 
 
 def require_assistant_prefill_supported(
-    profiles: Sequence[GatewayWireProfile], messages: Sequence[GatewayMessage]
+    profiles: Sequence[GatewayWireProfile],
+    messages: Sequence[GatewayMessage],
+    *,
+    surface: GatewayApiSurface = GatewayApiSurface.CHAT_COMPLETIONS,
 ) -> None:
     """Refuse a trailing assistant turn before dispatch on rungs whose model rejects it.
 
@@ -381,6 +385,7 @@ def require_assistant_prefill_supported(
         profiles: The route's wire profiles.
         messages: The history as it will be dispatched, after any foreign-wire
             conversion (a dropped native item can expose a trailing assistant turn).
+        surface: The public surface, which names the field the history arrived in.
 
     Raises:
         ProviderParameterError: The final message is an assistant turn and a
@@ -399,7 +404,7 @@ def require_assistant_prefill_supported(
                 "turn (assistant prefill). End the conversation with a user message, or "
                 "choose a model alias that supports prefill."
             ),
-            param="messages",
+            param=prompt_parameter(surface),
             code="unsupported_parameter",
         )
 

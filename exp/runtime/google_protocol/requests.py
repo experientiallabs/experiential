@@ -87,6 +87,8 @@ LOGPROBS_DROPPED = "generationConfig.responseLogprobs->dropped(unsupported)"
 MEDIA_RESOLUTION_DROPPED = "generationConfig.mediaResolution->dropped(unsupported)"
 VALIDATED_MODE_AS_AUTO = "toolConfig.functionCallingConfig.mode->auto(validated)"
 BEHAVIOR_DROPPED = "tools.functionDeclarations.behavior->dropped(unsupported)"
+RESPONSE_SCHEMA_DROPPED = "tools.functionDeclarations.response->dropped(unsupported)"
+"""Disclosure for a declared function output schema; no gateway wire carries one."""
 _THOUGHT_SIGNATURE_MAX = 65_536
 # Gemini spells MP3 audio `audio/mp3` (and WAV sometimes `audio/x-wav`); the
 # canonical audio contract knows the IANA names.
@@ -507,6 +509,9 @@ def _canonical(request: _GenerateContentRequest, *, stream: bool) -> GatewayRequ
             structured_text=output[0],
             json_object_output=output[1],
             maximum_output_tokens=config.max_output_tokens,
+            maximum_output_tokens_parameter=(
+                "generationConfig.maxOutputTokens" if config.max_output_tokens is not None else None
+            ),
             stop=_stop_sequences(config.stop_sequences),
             temperature=config.temperature,
             top_p=config.top_p,
@@ -564,14 +569,35 @@ def _has_non_text(part: _Part) -> bool:
     )
 
 
-def _refuse_code_parts(part: _Part, param: str) -> None:
-    """Refuse Google's code-execution parts, which no gateway wire executes."""
+def _require_one_payload(part: _Part, param: str) -> None:
+    """Refuse code-execution parts and any part not carrying exactly one payload.
+
+    ``Part`` is a protobuf ``oneof``: JSON that sets two members (``text`` and
+    ``inlineData``, a ``functionCall`` beside a ``functionResponse``) is
+    malformed, and picking one would silently change the caller's content.
+    """
     if part.executable_code is not None:
         raise unsupported_field(f"{param}.executableCode")
     if part.code_execution_result is not None:
         raise unsupported_field(f"{param}.codeExecutionResult")
     if part.video_metadata is not None:
         raise unsupported_field(f"{param}.videoMetadata")
+    payloads = sum(
+        value is not None
+        for value in (
+            part.text,
+            part.inline_data,
+            part.file_data,
+            part.function_call,
+            part.function_response,
+        )
+    )
+    if payloads != 1:
+        raise invalid_field(
+            param,
+            "A part carries exactly one of text, inlineData, fileData, functionCall or "
+            "functionResponse.",
+        )
 
 
 def _turn_messages(
@@ -591,37 +617,37 @@ def _turn_messages(
     """
     role = content.role or "user"
     out: list[GatewayMessage] = []
-    texts: list[str] = []
-    attachments: list[MessageContentPart] = []
+    segments: list[MessageContentPart] = []
     calls: list[ToolCall] = []
     reasoning: list[ProviderReasoningBlock] = []
 
     def flush() -> None:
-        """Emit the pending text, attachments, calls and reasoning as one message."""
-        if not texts and not attachments and not calls and not reasoning:
+        """Emit the pending segments, calls and reasoning as one message.
+
+        Segments keep the caller's part order (an image, its caption, the next
+        image); the canonical ``content`` is their text flattened in that order
+        and ``content_parts`` is retained only when media is present.
+        """
+        if not segments and not calls and not reasoning:
             return
-        text = "".join(texts)
-        parts: tuple[MessageContentPart, ...] = ()
-        if attachments:
-            leading: tuple[MessageContentPart, ...] = (TextContentPart(text=text),) if text else ()
-            parts = (*leading, *attachments)
+        text = "".join(part.text for part in segments if part.kind == "text")
+        multimodal = any(part.kind != "text" for part in segments)
         out.append(
             GatewayMessage(
                 role="assistant" if role == "model" else "user",
-                content=text if (text or attachments or not calls) else None,
-                content_parts=parts,
+                content=text if (text or multimodal or not calls) else None,
+                content_parts=tuple(segments) if multimodal else (),
                 tool_calls=tuple(calls),
                 provider_reasoning=tuple(reasoning),
             )
         )
-        texts.clear()
-        attachments.clear()
+        segments.clear()
         calls.clear()
         reasoning.clear()
 
     for index, part in enumerate(content.parts):
         part_param = f"{param}.parts.{index}"
-        _refuse_code_parts(part, part_param)
+        _require_one_payload(part, part_param)
         if part.function_response is not None:
             if role == "model":
                 raise invalid_field(part_param, "functionResponse parts belong to user turns.")
@@ -651,17 +677,11 @@ def _turn_messages(
         if part.thought_signature is not None:
             disclosures.append(TEXT_SIGNATURE_DROPPED)
         if part.inline_data is not None:
-            attachments.append(_inline_part(part.inline_data, part_param))
-            continue
-        if part.file_data is not None:
-            attachments.append(_file_part(part.file_data, part_param))
-            continue
-        if part.text is None:
-            raise invalid_field(
-                part_param,
-                "A part needs text, inlineData, fileData, a functionCall or a functionResponse.",
-            )
-        texts.append(part.text)
+            segments.append(_inline_part(part.inline_data, part_param))
+        elif part.file_data is not None:
+            segments.append(_file_part(part.file_data, part_param))
+        elif part.text:
+            segments.append(TextContentPart(text=part.text))
     flush()
     if not out:
         raise invalid_field(f"{param}.parts", "A content needs at least one gateway-visible part.")
@@ -799,6 +819,8 @@ def _tools(
         for declaration in tool.function_declarations or ():
             if declaration.behavior is not None:
                 disclosures.append(BEHAVIOR_DROPPED)
+            if declaration.response is not None or declaration.response_json_schema is not None:
+                disclosures.append(RESPONSE_SCHEMA_DROPPED)
             schema = declaration.parameters_json_schema
             if schema is None:
                 schema = (

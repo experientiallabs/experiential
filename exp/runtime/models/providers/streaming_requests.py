@@ -11,6 +11,7 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
+from exp.runtime.gateway.surfaces import prompt_parameter
 from exp.runtime.gateway.tool_contracts import GatewayCustomToolChoice
 from exp.runtime.gateway.tool_search.contracts import gateway_tool_search_name
 from exp.runtime.models.providers.allowed_tools import (
@@ -61,6 +62,7 @@ from exp.runtime.models.providers.gemini_requests import disclose_dropped_though
 from exp.runtime.models.providers.generation_parameter_validation import (
     anthropic_reasoning_disengaged,
     disclose_anthropic_tool_schemas,
+    output_limit_parameter,
     require_assistant_prefill_supported,
     require_route_reasoning_effort,
     require_tool_names_supported,
@@ -220,7 +222,7 @@ def route_generation_parameter_requests(
         if any(profile.omits_output_token_limit for profile in profiles):
             # A plan backend refuses any output ceiling, and a ceiling is caller
             # authority: the plan rung narrows out rather than serve unbounded.
-            parameter = request.maximum_output_tokens_parameter or "max_tokens"
+            parameter = output_limit_parameter(request)
             raise ProviderParameterError(
                 message=(
                     f"The parameter {parameter!r} is not accepted by a plan account on this "
@@ -236,7 +238,7 @@ def route_generation_parameter_requests(
         )
         if route_limits and request.maximum_output_tokens > min(route_limits):
             maximum = min(route_limits)
-            param = request.maximum_output_tokens_parameter or "max_tokens"
+            param = output_limit_parameter(request)
             raise ProviderParameterError(
                 message=(
                     f"The value {request.maximum_output_tokens!r} for {param!r} exceeds this "
@@ -255,7 +257,7 @@ def route_generation_parameter_requests(
             for profile in profiles
         )
         if request.maximum_output_tokens < output_floor:
-            parameter = request.maximum_output_tokens_parameter or "max_tokens"
+            parameter = output_limit_parameter(request)
             raise ProviderParameterError(
                 message=(
                     f"The parameter {parameter!r} must be at least {output_floor} on this "
@@ -826,13 +828,14 @@ def route_generation_parameter_requests(
                 "served by this model route: the provider rejects empty text "
                 "content blocks. Add content to the message or remove it."
             ),
-            param="messages",
+            param=prompt_parameter(request.surface),
             code="invalid_parameter",
         )
 
     require_assistant_prefill_supported(
         profiles,
         cast("Sequence[GatewayMessage]", provider_updates.get("messages", request.messages)),
+        surface=request.surface,
     )
     require_tool_names_supported(profiles, request)
     disclose_anthropic_tool_schemas(profiles, request, ignored)

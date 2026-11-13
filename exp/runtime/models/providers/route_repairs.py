@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING
 from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.generation_parameter_validation import (
+    output_limit_parameter,
     resolve_level_less_enable,
 )
 
@@ -106,7 +107,7 @@ def clamp_output_ceiling(
     floor, top = ranges[0]
     if top is not None and floor > top:
         return None
-    parameter = request.maximum_output_tokens_parameter or "max_tokens"
+    parameter = output_limit_parameter(request)
     if top is not None and value > top:
         target, reason = top, "route_maximum"
     else:

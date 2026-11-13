@@ -53,6 +53,12 @@ spelling, learns at admission that no rung on the route will receive it.
 """
 
 
+_SIGNATURE_ECHOING_SURFACES = frozenset(
+    {GatewayApiSurface.CHAT_COMPLETIONS, GatewayApiSurface.GENERATE_CONTENT}
+)
+"""The public surfaces whose callers can echo a Gemini thought signature on a call."""
+
+
 def disclose_dropped_thought_signatures(
     profiles: Iterable[GatewayWireProfile],
     request: GatewayRequest,
@@ -65,7 +71,7 @@ def disclose_dropped_thought_signatures(
     when none does. Nothing is recorded for a Chat request without one.
     """
     if (
-        request.surface == GatewayApiSurface.CHAT_COMPLETIONS
+        request.surface in _SIGNATURE_ECHOING_SURFACES
         and any(
             call.provider_thought_signature is not None
             for message in request.messages

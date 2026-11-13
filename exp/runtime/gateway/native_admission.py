@@ -63,6 +63,7 @@ from exp.runtime.gateway.prompt_caching import (
 from exp.runtime.gateway.recovery_binding import bind_recovery_profiles
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.sticky_affinity import AffinityPlacement, sticky_first_order
+from exp.runtime.gateway.surfaces import GatewayApiSurface, prompt_parameter
 from exp.runtime.gateway.tool_search.plan import plan_tool_search
 from exp.runtime.gateway.web_search.plan import strip_search_carriers
 from exp.runtime.models.providers import (
@@ -787,29 +788,28 @@ def protocol_compatible_indexes(
             errors.append(exc)
             continue
         except ProviderResponseError as exc:
-            errors.append(_unrepresentable_messages_error(exc))
+            errors.append(_unrepresentable_messages_error(exc, rung_request.surface))
             continue
         indexes.append(index)
     return tuple(indexes), tuple(errors)
 
 
-def _unrepresentable_messages_error(exc: ProviderResponseError) -> ProviderParameterError:
-    """Turn a payload builder's transcript rejection into a ``messages`` parameter error.
+def _unrepresentable_messages_error(
+    exc: ProviderResponseError, surface: GatewayApiSurface
+) -> ProviderParameterError:
+    """Turn a payload builder's transcript rejection into a prompt-field parameter error.
 
-    Args:
-        exc: The builder's gateway-authored reason the conversation cannot be
-            encoded on this wire.
-
-    Returns:
-        A field-specific pre-dispatch rejection the shared admit handler maps
-        to a caller-facing invalid request.
+    ``exc`` is the builder's gateway-authored reason the conversation cannot be
+    encoded on this wire; ``surface`` names the field it arrived in. The result is
+    a field-specific pre-dispatch rejection the shared admit handler maps to a
+    caller-facing invalid request.
     """
     return ProviderParameterError(
         message=(
             f"This model route cannot encode the conversation as sent: {exc}. "
             "Fix the message history or choose a different model."
         ),
-        param="messages",
+        param=prompt_parameter(surface),
         code="invalid_parameter",
     )
 

@@ -26,7 +26,8 @@ from typing import TYPE_CHECKING
 
 from exp.common.core.artifacts import JsonValue
 from exp.common.models.content import TextContentPart
-from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
+from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.surfaces import default_output_limit_parameter, prompt_parameter
 from exp.runtime.models.providers.errors import ProviderParameterError
 
 if TYPE_CHECKING:
@@ -130,6 +131,13 @@ def _without_media(value: JsonValue) -> JsonValue:
     return value
 
 
+def _output_limit_parameter(request: GatewayRequest) -> str:
+    """The caller's output-ceiling field, or the surface's when none was sent."""
+    return request.maximum_output_tokens_parameter or default_output_limit_parameter(
+        request.surface
+    )
+
+
 def minimum_prompt_tokens(request: GatewayRequest) -> int:
     """Lower-bound the prompt's token count from its text bytes.
 
@@ -198,7 +206,7 @@ def clamp_output_to_context_window(
         target = largest - typical - TEMPLATE_RESERVE_TOKENS
     if target < 1:
         return request, ()
-    parameter = request.maximum_output_tokens_parameter or "max_tokens"
+    parameter = _output_limit_parameter(request)
     return (
         request.model_copy(update={"maximum_output_tokens": target}),
         (f"{parameter}->{target}({CONTEXT_WINDOW_CLAMP_REASON})",),
@@ -265,14 +273,14 @@ def context_window_compatible_indexes(
     if compatible or largest is None:
         return tuple(compatible)
     if minimum > largest:
-        param = "input" if request.surface == GatewayApiSurface.RESPONSES else "messages"
+        param = prompt_parameter(request.surface)
         message = (
             f"The prompt is at least {minimum:,} tokens ({text_bytes:,} bytes of text), "
             f"but the largest context window on this model route is {largest:,} tokens. "
             "Shorten the conversation or choose a model with a larger context window."
         )
     else:
-        param = request.maximum_output_tokens_parameter or "max_tokens"
+        param = _output_limit_parameter(request)
         message = (
             f"The prompt is at least {minimum:,} tokens ({text_bytes:,} bytes of text) and "
             f"the request reserves {reserve:,} output tokens, but the largest context "

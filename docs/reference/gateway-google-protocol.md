@@ -44,14 +44,23 @@ Dropped with `x-experiential-ignored-parameters` disclosure: replayed `thought: 
 copy; a gateway-issued sealed carrier echoed on a model turn replays authenticated instead), a
 `thoughtSignature` on a text part, `safetySettings` (the gateway's own per-identity guardrails
 apply), `labels`, `seed`, `responseLogprobs`/`logprobs`, `mediaResolution`, `audioTimestamp`,
-`enableEnhancedCivicAnswers` and declaration `behavior`. Refused with a field-specific 400:
+`enableEnhancedCivicAnswers`, declaration `behavior` and a declaration's `response`/`responseJsonSchema`
+(no gateway wire carries a function output schema). Refused with a field-specific 400:
 `cachedContent` (a Google cache resource the gateway cannot address), Google server-executed tools
 (`googleSearch`, `codeExecution`, `urlContext`, `fileSearch`, ...), `executableCode` and
-`codeExecutionResult` parts, Google File API handles, `candidateCount` other than 1, non-text
-`responseModalities`, `speechConfig` and `imageConfig`, and an unknown field anywhere.
+`codeExecutionResult` parts, a part setting more than one `oneof` payload (`text` beside
+`inlineData`), Google File API handles, `candidateCount` other than 1, non-text
+`responseModalities`, `speechConfig` and `imageConfig`, and an unknown field anywhere. Parts keep
+their order on the canonical message (an image, its caption, the next image). Pre-dispatch
+rejections name Gemini's own fields (`contents`, `generationConfig.maxOutputTokens`), and a
+request routed to an Anthropic Messages or Bedrock Converse rung receives the gateway's automatic
+prompt-cache checkpoint exactly as a Chat Completions request does.
 
 The cross-surface extensions ride the body as on every other surface: `provider: {"zdr": true}`
 and the `gateway` request policy (through the SDK's `http_options.extra_body`).
+
+`GET /v1beta/models/{model}` reads the whole segment as the alias (`coding:free` is one granted
+spelling); only POST splits the trailing `:action`.
 
 ## Encoding
 

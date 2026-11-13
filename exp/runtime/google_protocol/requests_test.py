@@ -6,15 +6,19 @@ import pytest
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.content import AudioContentPart, DocumentContentPart
+from exp.common.models.content import AudioContentPart, DocumentContentPart, TextContentPart
 from exp.runtime.gateway.contracts import GatewayApiSurface
 from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice, GatewayNamedToolChoice
 from exp.runtime.google_protocol.requests import (
+    RESPONSE_SCHEMA_DROPPED,
     SAFETY_SETTINGS_DROPPED,
     THOUGHT_DROPPED,
     decode_generate_content,
     decode_generate_content_count_tokens,
 )
+from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.gemini_requests import THOUGHT_SIGNATURE_DROPPED
+from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 
@@ -107,6 +111,7 @@ def test_decode_full_sdk_request_is_lossless() -> None:
     assert request.structured_text is not None
     assert request.structured_text.json_schema == {"type": "object"}
     assert request.maximum_output_tokens == 64
+    assert request.maximum_output_tokens_parameter == "generationConfig.maxOutputTokens"
     assert request.stop == ("END",)
     assert (request.temperature, request.top_p) == (0.5, 0.9)
     assert request.reasoning_effort == "low"
@@ -349,6 +354,47 @@ def test_inline_media_becomes_canonical_parts() -> None:
             "invalid_parameter",
             "contents.0.parts.0.inlineData.mimeType",
         ),
+        # A protobuf oneof set twice is malformed, never a silent pick.
+        (
+            _body(
+                contents=[
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"text": "a", "inlineData": {"mimeType": "image/png", "data": "x"}}
+                        ],
+                    }
+                ]
+            ),
+            400,
+            "invalid_parameter",
+            "contents.0.parts.0",
+        ),
+        (
+            _body(
+                contents=[
+                    {"role": "user", "parts": [{"text": "q"}]},
+                    {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "functionCall": {"name": "f", "args": {}},
+                                "functionResponse": {"name": "f", "response": {}},
+                            }
+                        ],
+                    },
+                ]
+            ),
+            400,
+            "invalid_parameter",
+            "contents.1.parts.0",
+        ),
+        (
+            _body(contents=[{"role": "user", "parts": [{"thought": True}]}]),
+            400,
+            "invalid_parameter",
+            "contents.0.parts.0",
+        ),
     ],
 )
 def test_rejections_name_the_offending_field(
@@ -378,3 +424,95 @@ def test_count_tokens_accepts_contents_or_a_wrapped_request() -> None:
     with pytest.raises(OpenAIProtocolError) as caught:
         decode_generate_content_count_tokens({}, model="m")
     assert caught.value.detail.param == "contents"
+
+
+def test_interleaved_media_and_captions_keep_the_callers_part_order() -> None:
+    """An image, its caption and the next image land on the message in that order."""
+    png = {"inlineData": {"mimeType": "image/png", "data": "iVBORw0KGgo="}}
+    request = decode_generate_content(
+        _body(
+            contents=[
+                {
+                    "role": "user",
+                    "parts": [
+                        png,
+                        {"text": "first"},
+                        {"text": " caption"},
+                        png,
+                        {"text": "second"},
+                    ],
+                }
+            ]
+        ),
+        model="m",
+        stream=False,
+    ).request
+    message = request.messages[0]
+    assert [part.kind for part in message.content_parts] == [
+        "image",
+        "text",
+        "text",
+        "image",
+        "text",
+    ]
+    assert message.content_parts[1] == TextContentPart(text="first")
+    assert message.content == "first captionsecond"
+
+
+def test_function_response_schemas_drop_with_disclosure() -> None:
+    """A declared output schema has no canonical carrier; the caller learns it was dropped."""
+    request = decode_generate_content(
+        _body(
+            tools=[
+                {
+                    "functionDeclarations": [
+                        {
+                            "name": "f",
+                            "parameters": {"type": "OBJECT"},
+                            "response": {"type": "STRING"},
+                        }
+                    ]
+                }
+            ]
+        ),
+        model="m",
+        stream=False,
+    ).request
+    assert request.tools[0].parameters == {"type": "object"}
+    assert RESPONSE_SCHEMA_DROPPED in request.ignored_parameters
+
+
+def test_an_echoed_signature_is_disclosed_as_dropped_off_gemini_wires() -> None:
+    """A generateContent alias routed only to a non-Gemini wire discloses the dropped signature."""
+    request = decode_generate_content(
+        _body(
+            contents=[
+                {"role": "user", "parts": [{"text": "q"}]},
+                {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {"id": "c1", "name": "f", "args": {}},
+                            "thoughtSignature": "c2lnbmF0dXJlLWE=",
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "parts": [{"functionResponse": {"id": "c1", "name": "f", "response": {}}}],
+                },
+            ]
+        ),
+        model="m",
+        stream=False,
+    ).request
+    openai = GatewayWireProfile(
+        dialect="openai_compatible", url="https://openai.test/v1", model_id="gpt-5.5"
+    )
+    gemini = GatewayWireProfile(
+        dialect="gemini_generate_content", url="https://gemini.test", model_id="gemini-3"
+    )
+    public, _provider = route_generation_parameter_requests((openai,), request)
+    assert THOUGHT_SIGNATURE_DROPPED in public.ignored_parameters
+    public, _provider = route_generation_parameter_requests((gemini, openai), request)
+    assert THOUGHT_SIGNATURE_DROPPED not in public.ignored_parameters
