@@ -441,7 +441,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.judged",
             "exp.optimize.evaluation.variance.episode_evidence",
         ),
-        "871e22b4d6f64b5696b0385785e23a31949439f414040b2e279a973588180c51",
+        "984da01b396e026f84037a1e7438d807fdef2d74dfc4ab4841c7ecbcd3f037b1",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.admission:FAMILY_ADMISSION_POLICY",
@@ -574,7 +574,7 @@ PROTOCOLS = (
         "exp.optimize.evaluation.variance.decision_measure:DECISION_MEASURE_PROTOCOL",
         "decision-measure-v1",
         ("exp.optimize.evaluation.variance.decision_measure",),
-        "258d1b77a601a3d37484f637c5df1c2371011fa98b9dc78fb08123550bc1fdea",
+        "19c0cf6a093d71a093165c94c4f532e1bfdc41f2811ec8a712fdbf8539383e69",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.family_stages:ROLE_DRAWS_PROTOCOL",
@@ -589,7 +589,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.variance.family_stages:check_clarity",
             "exp.optimize.evaluation.variance.family_stages:review_clarity",
         ),
-        "b151845a4b71fbb0e4178e1031af8278e2f8796a6c17f82aef449d490796207d",
+        "faee18b1c0a9d06e6ccc0d17fb55099d9bdd41add2548375d6cfa463f62e2a8a",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.astra_prompt_contracts:ASTRA_PROMPT_PROTOCOL",
