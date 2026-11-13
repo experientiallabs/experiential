@@ -19,6 +19,12 @@ describe("gateway provider", () => {
     expect(reportedCost(null)).toBeUndefined();
   });
 
+  it("sends the gateway's headers with every call, escaped like the key", () => {
+    const config = gatewayProviderConfig({ ...local, headers: { "X-Explabs-Session-Id": "s", "X-Odd": "$HOME" } }, []);
+    expect(config.headers).toEqual({ "X-Explabs-Session-Id": "s", "X-Odd": "$$HOME" });
+    expect(gatewayProviderConfig(local, []).headers).toBeUndefined();
+  });
+
   it("registers one model per alias under the gateway's endpoint", () => {
     const models = gatewayProviderModels([{ id: "a" }, { id: "gpt-6-luna" }], local);
     const config = gatewayProviderConfig(local, models);

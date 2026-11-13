@@ -40,7 +40,7 @@ fn retries_and_conditional_failover_match_python() {
         assert!(case.policy.valid());
         let mut health = Health::new(Policy::default()).unwrap();
         for (key, failure) in keys.iter().zip(&case.prior) {
-            health.failed(key, failure, 100.0);
+            health.failed(key, failure, None, 100.0);
         }
         let retry = Retry {
             failure: &case.failure,

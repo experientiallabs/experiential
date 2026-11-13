@@ -40,7 +40,7 @@ impl Dispatch {
                     .lock()
                     .map_err(|_| PublicError::internal())?;
                 p.loads.retract(id);
-                p.health.release(&lane.key);
+                p.health.release(&lane.key, None);
                 return Err(error);
             }
         };
@@ -73,7 +73,7 @@ impl Dispatch {
                 .lock()
                 .map_err(|_| PublicError::internal())?;
             p.loads.retract(id);
-            p.health.release(&lane.key);
+            p.health.release(&lane.key, None);
             return Err(PublicError::internal());
         };
         let lease = lease.to_string();
@@ -98,7 +98,7 @@ impl Dispatch {
                 .policies
                 .lock()
                 .map_err(|_| PublicError::internal())?;
-            p.health.release(key);
+            p.health.release(key, None);
             if let Some(ticket) = ticket {
                 p.loads.release(ticket);
             }
@@ -293,13 +293,16 @@ impl Dispatch {
             .map_err(|_| PublicError::internal())?;
         p.loads.release_attempt(id);
         if data["graceful_transport_retirement"] == true {
-            p.health.release(&lane.key);
+            p.health.release(&lane.key, Some(id));
             return Ok(());
         }
-        if data["opened"] == true {
-            p.health.succeeded(&lane.key);
-        }
         let now = self.shared.now();
+        if let Some(wait) = observed.exhausted_wait() {
+            p.health.exhausted(&lane.key, wait as f64, now);
+        }
+        if data["opened"] == true {
+            p.health.succeeded(&lane.key, Some(id), now);
+        }
         if let Some(failure) = &failure {
             if throttled
                 && (lane.policy.concurrency_bound.is_some()
@@ -308,12 +311,9 @@ impl Dispatch {
             {
                 p.loads.record_throttle(&lane.load_key(), now);
             }
-            p.health.failed(&lane.key, failure, now);
+            p.health.failed(&lane.key, failure, Some(id), now);
         } else {
-            p.health.succeeded(&lane.key);
-        }
-        if let Some(wait) = observed.exhausted_wait() {
-            p.health.exhausted(&lane.key, wait as f64, now);
+            p.health.succeeded(&lane.key, Some(id), now);
         }
         if terminal["usage_estimated"] != true && !attempt.funded {
             if let Some(input) = terminal["usage"]["input_tokens"].as_u64() {

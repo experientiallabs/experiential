@@ -33,13 +33,14 @@ fn replay_health(trace: &str) {
             "claim_forced" => json!(health.claim(key, Claim::Forced, now)),
             "claim_throttle_redial" => json!(health.claim(key, Claim::ThrottleRedial, now)),
             "succeeded" | "dispatch_opened" => {
-                health.succeeded(key);
+                health.succeeded(key, None, now);
                 Value::Null
             }
             "failed" => {
                 health.failed(
                     key,
                     &crate::lossless_json::from_value(case["argument"].clone()).unwrap(),
+                    None,
                     now,
                 );
                 Value::Null
@@ -49,7 +50,7 @@ fn replay_health(trace: &str) {
                 Value::Null
             }
             "release_probe" => {
-                health.release(key);
+                health.release(key, None);
                 Value::Null
             }
             op => panic!("unknown operation {op}"),

@@ -177,6 +177,7 @@ impl Dispatch {
         {
             return Err(PublicError::internal());
         }
+        let probe = start.failure.is_none() || start.current_depth.is_none();
         let selected = c.selected_route && state.total == 0;
         let keys: Vec<_> = c.lanes.iter().map(|l| l.key.clone()).collect();
         let mut ladder = if selected {
@@ -252,6 +253,7 @@ impl Dispatch {
                             0
                         },
                         &ladder,
+                        true,
                         now,
                     ),
                     None,
@@ -322,7 +324,7 @@ impl Dispatch {
             let lane = &c.lanes[depth];
             if state.denied.contains(&lane.pool_id) {
                 self.release_probe(&keys[depth])?;
-                candidate = self.sideways(&mut failover, &keys, &ladder, depth)?;
+                candidate = self.sideways(&mut failover, &keys, &ladder, depth, probe)?;
                 continue;
             }
             if !c.attempt_policy.permits(state.total, state.physical[depth]) {
@@ -416,7 +418,7 @@ impl Dispatch {
                         break;
                     }
                     if !forced {
-                        candidate = self.sideways(&mut failover, &keys, &ladder, depth)?;
+                        candidate = self.sideways(&mut failover, &keys, &ladder, depth, probe)?;
                     }
                     continue;
                 }
@@ -510,7 +512,7 @@ impl Dispatch {
                     },
                 );
                 forced = false;
-                candidate = self.sideways(&mut failover, &keys, &ladder, depth)?;
+                candidate = self.sideways(&mut failover, &keys, &ladder, depth, probe)?;
                 continue;
             }
             let Some(id) = reserved["attempt_id"]
@@ -527,6 +529,9 @@ impl Dispatch {
                     .policies
                     .lock()
                     .map_err(|_| PublicError::internal())?;
+                policies
+                    .health
+                    .bind_throttle_probe(&lane.key, &id, probe, self.shared.now());
                 if let Some(ticket) = &ticket {
                     policies.loads.bind(ticket, &id);
                 }
@@ -702,7 +707,7 @@ impl Dispatch {
             .lock()
             .map_err(|_| PublicError::internal())?
             .health
-            .release(key);
+            .release(key, None);
         Ok(())
     }
     fn sideways(
@@ -711,6 +716,7 @@ impl Dispatch {
         keys: &[HealthKey],
         ladder: &[usize],
         depth: usize,
+        throttle_probe: bool,
     ) -> Result<Option<usize>, PublicError> {
         let mut p = self
             .shared
@@ -719,7 +725,14 @@ impl Dispatch {
             .map_err(|_| PublicError::internal())?;
         Ok(match failover {
             Some(pass) => pass.sideways(&mut p.health, keys, depth, self.shared.now()),
-            None => selection::claim(&mut p.health, keys, depth + 1, ladder, self.shared.now()),
+            None => selection::claim(
+                &mut p.health,
+                keys,
+                depth + 1,
+                ladder,
+                throttle_probe,
+                self.shared.now(),
+            ),
         })
     }
     fn fallback(&self, depth: usize, start: &Start) -> Option<String> {

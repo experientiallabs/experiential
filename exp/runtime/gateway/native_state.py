@@ -65,18 +65,38 @@ class NativeHealth(DeploymentHealthRegistry):
         """Claim the separately authorized warm-lane redial."""
         return self.state.read(bool, "health_claim", {"key": list(key), "mode": "throttle_redial"})
 
-    def dispatch_opened(self, key: DeploymentHealthKey) -> None:
+    def claim_throttle_probe(self, key: DeploymentHealthKey) -> bool:
+        """Claim a paced probe through a provider's hintless throttle window."""
+        return self.state.read(bool, "health_claim", {"key": list(key), "mode": "throttle_probe"})
+
+    def bind_throttle_probe(
+        self, key: DeploymentHealthKey, attempt_id: str, *, probe: bool = True
+    ) -> None:
+        """Bind the reserved attempt to its current hintless throttle window."""
+        self.state.write(
+            "health_bind_throttle_probe",
+            {"key": list(key), "attempt_id": attempt_id, "probe": probe},
+        )
+
+    def dispatch_opened(self, key: DeploymentHealthKey, attempt_id: str | None = None) -> None:
         """Publish reachability as soon as the provider opens."""
-        self.succeeded(key)
+        self.succeeded(key, attempt_id)
 
-    def succeeded(self, key: DeploymentHealthKey) -> None:
+    def succeeded(self, key: DeploymentHealthKey, attempt_id: str | None = None) -> None:
         """Clear the deployment and physical-lane failure circuits."""
-        self.state.write("health_succeeded", {"key": list(key)})
+        self.state.write("health_succeeded", {"key": list(key), "attempt_id": attempt_id})
 
-    def failed(self, key: DeploymentHealthKey, failure: GatewayFailure) -> None:
+    def failed(
+        self, key: DeploymentHealthKey, failure: GatewayFailure, attempt_id: str | None = None
+    ) -> None:
         """Apply one observed failure to the native health registry."""
         self.state.write(
-            "health_failed", {"key": list(key), "failure": failure.model_dump(mode="json")}
+            "health_failed",
+            {
+                "key": list(key),
+                "failure": failure.model_dump(mode="json"),
+                "attempt_id": attempt_id,
+            },
         )
 
     def exhausted(self, key: DeploymentHealthKey, reset_after_seconds: float) -> None:
@@ -126,9 +146,9 @@ class NativeHealth(DeploymentHealthRegistry):
             self.state.native.state_json("health_circuit_failure", json.dumps({"keys": judged}))
         )
 
-    def release_probe(self, key: DeploymentHealthKey) -> None:
+    def release_probe(self, key: DeploymentHealthKey, attempt_id: str | None = None) -> None:
         """Return an unconsumed health probe."""
-        self.state.write("health_release", {"key": list(key)})
+        self.state.write("health_release", {"key": list(key), "attempt_id": attempt_id})
 
 
 class NativeSticky(StickySpillRegistry):

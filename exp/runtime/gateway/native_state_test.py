@@ -65,6 +65,27 @@ def test_throttle_window_judges_only_the_depths_a_reservation_may_dial() -> None
     assert owner.close()
 
 
+def test_hintless_probe_ownership_crosses_admission_views() -> None:
+    """A probe's own successful open lifts the window observed by every native view."""
+    owner = NativeAccounting(background_recovery=False)
+    first, second = NativeHealth(NativeState(owner)), NativeHealth(NativeState(owner))
+    key = ("revision", "deployment", "connection")
+    first.failed(
+        key,
+        GatewayFailure(
+            failure_class=GatewayFailureClass.THROTTLED, safe_message="provider throttle"
+        ),
+    )
+    assert second.claim_throttle_probe(key)
+    first.release_probe(key, "unrelated")
+    second.bind_throttle_probe(key, "probe")
+    first.succeeded(key, "older-request")
+    assert second.suppressed(key)
+    first.dispatch_opened(key, "probe")
+    assert not second.suppressed(key)
+    assert owner.close()
+
+
 def test_account_failure_names_only_circuits_it_still_holds() -> None:
     """The native view names the account failure while it is the newest cause everywhere."""
     owner = NativeAccounting(background_recovery=False)

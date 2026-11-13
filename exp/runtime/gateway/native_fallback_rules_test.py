@@ -16,9 +16,8 @@ from exp.runtime.gateway.contracts import (
     GatewayRefusalReason,
 )
 from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
-from exp.runtime.gateway.health import DeploymentHealthRegistry
+from exp.runtime.gateway.health import DeploymentHealthRegistry, claim_route_from
 from exp.runtime.gateway.native_execution import (
-    claim_route_from,
     deployment_health_key,
     next_route_candidate,
 )

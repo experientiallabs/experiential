@@ -37,6 +37,7 @@ import { createWebSearchTool } from "../extension/web-search.js";
 import { GATEWAY_PROVIDER_ID, type GatewayConfig, trimBaseUrl } from "../gateway/config.js";
 import { DEFAULT_MAX_TOKENS, fetchGatewayModels, type ListedModel } from "../gateway/models.js";
 import { gatewayProviderConfig, gatewayProviderModels, messageBilling } from "../gateway/provider.js";
+import { conversationTraceHeaders } from "../gateway/trace.js";
 import { INTERRUPTED_LIMIT_MESSAGE, modelErrorEvent, RESTART_LIMIT_MESSAGE, RUN_LIMIT_MESSAGE } from "./errors.js";
 import { currentRun, EventLog, readEventLog } from "./event-log.js";
 import { listWorkFiles } from "./files.js";
@@ -205,7 +206,13 @@ export async function runOnce(options: RunnerOptions): Promise<RunEndStatus> {
     }
   }
 
-  const gateway: GatewayConfig = { kind: "hosted", baseUrl: trimBaseUrl(spec.gatewayBaseUrl), apiKey: options.apiKey };
+  // Every call this run makes (each model turn, and web search's own call) names its conversation and run.
+  const gateway: GatewayConfig = {
+    kind: "hosted",
+    baseUrl: trimBaseUrl(spec.gatewayBaseUrl),
+    apiKey: options.apiKey,
+    headers: conversationTraceHeaders({ conversationId: spec.sessionId, turnId: spec.runId })
+  };
   const tools = runnerTools(spec, options, gateway);
   const sessionManager = SessionManager.open(join(options.sessionDir, SESSION_FILE), options.sessionDir, options.workDir);
   // A restarted run whose agent had already finished its answer has nothing left to ask for.
