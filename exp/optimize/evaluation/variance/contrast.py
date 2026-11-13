@@ -67,6 +67,7 @@ from exp.optimize.evaluation.continuations.job import (
 )
 from exp.optimize.evaluation.continuations.study import restore_continuation_world
 from exp.optimize.evaluation.variance.actor_critic import admitted_concurrency
+from exp.optimize.evaluation.variance.bounded import run_keyed
 from exp.optimize.evaluation.variance.contracts import (
     DecisionState,
     Scenario,
@@ -710,7 +711,16 @@ def run_option_contrast(
     ]
     for spec in pending:
         preflight_action_contrast(project, spec, code_revision=code_revision)
-    reports = [run_action_contrast(project, spec, code_revision=code_revision) for spec in specs]
+    # Each option's contrast is its own registration (a distinct alternative action), so the
+    # options run at once; reports keep option order.
+    reports = run_keyed(
+        [
+            lambda spec=spec: run_action_contrast(project, spec, code_revision=code_revision)
+            for spec in specs
+        ],
+        [spec.identity(code_revision) for spec in specs],
+        max(1, len(specs)),
+    )
     store = project.artifacts
     references = tuple(
         artifact_input(store.read(spec.identity(code_revision) + "-result").manifest)

@@ -10,6 +10,7 @@ pipeline runs with no stand-in over a grounded world in
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -49,6 +50,7 @@ from exp.optimize.evaluation.variance.actor_critic_test import (
 from exp.optimize.evaluation.variance.admission import VariantJudging
 from exp.optimize.evaluation.variance.admission_test import bound_judging, unfrozen_judging
 from exp.optimize.evaluation.variance.authors import DECISION_STATE_TOOL, SCENARIO_TOOL
+from exp.optimize.evaluation.variance.bounded import run_keyed
 from exp.optimize.evaluation.variance.briefing_review import DEFAULT_REVIEW_VARIANTS, REVIEW_TOOL
 from exp.optimize.evaluation.variance.contracts import (
     DecisionState,
@@ -616,14 +618,26 @@ def test_family_qualifies_is_confirmed_and_yields_records_once_disposed(
         "delete-1",
         "delete-2",
     )
-    assert setup.stages.dispatches == [
-        "witness:six",
-        "selection:six",
-        "witness:seven",
-        "selection:seven",
-        "confirmation:six",
-        "confirmation:seven",
-    ]
+    # Scenarios run at once, so only each scenario's own order and selection before
+    # confirmation are fixed.
+    dispatched = setup.stages.dispatches
+    assert sorted(dispatched) == sorted(
+        [
+            "witness:six",
+            "selection:six",
+            "witness:seven",
+            "selection:seven",
+            "confirmation:six",
+            "confirmation:seven",
+        ]
+    )
+    assert max(dispatched.index(f"selection:{s}") for s in ("six", "seven")) < min(
+        dispatched.index(f"confirmation:{s}") for s in ("six", "seven")
+    )
+    assert all(
+        dispatched.index(f"witness:{s}") < dispatched.index(f"selection:{s}")
+        for s in ("six", "seven")
+    )
     assert set(report.grades) == {"six", "seven"} and report.ambiguous_criteria == ()
     sources = {finding.source for finding in report.findings}
     assert sources == {"actor_critic", "decision_state", "variant_review"}
@@ -654,6 +668,49 @@ def test_family_qualifies_is_confirmed_and_yields_records_once_disposed(
     assert all(not judge.trainable for judge in disposed.records.judges)
     assert len(setup.roles.requests) == 4
     assert len(setup.stages.dispatches) == 6
+
+
+def test_scenarios_and_confirmations_run_at_once_with_the_serial_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both scenarios are in their witness at once and both confirm at once; same report."""
+    serial_setup = _setup(tmp_path / "serial", monkeypatch)
+    monkeypatch.setattr(
+        family_module, "run_keyed", lambda calls, keys, _: run_keyed(calls, keys, 1)
+    )
+    serial = serial_setup.run()
+    monkeypatch.undo()
+    setup = _setup(tmp_path / "parallel", monkeypatch)
+    witnessed, contrasted = setup.stages.witness, setup.stages.contrast
+    barriers = {
+        "witness": threading.Barrier(2, timeout=30),
+        "confirm": threading.Barrier(2, timeout=30),
+    }
+
+    def witness(*args: object, **kwargs: object) -> object:
+        barriers["witness"].wait()  # both scenarios must be in flight together
+        return witnessed(*args, **kwargs)
+
+    def contrast(*args: object, **kwargs: object) -> object:
+        job = cast(ContinuationJob, kwargs["job"])
+        if "fresh confirmation" in job.study.selector:
+            barriers["confirm"].wait()  # both winners must confirm together
+        return contrasted(*args, **kwargs)
+
+    monkeypatch.setattr(stages_module, "run_observation_witness", witness)
+    monkeypatch.setattr(stages_module, "run_option_contrast", contrast)
+    report = setup.run()
+    assert [row.scenario_id for row in report.variants] == [
+        row.scenario_id for row in serial.variants
+    ]
+    assert report.selection is not None and serial.selection is not None
+    assert report.selection.qualifies and serial.selection.qualifies
+    assert [(v.scenario_id, v.status) for v in report.selection.variants] == [
+        (v.scenario_id, v.status) for v in serial.selection.variants
+    ]
+    assert report.confirmation is not None and serial.confirmation is not None
+    assert report.confirmation.winners == serial.confirmation.winners
+    assert sorted(setup.stages.dispatches) == sorted(serial_setup.stages.dispatches)
 
 
 def test_family_that_qualifies_on_selection_but_not_on_fresh_samples_is_ineligible(

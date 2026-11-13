@@ -55,6 +55,8 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
+from exp.optimize.evaluation.variance.actor_critic import admitted_concurrency
+from exp.optimize.evaluation.variance.bounded import run_at_once, run_keyed
 from exp.optimize.evaluation.variance.contracts import DecisionState, Scenario
 from exp.optimize.evaluation.variance.contrast import OptionContrast, WitnessResult
 from exp.optimize.evaluation.variance.episodes import EpisodeEvidence
@@ -74,7 +76,7 @@ from exp.optimize.evaluation.variance.family_stages import (
     run_role,
     slot_evidence,
 )
-from exp.optimize.evaluation.variance.judged import EpisodeJudge, slot_rewards
+from exp.optimize.evaluation.variance.judged import EpisodeJudge, JudgedSlot, slot_rewards
 from exp.optimize.evaluation.variance.records import load_judged_study
 from exp.optimize.evaluation.variance.rewards import (
     JOINT_OBJECTIVE,
@@ -656,30 +658,34 @@ def classify_free_study(
     judged = load_judged_study(project, reference)
     rewards = slot_rewards(project, judged.branches, judged.judge)
     stances = spec.classifier_stances
-    choices: list[EpisodeChoice] = []
-    for index, (slot, reward) in enumerate(zip(judged.branches, rewards, strict=True)):
+
+    def choice(index: int, slot: JudgedSlot, reward: float | None) -> EpisodeChoice:
+        """Classify one episode, or mark a gap without evidence unclear without any call."""
         evidence = slot_evidence(project, slot, judged.judge)
         if evidence is None:
             gap = slot.gap or "no evidence"
-            choices.append(
-                EpisodeChoice(position=slot.position, label=UNCLEAR, reward=reward, failure=gap)
-            )
-            continue
+            return EpisodeChoice(position=slot.position, label=UNCLEAR, reward=reward, failure=gap)
         assert slot.episode is not None
-        choices.append(
-            classify_episode(
-                project,
-                spec,
-                decision,
-                evidence,
-                position=slot.position,
-                reward=reward,
-                stance=stances[(offset + index) % len(stances)],
-                sources=(reference, slot.episode.assessment),
-                code_revision=code_revision,
-            )
+        return classify_episode(
+            project,
+            spec,
+            decision,
+            evidence,
+            position=slot.position,
+            reward=reward,
+            stance=stances[(offset + index) % len(stances)],
+            sources=(reference, slot.episode.assessment),
+            code_revision=code_revision,
         )
-    return tuple(choices)
+
+    # Episodes are classified independently, each under its own position and stance.
+    return run_at_once(
+        [
+            lambda index=index, slot=slot, reward=reward: choice(index, slot, reward)
+            for index, (slot, reward) in enumerate(zip(judged.branches, rewards, strict=True))
+        ],
+        admitted_concurrency(project, spec.classifier.model_alias),
+    )
 
 
 def outcome_consequence(
@@ -755,21 +761,26 @@ def measure_states(
                 project, spec, decision, state.free, offset=index, code_revision=code_revision
             )
             labels = [choice.label for choice in choices]
-            reviews = tuple(
-                review_clarity(
-                    project,
-                    spec.reviewer,
-                    spec.reviewer_profile,
-                    decision,
-                    state.scenario,
-                    contrast=state.contrast,
-                    witness=state.witness,
-                    free_choices={label: labels.count(label) for label in set(labels)},
-                    sources=(state.free,),
-                    stance=stance,
-                    code_revision=code_revision,
-                )
-                for stance in spec.reviewer_stances
+            free_choices = {label: labels.count(label) for label in set(labels)}
+            # Each stance reviews independently under its own identity; stance order is kept.
+            reviews = run_at_once(
+                [
+                    lambda stance=stance, state=state, chosen=free_choices: review_clarity(
+                        project,
+                        spec.reviewer,
+                        spec.reviewer_profile,
+                        decision,
+                        state.scenario,
+                        contrast=state.contrast,
+                        witness=state.witness,
+                        free_choices=chosen,
+                        sources=(state.free,),
+                        stance=stance,
+                        code_revision=code_revision,
+                    )
+                    for stance in spec.reviewer_stances
+                ],
+                admitted_concurrency(project, spec.reviewer.model_alias),
             )
             clear, notes = _clarity(reviews, spec.minimum_reviews)
             evidence = StateEvidence(
@@ -911,18 +922,29 @@ def measure_family(
     by_id = {scenario.scenario_id: scenario for scenario in scenarios}
     states: list[StateInput] = []
     try:
-        for row in variants:
-            checkpoint = row.decision_checkpoint
-            if row.selection is None or checkpoint is None:
-                continue
-            free, _ = free_continuations(
-                project,
-                jobs[row.scenario_id],
-                checkpoint,
-                repeats=spec.free_repeats,
-                judge=judges[row.scenario_id],
-                code_revision=code_revision,
-            )
+        # Each state's free continuations start from its own checkpoint, so they run at once;
+        # states sharing a checkpoint run in order on one worker. States keep variant order.
+        rows = [
+            row
+            for row in variants
+            if row.selection is not None and row.decision_checkpoint is not None
+        ]
+        frees = run_keyed(
+            [
+                lambda row=row: free_continuations(
+                    project,
+                    jobs[row.scenario_id],
+                    row.decision_checkpoint,
+                    repeats=spec.free_repeats,
+                    judge=judges[row.scenario_id],
+                    code_revision=code_revision,
+                )[0]
+                for row in rows
+            ],
+            [str(row.decision_checkpoint) for row in rows],
+            max(1, len(rows)),
+        )
+        for row, free in zip(rows, frees, strict=True):
             states.append(
                 StateInput(
                     scenario=by_id[row.scenario_id],
