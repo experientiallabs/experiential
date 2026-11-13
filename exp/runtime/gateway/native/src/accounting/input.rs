@@ -540,8 +540,13 @@ async fn run(
         let started = Instant::now();
         let budget = Duration::from_millis(c.check["timeout_ms"].as_u64().unwrap_or(0))
             .min(deadline.saturating_duration_since(started));
-        let (result, incomplete) =
-            inspect_until_ready(&c, budget, &mut ready, inspect(&c, budget)).await;
+        let response_expired =
+            response_deadline(&c, *ready.borrow()).is_some_and(|at| at <= started);
+        let (result, incomplete) = if !budget.is_zero() && response_expired {
+            (Err(()), "response_ready_timeout")
+        } else {
+            inspect_until_ready(&c, budget, &mut ready, inspect(&c, budget)).await
+        };
         let outcome = match &result {
             Ok(v) if v["coverage_error"] == true => "unsupported",
             Ok(v) if v["flagged"] == true => "flagged",
@@ -622,6 +627,20 @@ async fn run(
     decision
 }
 
+fn response_deadline(check: &Check, ready: Option<Instant>) -> Option<Instant> {
+    if check.policy["mode"] == "observe" || check.policy["input_fail_open"] != true {
+        return None;
+    }
+    ready.map(|at| {
+        at + Duration::from_millis(
+            check.policy["input_max_wait_ms"]
+                .as_u64()
+                .unwrap_or(0)
+                .min(5000),
+        )
+    })
+}
+
 /// Watch a one-shot response boundary while retaining the same in-flight classifier.
 async fn inspect_until_ready(
     check: &Check,
@@ -633,20 +652,9 @@ async fn inspect_until_ready(
         return (Err(()), "timeout");
     }
     let deadline = Instant::now() + budget;
-    let grace = (check.policy["mode"] != "observe" && check.policy["input_fail_open"] == true)
-        .then(|| {
-            Duration::from_millis(
-                check.policy["input_max_wait_ms"]
-                    .as_u64()
-                    .unwrap_or(0)
-                    .min(5000),
-            )
-        });
     tokio::pin!(inspection);
     loop {
-        let release = (*ready.borrow_and_update())
-            .zip(grace)
-            .map(|(at, grace)| at + grace);
+        let release = response_deadline(check, *ready.borrow_and_update());
         let until = release.map_or(deadline, |at| at.min(deadline));
         let reason = if release.is_some_and(|at| at <= deadline) {
             "response_ready_timeout"
@@ -663,6 +671,7 @@ async fn inspect_until_ready(
             changed = ready.changed() => {
                 if changed.is_err() { return (Err(()), "cancelled"); }
             },
+            _ = async {}, if Instant::now() >= until => return (Err(()), reason),
             _ = tokio::time::sleep_until(until.into()) => return (Err(()), reason),
         }
     }
@@ -813,6 +822,34 @@ mod interruption_tests {
 #[cfg(test)]
 mod readiness_tests {
     use super::*;
+    use futures_util::FutureExt;
+
+    #[tokio::test]
+    async fn unstarted_inspections_do_not_use_an_expired_response_budget() {
+        for grace_ms in [0, 20] {
+            let check = Check {
+                policy: json!({"input_fail_open": true, "input_max_wait_ms": grace_ms}),
+                check: json!({"action": "block", "timeout_ms": 1000}),
+                adapter: json!({"kind": "allow"}),
+            };
+            let (_sender, ready) = tokio::sync::watch::channel(Some(
+                Instant::now() - Duration::from_millis(grace_ms + 1),
+            ));
+            let decision = run(
+                vec![check],
+                Instant::now() + Duration::from_secs(1),
+                Arc::default(),
+                ready,
+            )
+            .await;
+            assert_eq!(decision["action"], "allow");
+            assert_eq!(decision["moderation"]["status"], "failed_open");
+            assert_eq!(
+                decision["moderation"]["observations"][0]["outcome"],
+                "response_ready_timeout"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn ready_verdict_wins_expired_grace_without_waiting_for_pending_work() {
@@ -835,17 +872,14 @@ mod readiness_tests {
                 .await;
                 assert_eq!(verdict.unwrap()["flagged"], flagged);
             }
-            let (verdict, reason) = tokio::time::timeout(
-                Duration::from_millis(500),
-                inspect_until_ready(
-                    &check,
-                    Duration::from_secs(1),
-                    &mut ready,
-                    std::future::pending(),
-                ),
+            let (verdict, reason) = inspect_until_ready(
+                &check,
+                Duration::from_secs(1),
+                &mut ready,
+                std::future::pending(),
             )
-            .await
-            .expect("expired grace must not wait for a pending classifier");
+            .now_or_never()
+            .expect("expired grace must finish on the first poll of a pending classifier");
             assert!(verdict.is_err());
             assert_eq!(reason, "response_ready_timeout");
         }
