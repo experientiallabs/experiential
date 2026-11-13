@@ -1,6 +1,6 @@
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -80,5 +80,33 @@ describe("exp-code CLI", () => {
   it("explains how to provide a gateway key when there is none", async () => {
     const result = await runCli(["-p", "hi"]);
     expect(result.stderr).toMatch(/No Experiential gateway key found/);
+  });
+
+  it("logs in, reports status, uses the saved key, and logs out", async () => {
+    const status = await runCli(["login", "--status"]);
+    expect(status.code).toBe(1);
+    expect(status.stdout).toContain("Not logged in");
+
+    const refused = await runCli(["login", "--no-browser"]);
+    expect(refused.code).toBe(1);
+    expect(refused.stderr).toContain("interactive terminal");
+
+    const agentDir = join(home, ".exp-code", "agent");
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(join(agentDir, "credentials.json"), JSON.stringify({ hostedKey: "xpl_savedkey_123456", baseUrl: gateway.baseUrl, savedAt: "now", keyName: "exp-code (ci)" }));
+    const saved = await runCli(["whoami"]);
+    expect(saved.code).toBe(0);
+    expect(saved.stdout).toContain("Using the saved login");
+    expect(saved.stdout).not.toContain("xpl_savedkey_123456");
+
+    gateway.script([{ text: "Hello with the saved key." }]);
+    const answer = await runCli(["-p", "say hello"]);
+    expect(answer.stdout.trim()).toBe("Hello with the saved key.");
+    expect(gateway.requests.filter((r) => r.path === "/v1/chat/completions").at(-1)!.headers.authorization).toBe("Bearer xpl_savedkey_123456");
+
+    const out = await runCli(["logout"]);
+    expect(out.code).toBe(0);
+    expect(out.stdout).toContain("still exists on the Experiential platform");
+    expect(existsSync(join(agentDir, "credentials.json"))).toBe(false);
   });
 });

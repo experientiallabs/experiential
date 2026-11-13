@@ -17,6 +17,28 @@ Experiential platform.
 - **A headless runner.** A file-protocol runner that executes one agent run inside a sandbox,
   for products that host agent sessions.
 
+## Log in
+
+```bash
+exp-code login        # opens your browser: sign in, pick an organization, approve
+exp-code              # start working in the current folder
+```
+
+`exp-code login` starts a one-time listener on `127.0.0.1`, opens the Experiential platform's
+approval page, and receives an organization API key named `exp-code (<hostname>)` once you
+approve. The key is checked against the gateway (`GET /v1/models`) and saved in
+`~/.exp-code/agent/credentials.json`, readable only by you.
+
+| Command | What it does |
+|---|---|
+| `exp-code login --no-browser` | Prints the approval URL to open on another device and reads the key it shows as a hidden paste (needs an interactive terminal). |
+| `exp-code login --status` (or `exp-code whoami`) | Shows which key is in use and where it comes from, masked. |
+| `exp-code logout` | Removes the saved key from this computer. The key stays valid until you revoke it on your organization's API keys page. |
+
+Prefer an environment variable? Set `EXP_API_KEY=xpl_...` instead; `EXP_API_KEY` and
+`EXP_GATEWAY_KEY` always take precedence over the saved login. Starting the interactive UI with
+no key anywhere offers to log in first. `EXP_PLATFORM_URL` points login at another platform origin.
+
 ## Install
 
 exp-code needs Node.js 22.19 or newer.
@@ -35,13 +57,14 @@ For development, `EXP_CODE_DIR=/path/to/agent exp code` runs a built checkout in
 
 | Gateway | How exp-code finds it |
 |---|---|
-| Hosted (`https://api.experientiallabs.ai/v1`) | `EXP_API_KEY=xpl_...`, or `exp login` once and launch with `exp code` |
+| Hosted (`https://api.experientiallabs.ai/v1`) | `exp-code login` once, or `EXP_API_KEY=xpl_...`, or `exp login` once and launch with `exp code` |
 | Local `exp` gateway (`http://127.0.0.1:8000/v1`) | `EXP_GATEWAY_KEY` set to the virtual key the gateway issued |
 
 `exp code` prefers a local gateway that is running and accepts `EXP_GATEWAY_KEY`, and otherwise
 uses the hosted gateway with `EXP_API_KEY`, `EXPLABS_API_KEY`, or your `exp login` credential.
 It never starts a gateway: start one with `exp` in another terminal (its first run prints the
-key). Run directly, exp-code reads these variables:
+key). Run directly, exp-code reads these variables, and falls back to the key `exp-code login`
+saved when neither key variable is set:
 
 | Variable | Meaning |
 |---|---|
@@ -52,6 +75,7 @@ key). Run directly, exp-code reads these variables:
 | `EXP_CODE_MODEL` | Default model alias (otherwise the first alias the gateway lists). |
 | `EXP_CODE_WIRE` | Force one wire API: `completions`, `responses`, or `messages`. |
 | `EXP_CODE_HOME` | Configuration directory (default `~/.exp-code`). |
+| `EXP_PLATFORM_URL` | Platform origin `exp-code login` opens (default `https://platform.experientiallabs.ai`). |
 
 The model listing is cached for five minutes in `~/.exp-code/cache/` (keyed by a digest of the
 endpoint and key; the key is never written). Each alias uses Chat Completions by default; OpenAI
