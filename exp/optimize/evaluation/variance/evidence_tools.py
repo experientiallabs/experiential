@@ -82,6 +82,7 @@ from exp.optimize.evaluation.variance.role_prompts import (
     loop_instruction,
     phase_prompt,
 )
+from exp.runtime.models.providers.errors import ProviderResponseError
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.models.spend_ceiling import (
     MAXIMUM_UNPRICED_ATTEMPTS,
@@ -790,12 +791,22 @@ class _Loop:
                 messages.append(ModelMessage(role="user", content=json.dumps(body, sort_keys=True)))
                 continue
             forced = None if free else own.name
-            response = self._call(
-                self._request(messages, offered, forced),
-                phase=phase,
-                forced=forced,
-                answer=answer.name,
-            )
+            try:
+                response = self._call(
+                    self._request(messages, offered, forced),
+                    phase=phase,
+                    forced=forced,
+                    answer=answer.name,
+                )
+            except ProviderResponseError as error:
+                # A response with no usable output (runaway reasoning past the allowance, no
+                # text or tool call) ends this draw as a failure; its rejection is saved, so a
+                # replay ends the same way. It never fails the whole stage.
+                return self._finish(
+                    answer.name,
+                    "protocol_failure",
+                    failure=f"model call gave no usable response: {str(error)[:300]}",
+                )
             done = self._answered(response, answer.name) if own is answer else None
             if done is not None:
                 return done
