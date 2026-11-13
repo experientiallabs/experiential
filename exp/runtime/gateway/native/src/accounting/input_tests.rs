@@ -447,15 +447,31 @@ fn capture_is_registered_once_after_approval_and_never_after_close_or_capacity_f
         let result = resources.status();
         assert_eq!(
             result["action"],
-            if mode == "closed" { "closed" } else { "allow" }
+            match mode {
+                "closed" => "closed",
+                "full" => "error",
+                _ => "allow",
+            }
         );
         assert_eq!(resources.status(), result);
         if mode == "full" {
+            assert_eq!(result["failure"]["failure_class"], "unavailable");
+            assert_eq!(
+                result["failure"]["safe_details"]["code"],
+                "capture_unavailable"
+            );
             let mut terminal = json!({});
             resources.terminal(&mut terminal);
-            assert_ne!(terminal["input_guardrail_denied"], true);
+            assert_eq!(terminal["input_guardrail_denied"], true);
+            assert_eq!(terminal["state"], "failed");
+            assert_eq!(terminal["failure"], result["failure"]);
         }
         collector.settle("occupied", false, false);
+        assert_eq!(
+            resources.status(),
+            result,
+            "capacity recovery cannot erase a failure"
+        );
         resources.settled(
             "request",
             &json!({"capture": {"keep_prompt": true, "keep_response": false}}),

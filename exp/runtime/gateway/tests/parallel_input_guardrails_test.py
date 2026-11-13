@@ -15,6 +15,7 @@ from typing import Literal, Protocol
 
 import httpx
 import pytest
+from exp_gateway_native import CaptureCollector
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import BillingSource, GatewayTokenPrices, ModelCapabilities
@@ -37,7 +38,7 @@ from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeControlPlane
-from exp.runtime.gateway.native_capture import CaptureController
+from exp.runtime.gateway.native_capture import CaptureConfiguration, CaptureController
 from exp.runtime.gateway.tests.guardrail_policy_integrity_test import _provider
 from exp.runtime.gateway.tests.mandatory_guardrails_paths_test import _serving
 from exp.runtime.gateway.tests.mandatory_guardrails_test import _tool_chunk
@@ -362,6 +363,72 @@ def test_parallel_verdict_controls_text_and_tools(
             finally:
                 case.provider.release.set()
                 case.moderator.release.set()
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("decision_ready", [False, True])
+def test_deferred_required_capture_failure_prevents_response_and_charge(
+    tmp_path: Path, surface: str, stream: bool, decision_ready: bool
+) -> None:
+    """Capture exhaustion remains a 503 after either approval or moderation fail-open."""
+    records: list[str] = []
+    collector = CaptureCollector(
+        CaptureConfiguration(
+            maximum_pending_records=1, settlement_required=True, asynchronous_delivery=True
+        ).model_dump_json(),
+        records.append,
+    )
+    capture = CaptureController(collector, application_for=lambda _auth: "application")
+    try:
+        with _scenario(tmp_path, capture=capture) as case:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                response = executor.submit(case.request, surface, stream=stream)
+                try:
+                    assert case.provider.started.wait(2)
+                    assert case.moderator.started.wait(2)
+                    assert collector.begin(
+                        json.dumps(
+                            {
+                                "request_id": "occupied",
+                                "scope": {
+                                    "organization_id": "org",
+                                    "identity_id": "identity",
+                                    "application_id": "application",
+                                },
+                                "protocol": "chat_completions",
+                                "model_id": "model",
+                                "context": {"schema_version": 1, "request": {}},
+                            }
+                        )
+                    )
+                    if decision_ready:
+                        case.moderator.release.set()
+                        assert case.moderator.finished.wait(2)
+                    else:
+                        case.provider.release.set()
+                    result = response.result(timeout=3)
+                    assert result.status_code == 503, result.text
+                    assert "provider-marker" not in result.text
+                    assert (
+                        "overloaded_error" if surface == "messages" else "capture_unavailable"
+                    ) in result.text
+                    observations = case.records()
+                    assert observations[0]["status"] == (
+                        "allowed" if decision_ready else "failed_open"
+                    )
+                    with connect_sqlite(case.database) as db:
+                        rows = db.execute(
+                            "SELECT state, budget_settled_nano_usd FROM gateway_attempts"
+                        ).fetchall()
+                    assert rows == [("failed", 0)]
+                finally:
+                    case.provider.release.set()
+                    case.moderator.release.set()
+    finally:
+        collector.settle("occupied", False, False)
+        assert collector.close(2)
+    assert not records
 
 
 @pytest.mark.parametrize("wait_ms", [0, 100])

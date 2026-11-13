@@ -17,6 +17,7 @@ pub(crate) struct Resources {
     pub(super) reporting: Option<super::input_reports::Factory>,
     pub capture: Option<Arc<Collector>>,
     pub pending_capture: Mutex<Option<Vec<u8>>>,
+    capture_failed: AtomicBool,
     reinspection_failure: Mutex<Option<Value>>,
     closed: AtomicBool,
 }
@@ -170,6 +171,16 @@ impl Resources {
             moderation["observations"] = json!(observations);
             decision["moderation"] = moderation;
         }
+        if self.capture_failed.load(Ordering::Acquire) {
+            decision["failure"] = json!({
+                "failure_class": "unavailable",
+                "safe_message": "Traffic capture is unavailable or at capacity. Restore capacity and retry.",
+                "safe_details": {"code": "capture_unavailable"},
+                "retryable_same_deployment": false,
+                "failover_eligible": false,
+            });
+            decision = super::input::denied(decision);
+        }
         decision
     }
 
@@ -199,12 +210,13 @@ impl Resources {
             reporting: None,
             capture,
             pending_capture: Mutex::new(pending),
+            capture_failed: AtomicBool::new(false),
             reinspection_failure: Mutex::new(None),
             closed: AtomicBool::new(false),
         })
     }
 
-    // The caller holds the dispatch lock so registration cannot race terminal cleanup.
+    // The pending-capture lock serializes registration with terminal cleanup.
     pub fn status(&self) -> Value {
         if self.closed.load(Ordering::Acquire) {
             return json!({"action": "closed"});
@@ -219,10 +231,15 @@ impl Resources {
             }
             if let Some(bytes) = pending.take() {
                 if let Some(collector) = &self.capture {
-                    // The collector counts skipped captures. Capacity cannot change
-                    // an already approved moderation or financial decision.
-                    admission::begin(collector, &bytes);
+                    // Required capture is independent of moderation fail-open. Retain
+                    // its failure through response gating and terminal settlement.
+                    if !admission::begin(collector, &bytes) {
+                        self.capture_failed.store(true, Ordering::Release);
+                    }
                 }
+            }
+            if self.capture_failed.load(Ordering::Acquire) {
+                return self.decision();
             }
         }
         decision
