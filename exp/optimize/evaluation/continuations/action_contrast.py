@@ -1,5 +1,8 @@
 """Preregistered alternative-action experiments with equal-budget suffixes and explicit unknowns."""
 
+from collections.abc import Callable, Sequence
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
+from contextvars import copy_context
 from datetime import UTC, datetime
 from typing import Literal, Self
 
@@ -33,7 +36,11 @@ from exp.optimize.evaluation.continuations.job import (
     saved_continuation_job,
 )
 from exp.optimize.evaluation.continuations.records import load_study
-from exp.optimize.evaluation.continuations.study import known_outcomes, required_verifier
+from exp.optimize.evaluation.continuations.study import (
+    known_outcomes,
+    required_verifier,
+    study_worker_count,
+)
 from exp.optimize.evaluation.executable.deferral import (
     deferred_execution,
     record_execution_deferral,
@@ -365,6 +372,25 @@ def saved_action_contrast(
     return report
 
 
+def _run_cells[T](calls: Sequence[Callable[[], T]], workers: int) -> tuple[T, ...]:
+    """Return every call's result in plan order, at most ``workers`` running at once.
+
+    One worker runs them in order on this thread, exactly like a loop. Otherwise each runs in a
+    copy of the caller's context (spend ceilings and the rollout gate travel with it); the
+    first failure cancels every call not yet started and is raised, in plan order, once the
+    running ones finish, so no new cell starts after a stop.
+    """
+    if workers <= 1 or len(calls) <= 1:
+        return tuple(call() for call in calls)
+    with ThreadPoolExecutor(max_workers=min(workers, len(calls))) as pool:
+        futures = [pool.submit(copy_context().run, call) for call in calls]
+        done, _ = wait(futures, return_when=FIRST_EXCEPTION)
+        if any(future.exception() is not None for future in done):
+            for future in futures:
+                future.cancel()
+        return tuple(future.result() for future in futures)
+
+
 def run_action_contrast(
     project: ProjectStore, spec: ActionContrastSpec, *, code_revision: str
 ) -> ActionContrast:
@@ -394,8 +420,11 @@ def run_action_contrast(
                 files={"spec.json": spec},
             )
         registration = artifact_input(store.read(identity).manifest)
-        cells, dependencies = [], {registration}
-        for index, (pair, arm) in enumerate(_plan(spec)):
+
+        def run_cell(
+            index: int, pair: int, arm: Literal["baseline", "alternative"]
+        ) -> tuple[ContrastCell, ArtifactInput]:
+            """Run, recover or replay one planned cell, save it and return it with its record."""
             key = f"{identity}-cell-{index}"
             if store.exists(key):
                 cell = ContrastCell.model_validate_json(store.read_bytes(key, "cell.json"))
@@ -451,8 +480,20 @@ def run_action_contrast(
                     ),
                     files={"cell.json": cell},
                 )
-            cells.append(cell)
-            dependencies.add(artifact_input(store.read(key).manifest))
+            return cell, artifact_input(store.read(key).manifest)
+
+        # Cells are independent (each restores the shared checkpoint and saves under its own
+        # index), so up to the installed study workers run at once; identities and the saved
+        # order do not depend on scheduling.
+        done = _run_cells(
+            [
+                lambda index=index, pair=pair, arm=arm: run_cell(index, pair, arm)
+                for index, (pair, arm) in enumerate(_plan(spec))
+            ],
+            study_worker_count(),
+        )
+        cells = [cell for cell, _ in done]
+        dependencies = {registration, *(record for _, record in done)}
         report = ActionContrast(spec=spec, cells=tuple(cells), metrics=_metrics(tuple(cells)))
         store.write_json(
             artifact_id=identity + "-result",

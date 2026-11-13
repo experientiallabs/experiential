@@ -1,5 +1,7 @@
 """Paired workbook decisions cannot erase policy violations or missing draws."""
 
+import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -11,6 +13,7 @@ from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonValue
 from exp.common.project import ArtifactManifest, ArtifactStore, ProjectStore
 from exp.optimize.evaluation.continuations import action_contrast
 from exp.optimize.evaluation.continuations.action_contrast import (
+    ActionContrast,
     ActionContrastSpec,
     ContrastCell,
     run_action_contrast,
@@ -18,7 +21,11 @@ from exp.optimize.evaluation.continuations.action_contrast import (
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.continuations.records import load_study
-from exp.optimize.evaluation.continuations.study import ContinuationStudy, required_verifier
+from exp.optimize.evaluation.continuations.study import (
+    ContinuationStudy,
+    required_verifier,
+    study_workers,
+)
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 
@@ -245,3 +252,58 @@ def test_deferred_child_resumes_the_same_registered_cell(
     report = run_action_contrast(project, spec, code_revision="test")
     assert report.cells[0].study is not None and report.cells[0].failure is None
     assert run_action_contrast(project, spec, code_revision="test") == report
+
+
+def test_cells_run_at_once_under_study_workers_with_the_serial_report_and_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Study workers run independent cells together; the report keeps plan order and outcomes.
+
+    Every cell must be in flight at once (a barrier) and later cells finish first, yet the
+    cells, their saved records and the result's inputs are exactly what a loop produces.
+    """
+    serial_project, serial_spec, _ = contrast_fixture(tmp_path / "serial", monkeypatch)
+    serial = run_action_contrast(serial_project, serial_spec, code_revision="test")
+    project, spec, transport = contrast_fixture(tmp_path / "parallel", monkeypatch)
+    execute = action_contrast.execute_continuation_job
+    barrier = threading.Barrier(4, timeout=30)
+    finished: list[str] = []
+    lock = threading.Lock()
+
+    def together(project: ProjectStore, job: ContinuationJob, **kwargs: object) -> object:
+        position = barrier.wait()  # every cell must be in flight at once, or this times out
+        time.sleep(0.05 * position)
+        result = execute(project, job, **kwargs)  # type: ignore[arg-type]
+        with lock:
+            finished.append(job.study.checkpoint.artifact_id)
+        return result
+
+    monkeypatch.setattr(action_contrast, "execute_continuation_job", together)
+    with study_workers(4):
+        report = run_action_contrast(project, spec, code_revision="test")
+    assert len(finished) == 4 and len(transport.requests) == 4
+
+    def shape(value: ActionContrast) -> list[tuple[int, str, str | None, str | None]]:
+        return [
+            (
+                cell.pair,
+                cell.arm,
+                None if cell.assessment is None else cell.assessment.status,
+                cell.failure,
+            )
+            for cell in value.cells
+        ]
+
+    assert shape(report) == shape(serial)
+    assert report.metrics == serial.metrics
+    identity = spec.identity("test")
+    for index, cell in enumerate(report.cells):
+        saved = project.artifacts.read_bytes(f"{identity}-cell-{index}", "cell.json")
+        assert ContrastCell.model_validate_json(saved) == cell
+    inputs = project.artifacts.read(identity + "-result").manifest.inputs
+    assert {ref.artifact_id for ref in inputs} == {
+        identity,
+        *(f"{identity}-cell-{index}" for index in range(4)),
+    }
+    assert run_action_contrast(project, spec, code_revision="test") == report
+    assert len(transport.requests) == 4
