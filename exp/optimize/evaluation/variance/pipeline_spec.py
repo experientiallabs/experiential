@@ -469,6 +469,8 @@ class AuthoringSettings(ContractModel):
         ladder_rounds: Most nudge-author rounds per ladder.
         ladder_strengths: Nudge strengths, strongest first; the un-nudged rung always follows.
         families_per_tier: Highest-ranked points of each tier's run turned into families.
+        maximum_families: Keep only this many families across tiers, by blast-radius rank
+            (None keeps every tier's); cuts the serial family stage.
         maximum_variants: Most scenarios one family may author; more is refused before any
             world is authored, so the up-front price stays an upper bound.
         repeats: Pairs per selection contrast.
@@ -514,6 +516,7 @@ class AuthoringSettings(ContractModel):
     ladder_rounds: int = Field(default=2, ge=1, le=8, strict=True)
     ladder_strengths: tuple[NudgeStrength, ...] = ("strong", "medium", "weak")
     families_per_tier: int = Field(default=1, ge=1, le=8, strict=True)
+    maximum_families: int | None = Field(default=None, ge=1, le=40, strict=True)
     maximum_variants: int = Field(default=4, ge=2, le=16, strict=True)
     repeats: int = Field(default=8, ge=1, le=100, strict=True)
     confirmation_repeats: int = Field(default=8, ge=1, le=100, strict=True)

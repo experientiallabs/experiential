@@ -89,7 +89,7 @@ from exp.optimize.evaluation.variance.pipeline_inputs import (
     world_sources,
 )
 from exp.optimize.evaluation.variance.pipeline_ladder import search_ladder_costs
-from exp.optimize.evaluation.variance.pipeline_points import family_order
+from exp.optimize.evaluation.variance.pipeline_points import family_order, load_blast_ranking
 from exp.optimize.evaluation.variance.pipeline_spec import (
     BuildOutputs,
     CostLine,
@@ -138,6 +138,40 @@ MAXIMUM_OPTIONS = 6
 def briefing_review_draws() -> int:
     """Most leak-review draws one scenario draw may buy: every scenario, stance and repair."""
     return MAXIMUM_SCENARIOS * len(DEFAULT_REVIEW_VARIANTS) * (1 + DEFAULT_REVIEW_REPAIRS)
+
+
+def _chosen_points(
+    context: StageContext, mining: MiningOutputs, reports: dict[str, ActorCriticReport]
+) -> list[tuple[TierMining, int]]:
+    """Each tier's highest-ranked points, capped across tiers by blast-radius rank.
+
+    Without ``authoring.maximum_families`` every tier keeps ``families_per_tier`` points in
+    tier order, as before. With it, the candidates are ordered by their global blast rank
+    (unranked last, in tier order) and only the first ``maximum_families`` are kept.
+    """
+    authoring = context.spec.authoring
+    candidates: list[tuple[TierMining, int]] = []
+    for tier in mining.tiers:
+        report = reports[tier.tier]
+        order = family_order(context.project.artifacts, mining.blast, report)
+        candidates.extend((tier, point) for point in order[: authoring.families_per_tier])
+    if authoring.maximum_families is None or len(candidates) <= authoring.maximum_families:
+        return candidates
+    rank: dict[str, int] = {}
+    if mining.blast is not None:
+        rank = {
+            row.point_id: row.rank
+            for row in load_blast_ranking(context.project.artifacts, mining.blast)
+            if row.score is not None
+        }
+
+    def key(item: tuple[int, tuple[TierMining, int]]) -> tuple[int, int]:
+        position, (tier, point) = item
+        checkpoints = {row.point: row.checkpoint.artifact_id for row in reports[tier.tier].points}
+        return (rank.get(checkpoints.get(point, ""), 10**9), position)
+
+    kept = sorted(enumerate(candidates), key=key)[: authoring.maximum_families]
+    return [candidate for _, candidate in sorted(kept)]
 
 
 @dataclass
@@ -479,6 +513,8 @@ class _FamiliesStage:
         del code_revision
         authoring, mining = spec.authoring, spec.mining
         families = len(mining.actors) * authoring.families_per_tier
+        if authoring.maximum_families is not None:
+            families = min(families, authoring.maximum_families)
         variants = authoring.maximum_variants + 1
         options = len(authoring.actions) or MAXIMUM_OPTIONS
         cells = variants * (options * (authoring.repeats + authoring.confirmation_repeats) + 1)
@@ -586,24 +622,23 @@ class _FamiliesStage:
             for tier in mining.tiers
         }
         outcomes: list[FamilyOutcome] = []
-        for tier in mining.tiers:
+        chosen = _chosen_points(context, mining, reports)
+        for tier, point in chosen:
             report = reports[tier.tier]
-            order = family_order(project.artifacts, mining.blast, report)
-            for point in order[: context.spec.authoring.families_per_tier]:
-                outcomes.append(
-                    _family(
-                        _Point(
-                            context=context,
-                            tier=tier,
-                            report=report,
-                            point=point,
-                            draws="",
-                            profile=mining.profile,
-                            coalition_reports=tuple(reports.values()),
-                            judged_groups=judged,
-                        )
+            outcomes.append(
+                _family(
+                    _Point(
+                        context=context,
+                        tier=tier,
+                        report=report,
+                        point=point,
+                        draws="",
+                        profile=mining.profile,
+                        coalition_reports=tuple(reports.values()),
+                        judged_groups=judged,
                     )
                 )
+            )
         references = [
             ref
             for row in outcomes
