@@ -217,10 +217,15 @@ impl InputGate {
                                     records.truncate(enforce_count);
                                     state.decision["moderation"]["observations"] = json!(records);
                                 }
+                                // A serial caller can drop its last gate as soon as
+                                // this decision wakes it. With no observers left,
+                                // make the report publishable in the same transition.
+                                state.report_ready = enforce_count == gate.checks.len();
                                 gate.changed.notify_all();
                                 gate.notified.notify_waiters();
                             }
                         }
+                        gate.publish();
                     }
                 }
                 decision
