@@ -83,7 +83,7 @@ jobs:
             for path in pyproject.toml exp/runtime/gateway/native/Cargo.toml; do
               head_version="$(grep -m1 '^version = ' "$path")"
               base_version="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${path}?ref=${GITHUB_BASE_REF}" \
-                -q .content | base64 -d | grep -m1 '^version = ')"
+                -q .content | base64 -d | awk '/^version = / && !seen++')"
               test "$head_version" = "$base_version" || {
                 echo "release deferral must preserve both base versions" >&2
                 exit 1
@@ -102,7 +102,7 @@ jobs:
             changed=1
             head_project="$(grep -m1 '^version = ' pyproject.toml)"
             base_project="$(gh api "repos/${GITHUB_REPOSITORY}/contents/pyproject.toml?ref=${GITHUB_BASE_REF}" \
-              -q .content | base64 -d | grep -m1 '^version = ')"
+              -q .content | base64 -d | awk '/^version = / && !seen++')"
             test "$head_project" != "$base_project" || {
               echo "ending a release deferral requires a new flagship version" >&2
               exit 1
@@ -115,7 +115,7 @@ jobs:
           head_version="$(grep -m1 '^version = ' exp/runtime/gateway/native/Cargo.toml)"
           base_version="$(gh api \
             "repos/${GITHUB_REPOSITORY}/contents/exp/runtime/gateway/native/Cargo.toml?ref=${GITHUB_BASE_REF}" \
-            -q .content | base64 -d | grep -m1 '^version = ')"
+            -q .content | base64 -d | awk '/^version = / && !seen++')"
           if [ "${head_version}" != "${base_version}" ]; then
             echo "crate changed and version moved: ${base_version} -> ${head_version}"
             exit 0
