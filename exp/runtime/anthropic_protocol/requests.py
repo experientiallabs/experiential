@@ -61,6 +61,7 @@ from exp.runtime.anthropic_protocol.media_blocks import (
     tool_result_references,
     tool_result_text,
 )
+from exp.runtime.anthropic_protocol.openai_tool_shapes import fold_openai_tool_shapes
 from exp.runtime.anthropic_protocol.reasoning_channels import (
     ReasoningConfig,
     resolve_reasoning_channels,
@@ -475,6 +476,9 @@ def _decode(
     # Clients with OpenAI-style extra body fields attach Chat's stream_options;
     # usage always streams on this surface.
     payload, stream_disclosures = accept_messages_stream_options(payload, streams=streams)
+    # Clients that speak Chat for generation reuse Chat's tool list on Messages
+    # (count_tokens above all); the OpenAI shapes are a lossless rename apart.
+    payload, tool_shape_disclosures = fold_openai_tool_shapes(payload)
     validate_manifest(payload, MESSAGES_MANIFEST)
     request = validate_wire(payload, wire)
     require_served_server_tool_types(request.tools)
@@ -583,6 +587,7 @@ def _decode(
                 *document_disclosures,
                 *prefill_disclosures,
                 *stream_disclosures,
+                *tool_shape_disclosures,
                 *dropped_beta_disclosures,
                 *tool_change_disclosures,
                 *channels.disclosures,

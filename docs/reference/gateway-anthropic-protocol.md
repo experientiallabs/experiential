@@ -128,6 +128,19 @@ text blocks is an empty prefill, which Anthropic treats as no prefill; the decod
 `/v1/messages/count_tokens`). An empty turn anywhere else, any role, stays a typed 400 naming
 the turn (`messages.<n>`).
 
+An OpenAI function tool in `tools`, Chat's nested `{"type": "function", "function": {name,
+description, parameters, strict}}` or Responses' flat `{"type": "function", name, ...}`, is the
+Messages custom tool `{name, description, input_schema, strict}` under other key names (the
+`defer_loading` and `cache_control` annotations, on Chat's wrapper or Responses' flat tool, carry
+under the same names), so the decoder renames it (`parameters` becomes `input_schema`; a function
+with no `parameters` takes `{}`, as the OpenAI decoders do) and discloses `tools.function->translated(custom)`. OpenAI's `tool_choice`
+spellings fold the same way (`auto`, `none`, `required` to `any`, and a named function to
+`{"type": "tool", "name": ...}`), disclosed as `tool_choice->translated(anthropic)`. Both apply to
+`/v1/messages` and `/v1/messages/count_tokens`: Claude Desktop in third-party mode speaks Chat
+Completions for generation and counts the same Chat tool list on `count_tokens`. `function` is
+no Messages tool type, so the fold never reinterprets a valid Messages declaration, and an entry
+that is not exactly one of the two OpenAI shapes keeps its named 400.
+
 ## Stream usage
 
 On the Messages stream, `message_start.message.usage` is a PRE-DISPATCH figure and
