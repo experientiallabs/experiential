@@ -39,7 +39,7 @@ from exp.runtime.gateway.web_search.contracts import GatewayWebSearchResult
 def test_native_capture_follows_the_final_moderation_release(
     tmp_path: Path, surface: str, stream: bool, outcome: str
 ) -> None:
-    """Only the native release can expose content; fail-open keeps it for offline review."""
+    """Moderation fail-open retains capture; required capture capacity still gates release."""
     records: list[str] = []
     collector = exp_gateway_native.CaptureCollector(
         CaptureConfiguration(settlement_required=True, maximum_pending_records=1).model_dump_json(),
@@ -78,11 +78,17 @@ def test_native_capture_follows_the_final_moderation_release(
             finally:
                 scenario.moderator.release.set()
                 scenario.provider.release.set()
-            allowed = outcome != "block"
-            assert response.status_code == (200 if allowed else 400), response.text
+            allowed = outcome not in {"block", "full"}
+            expected_status = 503 if outcome == "full" else 200 if allowed else 400
+            assert response.status_code == expected_status, response.text
             assert ("provider-marker" in response.text) is allowed
             evidence = scenario.records()
             assert len(evidence) == 1
+            if outcome == "full":
+                assert (
+                    "overloaded_error" if surface == "messages" else "capture_unavailable"
+                ) in response.text
+                assert evidence[0]["status"] == "allowed"
             with connect_sqlite(scenario.database) as db:
                 request_id, state = db.execute(
                     "SELECT request_id,terminal_state FROM gateway_requests"
@@ -103,7 +109,7 @@ def test_native_capture_follows_the_final_moderation_release(
             collector.settle("request", False, False)
             assert collector.close(2)
             parsed = [CaptureRecord.model_validate_json(record) for record in records]
-            captured_content = allowed and outcome != "full"
+            captured_content = allowed
             assert bool(parsed) is captured_content
             assert len({record.request.request_id for record in parsed}) == int(captured_content)
             assert sum(record.response is not None for record in parsed) == int(captured_content)
