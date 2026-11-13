@@ -7,6 +7,7 @@ injected model client. A saved branch replays without opening an environment or 
 an interrupted branch is retained as outcome-unknown and is never silently rerolled.
 """
 
+import os
 import threading
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -198,7 +199,26 @@ def study_identity(spec: ContinuationStudySpec, code_revision: str) -> str:
     Returns:
         The registration identity; branches and the result extend it with suffixes.
     """
-    return stable_id("continuation-study", {"spec": sha256_json(spec), "code": code_revision})
+    identity = stable_id("continuation-study", {"spec": sha256_json(spec), "code": code_revision})
+    if identity in redrawn_studies():
+        # An operator-named group whose attempts failed operationally is drawn afresh under
+        # a new identity; the failed group stays in the store as evidence.
+        return stable_id(
+            "continuation-study",
+            {"spec": sha256_json(spec), "code": code_revision, "redraw_of": identity},
+        )
+    return identity
+
+
+REDRAW_STUDIES = "EXP_REDRAW_STUDIES"
+"""Comma-separated study identities to draw afresh (operational failures only)."""
+
+
+def redrawn_studies() -> frozenset[str]:
+    """Return the study identities this process draws afresh; empty unless named."""
+    return frozenset(
+        part.strip() for part in os.environ.get(REDRAW_STUDIES, "").split(",") if part.strip()
+    )
 
 
 def actor_budget_exhausted(branches: Iterable["ContinuationBranch"]) -> int:
