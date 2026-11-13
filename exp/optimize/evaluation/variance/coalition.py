@@ -308,6 +308,13 @@ class CoalitionEvidence(ContractModel):
                     f"behavior-diff:{row.source.artifact_id}/{row.group_id}"
                     for row in self.behavior_differences
                 ),
+                # Each reviewed contrast pair is shown with its own id; citing the pair is as
+                # specific as citing its group.
+                *(
+                    f"behavior-diff:{row.source.artifact_id}/{pair.pair_id}"
+                    for row in self.behavior_differences
+                    for pair in row.pairs
+                ),
             }
         )
 

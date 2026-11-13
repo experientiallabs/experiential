@@ -398,10 +398,13 @@ def decision_state_request(
         payload["previous_draft_rejected"] = {
             "reason": rejection,
             "instruction": (
+                "Your previous attempt was not accepted for the reason above (if it ran out of "
+                "output, answer more concisely and call the tool sooner). "
                 "Your previous decision state failed the host's validation for the reason above. "
                 "Return a corrected decision state with the same tool: every path must exist "
                 "verbatim in before_state (no annotations inside paths), and every variation axis "
-                "must include the observed before-state value."
+                "must include the observed before-state value; cite only locators listed in "
+                "citable_locators."
             ),
         }
     return _request(
@@ -560,7 +563,9 @@ def author_decision_state(
     # each repair is its own saved draw, so replay is exact. A draw with no response (provider
     # failure) is not repaired here.
     for repair in range(1, decision_state_repairs() + 1):
-        if draft.answer is not None or draft.response is None or draft.failure is None:
+        if draft.answer is not None or draft.failure is None:
+            break
+        if draft.response is None and OUTPUT_EXHAUSTED not in draft.failure:
             break
         draft = _decision_state_draw(
             project, settings, context, identity=f"{identity}-repair-{repair}",
@@ -568,6 +573,9 @@ def author_decision_state(
         )  # fmt: skip
     return draft
 
+
+OUTPUT_EXHAUSTED = "exhausted its frozen output allowance"
+"""A provider failure that is redrawn like a refusal: the author reasoned past its allowance."""
 
 DECISION_STATE_REPAIRS = "EXP_DECISION_STATE_REPAIRS"
 """Environment override of how many validation repairs a decision-state draft may make."""
