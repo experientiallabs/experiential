@@ -32,6 +32,7 @@ own: executed witnesses and competing-action continuations from the same checkpo
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
 from typing import Self
 
@@ -360,7 +361,9 @@ def relevant_questions(book: RuleBook, tools: frozenset[str]) -> tuple[ResearchQ
     return tuple(item for item in book.questions if item.tool is None or known.match(item.tool))
 
 
-def decision_state_request(context: DecisionContext, *, output_tokens: int) -> ModelRequest:
+def decision_state_request(
+    context: DecisionContext, *, output_tokens: int, rejection: str | None = None
+) -> ModelRequest:
     """Render one decision-state draw.
 
     Args:
@@ -391,6 +394,16 @@ def decision_state_request(context: DecisionContext, *, output_tokens: int) -> M
         "coalition": context.coalition.model_dump(mode="json"),
         "citable_locators": sorted(context.refs()),
     }
+    if rejection is not None:
+        payload["previous_draft_rejected"] = {
+            "reason": rejection,
+            "instruction": (
+                "Your previous decision state failed the host's validation for the reason above. "
+                "Return a corrected decision state with the same tool: every path must exist "
+                "verbatim in before_state (no annotations inside paths), and every variation axis "
+                "must include the observed before-state value."
+            ),
+        }
     return _request(
         DECISION_STATE_PROMPT,
         payload,
@@ -539,7 +552,46 @@ def author_decision_state(
         The draft. A draft with a saved response is also saved as a ``decision-state-draft``
         artifact and replayed from it; a draw with no response is returned unsaved.
     """
-    request = decision_state_request(context, output_tokens=settings.output_tokens)
+    draft = _decision_state_draw(
+        project, settings, context, identity=identity, code_revision=code_revision,
+        sources=sources, rejection=None,
+    )  # fmt: skip
+    # A draft the host's validation refused is shown its reason and redrawn, up to the bound;
+    # each repair is its own saved draw, so replay is exact. A draw with no response (provider
+    # failure) is not repaired here.
+    for repair in range(1, decision_state_repairs() + 1):
+        if draft.answer is not None or draft.response is None or draft.failure is None:
+            break
+        draft = _decision_state_draw(
+            project, settings, context, identity=f"{identity}-repair-{repair}",
+            code_revision=code_revision, sources=sources, rejection=draft.failure,
+        )  # fmt: skip
+    return draft
+
+
+DECISION_STATE_REPAIRS = "EXP_DECISION_STATE_REPAIRS"
+"""Environment override of how many validation repairs a decision-state draft may make."""
+
+
+def decision_state_repairs() -> int:
+    """Validation repairs per decision-state draft (default 3; 0 keeps a single draw)."""
+    return max(0, int(os.environ.get(DECISION_STATE_REPAIRS, "3")))
+
+
+def _decision_state_draw(
+    project: ProjectStore,
+    settings: AuthorSettings,
+    context: DecisionContext,
+    *,
+    identity: str,
+    code_revision: str,
+    sources: tuple[ArtifactInput, ...],
+    rejection: str | None,
+) -> DecisionStateDraft:
+    """Buy or replay one decision-state draw under its own identity and lock."""
+    request = decision_state_request(
+        context, output_tokens=settings.output_tokens, rejection=rejection
+    )
     store = project.artifacts
     with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         result_id = identity + "-result"

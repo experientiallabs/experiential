@@ -328,7 +328,8 @@ def test_a_decision_state_must_stay_grounded_in_what_was_shown() -> None:
 def test_a_decision_state_draw_is_saved_and_replayed_and_a_refusal_is_kept(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A valid draw is bought once; a refused one keeps its response and is never redrawn."""
+    """A valid draw is bought once; with repairs off, a refused one is kept and not redrawn."""
+    monkeypatch.setenv("EXP_DECISION_STATE_REPAIRS", "0")
     project, settings = _setup(tmp_path, monkeypatch)
     context = _context(_checkpoint(project))
     bad = _answer(_state(evidence_refs=["attempt:9"]))
@@ -357,6 +358,35 @@ def test_a_decision_state_draw_is_saved_and_replayed_and_a_refusal_is_kept(
     assert again == refused
     assert len(transport.requests) == 2
     assert project.artifacts.exists("state-bad-result")
+
+
+def test_a_refused_decision_state_is_repaired_from_its_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused draw is redrawn with its reason shown; the repair is saved and replayed."""
+    monkeypatch.setenv("EXP_DECISION_STATE_REPAIRS", "2")
+    project, settings = _setup(tmp_path, monkeypatch)
+    context = _context(_checkpoint(project))
+    bad = _answer(_state(evidence_refs=["attempt:9"]))
+    transport = _wire(
+        monkeypatch,
+        _tool_reply(DECISION_STATE_TOOL, bad),
+        _tool_reply(DECISION_STATE_TOOL, _answer()),
+    )
+
+    draft = author_decision_state(
+        project, settings, context, identity="state-fix", code_revision="test"
+    )
+    again = author_decision_state(
+        project, settings, context, identity="state-fix", code_revision="test"
+    )
+
+    assert draft.answer is not None and draft.identity == "state-fix-repair-1"
+    assert again == draft
+    assert len(transport.requests) == 2
+    assert "attempt:9" in json.dumps(transport.requests[1], default=str)
+    assert project.artifacts.exists("state-fix-result")
+    assert project.artifacts.exists("state-fix-repair-1-result")
 
 
 def test_scenarios_with_problems_are_saved_and_never_accepted(
