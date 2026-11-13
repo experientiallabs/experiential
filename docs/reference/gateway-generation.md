@@ -266,6 +266,15 @@ the order the model produced.
 - `chat_template_kwargs.preserve_thinking` is accepted and disclosed as
   `chat_template_kwargs.preserve_thinking->ignored(not_forwarded)`: no wire receives
   `chat_template_kwargs` verbatim.
+- DeepSeek's reasoning switch, `thinking: {"type": "enabled" | "disabled"}` (Anthropic's
+  `adaptive` included), is folded into the Responses reasoning control as Chat already folds it
+  into `reasoning_effort`: `disabled` becomes `reasoning.effort: "none"`, `enabled` and
+  `adaptive` ask for the route's default depth (a level-less enable), each disclosed as
+  `thinking->translated(reasoning.effort)`. An explicit `reasoning.effort` that agrees decides
+  the request (`thinking->ignored(explicit_reasoning_effort)`); one that disagrees is a 400
+  naming `thinking`. `display` drops as on Chat, `budget_tokens` stays `unsupported_parameter`
+  on Responses, and any other shape is a 400 naming `thinking`, `thinking.type` or the unknown
+  key.
 - A Responses reasoning input item with neither `id` nor `encrypted_content` cannot be resolved
   by any provider, and its summary never reaches provider history, so it is removed,
   `input.reasoning->dropped(no_id_or_encrypted_content)`.

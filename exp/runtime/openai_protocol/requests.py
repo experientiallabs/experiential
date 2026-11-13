@@ -112,6 +112,7 @@ from exp.runtime.openai_protocol.responses_probe import (
     require_responses_input,
     require_responses_text_spelling,
 )
+from exp.runtime.openai_protocol.responses_thinking import translate_responses_thinking
 from exp.runtime.openai_protocol.structured_text import (
     chat_json_object_output,
     chat_structured_text,
@@ -479,6 +480,7 @@ def decode_responses(
     payload, alias_disclosures = repair_responses(
         *fold_prompt_cache_key_alias(drop_null_defaults(payload, RESPONSES_NULLABLE_PARAMS))
     )
+    payload, thinking_disclosures, thinking_default_enable = translate_responses_thinking(payload)
     payload, media_disclosures = degrade_responses_media(payload)
     breakpoints = extract_prompt_cache_breakpoints(payload, container="input")
     payload = breakpoints.payload
@@ -569,6 +571,7 @@ def decode_responses(
             json_object_output=responses_json_object_output(request.text),
             ignored_parameters=(
                 *alias_disclosures,
+                *thinking_disclosures,
                 *media_disclosures,
                 *document_disclosures,
                 *breakpoints.disclosures,
@@ -591,6 +594,7 @@ def decode_responses(
             include_output_text_logprobs=include_output_text_logprobs,
             include_web_search_sources=include_web_search_sources,
             reasoning_effort=(request.reasoning.effort if request.reasoning is not None else None),
+            thinking_default_enable=thinking_default_enable,
             reasoning_context=(
                 request.reasoning.context if request.reasoning is not None else None
             ),

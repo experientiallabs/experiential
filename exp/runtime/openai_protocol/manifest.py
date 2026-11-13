@@ -212,6 +212,11 @@ RESPONSES_MANIFEST = CompatibilityManifest(
             "client_metadata",
         ),
         _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
+        # DeepSeek's (and Anthropic's) ``thinking: {"type": ...}`` switch, folded
+        # into the Responses reasoning control before the manifest reads the body
+        # (``responses_thinking.translate_responses_thinking``), as Chat folds it
+        # into ``reasoning_effort``.
+        _field("thinking", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("top_logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
         # Accepted only at its no-op value (the wire model enforces it): Copilot

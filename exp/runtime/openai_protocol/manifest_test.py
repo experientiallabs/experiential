@@ -93,6 +93,9 @@ def test_manifests_classify_explicit_exclusions() -> None:
     # answer already carries usage); the Responses API documents no equivalent.
     assert chat["usage"] == CompatibilityDisposition.IGNORED
     assert "usage" not in responses
+    # DeepSeek's thinking switch is folded into reasoning on both surfaces.
+    assert chat["thinking"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
+    assert responses["thinking"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
 
 
 def test_schema_drift_fields_carry_capability_vocabulary() -> None:
