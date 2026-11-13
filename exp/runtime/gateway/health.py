@@ -106,11 +106,9 @@ class _DeploymentHealth:
             itself (a parsed ``Retry-After`` or a plan reset). Only the part of
             ``throttle_until`` past this instant is the engine's own default
             guess, which a paced probe may test.
-        probe_unbound: Whether a paced throttle probe was claimed and has not
-            yet been bound to its reserved attempt (``bind_throttle_probe``).
-        probe_attempts: Reserved probe attempts dispatched since the latest
-            throttle window was armed; only THEIR success lifts the hintless
-            window, never an older request's.
+        probe_attempts: Attempts reserved inside a hintless window since it was
+            last armed (``bind_throttle_probe``); only THEIR success lifts it,
+            never an older request's.
     """
 
     consecutive_failures: int = 0
@@ -122,7 +120,6 @@ class _DeploymentHealth:
     circuit_failure: GatewayFailure | None = None
     newer_throttle_until: float = 0.0
     stated_throttle_until: float = 0.0
-    probe_unbound: bool = False
     probe_attempts: set[str] = field(default_factory=set)
 
 
@@ -321,26 +318,35 @@ class DeploymentHealthRegistry:
             if last is not None and now - last < THROTTLE_PROBE_INTERVAL_SECONDS:
                 return False
             self._probe_paced_at[_lane(key)] = now
-            state.probe_unbound = True
             self._lanes.claimed(_lane(key), now)
             return True
 
-    def bind_throttle_probe(self, key: DeploymentHealthKey, attempt_id: str) -> None:
-        """Tie a claimed throttle probe to the attempt actually reserved for it.
+    def bind_throttle_probe(
+        self, key: DeploymentHealthKey, attempt_id: str, *, probe: bool = True
+    ) -> None:
+        """Record a no-failure dial's reserved attempt as a probe of its window.
 
-        Recovery is judged on this attempt's own outcome: a probe the worker
-        later sheds or refuses before reservation is never bound, so it can
-        neither lift the window nor leave a stale claim behind.
+        Ownership is decided at reservation, by the claimant, from the window
+        as it stands then: an attempt reserved while the deployment sits in a
+        hintless window can only have passed it as a probe, so its own success
+        lifts the window. Nothing is shared between claim and reservation, so
+        an unrelated release cannot drop the probe, a probe shed and then
+        force-admitted still counts, and a 429 armed before this reservation
+        is already behind it. A 429 armed after it clears it (:meth:`failed`).
 
         Args:
             key: Catalog, deployment, and connection identity tuple.
-            attempt_id: The reserved attempt dispatching the probe.
+            attempt_id: The reserved attempt.
+            probe: Whether the reservation came from a dial with no failure of
+                its own; any other (a throttle redial) is never a probe here.
         """
+        if not probe:
+            return
+        now = self._clock()
         with self._lock:
             state = self._states.get(key)
-            if state is None or not state.probe_unbound:
+            if state is None or state.throttle_until <= now or state.stated_throttle_until > now:
                 return
-            state.probe_unbound = False
             state.probe_attempts.add(attempt_id)
 
     def dispatch_opened(self, key: DeploymentHealthKey, attempt_id: str | None = None) -> None:
@@ -606,7 +612,6 @@ class DeploymentHealthRegistry:
             if state is not None:
                 state.half_open_probe = False
                 state.last_resort_probe = False
-                state.probe_unbound = False
                 if attempt_id is not None:
                     state.probe_attempts.discard(attempt_id)
             self._lanes.released(_lane(key))

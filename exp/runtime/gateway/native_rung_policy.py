@@ -621,6 +621,11 @@ def record_attempt_health(
         # a probe without clearing prior real failures or recording success.
         health.release_probe(key, attempt_id)
         return
+    # A provider-stated reset is armed before any success can lift a hintless
+    # window, so no request slips through between the two.
+    exhausted = settlement_rate_limit(settlement).exhausted_reset_after_seconds
+    if exhausted is not None:
+        health.exhausted(key, exhausted)
     if opened:
         health.dispatch_opened(key, attempt_id)
     if failure is not None:
@@ -640,9 +645,6 @@ def record_attempt_health(
         health.failed(key, failure, attempt_id)
     else:
         health.succeeded(key, attempt_id)
-    exhausted = settlement_rate_limit(settlement).exhausted_reset_after_seconds
-    if exhausted is not None:
-        health.exhausted(key, exhausted)
 
 
 def _count(usage: JsonObject, key: str) -> int | None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass, GatewayHeaderTimeout
+from exp.runtime.gateway.failover_pass import no_failure_claim, sideways_claim
 from exp.runtime.gateway.health import (
     PLAN_WINDOW_MAXIMUM_SECONDS,
     DeploymentHealthKey,
@@ -265,7 +266,7 @@ def test_a_lone_lane_dispatches_the_next_request_after_one_hintless_429() -> Non
 
 
 def test_only_the_probe_attempt_lifts_the_window() -> None:
-    """An older request finishing, or a probe shed before reservation, lifts nothing."""
+    """An older request finishing lifts nothing; the reserved probe's success does."""
     now = [100.0]
     registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
     registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
@@ -275,11 +276,34 @@ def test_only_the_probe_attempt_lifts_the_window() -> None:
     registry.succeeded(_KEY, "older-request")
     registry.dispatch_opened(_KEY, "older-request")
     assert not registry.claim(_KEY)
-    # The probe is shed before reservation: its claim is released, never bound.
-    registry.release_probe(_KEY)
-    registry.bind_throttle_probe(_KEY, "unrelated")
-    registry.succeeded(_KEY, "unrelated")
+    # An unrelated release between claim and reservation cannot drop the probe.
+    registry.release_probe(_KEY, "other-request")
+    registry.bind_throttle_probe(_KEY, "probe-one")
+    registry.dispatch_opened(_KEY, "probe-one")
+    assert registry.claim(_KEY)
+
+
+def test_a_probe_bound_outside_a_window_is_not_a_probe() -> None:
+    """A reservation made while no hintless window runs records nothing."""
+    now = [100.0]
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
+    registry.bind_throttle_probe(_KEY, "plain-request")
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+    registry.succeeded(_KEY, "plain-request")
     assert not registry.claim(_KEY)
+
+
+def test_a_reset_reported_beside_a_probe_success_keeps_suppression() -> None:
+    """A plan reset the probe's own response reports outranks the probe's success."""
+    now = [100.0]
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+    assert registry.claim_throttle_probe(_KEY)
+    registry.bind_throttle_probe(_KEY, "probe-one")
+    registry.exhausted(_KEY, 600.0)
+    registry.succeeded(_KEY, "probe-one")
+    assert not registry.claim(_KEY)
+    assert not registry.claim_throttle_probe(_KEY)
 
 
 def test_a_probe_that_is_throttled_again_keeps_the_window_and_the_pace() -> None:
@@ -642,3 +666,26 @@ def test_a_hung_lane_is_ejected_on_header_timeouts_and_a_byok_variant_is_not() -
     health.failed(hung, timeout)
     assert health.order((hung, live), [0, 1]) == [1, 0]
     assert not health.lane_ejected(variant)
+
+
+def test_a_sideways_spill_keeps_the_probe_permission() -> None:
+    """A probed rung shed before reservation spills to another lane's own probe."""
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: 100.0)
+    first: DeploymentHealthKey = ("catalog", "deployment-a", "connection-a")
+    second: DeploymentHealthKey = ("catalog", "deployment-b", "connection-b")
+    keys = (first, second)
+    for key in keys:
+        registry.failed(key, _failure(GatewayFailureClass.THROTTLED))
+    assert no_failure_claim(registry, keys, (0, 1), selected_first=False, start=0) == 0
+    registry.release_probe(first)
+    assert sideways_claim(None, registry, keys, (0, 1), 0) is None
+    assert sideways_claim(None, registry, keys, (0, 1), 0, throttle_probe=True) == 1
+
+
+def test_a_throttle_redial_reservation_is_not_bound_as_a_probe() -> None:
+    """Only a dial with no failure of its own binds; a redial keeps prior behavior."""
+    registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: 100.0)
+    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
+    registry.bind_throttle_probe(_KEY, "redial", probe=False)
+    registry.succeeded(_KEY, "redial")
+    assert not registry.claim(_KEY)
