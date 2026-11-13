@@ -28,6 +28,7 @@ mod inspection_http;
 mod prices;
 mod registry;
 mod resources;
+pub(crate) use resources::Resources as InputResources;
 mod route_config;
 mod rung;
 mod shared;

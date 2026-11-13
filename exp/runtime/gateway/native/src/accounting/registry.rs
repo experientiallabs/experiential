@@ -19,6 +19,7 @@ use super::shared::Shared;
 
 pub(super) struct Entry {
     pub owner: Arc<Owner>,
+    resources: Arc<super::resources::Resources>,
     registry: Weak<Registry>,
 }
 
@@ -235,6 +236,9 @@ impl CallbackTarget for Registry {
     fn retain_request(&self, id: &str) -> Option<Arc<dyn Send + Sync>> {
         self.lookup(id).map(|entry| entry as Arc<dyn Send + Sync>)
     }
+    fn input_resources(&self, id: &str) -> Option<Arc<super::resources::Resources>> {
+        self.lookup(id).map(|entry| entry.resources.clone())
+    }
 }
 
 /// Admission hands off one validated route and one retained native transaction owner.
@@ -324,6 +328,7 @@ impl NativeAccounting {
             }
             if self.inner.lookup(id).is_none() {
                 let entry = Arc::new(Entry {
+                    resources: Arc::new(super::resources::Resources::default()),
                     owner: Owner::new(
                         id.into(),
                         organization_id.into(),
@@ -401,6 +406,7 @@ impl NativeAccounting {
             let dispatch =
                 Dispatch::with_resources(config, self.inner.shared.clone(), host, resources)?;
             self.inner.register(Arc::new(Entry {
+                resources: dispatch.resources.clone(),
                 owner: Owner::new(id, org, deadline, dispatch),
                 registry: Arc::downgrade(&self.inner),
             }))

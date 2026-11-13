@@ -550,11 +550,21 @@ class GuardrailEngine:
             )
             self._emit_observation(policy, None, outcome, 0.0)
 
-    def record_unsupported_observations(self, policies: tuple[GuardrailPolicy, ...]) -> None:
-        """Record incomplete observation coverage on a surface with no inspection boundary."""
+    def record_unsupported_observations(
+        self,
+        policies: tuple[GuardrailPolicy, ...],
+        *,
+        request_id: str | None = None,
+        surface: str | None = None,
+    ) -> None:
+        """Record missed coverage without delaying an unsupported fail-open request."""
         for policy in policies:
-            if policy.mode == "observe":
-                self._emit_observation(policy, None, GuardrailOutcome.UNSUPPORTED, 0.0)
+            if policy.mode == "observe" or policy.input_fail_open:
+                self._observation_records.submit(
+                    ObservationRecord(
+                        policy, None, GuardrailOutcome.UNSUPPORTED, 0.0, request_id, surface
+                    )
+                )
 
     def close(self, *, timeout_seconds: float = 1.0) -> None:
         """Stop observations and drain within a bounded host shutdown budget."""
@@ -770,9 +780,8 @@ class GuardrailEngine:
     ) -> ClassifierVerdict | None:
         """Invoke one adapter under the tighter of check timeout and request deadline.
 
-        The inspect itself runs on an isolation worker. This caller only waits
-        until the remaining budget elapses. A decision-model answer also queues
-        its category scores for the host's score sink when the request is known.
+        Inspection runs on an isolation worker within the remaining budget.
+        Decision-model scores use the host's score sink when the request is known.
 
         Returns:
             The verdict, or ``None`` when a non-protected check is skipped.
@@ -899,6 +908,7 @@ class GuardrailEngine:
 
     def _deliver_observation(self, record: ObservationRecord) -> None:
         """Invoke the host sink only on the separately bounded metadata worker."""
+        record.log_coverage()
         self._record_observation(
             record.policy, record.check, record.outcome, record.latency_seconds
         )
@@ -911,19 +921,7 @@ class GuardrailEngine:
         latency_seconds: float,
     ) -> None:
         """Emit content-free observation metadata separately from enforced decisions."""
-        _logger.info(
-            "guardrail observation policy_id=%s revision=%s organization_id=%s identity_id=%s "
-            "check_id=%s capability=%s would_action=%s outcome=%s latency_ms=%.1f",
-            policy.policy_id,
-            policy.revision,
-            policy.organization_id,
-            policy.identity_id,
-            None if check is None else check.check_id,
-            None if check is None else check.capability.value,
-            None if check is None else check.action.value,
-            outcome.value,
-            latency_seconds * 1000,
-        )
+        ObservationRecord(policy, check, outcome, latency_seconds).log_outcome()
 
     def _apply_input(
         self,

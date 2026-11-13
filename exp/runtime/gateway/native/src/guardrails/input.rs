@@ -1,23 +1,25 @@
 //! Withhold the first outward event while the shared engine checks the input.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use serde::Deserialize;
+#[cfg(test)]
 use serde_json::json;
 use tokio::sync::OnceCell;
 
 use crate::bridge::Bridge;
-use crate::encode::compact_json;
 use crate::errors::{Failure, FailureClass, PublicError};
-use crate::relay::{collection_public_error, remaining};
+use crate::relay::collection_public_error;
 use crate::settlement::AttemptGuard;
 use crate::waterfall::{acquire_attempt, WaterfallContext, Won};
 
 /// One cached decision shared by response release and every attempt settlement.
 pub(crate) struct InputGate {
     request_id: String,
-    deadline: Instant,
     decision: OnceCell<Result<InputDecision, InputFailure>>,
 }
 
@@ -66,7 +68,7 @@ pub(crate) struct InputFailure {
 
 impl InputFailure {
     /// Preserve capture admission's typed 503 without changing ordinary classifier failures.
-    fn public_error(self) -> PublicError {
+    pub(crate) fn public_error(self) -> PublicError {
         let failure = self.failure.boundary();
         match self.safe_details.code {
             Some(InputFailureCode::CaptureUnavailable)
@@ -98,92 +100,70 @@ impl InputGate {
     pub(crate) async fn wait(&self, bridge: &Bridge) -> Result<InputDecision, InputFailure> {
         self.decision
             .get_or_init(|| async {
-                // Each callback is a nonblocking poll. No classifier can occupy
-                // all bridge workers and prevent provider dispatch/settlement.
-                let argument = compact_json(&json!({"request_id": self.request_id}));
-                let mut delay_ms = 1;
-                loop {
-                    let response = tokio::time::timeout(
-                        remaining(self.deadline),
-                        bridge.call("guardrail_input_status", argument.clone()),
-                    )
-                    .await
-                    .map_err(|_| unavailable())?
-                    .map_err(|_| unavailable())?;
-                    let decision: Decision =
-                        crate::lossless_json::from_str(&response).map_err(|_| unavailable())?;
-                    match decision.action.as_str() {
-                        "allow" => return Ok(InputDecision::Allowed),
-                        "closed" => return Ok(InputDecision::AdmissionClosed),
-                        "error" => return Err(decision.failure.unwrap_or_else(unavailable)),
-                        "pending" if Instant::now() < self.deadline => {
-                            tokio::time::sleep(
-                                Duration::from_millis(delay_ms).min(remaining(self.deadline)),
-                            )
-                            .await;
-                            delay_ms = (delay_ms * 2).min(10);
-                        }
-                        _ => return Err(unavailable()),
-                    }
+                let value = bridge
+                    .input_resources(&self.request_id)
+                    .ok_or_else(unavailable)?
+                    .wait()
+                    .await;
+                let decision: Decision =
+                    crate::lossless_json::from_value(value).map_err(|_| unavailable())?;
+                match decision.action.as_str() {
+                    "allow" => Ok(InputDecision::Allowed),
+                    "closed" => Ok(InputDecision::AdmissionClosed),
+                    "error" => Err(decision.failure.unwrap_or_else(unavailable)),
+                    _ => Err(unavailable()),
                 }
             })
             .await
             .clone()
     }
-}
 
-fn release(won: Won, decision: InputDecision) -> Result<Won, InputFailure> {
-    // A terminal admission failure owns its public error. A closed admission
-    // never authorizes releasing a provider completion or any prefix.
-    if matches!(won, Won::Failed(_)) {
-        return Ok(won);
+    pub(crate) async fn response_ready(
+        &self,
+        bridge: &Bridge,
+    ) -> Result<InputDecision, InputFailure> {
+        let resources = bridge
+            .input_resources(&self.request_id)
+            .ok_or_else(unavailable)?;
+        resources.begin_response();
+        self.wait(bridge).await
     }
-    decision.require_allow().map(|()| won)
+
+    pub(crate) fn new(ctx: &WaterfallContext<'_>) -> Arc<Self> {
+        Arc::new(Self {
+            request_id: ctx.request_id.to_owned(),
+            decision: OnceCell::new(),
+        })
+    }
+
+    /// Race one physical generation against its own input decision.
+    pub(crate) async fn inspect_attempt<T>(
+        &self,
+        bridge: &Bridge,
+        attempt: impl std::future::Future<Output = T>,
+    ) -> Result<T, InputFailure> {
+        tokio::pin!(attempt);
+        tokio::select! {
+            biased;
+            decision = self.wait(bridge) => {
+                decision?.require_allow()?;
+                Ok(attempt.await)
+            },
+            end = &mut attempt => Ok(end),
+        }
+    }
 }
 
-/// Generate and inspect concurrently, withholding all protocol/replay/capture output.
+/// Enable request-owned input decisions for each physical generation.
 pub(crate) async fn acquire_guarded_attempt(
     ctx: &WaterfallContext<'_>,
     guard: &mut AttemptGuard,
     enabled: bool,
 ) -> Won {
-    if !enabled {
-        return acquire_attempt(ctx, guard).await;
+    if enabled {
+        guard.input_gate = Some(InputGate::new(ctx));
     }
-    let gate = Arc::new(InputGate {
-        request_id: ctx.request_id.to_owned(),
-        deadline: ctx.deadline,
-        decision: OnceCell::new(),
-    });
-    guard.input_gate = Some(gate.clone());
-    let outcome = {
-        let acquire = acquire_attempt(ctx, guard);
-        tokio::pin!(acquire);
-        tokio::select! {
-            biased;
-            decision = gate.wait(ctx.bridge) => match decision {
-                Ok(decision) => release(acquire.await, decision),
-                Err(failure) => Err(failure),
-            },
-            won = &mut acquire => {
-                if matches!(won, Won::Failed(_)) {
-                    Ok(won)
-                } else {
-                    gate.wait(ctx.bridge).await.and_then(|decision| release(won, decision))
-                }
-            },
-        }
-    };
-    match outcome {
-        Ok(won) => won,
-        Err(failure) => {
-            // Dropping acquire/the committed relay closes upstream immediately.
-            // The guard retains witnessed usage for our cost, while the host
-            // applies the input verdict to customer settlement.
-            guard.fail_before_release(&failure.failure).await;
-            Won::Failed(failure.public_error())
-        }
-    }
+    acquire_attempt(ctx, guard).await
 }
 
 #[cfg(test)]
@@ -191,19 +171,79 @@ mod tests {
     use super::*;
     use pyo3::prelude::*;
 
+    struct NativePlane {
+        input: Arc<crate::accounting::InputResources>,
+        writes: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    }
+    impl crate::native_callbacks::CallbackTarget for NativePlane {
+        fn handles(&self, method: &str) -> bool {
+            method == "settle"
+        }
+        fn call(&self, method: &str, argument: &str) -> Result<String, PublicError> {
+            assert_eq!(method, "settle");
+            self.writes
+                .send(crate::lossless_json::from_str(argument).unwrap())
+                .unwrap();
+            Ok("{}".into())
+        }
+        fn input_resources(&self, _: &str) -> Option<Arc<crate::accounting::InputResources>> {
+            Some(self.input.clone())
+        }
+    }
+
+    fn setup(
+        grace: u64,
+    ) -> (
+        Arc<Bridge>,
+        tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/inspect", server.local_addr().unwrap());
+        let (release, released) = std::sync::mpsc::channel();
+        let (received, accepted) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            received.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"flagged\":true}");
+        });
+        let input = Arc::new(crate::accounting::InputResources::test_input(
+            json!([{
+                "policy": {"mode": "enforce", "protected": true, "input_fail_open": true, "input_max_wait_ms": grace},
+                "check": {"check_id": "moderation", "action": "block", "timeout_ms": 4000},
+                "adapter": {"kind": "http_json", "url": url, "max_response_bytes": 1024, "payload": {},
+                    "transport": {"public_only": false, "headers": {}}}
+            }]),
+            5.0,
+        ));
+        accepted.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (writes, receiver) = tokio::sync::mpsc::unbounded_channel();
+        Python::initialize();
+        let plane = Python::attach(|py| {
+            pyo3::types::PyModule::from_code(py, c"class Plane:\n def __getattr__(self, name):\n  raise AssertionError('post-admission Python callback: ' + name)\n def close_thread_resources(self, argument): return '{}'\n", c"unused_plane.py", c"unused_plane").unwrap()
+                .getattr("Plane").unwrap().call0().unwrap().unbind()
+        });
+        let target =
+            crate::native_callbacks::NativeTarget::new(Arc::new(NativePlane { input, writes }));
+        (
+            Arc::new(Bridge::new(plane, 1).unwrap().with_native(Some(target))),
+            receiver,
+            release,
+            thread,
+        )
+    }
+
     #[tokio::test]
     async fn denial_cancelling_provider_settlement_keeps_health_facts() {
-        Python::initialize();
         for drop_handler in [false, true] {
-            let plane = Python::attach(|py| {
-                pyo3::types::PyModule::from_code(py, c"import json\nclass Plane:\n def __init__(self): self.writes = []; self.polls = 0\n def guardrail_input_status(self, argument):\n  self.polls += 1\n  if self.polls == 1: return '{\"action\":\"pending\"}'\n  return json.dumps({'action':'error','failure':{'failure_class':'guardrail','safe_message':'Input was rejected.'}})\n def settle(self, argument):\n  self.writes.append(json.loads(argument))\n  return '{}'\n def close_thread_resources(self, argument): return '{}'\n", c"provider_input_plane.py", c"provider_input_plane")
-                    .unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
-            });
-            let bridge =
-                Arc::new(Bridge::scripted(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
+            let (bridge, mut writes, release, server) = setup(100);
             let gate = Arc::new(InputGate {
                 request_id: "request".into(),
-                deadline: Instant::now() + Duration::from_secs(2),
                 decision: OnceCell::new(),
             });
             let mut guard = AttemptGuard::new(
@@ -215,26 +255,23 @@ mod tests {
             guard.rebind("attempt".into());
             guard.mark_dispatched();
             guard.input_gate = Some(gate.clone());
-            let headers = json!({
-                "retry-after": "120",
-                "x-ratelimit-remaining-requests": "0",
-                "x-ratelimit-reset-requests": "120s"
-            })
-            .as_object()
-            .unwrap()
-            .clone();
+            let headers = json!({"retry-after": "120", "x-ratelimit-remaining-requests": "0", "x-ratelimit-reset-requests": "120s"}).as_object().unwrap().clone();
             let provider = crate::upstream::transport_failure(Some(429))
                 .with_rate_limit_facts(Some(headers.clone()), Some(120));
-            // A failed open is retained before the waterfall can await the shared gate.
             guard
                 .capture_observation()
                 .record(&crate::events::Event::Failed(provider.clone()));
-            let mut settling_polled = false;
+            let started = Arc::new(tokio::sync::Notify::new());
+            let notified = started.clone();
+            tokio::spawn(async move {
+                notified.notified().await;
+                release.send(()).unwrap();
+            });
             let denied = {
                 let settling = async {
-                    settling_polled = true;
+                    started.notify_one();
                     guard
-                        .settle("failed", None, &[], Some(&provider), false)
+                        .settle("failed", None, &[], Some(&provider), true)
                         .await
                 };
                 tokio::pin!(settling);
@@ -244,39 +281,49 @@ mod tests {
                     _ = &mut settling => panic!("the outer input gate must win"),
                 }
             };
-            assert!(
-                settling_polled,
-                "cancel an actual in-flight settlement future"
-            );
+            assert_eq!(denied.failure.failure_class, FailureClass::Guardrail);
             if drop_handler {
                 drop(guard);
             } else {
                 guard.fail_before_release(&denied.failure).await;
             }
-            tokio::time::timeout(Duration::from_secs(2), async {
-                while Python::attach(|py| plane.bind(py).getattr("writes").unwrap().len().unwrap())
-                    == 0
-                {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            })
-            .await
-            .expect("terminal settlement delivered");
-            let writes: String = Python::attach(|py| {
-                py.import("json")
-                    .unwrap()
-                    .call_method1("dumps", (plane.bind(py).getattr("writes").unwrap(),))
-                    .unwrap()
-                    .extract()
-                    .unwrap()
-            });
-            let writes: Vec<serde_json::Value> = crate::lossless_json::from_str(&writes).unwrap();
-            assert_eq!(writes.len(), 1);
-            assert_eq!(writes[0]["failure"]["failure_class"], "throttled");
-            assert_eq!(writes[0]["failure"]["retry_after_seconds"], 120);
-            assert_eq!(writes[0]["rate_limit_headers"], json!(headers));
-            assert_eq!(writes[0]["finalize"], true);
-            assert_eq!(writes[0]["usage_incomplete_due_to_disconnect"], false);
+            let write = tokio::time::timeout(Duration::from_secs(2), writes.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(write["failure"]["failure_class"], "throttled");
+            assert_eq!(write["failure"]["retry_after_seconds"], 120);
+            assert_eq!(write["rate_limit_headers"], json!(headers));
+            assert_eq!(write["finalize"], true);
+            assert_eq!(write["usage_incomplete_due_to_disconnect"], false);
+            assert!(writes.try_recv().is_err());
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_response_releases_after_configured_grace_without_polling() {
+        for grace in [0, 20] {
+            let (bridge, _, release, server) = setup(grace);
+            let gate = InputGate {
+                request_id: "request".into(),
+                decision: OnceCell::new(),
+            };
+            let started = Instant::now();
+            let result =
+                tokio::time::timeout(Duration::from_millis(500), gate.response_ready(&bridge))
+                    .await
+                    .unwrap();
+            result.unwrap().require_allow().unwrap();
+            assert!(started.elapsed() >= Duration::from_millis(grace));
+            let resources = bridge.input_resources("request").unwrap();
+            assert_eq!(
+                resources.status()["moderation"]["reason"],
+                "response_ready_timeout"
+            );
+            release.send(()).unwrap();
+            server.join().unwrap();
+            gate.wait(&bridge).await.unwrap().require_allow().unwrap();
         }
     }
 

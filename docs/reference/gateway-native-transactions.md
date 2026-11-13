@@ -58,11 +58,29 @@ one bounded result. The engine validates the table, method ownership and result;
 an unavailable method or malformed result fails closed. The engine retains the
 host context independently of the Python capsule for detached recovery work.
 
-Methods 1-16 cover serving callbacks. Method 17 carries durable cache operations
+Methods 1–16 cover serving callbacks. Method 17 carries durable cache operations
 between the native owner and its host. Method 18 preserves a late meter after
-cancellation. Method 19 retains content-free inspection records asynchronously so
-existing guardrails keep their observation and decision history after the accounting
-owner takes over. These internal host operations are never HTTP endpoints.
+cancellation. Method 19 writes content-free input moderation records, including
+policy revision, decision scores and incomplete coverage. These internal host
+operations are never HTTP endpoints.
+
+## Online input tagging
+
+Policies choose `parallel` or `before_dispatch` input execution. Parallel input
+inspection and provider work run concurrently in Rust. A completed deny cancels
+the provider and returns the policy refusal before response content is released.
+The response waits on asynchronous notifications, with no polling callback.
+
+`input_fail_open` releases a request when inspection fails or cannot finish within
+`input_max_wait_ms` after response content is ready. Zero introduces no intentional
+wait. The release decision becomes final, so a late deny cannot revoke content
+already delivered. Moderation records identify incomplete coverage for later
+offline processing. Observe policies never gate delivery and can finish after it.
+
+A composition selects model coverage and reloads policy snapshots independently
+of deployment. Online and offline tagging may use separate policies and decision
+models. The engine consumes generic scoped policies and compiled transport
+authority; it does not depend on a model's naming convention or catalog tags.
 
 ## Payload and credential fidelity
 

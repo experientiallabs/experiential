@@ -133,17 +133,12 @@ class GuardrailSession:
         )
 
     def can_overlap_input(self, request: GatewayRequest) -> bool:
-        """Overlap read-only input decisions only when generation cannot cause side effects."""
+        """Use the configured execution order for every read-only input policy."""
         inputs = tuple(p for p in self.enforcing_policies if p.input_checks)
         return (
             bool(inputs)
             and all(p.input_execution == "parallel" for p in inputs)
             and all(c.action is not GuardrailAction.MODIFY for p in inputs for c in p.input_checks)
-            and not request.provider_native_tools
-            and not request.provider_server_tools
-            and request.web_search is None
-            and request.tool_search is None
-            and request.service_tier is None
         )
 
     def inspect_input(self, request: GatewayRequest, *, defer: bool = False) -> GatewayRequest:

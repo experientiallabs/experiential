@@ -16,7 +16,7 @@ fn coverage(check: Option<&str>) -> Value {
         "Content inspection does not support this complete request. Use a supported context or modality.")
 }
 
-fn prepare(check: &Check, subject: &Subject) -> Result<Check, ()> {
+pub(super) fn prepare(check: &Check, subject: &Subject) -> Result<Check, ()> {
     let mut c = check.clone();
     match c.adapter["kind"].as_str() {
         Some("keyword" | "regex") => {
@@ -81,11 +81,19 @@ async fn one(
     classification: &mut Value,
 ) -> Result<Subject, Value> {
     let id = check.check["check_id"].as_str();
+    let unavailable = |failure: Value, observed: &mut Value| {
+        *observed = failure.clone();
+        if check.policy["input_fail_open"] == true {
+            Ok(subject.clone())
+        } else {
+            Err(failure)
+        }
+    };
     if check.adapter["input_limit"]
         .as_u64()
         .is_some_and(|limit| subject.size().map_or(true, |size| size as u64 > limit))
     {
-        return Err(coverage(None));
+        return unavailable(coverage(None), observed);
     }
     let started = Instant::now();
     let budget = Duration::from_millis(check.check["timeout_ms"].as_u64().unwrap_or(0))
@@ -97,7 +105,10 @@ async fn one(
             "unavailable",
             "Content inspection is unavailable. Retry later.",
         );
-        return inspection::uncertain(check).map_or_else(|| Ok(subject.clone()), Err);
+        return inspection::uncertain(check).map_or_else(
+            || Ok(subject.clone()),
+            |failure| unavailable(failure, observed),
+        );
     }
     let check_for_input = prepare(check, subject).ok();
     let result = match &check_for_input {
@@ -137,9 +148,12 @@ async fn one(
                 "unavailable",
                 "Content inspection is unavailable. Retry later.",
             );
-            return inspection::uncertain(check).map_or_else(|| Ok(subject.clone()), Err);
+            return inspection::uncertain(check).map_or_else(
+                || Ok(subject.clone()),
+                |failure| unavailable(failure, observed),
+            );
         }
-        Ok(v) if v["coverage_error"] == true => return Err(coverage(id)),
+        Ok(v) if v["coverage_error"] == true => return unavailable(coverage(id), observed),
         Ok(v) => v,
     };
     if verdict["flagged"] != true || check.check["action"] == "allow" {
@@ -152,8 +166,10 @@ async fn one(
     let replacement = verdict["replacement_messages"]
         .as_array()
         .cloned()
-        .and_then(|m| input_rewrite::restore(subject, m).ok())
-        .ok_or_else(|| inspection::failed("error", id))?;
+        .and_then(|m| input_rewrite::restore(subject, m).ok());
+    let Some(replacement) = replacement else {
+        return unavailable(inspection::failed("error", id), observed);
+    };
     let mut result = subject.clone();
     result.set_messages(replacement);
     Ok(result)
@@ -262,6 +278,62 @@ mod tests {
                 assert_eq!(error["failure"]["failure_class"], "unavailable");
             }
         }
+    }
+
+    #[test]
+    fn modifying_followups_fail_open_on_missing_coverage_but_keep_known_denials() {
+        let runtime = super::super::inspection_http::runtime().unwrap();
+        let case: Value = crate::lossless_json::from_str(
+            include_str!("../../tests/generated/input_programs.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let subject: Subject = crate::lossless_json::from_value(case["subject"].clone()).unwrap();
+        let mut check: Check = crate::lossless_json::from_value(case["checks"][0].clone()).unwrap();
+        check.policy["input_fail_open"] = json!(true);
+        check.policy["protected"] = json!(true);
+        check.check["action"] = json!("modify");
+        for adapter in [
+            json!({"kind": "unavailable"}),
+            json!({"kind": "coverage_error"}),
+            json!({"kind": "allow", "input_limit": 0}),
+            json!({"kind": "decision_model"}),
+        ] {
+            check.adapter = adapter;
+            let actual = runtime
+                .block_on(one(
+                    &check,
+                    &subject,
+                    Instant::now() + Duration::from_secs(1),
+                    &mut Value::Null,
+                ))
+                .unwrap();
+            assert_eq!(actual.request, subject.request);
+        }
+        let denied_case: Value = crate::lossless_json::from_str(
+            include_str!("../../tests/generated/input_programs.jsonl")
+                .lines()
+                .nth(4)
+                .unwrap(),
+        )
+        .unwrap();
+        let subject: Subject =
+            crate::lossless_json::from_value(denied_case["subject"].clone()).unwrap();
+        let mut check: Check =
+            crate::lossless_json::from_value(denied_case["checks"][0].clone()).unwrap();
+        check.policy["input_fail_open"] = json!(true);
+        let denied = runtime
+            .block_on(one(
+                &check,
+                &subject,
+                Instant::now() + Duration::from_secs(1),
+                &mut Value::Null,
+            ))
+            .err()
+            .expect("an explicit detected violation still denies the request");
+        assert_eq!(denied["action"], "block");
     }
 
     #[test]

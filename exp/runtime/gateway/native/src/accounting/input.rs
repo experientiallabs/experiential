@@ -12,6 +12,7 @@ use super::inspection::{self, Check};
 
 struct State {
     decision: Value,
+    strict_decision: Value,
     task: Option<AbortHandle>,
     reporter: Option<super::input_reports::Reporter>,
     reported: bool,
@@ -22,8 +23,17 @@ pub(super) struct InputGate {
     deadline: Instant,
     state: Mutex<State>,
     changed: Condvar,
-    checks: Vec<Value>,
+    notified: tokio::sync::Notify,
+    observe: bool,
+    #[cfg(test)]
+    grace: Duration,
+    checks: Vec<(Value, bool)>,
     progress: Arc<Mutex<Vec<Value>>>,
+    observed_progress: Arc<Mutex<Vec<Value>>>,
+    strict_progress: Arc<Mutex<Vec<Value>>>,
+    strict_count: usize,
+    enforce_count: usize,
+    response_ready: tokio::sync::watch::Sender<Option<Instant>>,
     started: Instant,
 }
 
@@ -40,7 +50,7 @@ pub(super) fn unavailable() -> Value {
 }
 
 impl InputGate {
-    pub fn start(checks: Vec<Check>, remaining: f64) -> Result<Arc<Self>, ()> {
+    pub fn start(mut checks: Vec<Check>, remaining: f64) -> Result<Arc<Self>, ()> {
         if !remaining.is_finite()
             || !(0.0..=86_400.0).contains(&remaining)
             || checks.len() > 256
@@ -64,87 +74,190 @@ impl InputGate {
         {
             return Err(());
         }
+        // Strict, fail-open, and observe policies progress independently.
+        let group = |c: &Check| {
+            if c.policy["mode"] == "observe" {
+                2
+            } else if c.policy["input_fail_open"] == true || c.policy["protected"] == false {
+                1
+            } else {
+                0
+            }
+        };
+        checks.sort_by_key(group);
+        let strict_count = checks.iter().take_while(|c| group(c) == 0).count();
+        let enforce_count = checks.iter().take_while(|c| group(c) != 2).count();
         let observe = !checks.is_empty() && checks.iter().all(|c| c.policy["mode"] == "observe");
-        let records = checks
-            .iter()
-            .map(|c| {
-                json!({
-                    "policy_id": c.policy["policy_id"], "revision": c.policy["revision"],
-                    "check_id": c.check["check_id"], "adapter_id": c.check["adapter_id"],
-                    "capability": c.check["capability"], "stage": c.check["stage"],
-                    "mode": if observe {"observe"} else {"enforce"},
-                    "action": if observe {"allow"} else {"error"}
-                })
-            })
-            .collect();
+        #[cfg(test)]
+        let grace = Duration::from_millis(
+            checks
+                .iter()
+                .filter(|c| c.policy["mode"] != "observe")
+                .filter_map(|c| c.policy["input_max_wait_ms"].as_u64())
+                .max()
+                .unwrap_or(0)
+                .min(5000),
+        );
         let gate = Arc::new(Self {
             deadline: Instant::now() + Duration::from_secs_f64(remaining),
             state: Mutex::new(State {
                 decision: json!({"action": "pending"}),
+                strict_decision: json!({"action": if strict_count == 0 {"allow"} else {"pending"}}),
                 task: None,
                 reporter: None,
                 reported: false,
                 report_ready: false,
             }),
             changed: Condvar::new(),
-            checks: records,
+            notified: tokio::sync::Notify::new(),
+            observe,
+            #[cfg(test)]
+            grace,
             progress: Arc::default(),
+            observed_progress: Arc::default(),
+            strict_progress: Arc::default(),
+            strict_count,
+            enforce_count,
+            response_ready: tokio::sync::watch::channel(None).0,
             started: Instant::now(),
+            checks: checks
+                .iter()
+                .map(|c| {
+                    (
+                        json!({"policy_id": c.policy["policy_id"],
+                "revision": c.policy["revision"], "check_id": c.check["check_id"],
+                "adapter_id": c.check["adapter_id"], "capability": c.check["capability"],
+                "stage": c.check["stage"], "action": "allow",
+                "mode": if c.policy["mode"] == "observe" {"observe"} else {"enforce"}}),
+                        c.policy["mode"] == "observe"
+                            || c.policy["input_fail_open"] == true
+                            || c.policy["protected"] == false,
+                    )
+                })
+                .collect(),
         });
         let weak = Arc::downgrade(&gate);
-        // Observations outlive the financial owner but remain bounded and deadline-owned.
-        let observation = observe.then(|| gate.clone());
+        let observation = (enforce_count < checks.len()).then(|| gate.clone());
+        let deadline = gate.deadline;
         static JOBS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
         static BYTES: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
-        let permits = if observe {
-            let bytes = checks
-                .iter()
-                .fold(0usize, |n, c| n.saturating_add(c.adapter.to_string().len()));
-            let job = JOBS
-                .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(128)))
-                .clone()
-                .try_acquire_owned();
-            let memory = BYTES
-                .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(64 * 1024 * 1024)))
-                .clone()
-                .try_acquire_many_owned(u32::try_from(bytes.max(1)).unwrap_or(u32::MAX));
-            match (job, memory) {
-                (Ok(job), Ok(memory)) => Some((job, memory)),
-                _ => {
-                    let mut state = gate.state.lock().map_err(|_| ())?;
-                    state.decision = gate.incomplete("overload");
-                    state.report_ready = true;
-                    drop(state);
-                    return Ok(gate);
-                }
-            }
-        } else {
-            None
+        let weight = checks.iter().fold(0usize, |size, c| {
+            size.saturating_add(c.adapter.to_string().len())
+        });
+        let units = (weight / 1024 + 1).min(u32::MAX as usize) as u32;
+        let job = JOBS
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(256)))
+            .clone()
+            .try_acquire_owned();
+        let bytes = BYTES
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(64 * 1024)))
+            .clone()
+            .try_acquire_many_owned(units);
+        let (Ok(job), Ok(bytes), Ok(runtime)) = (job, bytes, super::inspection_http::runtime())
+        else {
+            let mut state = gate.state.lock().map_err(|_| ())?;
+            state.decision = gate.incomplete("capacity_or_unavailable");
+            state.report_ready = true;
+            drop(state);
+            return Ok(gate);
         };
-        let deadline = gate.deadline;
         let progress = gate.progress.clone();
-        let handle = super::inspection_http::runtime()?.spawn(async move {
-            let _observation = observation;
-            let _permits = permits;
-            let result = run(checks, deadline, progress).await;
-            if let Some(gate) = weak.upgrade() {
+        let observed_progress = gate.observed_progress.clone();
+        let ready = gate.response_ready.subscribe();
+        let observed_checks = checks.split_off(enforce_count);
+        let permissive_checks = checks.split_off(strict_count);
+        let strict_progress = gate.strict_progress.clone();
+        let handle = runtime.spawn(async move {
+            let _capacity = (job, bytes);
+            let serving = async {
+                let strict = async {
+                    let result = run(checks, deadline, strict_progress, ready.clone()).await;
+                    if let Some(gate) = weak.upgrade() {
+                        if let Ok(mut state) = gate.state.lock() {
+                            state.strict_decision = result.clone();
+                            gate.changed.notify_all();
+                            gate.notified.notify_waiters();
+                        }
+                    }
+                    result
+                };
+                let permissive = run(permissive_checks, deadline, progress, ready.clone());
+                tokio::pin!(strict, permissive);
+                let (first, strict_first) = tokio::select! {
+                    value = &mut strict => (value, true),
+                    value = &mut permissive => (value, false),
+                };
+                let decision = if first["action"] == "error" {
+                    first
+                } else {
+                    let second = if strict_first {
+                        permissive.await
+                    } else {
+                        strict.await
+                    };
+                    combine(first, second)
+                };
+                if enforce_count > 0 {
+                    if let Some(gate) = weak.upgrade() {
+                        if let Ok(mut state) = gate.state.lock() {
+                            if state.decision["action"] == "pending" {
+                                state.decision = decision.clone();
+                                if state.decision["action"] == "error" {
+                                    let reason = if Instant::now() >= deadline {
+                                        "timeout"
+                                    } else {
+                                        "cancelled"
+                                    };
+                                    let mut records = gate.incomplete(reason)["moderation"]
+                                        ["observations"]
+                                        .as_array()
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    records.truncate(enforce_count);
+                                    state.decision["moderation"]["observations"] = json!(records);
+                                }
+                                gate.changed.notify_all();
+                                gate.notified.notify_waiters();
+                            }
+                        }
+                    }
+                }
+                decision
+            };
+            let (enforced, observed) = tokio::join!(
+                serving,
+                run(observed_checks, deadline, observed_progress, ready.clone())
+            );
+            if let Some(gate) = observation.or_else(|| weak.upgrade()) {
                 if let Ok(mut state) = gate.state.lock() {
                     if state.decision["action"] == "pending" {
                         state.decision = if Instant::now() >= deadline {
                             gate.incomplete("timeout")
+                        } else if enforce_count == 0 {
+                            observed.clone()
                         } else {
-                            result
+                            enforced
                         };
+                    }
+                    if enforce_count > 0 {
+                        if let Some(records) = observed["moderation"]["observations"].as_array() {
+                            if let Some(existing) =
+                                state.decision["moderation"]["observations"].as_array_mut()
+                            {
+                                existing.extend(records.iter().cloned());
+                            }
+                        }
                     }
                     state.report_ready = true;
                     state.task = None;
                     gate.changed.notify_all();
+                    gate.notified.notify_waiters();
                 }
                 gate.publish();
             }
         });
         let mut state = gate.state.lock().map_err(|_| ())?;
-        if state.decision["action"] == "pending" {
+        if !state.report_ready {
             state.task = Some(handle.abort_handle());
         }
         drop(state);
@@ -153,7 +266,7 @@ impl InputGate {
 
     pub fn decision(&self) -> Value {
         let Ok(mut state) = self.state.lock() else {
-            return unavailable();
+            return self.incomplete("unavailable");
         };
         if state.decision["action"] == "pending" && Instant::now() >= self.deadline {
             state.decision = self.incomplete("timeout");
@@ -162,6 +275,7 @@ impl InputGate {
                 task.abort();
             }
             self.changed.notify_all();
+            self.notified.notify_waiters();
         }
         let decision = state.decision.clone();
         drop(state);
@@ -195,22 +309,120 @@ impl InputGate {
     }
 
     fn incomplete(&self, reason: &str) -> Value {
-        let progress = self.progress.lock().map(|v| v.clone()).unwrap_or_default();
-        let observations = self
+        let progress = self.progress.lock().map(|p| p.clone()).unwrap_or_default();
+        let strict_progress = self
+            .strict_progress
+            .lock()
+            .map(|p| p.clone())
+            .unwrap_or_default();
+        let observed_progress = self
+            .observed_progress
+            .lock()
+            .map(|p| p.clone())
+            .unwrap_or_default();
+        let observations: Vec<_> = self
             .checks
             .iter()
             .enumerate()
-            .map(|(index, check)| {
-                if let Some(record) = progress.get(index) {
+            .map(|(index, (check, fail_open))| {
+                let completed = if index < self.strict_count {
+                    strict_progress.get(index)
+                } else if index < self.enforce_count {
+                    progress.get(index - self.strict_count)
+                } else {
+                    observed_progress.get(index - self.enforce_count)
+                };
+                if let Some(record) = completed {
                     return record.clone();
                 }
                 let mut record = check.clone();
                 record["outcome"] = json!(reason);
+                record["action"] = json!(if *fail_open { "allow" } else { "error" });
                 record["latency_ms"] = json!(self.started.elapsed().as_secs_f64() * 1000.0);
                 record
             })
             .collect();
         interrupted(observations, reason)
+    }
+
+    pub fn observe(&self) -> bool {
+        self.observe
+    }
+
+    #[cfg(test)]
+    pub fn grace(&self) -> Option<Duration> {
+        self.checks
+            .iter()
+            .all(|(_, fail_open)| *fail_open)
+            .then_some(self.grace)
+    }
+
+    /// Wake on completion or cancellation, without occupying a bridge worker.
+    pub async fn wait_async(&self) -> Value {
+        loop {
+            let notified = self.notified.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let decision = self.decision();
+            if decision["action"] != "pending" {
+                return decision;
+            }
+            let _ = tokio::time::timeout_at(self.deadline.into(), notified).await;
+        }
+    }
+
+    /// Search side effects wait only for independently running strict policies.
+    pub async fn wait_strict(&self) -> Value {
+        loop {
+            let notified = self.notified.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let overall = self.decision();
+            if overall["action"] == "error" {
+                return overall;
+            }
+            let strict = self
+                .state
+                .lock()
+                .map(|s| s.strict_decision.clone())
+                .unwrap_or_else(|_| unavailable());
+            if strict["action"] != "pending" {
+                return strict;
+            }
+            if overall["action"] != "pending" {
+                return overall;
+            }
+            let _ = tokio::time::timeout_at(self.deadline.into(), notified).await;
+        }
+    }
+
+    /// Publish the outward boundary once; each policy owns its own grace.
+    pub fn begin_response(&self, at: Instant) {
+        self.response_ready.send_if_modified(|value| {
+            if value.is_some() {
+                false
+            } else {
+                *value = Some(at);
+                true
+            }
+        });
+    }
+
+    /// Commit the release decision before any outward provider byte is sent.
+    #[cfg(test)]
+    pub fn release_incomplete(&self, reason: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.decision["action"] == "pending" && self.grace().is_some() {
+                state.decision = self.incomplete(reason);
+                state.report_ready = true;
+                if let Some(task) = state.task.take() {
+                    task.abort();
+                }
+                self.changed.notify_all();
+                self.notified.notify_waiters();
+            }
+        }
+        self.publish();
     }
 
     pub fn wait(&self) -> Value {
@@ -233,13 +445,11 @@ impl InputGate {
 
     pub fn cancel(&self, failure: Option<Value>) {
         if let Ok(mut state) = self.state.lock() {
-            let unfinished = state.decision["action"] == "pending";
-            if unfinished {
-                state.decision = self.incomplete("cancelled");
-            }
+            let unfinished = state.decision["action"] == "pending" || failure.is_some();
             if let Some(failure) = failure {
-                state.decision["failure"] = denied(json!({"failure": failure}))["failure"].clone();
-                state.decision["action"] = json!("error");
+                state.decision = denied(json!({"action": "error", "failure": failure}));
+            } else if state.decision["action"] == "pending" {
+                state.decision = self.incomplete("cancelled");
             }
             if unfinished {
                 state.report_ready = true;
@@ -248,6 +458,7 @@ impl InputGate {
                 }
             }
             self.changed.notify_all();
+            self.notified.notify_waiters();
         }
         self.publish();
     }
@@ -287,7 +498,38 @@ fn interrupted(observations: Vec<Value>, reason: &str) -> Value {
     decision
 }
 
-async fn run(checks: Vec<Check>, deadline: Instant, progress: Arc<Mutex<Vec<Value>>>) -> Value {
+fn combine(first: Value, second: Value) -> Value {
+    let mut records = first["moderation"]["observations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    records.extend(
+        second["moderation"]["observations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .cloned(),
+    );
+    let mut decision = if second["action"] == "error"
+        || first["moderation"].is_null()
+        || second["moderation"]["status"] == "failed_open"
+    {
+        second
+    } else {
+        first
+    };
+    if !records.is_empty() {
+        decision["moderation"]["observations"] = json!(records);
+    }
+    decision
+}
+
+async fn run(
+    checks: Vec<Check>,
+    deadline: Instant,
+    progress: Arc<Mutex<Vec<Value>>>,
+    mut ready: tokio::sync::watch::Receiver<Option<Instant>>,
+) -> Value {
     if checks.is_empty() {
         return json!({"action": "allow"});
     }
@@ -300,13 +542,7 @@ async fn run(checks: Vec<Check>, deadline: Instant, progress: Arc<Mutex<Vec<Valu
         let started = Instant::now();
         let budget = Duration::from_millis(c.check["timeout_ms"].as_u64().unwrap_or(0))
             .min(deadline.saturating_duration_since(started));
-        let result = tokio::time::timeout(budget, inspect(&c, budget)).await;
-        let incomplete = if result.is_err() {
-            "timeout"
-        } else {
-            "unavailable"
-        };
-        let result = result.unwrap_or(Err(()));
+        let (result, incomplete) = inspect_until_ready(&c, budget, &mut ready).await;
         let outcome = match &result {
             Ok(v) if v["coverage_error"] == true => "unsupported",
             Ok(v) if v["flagged"] == true => "flagged",
@@ -316,7 +552,10 @@ async fn run(checks: Vec<Check>, deadline: Instant, progress: Arc<Mutex<Vec<Valu
         let verdict = result.as_ref().ok();
         let action = if outcome == "flagged" {
             c.check["action"].as_str().unwrap_or("block")
-        } else if !observe && (outcome == "unsupported" || result.is_err()) {
+        } else if !observe
+            && c.policy["input_fail_open"] != true
+            && (outcome == "unsupported" || result.is_err())
+        {
             "error"
         } else {
             "allow"
@@ -361,7 +600,7 @@ async fn run(checks: Vec<Check>, deadline: Instant, progress: Arc<Mutex<Vec<Valu
             }
             _ => None,
         };
-        if !observe {
+        if !observe && c.policy["input_fail_open"] != true {
             if let Some(failure) = failure {
                 let mut decision = denied(failure);
                 decision["moderation"] = json!({"status": "unavailable", "observations": records});
@@ -382,6 +621,52 @@ async fn run(checks: Vec<Check>, deadline: Instant, progress: Arc<Mutex<Vec<Valu
         decision["moderation"]["reason"] = reason;
     }
     decision
+}
+
+/// Watch a one-shot response boundary while retaining the same in-flight classifier.
+async fn inspect_until_ready(
+    check: &Check,
+    budget: Duration,
+    ready: &mut tokio::sync::watch::Receiver<Option<Instant>>,
+) -> (Result<Value, ()>, &'static str) {
+    let deadline = Instant::now() + budget;
+    let grace = (check.policy["mode"] != "observe"
+        && (check.policy["input_fail_open"] == true || check.policy["protected"] == false))
+        .then(|| {
+            Duration::from_millis(
+                check.policy["input_max_wait_ms"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .min(5000),
+            )
+        });
+    let inspection = inspect(check, budget);
+    tokio::pin!(inspection);
+    loop {
+        let release = (*ready.borrow_and_update())
+            .zip(grace)
+            .map(|(at, grace)| at + grace);
+        let until = release.map_or(deadline, |at| at.min(deadline));
+        let reason = if release.is_some_and(|at| at <= deadline) {
+            "response_ready_timeout"
+        } else {
+            "timeout"
+        };
+        if Instant::now() >= until {
+            return (Err(()), reason);
+        }
+        tokio::select! {
+            biased;
+            changed = ready.changed() => {
+                if changed.is_err() { return (Err(()), "cancelled"); }
+            },
+            _ = tokio::time::sleep_until(until.into()) => return (Err(()), reason),
+            result = &mut inspection => {
+                if Instant::now() >= until { return (Err(()), reason); }
+                return (result, "unavailable");
+            }
+        }
+    }
 }
 
 pub(super) async fn inspect(c: &Check, budget: Duration) -> Result<Value, ()> {
@@ -416,7 +701,8 @@ pub(super) async fn inspect(c: &Check, budget: Duration) -> Result<Value, ()> {
         }
         Some("http_json") => {
             let mut adapter = c.adapter.clone();
-            adapter["fail_fast"] = json!(c.policy["mode"] == "observe");
+            adapter["fail_fast"] =
+                json!(c.policy["input_fail_open"] == true || c.policy["mode"] == "observe");
             let result = super::inspection_http::inspect_async(
                 &adapter,
                 c.adapter["payload"].clone(),
@@ -431,7 +717,8 @@ pub(super) async fn inspect(c: &Check, budget: Duration) -> Result<Value, ()> {
         }
         Some("decision_model") => {
             let mut adapter = c.adapter.clone();
-            adapter["fail_fast"] = json!(c.policy["mode"] == "observe");
+            adapter["fail_fast"] =
+                json!(c.policy["input_fail_open"] == true || c.policy["mode"] == "observe");
             super::input_decisions::inspect(&adapter, budget).await
         }
         _ => Err(()),
@@ -495,5 +782,31 @@ impl NativeInputInspection {
             .map_err(|_| PyValueError::new_err("Invalid inspection failure"))?;
         self.inner.cancel(failure);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod interruption_tests {
+    use super::*;
+
+    #[test]
+    fn completed_denials_survive_cancellation_and_deadline_recovery() {
+        for reason in ["cancelled", "timeout"] {
+            for action in ["block", "error"] {
+                let records = vec![
+                    json!({"mode":"enforce", "outcome":"flagged", "action":action, "check_id":"denied-check"}),
+                    json!({"mode":"enforce", "outcome":reason, "action":"error"}),
+                ];
+                let decision = interrupted(records.clone(), reason);
+                assert_eq!(decision["failure"]["failure_class"], "guardrail");
+                assert_eq!(decision["failure"]["safe_details"]["action"], action);
+                assert_eq!(
+                    decision["failure"]["safe_details"]["check_id"],
+                    "denied-check"
+                );
+                assert_eq!(decision["moderation"]["status"], "denied");
+                assert_eq!(decision["moderation"]["observations"], json!(records));
+            }
+        }
     }
 }

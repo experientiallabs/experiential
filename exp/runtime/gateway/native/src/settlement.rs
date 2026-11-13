@@ -567,9 +567,9 @@ impl AttemptGuard {
         if !self.armed {
             return None;
         }
-        let input_failure = match self.input_gate.clone() {
+        let input_failure = match self.input_gate.clone().filter(|_| finalize) {
             Some(gate) => gate
-                .wait(&self.bridge)
+                .response_ready(&self.bridge)
                 .await
                 .and_then(|d| d.require_allow())
                 .err()

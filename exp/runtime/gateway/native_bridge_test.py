@@ -17,6 +17,7 @@ from unittest import mock
 from uuid import uuid4
 
 import pytest
+from exp_gateway_native import NativeInputInspection, NativeSQLiteLedger
 
 import exp.runtime.gateway.native_bridge as native_bridge_module
 from exp.common.core.artifacts import JsonObject, JsonValue
@@ -4361,9 +4362,55 @@ def test_metrics_snapshot_merges_the_injected_data_plane_registry(tmp_path: Path
     assert snapshot["data_plane"] == {"served_requests": 3}
 
 
+def _record_native_moderation_losses(control: NativeControlPlane) -> None:
+    """Produce a failed native storage write and an oversized dropped observation."""
+    path = cast(SQLiteAttemptLedger, control._components.ledger).database_path
+    with connect_sqlite(path) as connection:
+        connection.execute("DROP TABLE gateway_input_moderation")
+    ledger = NativeSQLiteLedger(path)
+    callbacks = ledger.admission(
+        json.dumps({"request_id": "native-metrics", "organization_id": "org-one"})
+    )
+    owner = control._accounting.native
+    for policy_id in ("native-metrics", "large-policy-" * 30_000):
+        inspection = NativeInputInspection(
+            json.dumps(
+                [
+                    {
+                        "policy": {"policy_id": policy_id, "revision": "one", "mode": "observe"},
+                        "check": {"check_id": "check", "action": "allow"},
+                        "adapter": {"kind": "allow"},
+                    }
+                ]
+            ),
+            5,
+        )
+        owner.record_input(inspection, callbacks, "native-metrics")
+        inspection.wait_json()
+    assert owner.close(timeout_seconds=2)
+    counters = json.loads(owner.moderation_recording_json())
+    assert counters == {"dropped": 1, "failed": 1, "pending": 0}
+
+
+def test_metrics_expose_native_recording_losses_without_python_guardrails(tmp_path: Path) -> None:
+    """Native loss counters remain visible when no Python recorder is configured."""
+    control, _raw_key = _control_plane(tmp_path)
+    assert control._guardrails is None
+    _record_native_moderation_losses(control)
+    for _ in range(2):
+        metrics = json.loads(control.metrics_json("{}"))["control_plane"]
+        assert metrics["observation_recording_dropped"] == 1
+        assert metrics["observation_recording_failed"] == 1
+        text = json.loads(control.metrics_text("{}"))["text"]
+        assert "exp_gateway_observation_recording_dropped_total 1\n" in text
+        assert "exp_gateway_observation_recording_failed_total 1\n" in text
+
+
+@pytest.mark.parametrize("native_records", [False, True])
 def test_metrics_expose_actual_observation_sink_failures_and_saturation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    native_records: bool,
 ) -> None:
     """JSON and Prometheus report actual bounded recorder loss without detector diagnostics."""
     control, _raw_key = _control_plane(tmp_path)
@@ -4395,12 +4442,15 @@ def test_metrics_expose_actual_observation_sink_failures_and_saturation(
         engine.record_unsupported_observations((policy,))
         assert started.wait(2)
         engine.record_unsupported_observations((policy,))
+        if native_records:
+            _record_native_moderation_losses(control)
+        expected = 2 if native_records else 1
         metrics = json.loads(control.metrics_json("{}"))["control_plane"]
-        assert metrics["observation_recording_dropped"] == 1
-        assert metrics["observation_recording_failed"] == 1
+        assert metrics["observation_recording_dropped"] == expected
+        assert metrics["observation_recording_failed"] == expected
         text = json.loads(control.metrics_text("{}"))["text"]
-        assert "exp_gateway_observation_recording_dropped_total 1\n" in text
-        assert "exp_gateway_observation_recording_failed_total 1\n" in text
+        assert f"exp_gateway_observation_recording_dropped_total {expected}\n" in text
+        assert f"exp_gateway_observation_recording_failed_total {expected}\n" in text
         assert "private-sink-diagnostic-canary" not in text
     finally:
         release.set()

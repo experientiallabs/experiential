@@ -252,8 +252,8 @@ def test_every_scope_uses_the_same_parallel_approval_and_settlement(
 
 
 @pytest.mark.parametrize("kind", ["provider_native", "provider_server", "tier"])
-def test_effectful_requests_use_the_same_session_before_dispatch(kind: str) -> None:
-    """Provider-executed actions and tier pricing do not overlap unapproved input."""
+def test_configured_parallel_mode_applies_to_tools_and_service_tiers(kind: str) -> None:
+    """Tools and service tiers do not silently replace the configured execution mode."""
     session = _session(_engine(_Classifier("allow")))
     request = _request()
     assert session.can_overlap_input(request)
@@ -271,6 +271,11 @@ def test_effectful_requests_use_the_same_session_before_dispatch(kind: str) -> N
         )
     else:
         request = request.model_copy(update={"service_tier": "priority"})
+    assert session.can_overlap_input(request)
+    session.policies = tuple(
+        policy.model_copy(update={"input_execution": "before_dispatch"})
+        for policy in session.policies
+    )
     assert not session.can_overlap_input(request)
 
 
