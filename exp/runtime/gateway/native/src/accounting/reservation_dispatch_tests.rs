@@ -257,6 +257,7 @@ fn native_first_dial_discloses_the_ejected_lane_it_bypasses() {
         shared.policies.lock().unwrap().health.failed(
             &("revision".into(), "lane-a".into(), "connection".into()),
             &Failure::new(FailureClass::Transport, "refused"),
+            None,
             shared.now(),
         );
     }

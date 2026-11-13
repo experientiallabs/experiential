@@ -42,6 +42,7 @@ pub(super) fn call(
                 Some("last_resort") => Claim::LastResort,
                 Some("forced") => Claim::Forced,
                 Some("throttle_redial") => Claim::ThrottleRedial,
+                Some("throttle_probe") => Claim::ThrottleProbe,
                 _ => return Err(PublicError::internal()),
             };
             json!(p
@@ -49,19 +50,36 @@ pub(super) fn call(
                 .claim(&field::<HealthKey>(&data, "key")?, mode, now))
         }
         "health_release" => {
-            p.health.release(&field::<HealthKey>(&data, "key")?);
+            p.health.release(
+                &field::<HealthKey>(&data, "key")?,
+                data["attempt_id"].as_str(),
+            );
+            Value::Null
+        }
+        "health_bind_throttle_probe" => {
+            p.health.bind_throttle_probe(
+                &field::<HealthKey>(&data, "key")?,
+                &field::<String>(&data, "attempt_id")?,
+                field(&data, "probe")?,
+                now,
+            );
             Value::Null
         }
         "health_failed" => {
             p.health.failed(
                 &field::<HealthKey>(&data, "key")?,
                 &field::<Failure>(&data, "failure")?,
+                data["attempt_id"].as_str(),
                 now,
             );
             Value::Null
         }
         "health_succeeded" => {
-            p.health.succeeded(&field::<HealthKey>(&data, "key")?);
+            p.health.succeeded(
+                &field::<HealthKey>(&data, "key")?,
+                data["attempt_id"].as_str(),
+                now,
+            );
             Value::Null
         }
         "health_exhausted" => {

@@ -109,3 +109,6 @@ mod reservation_dispatch_tests;
 
 #[cfg(test)]
 mod budget_dispatch_tests;
+
+#[cfg(test)]
+mod throttle_probe_tests;

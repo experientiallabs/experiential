@@ -3,7 +3,7 @@
 //! The owner serializes access. Monotonic seconds are supplied by that owner so
 //! replay tests can exercise the same boundary instants as the admission policy.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::Deserialize;
 
@@ -75,6 +75,8 @@ struct Circuit {
     /// End of the throttle windows observed after `account` was recorded; only
     /// these, never an older window, outrank the recorded account failure.
     newer_throttle_until: f64,
+    stated_throttle_until: f64,
+    probe_attempts: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -89,6 +91,7 @@ pub(super) struct Health {
     policy: Policy,
     circuits: HashMap<HealthKey, Circuit>,
     lanes: HashMap<LaneKey, Lane>,
+    probe_paced_at: HashMap<LaneKey, f64>,
 }
 
 #[derive(Clone, Copy)]
@@ -97,6 +100,7 @@ pub(super) enum Claim {
     LastResort,
     Forced,
     ThrottleRedial,
+    ThrottleProbe,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -126,6 +130,7 @@ impl Health {
             policy,
             circuits: HashMap::new(),
             lanes: HashMap::new(),
+            probe_paced_at: HashMap::new(),
         })
     }
 
@@ -150,7 +155,20 @@ impl Health {
         if matches!(mode, Claim::ThrottleRedial) {
             return state.open_until <= now;
         }
-        if state.throttle_until > now {
+        if matches!(mode, Claim::ThrottleProbe) {
+            if state.throttle_until <= now || state.stated_throttle_until > now {
+                return false;
+            }
+            let physical = lane(key);
+            if self
+                .probe_paced_at
+                .get(&physical)
+                .is_some_and(|last| now - last < 1.0)
+            {
+                return false;
+            }
+            self.probe_paced_at.insert(physical, now);
+        } else if state.throttle_until > now {
             return false;
         }
         match mode {
@@ -171,7 +189,7 @@ impl Health {
                 }
                 state.last_resort = true;
             }
-            Claim::Forced => (),
+            Claim::Forced | Claim::ThrottleProbe => (),
             Claim::ThrottleRedial => unreachable!(),
         }
         if let Some(state) = self.lanes.get_mut(&lane(key)) {
@@ -187,21 +205,44 @@ impl Health {
         true
     }
 
+    /// Bind a no-failure reservation to the hintless window current at reservation.
+    pub fn bind_throttle_probe(&mut self, key: &HealthKey, id: &str, probe: bool, now: f64) {
+        if !probe {
+            return;
+        }
+        if let Some(state) = self.circuits.get_mut(key) {
+            if state.throttle_until > now && state.stated_throttle_until <= now {
+                state.probe_attempts.insert(id.into());
+            }
+        }
+    }
+
     /// An opened response and a successful terminal restore the circuit equally.
-    pub fn succeeded(&mut self, key: &HealthKey) {
+    pub fn succeeded(&mut self, key: &HealthKey, attempt: Option<&str>, now: f64) {
         let state = self.circuits.entry(key.clone()).or_default();
         state.failures = 0;
         state.open_until = 0.0;
         state.half_open = false;
         state.last_resort = false;
         state.account = None;
+        if attempt.is_some_and(|id| state.probe_attempts.remove(id))
+            && state.throttle_until > now
+            && state.stated_throttle_until <= now
+        {
+            state.throttle_until = state.stated_throttle_until;
+            state.newer_throttle_until =
+                state.newer_throttle_until.min(state.stated_throttle_until);
+        }
         self.lanes.remove(&lane(key));
         // Provider quota windows survive an otherwise successful response.
     }
 
-    pub fn failed(&mut self, key: &HealthKey, failure: &Failure, now: f64) {
+    pub fn failed(&mut self, key: &HealthKey, failure: &Failure, attempt: Option<&str>, now: f64) {
         self.lane_failed(key, failure, now);
         let state = self.circuits.entry(key.clone()).or_default();
+        if let Some(id) = attempt {
+            state.probe_attempts.remove(id);
+        }
         state.half_open = false;
         state.last_resort = false;
         match cause(failure.failure_class) {
@@ -213,6 +254,10 @@ impl Health {
                     });
                 state.throttle_until = state.throttle_until.max(now + window);
                 state.newer_throttle_until = state.newer_throttle_until.max(now + window);
+                state.probe_attempts.clear();
+                if failure.retry_after_seconds.is_some() {
+                    state.stated_throttle_until = state.stated_throttle_until.max(now + window);
+                }
             }
             Some(Cause::Credential) => {
                 state.failures = self.policy.failure_threshold;
@@ -246,6 +291,7 @@ impl Health {
         let window_end = now + reset_seconds.clamp(5.0, 8.0 * 86400.0);
         state.throttle_until = state.throttle_until.max(window_end);
         state.newer_throttle_until = state.newer_throttle_until.max(window_end);
+        state.stated_throttle_until = state.stated_throttle_until.max(window_end);
     }
 
     pub fn suppressed(&self, key: &HealthKey, now: f64) -> bool {
@@ -285,10 +331,13 @@ impl Health {
         first.cloned()
     }
 
-    pub fn release(&mut self, key: &HealthKey) {
+    pub fn release(&mut self, key: &HealthKey, attempt: Option<&str>) {
         if let Some(state) = self.circuits.get_mut(key) {
             state.half_open = false;
             state.last_resort = false;
+            if let Some(id) = attempt {
+                state.probe_attempts.remove(id);
+            }
         }
         if let Some(state) = self.lanes.get_mut(&lane(key)) {
             state.probe_started = None;

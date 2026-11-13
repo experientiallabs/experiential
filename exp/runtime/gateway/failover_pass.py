@@ -44,10 +44,14 @@ from exp.runtime.gateway.contracts import (
     GatewayFailure,
     GatewayFailureClass,
 )
-from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
+from exp.runtime.gateway.health import (
+    DeploymentHealthKey,
+    DeploymentHealthRegistry,
+    claim_route_from,
+)
 from exp.runtime.gateway.lane_ejection import DEAD_LANE_FAILURES
 from exp.runtime.gateway.lane_saturation import lane_saturated_failure
-from exp.runtime.gateway.native_execution import InflightRequest, claim_route_from
+from exp.runtime.gateway.native_execution import InflightRequest
 from exp.runtime.gateway.native_fallback_rules import route_fallback_rules, untried_depths
 from exp.runtime.gateway.rung_admission import RungShed
 
@@ -236,6 +240,8 @@ def sideways_claim(
     keys: tuple[DeploymentHealthKey, ...],
     ladder: tuple[int, ...],
     candidate: int,
+    *,
+    throttle_probe: bool = False,
 ) -> int | None:
     """Claim where a shed or skipped ``candidate`` spills.
 
@@ -246,10 +252,42 @@ def sideways_claim(
         keys: One health key per route depth.
         ladder: The reservation's eligible depths (used without a failover).
         candidate: The depth that shed or was skipped.
+        throttle_probe: Whether the spill may take a paced probe through a
+            hintless throttle window (a dial with no failure of its own).
 
     Returns:
         The next claimed depth, or ``None`` when nothing is left.
     """
     if failover is None:
-        return claim_route_from(health, keys, candidate + 1, ladder)
+        return claim_route_from(health, keys, candidate + 1, ladder, throttle_probe=throttle_probe)
     return failover.sideways(health, keys, candidate)
+
+
+def no_failure_claim(
+    health: DeploymentHealthRegistry,
+    keys: tuple[DeploymentHealthKey, ...],
+    ladder: tuple[int, ...],
+    *,
+    selected_first: bool,
+    start: int,
+) -> int | None:
+    """Claim for a dial with no failure of its own (a first dial, a tool or repair turn).
+
+    A caller-selected first dial may take only its lead, through a healthy
+    claim. Every other such dial walks the ladder and, when every candidate
+    sits in a throttle window, may take one paced probe through a hintless
+    one (``DeploymentHealthRegistry.claim_throttle_probe``).
+
+    Args:
+        health: The worker's circuit registry.
+        keys: One health key per route depth.
+        ladder: The depths this dial may claim.
+        selected_first: Whether this is a caller-selected route's first dial.
+        start: The first depth eligible for the claim.
+
+    Returns:
+        The claimed depth, or ``None`` when nothing is claimable.
+    """
+    if selected_first:
+        return 0 if health.claim(keys[0]) else None
+    return claim_route_from(health, keys, start, ladder, throttle_probe=True)

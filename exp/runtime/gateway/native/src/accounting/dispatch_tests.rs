@@ -171,7 +171,7 @@ fn exhaust_first_dial(config: Registration, failure: &Failure) -> (Value, Vec<(S
         .lock()
         .unwrap()
         .health
-        .failed(&lead, failure, shared.now());
+        .failed(&lead, failure, None, shared.now());
     let exhausted = owner
         .call(
             "start_attempt",
@@ -199,6 +199,7 @@ fn exhausted_requests_keep_their_terminal_until_cleanup_is_acknowledged() {
     shared.policies.lock().unwrap().health.failed(
         &("revision".into(), "lane-a".into(), "connection".into()),
         &failure,
+        None,
         shared.now(),
     );
     let exhausted = owner

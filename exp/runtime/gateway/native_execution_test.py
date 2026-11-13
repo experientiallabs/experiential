@@ -20,13 +20,16 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
-from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
+from exp.runtime.gateway.health import (
+    DeploymentHealthKey,
+    DeploymentHealthRegistry,
+    claim_route_from,
+)
 from exp.runtime.gateway.native_execution import (
     THROTTLE_BACKOFF,
     THROTTLE_FAILOVER_COLD,
     THROTTLE_SURFACED_CACHE_PRESERVING,
     InflightRequest,
-    claim_route_from,
     deployment_wire_entry,
     dispatch_disclosure,
     next_route_candidate,
