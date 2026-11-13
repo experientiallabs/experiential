@@ -200,10 +200,11 @@ def study_identity(spec: ContinuationStudySpec, code_revision: str) -> str:
         The registration identity; branches and the result extend it with suffixes.
     """
     identity = stable_id("continuation-study", {"spec": sha256_json(spec), "code": code_revision})
-    if identity in redrawn_studies():
+    redrawn = redrawn_studies()
+    while identity in redrawn:
         # An operator-named group whose attempts failed operationally is drawn afresh under
-        # a new identity; the failed group stays in the store as evidence.
-        return stable_id(
+        # a new identity (a named redraw is redrawn again); failed groups stay as evidence.
+        identity = stable_id(
             "continuation-study",
             {"spec": sha256_json(spec), "code": code_revision, "redraw_of": identity},
         )
