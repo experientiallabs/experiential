@@ -12,8 +12,10 @@ Family authoring and record export live in ``pipeline_families`` and ``pipeline_
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import math
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -852,8 +854,9 @@ class _MiningStage:
             embedder = retrieval_embedder(context, build.index)
         tiers: list[TierMining] = []
         references: list[ArtifactInput] = [rubric, *(() if packet is None else (packet,))]
-        for alias in pickable:
-            tier = self._tier(
+
+        def mine(alias: str) -> TierMining:
+            return self._tier(
                 context,
                 _Tier(
                     exposure,
@@ -870,6 +873,17 @@ class _MiningStage:
                 build,
                 embedder,
             )
+
+        # Tiers are independent (never pooled), so they mine at once; results keep tier order
+        # and identities are unchanged. Every tier finishes (its work is saved) before the
+        # first failure, in tier order, is raised.
+        with ThreadPoolExecutor(max_workers=max(1, len(pickable))) as pool:
+            futures = [
+                pool.submit(contextvars.copy_context().run, mine, alias) for alias in pickable
+            ]
+            wait(futures)
+        for future in futures:
+            tier = future.result()
             tiers.append(tier)
             references.extend((tier.report, tier.judged_group, tier.job.study.checkpoint))
             if tier.behavior_differences is not None:
