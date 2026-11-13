@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,10 +13,12 @@ from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, sha256_js
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.continuations.job_test import job_fixture
+from exp.optimize.evaluation.variance import crosstalk as crosstalk_module
 from exp.optimize.evaluation.variance.crosstalk import (
     CROSSTALK_EXEMPLARS_TYPE,
     CROSSTALK_RESULT_TYPE,
     CROSSTALK_SPEC_TYPE,
+    ArmResult,
     ContinuationProbeBackend,
     CrosstalkProbeSpec,
     ExemplarSet,
@@ -312,3 +315,40 @@ def test_file_delivery_needs_a_delivery_function(
         file_delivery=lambda job, ref: job.model_copy(update={"system_prompt": ref.artifact_id}),
     ).deliver(file_spec.targets[0], exemplars, reference, file_spec)
     assert delivered.system_prompt == "exemplars"
+
+
+def test_target_arms_run_at_once_and_keep_their_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every target arm is in flight together, yet arms and the result keep a loop's order."""
+    rewards: dict[str, tuple[float | None, ...]] = {
+        "none": (0.0,) * 8,
+        "random": (0.0,) * 7 + (1.0,),
+        "top": (1.0,) * 7 + (None,),
+    }
+    project, spec = _spec(tmp_path / "serial", monkeypatch)
+    monkeypatch.setattr(crosstalk_module, "CROSSTALK_CONCURRENCY", 1)
+    _, serial = run_crosstalk_probe(
+        project, spec, code_revision="test", backend=_Backend(rewards=rewards)
+    )
+    monkeypatch.setattr(crosstalk_module, "CROSSTALK_CONCURRENCY", 6)
+    project, spec = _spec(tmp_path / "parallel", monkeypatch)
+    barrier = threading.Barrier(3, timeout=30)
+
+    class _Together(_Backend):
+        def run(self, job: ContinuationJob) -> ProbeRun:
+            if _arm_of(job) != "source":
+                barrier.wait()  # all three arms must be running at once
+            return super().run(job)
+
+    _, result = run_crosstalk_probe(
+        project, spec, code_revision="test", backend=_Together(rewards=rewards)
+    )
+    assert [arm.arm for arm in result.arms] == ["none", "random", "top"]
+
+    def shape(arms: tuple[ArmResult, ...]) -> list[tuple[object, ...]]:
+        return [(a.target, a.arm, a.planned, a.scored, a.successes, a.bounds) for a in arms]
+
+    assert shape(result.arms) == shape(serial.arms)
+    assert [c.summary for c in result.contrasts] == [c.summary for c in serial.contrasts]
+    assert result.verdict == serial.verdict

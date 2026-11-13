@@ -59,6 +59,7 @@ from exp.optimize.evaluation.continuations.job import (
     saved_continuation_job,
 )
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
+from exp.optimize.evaluation.variance.actor_critic import admitted_concurrency
 from exp.optimize.evaluation.variance.contracts import (
     DecisionOption,
     DecisionState,
@@ -590,7 +591,12 @@ def free_continuations(
         execute_continuation_job(project, bound, code_revision=code_revision)
     reference = continuation_result_reference(project, bound, code_revision=code_revision)
     return judge_study(
-        project, reference, judge, configuration=bound.configuration, code_revision=code_revision
+        project,
+        reference,
+        judge,
+        configuration=bound.configuration,
+        code_revision=code_revision,
+        concurrency=admitted_concurrency(project, judge.settings.model_alias),
     )
 
 

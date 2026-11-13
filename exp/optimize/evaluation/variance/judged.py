@@ -49,7 +49,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.core.locks import CoordinationLock
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation.continuations.action_contrast import ActionContrast
+from exp.optimize.evaluation.continuations.action_contrast import ActionContrast, ContrastCell
 from exp.optimize.evaluation.continuations.intervention import ActionIntervention
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.study import ContinuationBranch
@@ -433,6 +433,7 @@ def judge_cells(
     judge: EpisodeJudge,
     *,
     code_revision: str,
+    concurrency: int = 1,
 ) -> tuple[JudgedCell, ...]:
     """Judge every cell of one saved action contrast once: its imposed action, then its suffix.
 
@@ -442,6 +443,7 @@ def judge_cells(
         reference: Its saved result reference.
         judge: The frozen judge and its admitted settings.
         code_revision: Producing source identity.
+        concurrency: Most cells judged at once (the judge's host admission bound).
 
     Returns:
         One judged cell per planned cell, in plan order.
@@ -455,8 +457,9 @@ def judge_cells(
     checkpoint = load_continuation_checkpoint(store, spec.base.study.checkpoint)
     require_run(judge, checkpoint, spec.base.configuration)
     prefix = reference.artifact_id.removesuffix("-result")
-    cells: list[JudgedCell] = []
-    for index, cell in enumerate(contrast.cells):
+
+    def judged(index: int, cell: ContrastCell) -> JudgedCell:
+        """Judge one cell, or record why its evidence cannot be judged."""
         episode_id = f"{prefix}-cell-{index}"
         try:
             intervention = (
@@ -485,8 +488,16 @@ def judge_cells(
             slot = JudgedSlot(position=index, gap=_reason(error))
         else:
             slot = _judge(project, judge, evidence, index, code_revision)
-        cells.append(JudgedCell(contrast=reference, pair=cell.pair, arm=cell.arm, slot=slot))
-    return tuple(cells)
+        return JudgedCell(contrast=reference, pair=cell.pair, arm=cell.arm, slot=slot)
+
+    # Cells are judged independently, each under its own episode id; order is plan order.
+    return run_at_once(
+        [
+            lambda index=index, cell=cell: judged(index, cell)
+            for index, cell in enumerate(contrast.cells)
+        ],
+        concurrency,
+    )
 
 
 def assessment_inputs(slots: Sequence[JudgedSlot]) -> tuple[ArtifactInput, ...]:

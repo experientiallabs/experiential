@@ -703,6 +703,11 @@ def _execute_reasking(session: EnvironmentSession, action: ToolCall) -> Observat
     raise AssertionError("unreachable")
 
 
+def study_worker_count() -> int:
+    """Return how many units of one study (branches, contrast cells) may run at once here."""
+    return _WORKERS.get()
+
+
 @contextmanager
 def study_workers(workers: int) -> Iterator[None]:
     """Run up to ``workers`` branches of each study at once inside this block.

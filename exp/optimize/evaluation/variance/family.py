@@ -98,11 +98,13 @@ from exp.optimize.evaluation.variance.authors import (
     relevant_questions,
     relevant_rules,
 )
+from exp.optimize.evaluation.variance.bounded import run_keyed
 from exp.optimize.evaluation.variance.coalition import CoalitionEvidence
 from exp.optimize.evaluation.variance.contracts import (
     ActorView,
     DecisionState,
     EstimationPoint,
+    Scenario,
     ScenarioLimits,
     StatePart,
     message_texts,
@@ -712,24 +714,34 @@ def _continue(
         return _finish(family, base, findings, relied, failure=f"frozen start: {error}")
     jobs = {sid: variant_job(base.job, start) for sid, start in starts.items()}
     frozen = {sid: start[0] for sid, start in starts.items() if start is not None}
-    variants = [
-        run_variant(
-            project,
-            job=jobs[scenario.scenario_id],
-            base=base.checkpoint,
-            boundaries=boundaries,
-            decision=state,
-            scenario=scenario,
-            actions=mapping,
-            facts=spec.facts,
-            repeats=spec.repeats,
-            judge=judging[scenario.scenario_id].judge,
-            code_revision=code_revision,
-            required_state=frozenset(spec.required_state),
-            frozen=frozen.get(scenario.scenario_id),
+    # Scenarios are independent variants (own checkpoint, witness and contrast), so they run at
+    # once; ones that could share a saved identity (same frozen start, or the same edits without
+    # one) run in order on one worker. Results keep scenario order.
+    ordered = scenarios.scenarios.scenarios
+    variants = list(
+        run_keyed(
+            [
+                lambda scenario=scenario: run_variant(
+                    project,
+                    job=jobs[scenario.scenario_id],
+                    base=base.checkpoint,
+                    boundaries=boundaries,
+                    decision=state,
+                    scenario=scenario,
+                    actions=mapping,
+                    facts=spec.facts,
+                    repeats=spec.repeats,
+                    judge=judging[scenario.scenario_id].judge,
+                    code_revision=code_revision,
+                    required_state=frozenset(spec.required_state),
+                    frozen=frozen.get(scenario.scenario_id),
+                )
+                for scenario in ordered
+            ],
+            [_variant_key(scenario, frozen.get(scenario.scenario_id)) for scenario in ordered],
+            max(1, len(ordered)),
         )
-        for scenario in scenarios.scenarios.scenarios
-    ]
+    )
     for row in variants:
         findings.extend(
             audit_finding(
@@ -792,22 +804,37 @@ def _continue(
             rungs = () if isinstance(built, str) else built[2]
             base = base.model_copy(update={"ladder": ladder, "rungs": rungs})
     if selection.qualifies and admitted:
-        variants = [
-            confirm_variant(
-                project,
-                job=jobs[row.scenario_id],
-                decision=state,
-                row=row,
-                actions=mapping,
-                seed=spec.confirmation_seed,
-                repeats=spec.confirmation_repeats,
-                judge=judging[row.scenario_id].judge,
-                code_revision=code_revision,
-            )
-            if row.scenario_id in winners
-            else row
-            for row in variants
-        ]
+        # Each winner confirms from its own decision checkpoint, so winners confirm at once;
+        # winners sharing a checkpoint confirm in order on one worker.
+        confirmed = run_keyed(
+            [
+                lambda row=row: (
+                    confirm_variant(
+                        project,
+                        job=jobs[row.scenario_id],
+                        decision=state,
+                        row=row,
+                        actions=mapping,
+                        seed=spec.confirmation_seed,
+                        repeats=spec.confirmation_repeats,
+                        judge=judging[row.scenario_id].judge,
+                        code_revision=code_revision,
+                    )
+                    if row.scenario_id in winners
+                    else row
+                )
+                for row in variants
+            ],
+            [
+                str(
+                    None if row.decision_checkpoint is None else row.decision_checkpoint.artifact_id
+                )
+                + ("" if row.scenario_id in winners else "|" + row.scenario_id)
+                for row in variants
+            ],
+            max(1, len(variants)),
+        )
+        variants = list(confirmed)
         confirmation = family_flip(
             {r.scenario_id: r.confirmation for r in variants if r.confirmation is not None},
             [s for s in scenarios.scenarios.scenarios if s.scenario_id in winners],
@@ -836,6 +863,18 @@ def _continue(
         contrasted=contrasted,
         failure=grading_failure,
         measure=measure if measure is not None else base.decision_variance,
+    )
+
+
+def _variant_key(scenario: Scenario, frozen: ArtifactInput | None) -> str:
+    """Return what two scenarios must share to possibly work one saved identity."""
+    if frozen is not None:
+        return "frozen:" + frozen.artifact_id
+    return "edits:" + sha256_json(
+        {
+            "edits": [edit.model_dump(mode="json") for edit in scenario.edits],
+            "initialization": scenario.initialization,
+        }
     )
 
 

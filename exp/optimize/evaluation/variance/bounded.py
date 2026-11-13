@@ -29,3 +29,31 @@ def run_at_once[T](calls: Sequence[Callable[[], T]], concurrency: int) -> tuple[
             for future in futures:
                 future.cancel()
         return tuple(future.result() for future in futures)
+
+
+def run_keyed[T](
+    calls: Sequence[Callable[[], T]], keys: Sequence[str], concurrency: int
+) -> tuple[T, ...]:
+    """Return every call's result in input order, running calls with distinct keys at once.
+
+    Calls sharing a key (they may work the same saved identity, whose lock refuses a second
+    holder) run one after another, in input order, on one worker; distinct keys run at once,
+    at most ``concurrency`` in flight, with :func:`run_at_once`'s failure handling.
+
+    Raises:
+        ValueError: The bound is not positive or the keys do not match the calls.
+    """
+    if len(keys) != len(calls):
+        raise ValueError("every call needs one key")
+    if concurrency == 1:
+        return run_at_once(calls, 1)
+    groups: dict[str, list[int]] = {}
+    for index, key in enumerate(keys):
+        groups.setdefault(key, []).append(index)
+    members = list(groups.values())
+    done = run_at_once(
+        [lambda rows=rows: [(row, calls[row]()) for row in rows] for rows in members],
+        concurrency,
+    )
+    results: dict[int, T] = dict(pair for group in done for pair in group)
+    return tuple(results[index] for index in range(len(calls)))
