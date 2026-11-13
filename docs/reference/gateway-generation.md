@@ -436,6 +436,11 @@ documents: `false` becomes `reasoning.exclude: true` (disclosed as
 omission policy, `reasoning.exclude->dropped(not_carried)`), while `true` (the default) and `null`
 are consumed silently. A value contradicting an explicit `reasoning.exclude` is a 400 naming both.
 
+The Responses `reasoning.summary` that clients reuse on Chat (`auto`, `concise`, `detailed`, `none`)
+is accepted and never forwarded: Chat has no summary control, so it is disclosed as
+`reasoning.summary->ignored(not_supported)`. `null` is consumed silently and any other value is a 400
+`invalid_parameter` naming `reasoning.summary`. Messages has no `reasoning` object.
+
 ## Truncated tools
 
 Streaming tool argument fragments retain their order and bytes. Missing arguments, an empty

@@ -126,6 +126,16 @@ https://openrouter.ai/docs/guides/best-practices/reasoning-tokens, read
 2026-10-24). ``true`` asks for the default (reasoning returned where the model
 produces it) and ``null`` for nothing, so both are removed without disclosure."""
 
+REASONING_SUMMARY_IGNORED = "reasoning.summary->ignored(not_supported)"
+"""Disclosure recorded when a Chat ``reasoning.summary`` preference is removed.
+
+``summary`` (``auto``, ``concise``, ``detailed``) is the OpenAI Responses control
+for the reasoning summary; clients reuse the object on Chat Completions, whose
+reasoning channel has no summary control, so the preference has nothing to
+configure and is never forwarded."""
+
+_CHAT_REASONING_SUMMARIES = frozenset({"auto", "concise", "detailed", "none"})
+
 USAGE_INCLUDE_TRANSLATED = "usage.include->translated(stream_options.include_usage)"
 """Disclosure recorded when ``usage.include: true`` turns on the stream's usage chunk.
 
@@ -667,6 +677,38 @@ def drop_chat_thinking_display(payload: JsonObject) -> tuple[JsonObject, tuple[s
     return {**payload, "thinking": stripped}, disclosures
 
 
+def drop_chat_reasoning_summary(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
+    """Remove the Responses-only ``summary`` key from a Chat ``reasoning`` object.
+
+    ``null`` is removed silently; ``auto``, ``concise``, ``detailed`` and
+    ``none`` are removed with a disclosure. A ``reasoning`` that is not an
+    object keeps its own refusal from the wire model.
+
+    Args:
+        payload: Parsed Chat Completions body.
+
+    Returns:
+        The payload without ``reasoning.summary``, plus its disclosure.
+
+    Raises:
+        OpenAIProtocolError: ``summary`` is neither null nor one of the values.
+    """
+    reasoning = payload.get("reasoning")
+    if not isinstance(reasoning, dict) or "summary" not in reasoning:
+        return payload, ()
+    summary = reasoning["summary"]
+    if summary is not None and (
+        not isinstance(summary, str) or summary not in _CHAT_REASONING_SUMMARIES
+    ):
+        raise invalid_field(
+            "reasoning.summary",
+            "'reasoning.summary' must be one of auto, concise, detailed or none.",
+        )
+    stripped = {key: value for key, value in reasoning.items() if key != "summary"}
+    disclosures = () if summary is None else (REASONING_SUMMARY_IGNORED,)
+    return {**payload, "reasoning": stripped}, disclosures
+
+
 def translate_chat_include_reasoning(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
     """Consume OpenRouter's deprecated ``include_reasoning`` boolean on a Chat request.
 
@@ -863,6 +905,7 @@ def repair_chat(
     payload, hints = drop_unforwarded_hints(payload)
     payload, stream = drop_chat_stream_options_without_stream(payload)
     payload, display = drop_chat_thinking_display(payload)
+    payload, reasoning_summary = drop_chat_reasoning_summary(payload)
     payload, include_reasoning = translate_chat_include_reasoning(payload)
     payload, usage = accept_chat_usage_accounting(payload)
     payload = accept_chat_output_modalities(payload)
@@ -875,6 +918,7 @@ def repair_chat(
         *hints,
         *stream,
         *display,
+        *reasoning_summary,
         *include_reasoning,
         *usage,
     )
