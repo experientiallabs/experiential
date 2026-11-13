@@ -58,9 +58,16 @@ const MISSING_KEY_HELP =
   "No Experiential gateway key found. Run `exp-code login` to sign in through your browser, " +
   "or set EXP_API_KEY to an xpl_ key for the hosted gateway (EXP_GATEWAY_KEY for a local `exp` gateway).";
 
+/** Drop trailing slashes in linear time (a regex like `/\/+$/` backtracks on long slash runs). */
+export function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end -= 1;
+  return value.slice(0, end);
+}
+
 /** Remove trailing slashes so path joins stay predictable. */
 export function trimBaseUrl(url: string): string {
-  return url.trim().replace(/\/+$/, "");
+  return trimTrailingSlashes(url.trim());
 }
 
 /**

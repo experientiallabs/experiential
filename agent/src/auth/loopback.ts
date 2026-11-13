@@ -11,6 +11,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { trimTrailingSlashes } from "../gateway/config.js";
 
 /** The platform the approval page lives on. */
 export const PLATFORM_DEFAULT_URL = "https://platform.experientiallabs.ai";
@@ -23,7 +24,7 @@ export const KEY_NAME_MAX_LENGTH = 80;
 
 /** The platform origin, without a trailing slash. */
 export function platformUrl(env: NodeJS.ProcessEnv): string {
-  const configured = env[PLATFORM_URL_ENV]?.trim().replace(/\/+$/, "") ?? "";
+  const configured = trimTrailingSlashes(env[PLATFORM_URL_ENV]?.trim() ?? "");
   return configured !== "" ? configured : PLATFORM_DEFAULT_URL;
 }
 
@@ -42,7 +43,7 @@ export function newState(): string {
 
 /** The approval URL. Without a port the page shows the key for pasting instead of handing it back. */
 export function authorizeUrl(platform: string, options: { state: string; port?: number; keyName: string }): string {
-  const url = new URL(`${platform.replace(/\/+$/, "")}/cli/auth`);
+  const url = new URL(`${trimTrailingSlashes(platform)}/cli/auth`);
   url.searchParams.set("state", options.state);
   if (options.port !== undefined) url.searchParams.set("port", String(options.port));
   url.searchParams.set("name", options.keyName);
@@ -92,7 +93,7 @@ export class LoopbackLogin {
   private waiters: ((key: string | null) => void)[] = [];
 
   constructor(platform: string, state: string = newState()) {
-    this.platform = platform.replace(/\/+$/, "");
+    this.platform = trimTrailingSlashes(platform);
     this.state = state;
   }
 
