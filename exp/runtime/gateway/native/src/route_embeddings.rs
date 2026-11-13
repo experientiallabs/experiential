@@ -107,7 +107,7 @@ pub(crate) async fn embeddings(
         Ok(text) => text,
         Err(error) => return error_response(&error),
     };
-    let admission_value: Value = match serde_json::from_str(&admission_text) {
+    let admission_value: Value = match crate::lossless_json::from_str(&admission_text) {
         Ok(value) => value,
         Err(_) => return error_response(&PublicError::internal()),
     };
@@ -117,10 +117,16 @@ pub(crate) async fn embeddings(
         // startup validation guarantees native servability, so fail closed.
         return error_response(&escalation_error(reason.as_str().unwrap_or_default()));
     }
-    let admission: EmbeddingsAdmission = match serde_json::from_value(admission_value.clone()) {
-        Ok(admission) => admission,
-        Err(_) => return wire_drift_response(&state, &admission_value, started).await,
+    let state = match crate::admission::bind_owner(&state, &admission_value) {
+        Ok(state) => state,
+        Err(error) => return error_response(&error),
     };
+
+    let admission: EmbeddingsAdmission =
+        match crate::lossless_json::from_value(admission_value.clone()) {
+            Ok(admission) => admission,
+            Err(_) => return wire_drift_response(&state, &admission_value, started).await,
+        };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
     let permit = match acquire_permit(&state, &mut guard, deadline, None).await {
         Ok(permit) => permit,
@@ -184,7 +190,7 @@ async fn run_ladder(
                 return Err(error);
             }
         };
-        let started: StartResponse = match serde_json::from_str(&started_text) {
+        let started: StartResponse = match crate::lossless_json::from_str(&started_text) {
             Ok(started) => started,
             Err(_) => {
                 guard
@@ -309,7 +315,7 @@ async fn dispatch(
     let bytes = read_bounded_body(response, deadline, phase_timeout)
         .await
         .map_err(|failure| (failure, true))?;
-    let payload: Value = match serde_json::from_slice(&bytes) {
+    let payload: Value = match crate::lossless_json::from_slice(&bytes) {
         Ok(payload) => payload,
         Err(_) => return Err((malformed("embeddings response is not JSON"), true)),
     };

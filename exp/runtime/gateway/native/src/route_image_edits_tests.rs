@@ -47,7 +47,7 @@ class Control:
 
 fn state() -> AppState {
     AppState {
-        bridge: Arc::new(crate::bridge::Bridge::new(plane(), 2).unwrap()),
+        bridge: Arc::new(crate::bridge::Bridge::scripted(plane(), 2).unwrap()),
         http: crate::upstream::build_client(Duration::from_secs(1), false).unwrap(),
         permits: Arc::new(tokio::sync::Semaphore::new(2)),
         dispatch_capacity: Arc::new(crate::dispatch_capacity::DispatchCapacity::new()),
@@ -69,7 +69,7 @@ fn state() -> AppState {
 
 fn bound(base: &AppState, target: &Py<PyAny>) -> AppState {
     let handle = Python::attach(|py| {
-        ExecutionHandle::new(target.clone_ref(py), 1, 2, 1, &PyDict::new(py), None)
+        ExecutionHandle::new(target.clone_ref(py), 1, 2, 1, &PyDict::new(py), None, None)
     })
     .unwrap();
     let bindings = ExecutionBindings::new(1).unwrap();

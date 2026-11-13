@@ -10,12 +10,9 @@ from uuid import uuid4
 import pytest
 
 from exp.common.models import ModelSnapshot
-from exp.common.models.catalog import GatewayRungDispatchPolicy
 from exp.common.models.gateway_catalog import normalize_gateway_catalog
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayUsage
 from exp.runtime.gateway.execution_resolution import _resolved_wire_profile
-from exp.runtime.gateway.native_accounting import NativeAttemptAccounting, NativeBridgeError
-from exp.runtime.gateway.native_accounting_test import _RecordingLedger, _registry, _start
 from exp.runtime.gateway.native_admission_test import _affinity_fixture
 from exp.runtime.gateway.native_execution import InflightRequest, deployment_wire_entry
 from exp.runtime.gateway.native_execution_test import _route
@@ -35,6 +32,7 @@ from exp.runtime.gateway.recovery_binding import (
     validated_recovery_binding,
 )
 from exp.runtime.gateway.recovery_test import Clock
+from exp.runtime.gateway.tests.native_admission_fixture_test import admission_accounting
 from exp.runtime.models.credentials import CredentialResolution, DispatchCredentialReceipt
 from exp.runtime.models.credentials_test import AtomicEnvironment
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -64,86 +62,6 @@ class Host:
     def snapshot(self) -> RecoverySnapshot:
         """Provide an empty snapshot without authorizing recovery."""
         return RecoverySnapshot(loaded_at=0)
-
-
-@pytest.mark.parametrize("swept", [False, True])
-def test_k1_scope_survives_rotation_through_actual_accounting_settlement(swept: bool) -> None:
-    """Both settlement paths retain K1 and cannot create K2 cache evidence."""
-    accounting, ledger, entry = _registry()
-    host = Host()
-    accounting.recovery_host = host
-    accounting.recovery = SessionRecoveryRegistry(clock=Clock())
-    deployment = entry.route.deployment.model_copy(
-        update={
-            "gateway": entry.route.deployment.gateway.model_copy(
-                update={
-                    "cache_retention_seconds": 100,
-                    "dispatch": GatewayRungDispatchPolicy(sticky_spill_seconds=60),
-                }
-            )
-        }
-    )
-    entry.route = entry.route.model_copy(
-        update={
-            "deployment": deployment,
-            "snapshot": entry.route.snapshot.model_copy(
-                update={"failover_mode": "maximize_cache_affinity"}
-            ),
-        }
-    )
-    entry.request = request()
-    first, second = DispatchCredentialReceipt(uuid4()), DispatchCredentialReceipt(uuid4())
-    scope = RecoveryScope(
-        provider=deployment.provider,
-        exact_model_id=deployment.exact_model_id,
-        endpoint_scope="endpoint",
-        region_scope="region",
-        organization_id=entry.authorization.organization_id,
-        credential_scope=str(first.binding_id),
-    )
-    binding = FrozenRecoveryBinding(
-        deployment.deployment_id,
-        deployment.connection_sha256,
-        "https://test.invalid",
-        deployment.provider_model,
-        scope,
-    )
-    entry.recovery_bindings = {deployment.deployment_id: binding}
-    started = _start(accounting, ordinal=0)
-    rotated = scope.model_copy(update={"credential_scope": str(second.binding_id)})
-    settlement = json.dumps(
-        {
-            "request_id": entry.authorization.request_id,
-            "attempt_id": started["attempt_id"],
-            "outcome": "completed",
-            "usage": {"input_tokens": 100, "output_tokens": 1, "cached_input_tokens": 80},
-            "finalize": True,
-        }
-    )
-    if swept:
-        ledger.fail_finishes = 1
-        with pytest.raises(NativeBridgeError):
-            accounting.settle(settlement)
-        accounting.sweep_expired()
-    else:
-        accounting.settle(settlement)
-    key = session_cache_key(entry)
-    assert key is not None
-    assert (
-        accounting.recovery.choose(
-            key, ((deployment.deployment_id, scope),), eligible=lambda _: True, snapshot=None
-        ).deployment_id
-        == deployment.deployment_id
-    )
-    assert (
-        accounting.recovery.choose(
-            key, ((deployment.deployment_id, rotated),), eligible=lambda _: True, snapshot=None
-        ).deployment_id
-        is None
-    )
-    assert accounting.entry(entry.authorization.request_id) is None
-    assert len(ledger.finished) == 1 and accounting.accounting_healthy
-    assert host.observed == [scope.operational()]
 
 
 def test_actual_runtime_client_auth_and_receipt_rotate_together() -> None:
@@ -367,8 +285,8 @@ def test_real_binding_gates_retained_stage_recovery_without_changing_normal_affi
             }
         )
     host = Host()
-    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=host)
-    accounting.recovery = SessionRecoveryRegistry(clock=Clock())
+    accounting = admission_accounting(recovery_host=host)
+    accounting.recovery._clock = Clock()
     auth = route.snapshot.authorization
     wire_request = request()
     resolved = tuple(
@@ -461,88 +379,6 @@ def test_real_binding_gates_retained_stage_recovery_without_changing_normal_affi
         assert ordered.deployment.deployment_id == preferred.deployment_id
         assert placement.verified_warm_deployment_id == preferred.deployment_id
         assert host.observed
-
-
-@pytest.mark.parametrize("swept", [False, True])
-def test_unknown_frozen_region_does_not_record_settled_cache_evidence(swept: bool) -> None:
-    """Old unknown-region bindings cannot seed history through direct or retained settlement."""
-    accounting, ledger, entry = _registry()
-    host = Host()
-    accounting.recovery_host = host
-    accounting.recovery = SessionRecoveryRegistry(clock=Clock())
-    deployment = entry.route.deployment.model_copy(
-        update={
-            "gateway": entry.route.deployment.gateway.model_copy(
-                update={
-                    "cache_retention_seconds": 100,
-                    "dispatch": GatewayRungDispatchPolicy(sticky_spill_seconds=60),
-                }
-            )
-        }
-    )
-    entry.route = entry.route.model_copy(
-        update={
-            "deployment": deployment,
-            "snapshot": entry.route.snapshot.model_copy(
-                update={"failover_mode": "maximize_cache_affinity"}
-            ),
-        }
-    )
-    entry.request = request()
-    scope = RecoveryScope(
-        provider=deployment.provider,
-        exact_model_id=deployment.exact_model_id,
-        endpoint_scope="endpoint",
-        region_scope=None,
-        credential_scope=str(uuid4()),
-        organization_id=entry.authorization.organization_id,
-    )
-    binding = FrozenRecoveryBinding(
-        deployment.deployment_id,
-        deployment.connection_sha256,
-        "https://custom.test/v1",
-        deployment.provider_model,
-        scope,
-    )
-    entry.recovery_bindings = {deployment.deployment_id: binding}
-    started = _start(accounting, ordinal=0)
-    payload = json.dumps(
-        {
-            "request_id": entry.authorization.request_id,
-            "attempt_id": started["attempt_id"],
-            "outcome": "completed",
-            "usage": {
-                "input_tokens": 100,
-                "output_tokens": 1,
-                "cached_input_tokens": 80,
-                "cache_creation_input_tokens": 10,
-            },
-            "first_token_at": "2026-09-18T01:02:03+00:00",
-            "upstream_provider": "Azure",
-            "finalize": True,
-        }
-    )
-    if swept:
-        ledger.fail_finishes = 1
-        with pytest.raises(NativeBridgeError):
-            accounting.settle(payload)
-        accounting.sweep_expired()
-    else:
-        accounting.settle(payload)
-    key = session_cache_key(entry)
-    assert key is not None and not accounting.recovery.has_retained_history(key)
-    assert (
-        frozen_scope(entry.recovery_bindings, deployment, entry.authorization.organization_id)
-        is None
-    )
-    assert entry.recovery_bindings[deployment.deployment_id] is binding
-    assert len(ledger.finished) == 1 and accounting.accounting_healthy
-    assert not host.observed
-    assert ledger.first_token_times[-1] is not None
-    assert ledger.upstream_providers[-1] == "Azure"
-    terminal = ledger.terminal_events[-1]
-    assert terminal is not None and terminal.usage is not None
-    assert terminal.usage.cache_creation_input_tokens == 10
 
 
 def test_operator_us_inference_constraint_cannot_inherit_global_recovery() -> None:

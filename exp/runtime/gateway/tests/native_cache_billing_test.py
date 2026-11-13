@@ -18,6 +18,7 @@ from exp.common.models import (
     GatewayTokenPrices,
     ModelCapabilities,
 )
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.catalog_authority import upsert_connection, upsert_singleton_deployment
 from exp.runtime.gateway.contracts import GatewayEvent, GatewayEventKind, GatewayUsage
 from exp.runtime.gateway.management import GatewayManagement
@@ -194,7 +195,7 @@ def test_native_cache_write_settlement_uses_observed_ttl(
         upstream.shutdown()
         upstream.server_close()
         worker.join(timeout=5)
-    with sqlite3.connect(manager.database_path) as connection:
+    with connect_sqlite(manager.database_path) as connection:
         connection.row_factory = sqlite3.Row
         row = connection.execute("SELECT * FROM gateway_attempts").fetchone()
     assert row["state"] == "completed"
@@ -234,7 +235,7 @@ def test_native_cache_write_settlement_uses_observed_ttl(
                 }
             )
         )
-    with sqlite3.connect(manager.database_path) as connection:
+    with connect_sqlite(manager.database_path) as connection:
         after = connection.execute(
             "SELECT estimated_cost_nano_usd, budget_settled_nano_usd FROM gateway_attempts"
         ).fetchone()

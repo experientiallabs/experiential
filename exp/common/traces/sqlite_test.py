@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import SourceIdentity
+from exp.common.sqlite.native import connect
 from exp.common.traces.sqlite import SQLiteTraceStore, TraceImportReceipt
 from exp.common.traces.sqlite_import import ImportRecord, PreparedImport
 from exp.common.traces.sqlite_schema import TraceStoreError
@@ -150,7 +151,7 @@ def test_write_failure_keeps_staging_hidden_and_retryable(tmp_path: Path) -> Non
     """Publication failure keeps staged evidence hidden; retry verifies and completes it."""
     store = SQLiteTraceStore(tmp_path / "traffic.db")
     first = _save(store, (_trace(),))
-    with sqlite3.connect(store.path) as connection:
+    with connect(store.path) as connection:
         connection.execute(
             "CREATE TRIGGER reject_link BEFORE INSERT ON trace_project_imports "
             "BEGIN SELECT RAISE(ABORT, 'private payload error'); END"
@@ -159,13 +160,13 @@ def test_write_failure_keeps_staging_hidden_and_retryable(tmp_path: Path) -> Non
         _save(store, (_trace().model_copy(update={"task": "Different task"}),))
     assert "private payload" not in str(raised.value)
     assert store.list_imports("powerset") == (first.import_id,)
-    with sqlite3.connect(store.path) as connection:
+    with connect(store.path) as connection:
         staged = connection.execute(
             "SELECT import_id FROM trace_imports WHERE import_id<>?", (first.import_id,)
         ).fetchone()[0]
     with pytest.raises(TraceStoreError, match="not found"):
         store.read_import(staged)
-    with sqlite3.connect(store.path) as connection:
+    with connect(store.path) as connection:
         connection.execute("DROP TRIGGER reject_link")
     retry = _save(store, (_trace().model_copy(update={"task": "Different task"}),))
     assert retry.import_id == staged and retry.new_records == 0
@@ -188,7 +189,7 @@ def test_corrupt_evidence_is_rejected_on_read_and_repeat(tmp_path: Path, mutatio
     """Neither reading nor idempotent reuse can bless changed bytes or missing memberships."""
     store = SQLiteTraceStore(tmp_path / "traffic.db")
     first = _save(store, (_trace(),))
-    with sqlite3.connect(store.path) as connection:
+    with connect(store.path) as connection:
         connection.execute(mutation)
     with pytest.raises(TraceStoreError) as raised:
         store.read_import(first.import_id)
@@ -209,7 +210,7 @@ def test_batches_release_writer_and_keep_partial_import_hidden(
         """After each committed batch, exercise an independent short-timeout SQLite writer."""
         for batch in original(prepared):
             yield batch
-            with sqlite3.connect(store.path, timeout=0.01) as writer:
+            with connect(store.path, busy_timeout_ms=10) as writer:
                 writer.execute(
                     "CREATE TABLE IF NOT EXISTS gateway_captures (sequence INTEGER PRIMARY KEY)"
                 )
@@ -276,7 +277,7 @@ def test_wal_startup_retries_real_contention_before_publishing(
     """A real rollback-journal reader blocks WAL until the import releases and retries."""
     store = SQLiteTraceStore(tmp_path / "traffic.db")
     store.path.touch(mode=0o600)
-    reader = sqlite3.connect(store.path)
+    reader = connect(store.path)
     retries: list[float] = []
     try:
         reader.execute("CREATE TABLE gateway_captures(payload TEXT)")
@@ -292,7 +293,7 @@ def test_wal_startup_retries_real_contention_before_publishing(
         receipt = _save(store, (_trace(),))
         assert len(retries) == 1 and 0 < retries[0] <= 0.01
         assert store.read_import(receipt.import_id).traces == (_trace(),)
-        with closing(sqlite3.connect(store.path)) as reopened:
+        with closing(connect(store.path)) as reopened:
             assert reopened.execute("PRAGMA journal_mode").fetchone() == ("wal",)
     finally:
         reader.close()
@@ -304,7 +305,7 @@ def test_wal_startup_contention_stops_at_the_existing_timeout(
     """A persistent lock exhausts the setup deadline without publishing partial evidence."""
     store = SQLiteTraceStore(tmp_path / "traffic.db")
     store.path.touch(mode=0o600)
-    reader = sqlite3.connect(store.path)
+    reader = connect(store.path)
     ticks = iter((0.0, 5.0))
     try:
         reader.execute("CREATE TABLE gateway_captures(payload TEXT)")

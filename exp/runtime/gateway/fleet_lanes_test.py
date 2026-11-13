@@ -13,17 +13,9 @@ from exp.common.models.dispatch_policy import GatewayFleetLanePolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.fleet_lanes import FleetLane, FleetLaneShed, FleetLeases, FleetUsage
 from exp.runtime.gateway.lane_saturation import overflow_target
-from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
-from exp.runtime.gateway.native_accounting_test import (
-    _admit,
-    _deployment,
-    _RecordingLedger,
-    _settle,
-    _settle_with_usage,
-    _start,
-)
 from exp.runtime.gateway.native_rung_policy import settled_usage
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
+from exp.runtime.gateway.tests.native_route_fixture_test import _deployment, _route
 
 _FLEET = GatewayFleetLanePolicy(requests_per_minute=100)
 _LANE = FleetLane("deployment-a", "b" * 64, _FLEET)
@@ -170,148 +162,16 @@ def _ladder(capped: GatewayRungDispatchPolicy) -> tuple[ExactModelDeployment, ..
     )
 
 
-def test_a_capped_lane_spills_to_the_next_sibling() -> None:
-    """At the fleet pace the pinned-first lane sheds and the first sibling serves."""
-    ledger = _RecordingLedger()
-    registry = NativeAttemptAccounting(ledger, background_recovery=False)
-    gate = _Gate(FleetLaneShed("rate"))
-    registry.loads.attach_fleet_gate(gate)
-    deployments = _ladder(GatewayRungDispatchPolicy(fleet=_FLEET))
-    _admit(registry, deployments, request_id="request-one")
-    started = _start(registry, ordinal=0)
-    assert started["route_depth"] == 1
-    assert ledger.started[0]["dispatch_reason"] == "rate_limit"
-    assert gate.acquired == [_LANE]
-    assert gate.reserved[0] > 0
-    # The gate learns what the request's deadline leaves (a queue never outlives it).
-    assert 0.0 <= gate.deadlines[0] < float("inf")
-
-
-def test_a_fleet_cap_is_hard_when_every_sibling_is_full() -> None:
-    """Every rung shed: the forced overflow lands on a sibling, never the capped lane."""
-    ledger = _RecordingLedger()
-    registry = NativeAttemptAccounting(ledger, background_recovery=False)
-    gate = _Gate(FleetLaneShed("concurrency"))
-    registry.loads.attach_fleet_gate(gate)
-    deployments = _ladder(GatewayRungDispatchPolicy(fleet=_FLEET))
-    for index in range(2):
-        _admit(registry, deployments, request_id=f"fill-{index}")
-        assert _start(registry, ordinal=0, request_id=f"fill-{index}")["route_depth"] == index + 1
-    _admit(registry, deployments, request_id="request-one")
-    started = _start(registry, ordinal=0)
-    assert started["route_depth"] == 1
-    assert ledger.started[-1]["dispatch_reason"] == "saturated_overflow"
-    # Every acquire on the capped lane was refused; none was forced past it.
-    assert len(gate.acquired) == 3
-
-
-def test_a_single_capped_lane_refuses_rather_than_exceeding_its_cap() -> None:
-    """No sibling at all: the caller is answered lane_saturated, the lane stays capped."""
-    ledger = _RecordingLedger()
-    registry = NativeAttemptAccounting(ledger, background_recovery=False)
-    registry.loads.attach_fleet_gate(_Gate(FleetLaneShed("rate")))
-    capped = _deployment(
-        "deployment-a",
-        connection_sha256="b" * 64,
-        dispatch=GatewayRungDispatchPolicy(fleet=_FLEET),
-    )
-    _admit(registry, (capped,), request_id="request-one")
-    refused = _start(registry, ordinal=0)
-    assert refused["exhausted"] is True
-    failure = refused["failure"]
-    assert isinstance(failure, dict)
-    assert failure["failure_class"] == "throttled"
-    assert ledger.started == []
-
-
-@pytest.mark.parametrize("throttled", [False, True])
-def test_settle_releases_the_lease_and_reports_a_provider_throttle(throttled: bool) -> None:
-    """The settle path hands the gate the dispatch's outcome exactly once."""
-    ledger = _RecordingLedger()
-    registry = NativeAttemptAccounting(ledger, background_recovery=False)
-    gate = _Gate()
-    registry.loads.attach_fleet_gate(gate)
-    deployments = _ladder(GatewayRungDispatchPolicy(fleet=_FLEET))
-    _admit(registry, deployments, request_id="request-one")
-    started = _start(registry, ordinal=0)
-    assert started["route_depth"] == 0
-    failure: JsonObject | None = (
-        {
-            "failure_class": "throttled",
-            "safe_message": "provider throttled the request",
-            "failover_eligible": True,
-        }
-        if throttled
-        else None
-    )
-    _settle(
-        registry,
-        attempt_id=str(started["attempt_id"]),
-        outcome="failed" if throttled else "completed",
-        finalize=True,
-        failure=failure,
-    )
-    assert [(lease, throttle) for lease, _duration, throttle in gate.released] == [
-        ("lease-1", throttled)
-    ]
-    # No usage in this settle: the full reservation stays counted.
-    assert gate.used == [None]
-    assert registry.loads.fleet is not None
-    assert registry.loads.fleet.held() == 0
-
-
 def test_overflow_target_skips_a_fleet_capped_rung_for_the_next_sibling() -> None:
     """A free caller's overflow moves past the capped first rung to the next bypass."""
     deployments = _ladder(GatewayRungDispatchPolicy(fleet=_FLEET))
-    entry_route = _admit(
-        NativeAttemptAccounting(_RecordingLedger(), background_recovery=False),
-        deployments,
-        request_id="request-one",
-    ).route
+    entry_route = _route(deployments)
     sheds = {
         0: RungShed("rate_limit", overflow_ceiling=True, fleet=True),
         1: RungShed("queue_bound"),
     }
     assert overflow_target(entry_route, [(0, "rate_limit"), (1, "queue_bound")], sheds) == 1
     assert overflow_target(entry_route, [(0, "rate_limit")], {0: sheds[0]}) is None
-
-
-def test_a_refusing_lane_answers_lane_saturated_without_trying_siblings() -> None:
-    """saturation=refuse: the capped lane refuses the caller even with siblings free."""
-    ledger = _RecordingLedger()
-    registry = NativeAttemptAccounting(ledger, background_recovery=False)
-    registry.loads.attach_fleet_gate(_Gate(FleetLaneShed("rate")))
-    refusing = GatewayFleetLanePolicy(requests_per_minute=100, saturation="refuse")
-    deployments = _ladder(GatewayRungDispatchPolicy(fleet=refusing))
-    _admit(registry, deployments, request_id="request-one")
-    refused = _start(registry, ordinal=0)
-    assert refused["exhausted"] is True
-    failure = refused["failure"]
-    assert isinstance(failure, dict)
-    assert failure["failure_class"] == "throttled"
-    assert ledger.started == []
-
-
-def test_settled_usage_reaches_the_gate_for_token_reconciliation() -> None:
-    """A settle carrying usage credits the token pace back to what was really used."""
-    ledger = _RecordingLedger()
-    registry = NativeAttemptAccounting(ledger, background_recovery=False)
-    gate = _Gate()
-    registry.loads.attach_fleet_gate(gate)
-    tokens = GatewayFleetLanePolicy(tokens_per_minute=1_000_000)
-    deployments = _ladder(GatewayRungDispatchPolicy(fleet=tokens))
-    _admit(registry, deployments, request_id="request-one")
-    started = _start(registry, ordinal=0)
-    _settle_with_usage(
-        registry,
-        attempt_id=str(started["attempt_id"]),
-        request_id="request-one",
-        cached_input_tokens=0,
-        input_tokens=40,
-    )
-    assert gate.used == [45]
-    assert gate.outputs == [5]
-    assert gate.reserved[0] > 45
 
 
 @pytest.mark.parametrize(

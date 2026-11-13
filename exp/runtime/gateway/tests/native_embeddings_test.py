@@ -15,7 +15,6 @@ import base64
 import json
 import os
 import signal
-import sqlite3
 import struct
 import subprocess
 import sys
@@ -34,6 +33,7 @@ from exp.common.models import (
     GatewayTokenPrices,
     ModelCapabilities,
 )
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.catalog_authority import upsert_singleton_deployment
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
@@ -420,7 +420,7 @@ def test_unbillable_or_failing_provider_answers_fail_closed(
 ) -> None:
     """A vector-count mismatch, a missing prompt_tokens, or a 5xx never reaches the caller."""
     inputs = [selector, "second"]
-    with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+    with connect_sqlite(GatewayManagement(engine.root).database_path) as connection:
         (request_watermark,) = connection.execute(
             "SELECT coalesce(max(rowid), 0) FROM gateway_requests"
         ).fetchone()
@@ -437,7 +437,7 @@ def test_unbillable_or_failing_provider_answers_fail_closed(
         posts = sum(payload.get("input") == inputs for payload in _EmbeddingsUpstream.payloads)
     physical_attempts = posts - posts_before
     assert 1 <= physical_attempts <= (2 if selector == "server-error" else 1)
-    with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+    with connect_sqlite(GatewayManagement(engine.root).database_path) as connection:
         attempts = connection.execute(
             """
             SELECT a.request_id, a.state, a.attempt_ordinal, a.terminal_at

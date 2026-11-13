@@ -1,17 +1,55 @@
 """Clock-injected reason-aware session recovery and no-fabricated-warmth tests."""
 
+import json
 from dataclasses import dataclass
 from itertools import permutations
 
 import pytest
+from pydantic import TypeAdapter
 
+from exp.runtime.gateway.native_recovery_state import NativeRecovery, key_registration
 from exp.runtime.gateway.recovery import (
     RecoveryObservation,
     RecoveryScope,
     RecoverySnapshot,
     SessionCacheKey,
     SessionRecoveryRegistry,
+    _SessionHistory,
 )
+
+
+@pytest.fixture(autouse=True, params=["python", "native"])
+def _registry_owner(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the same behavioral contract against both ownership implementations."""
+    if request.param == "native":
+        monkeypatch.setitem(globals(), "SessionRecoveryRegistry", NativeRecovery)
+
+
+def _history(registry: SessionRecoveryRegistry, session: SessionCacheKey) -> _SessionHistory:
+    if isinstance(registry, NativeRecovery):
+        return TypeAdapter(_SessionHistory).validate_json(
+            registry.native.state_json(
+                "inspect",
+                json.dumps({"key": key_registration(session), "now": registry.observation_time()}),
+            )
+        )
+    return registry._sessions[session]
+
+
+def _contains(registry: SessionRecoveryRegistry, session: SessionCacheKey) -> bool:
+    if isinstance(registry, NativeRecovery):
+        return (
+            json.loads(
+                registry.native.state_json(
+                    "inspect",
+                    json.dumps(
+                        {"key": key_registration(session), "now": registry.observation_time()}
+                    ),
+                )
+            )
+            is not None
+        )
+    return session in registry._sessions
 
 
 @dataclass
@@ -423,7 +461,7 @@ def test_receipt_order_clears_only_superseded_causes(order: tuple[str, ...]) -> 
         True,
         92,
     )
-    history = registry._sessions[key()]
+    history = _history(registry, key())
     assert history.retained == "fallback"
     assert history.retained_until == 1112
     assert history.evidence["primary"].age_deadline == 1400
@@ -470,7 +508,7 @@ def test_old_success_never_rolls_placement_back_past_failure(
         False,
         70,
     )
-    history = registry._sessions[key()]
+    history = _history(registry, key())
     assert history.retained_until == 1110
     assert history.retained_age_deadline == 1410
 
@@ -496,7 +534,7 @@ def test_delayed_success_can_tighten_but_never_renew_original_age(
     for now in (1014, 1021, 1028, 1035):
         clock.now = now
         warm(registry, "fallback", ttl=10)
-    history = registry._sessions[key()]
+    history = _history(registry, key())
     assert history.evidence["fallback"].age_deadline == 1040
     assert history.retained_age_deadline == 1040
     decision = registry.choose(key(), (("fallback", scope()),), eligible=eligible, snapshot=None)
@@ -566,7 +604,7 @@ def test_unrelated_success_cannot_clear_or_retain_current_failed_scope(
         ).deployment_id
         == "fallback"
     )
-    assert registry._sessions[key()].departures["primary"].scope == scope()
+    assert _history(registry, key()).departures["primary"].scope == scope()
 
 
 @pytest.mark.parametrize("success_first", [False, True])
@@ -681,8 +719,8 @@ def test_newer_rotated_scope_resets_only_its_own_evidence_window() -> None:
         sticky_seconds=10,
         observed_at=1002,
     )
-    assert registry._sessions[key()].evidence["primary"].scope == scope("rotated")
-    assert registry._sessions[key()].retained_age_deadline == 1045
+    assert _history(registry, key()).evidence["primary"].scope == scope("rotated")
+    assert _history(registry, key()).retained_age_deadline == 1045
     assert (
         registry.choose(
             key(),
@@ -742,7 +780,7 @@ def test_old_failure_cannot_replace_evicted_newer_local_cause(delayed: bool) -> 
         local_capacity=eligible,
     )
     assert decision.deployment_id is None
-    departure = registry._sessions[key()].departures["primary"]
+    departure = _history(registry, key()).departures["primary"]
     assert departure.failed_at == 1010
     assert departure.causes == frozenset({"credential"})
 
@@ -767,7 +805,7 @@ def test_expired_overlapping_receipt_only_tightens_existing_hard_age(delayed: bo
     for receipt in (1021, 1028, 1035):
         clock.now = receipt
         warm(registry, "fallback", ttl=10)
-    history = registry._sessions[key()]
+    history = _history(registry, key())
     assert history.evidence["fallback"].age_deadline == 1040
     assert history.retained_age_deadline == 1040
     decision = registry.choose(key(), (("fallback", scope()),), eligible=eligible, snapshot=None)
@@ -797,7 +835,7 @@ def test_expired_age_tightening_cannot_grant_success_effects(mismatch: str | Non
     registry.depart(key(), "fallback", scope(), "credential")
     clock.now = 1010
     warm(registry, "newer-route", ttl=10)
-    history = registry._sessions[key()]
+    history = _history(registry, key())
     before = history.evidence["fallback"]
     placement = (history.retained, history.retained_until, history.retained_observed_at)
     departure = history.departures["fallback"]
@@ -813,6 +851,7 @@ def test_expired_age_tightening_cannot_grant_success_effects(mismatch: str | Non
         sticky_seconds=10,
         observed_at=1000,
     )
+    history = _history(registry, key())
     after = history.evidence["fallback"]
     assert (history.retained, history.retained_until, history.retained_observed_at) == placement
     assert history.departures["fallback"] == departure
@@ -829,7 +868,7 @@ def test_expired_age_tightening_cannot_grant_success_effects(mismatch: str | Non
         sticky_seconds=10,
         observed_at=1000,
     )
-    assert key("empty") not in registry._sessions
+    assert not _contains(registry, key("empty"))
 
 
 def test_future_and_expired_success_never_replace_current_placement() -> None:
@@ -848,8 +887,8 @@ def test_future_and_expired_success_never_replace_current_placement() -> None:
             sticky_seconds=100,
             observed_at=receipt,
         )
-    assert registry._sessions[key()].retained == "fallback"
-    assert registry._sessions[key()].retained_until == 1100
+    assert _history(registry, key()).retained == "fallback"
+    assert _history(registry, key()).retained_until == 1100
 
 
 def test_eviction_and_credential_rotation_lose_warmth() -> None:

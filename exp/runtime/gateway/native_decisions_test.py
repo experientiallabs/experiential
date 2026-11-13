@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -29,6 +28,7 @@ from exp.common.models.gateway_chains import (
     GatewayModelChain,
     GatewayModelReferenceRung,
 )
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.catalog_authority import (
     upsert_connection,
     upsert_singleton_deployment,
@@ -55,7 +55,7 @@ from exp.runtime.gateway.tests.chain_authority_fixture_test import (
     chain_components,
     publish_authored_chain_fixture,
 )
-from exp.runtime.gateway.tests.parallel_input_guardrails_test import _Classifier, _engine
+from exp.runtime.gateway.tests.guardrail_fixture_test import _Classifier, _engine
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.typesafe import TYPESAFE_IMAGES_HEADER, TypeSafeClient
 
@@ -214,14 +214,14 @@ def test_decisions_refuse_selected_model_chain_before_acceptance(tmp_path: Path)
     assert _public_error(error.value)["code"] == "model_chain_authority_unavailable"
     assert _rows(control) == []
     ledger = cast(SQLiteAttemptLedger, control._components.ledger)
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0] == 0
 
 
 def _rows(control: NativeControlPlane) -> list[tuple[str, str | None]]:
     """Read durable API surfaces and terminal states, not content-bearing traffic."""
     ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         return connection.execute(
             "select api_surface, terminal_state from gateway_requests order by rowid"
         ).fetchall()
@@ -257,13 +257,20 @@ def test_admit_decisions_preserves_questions_native_wire_and_reservation(tmp_pat
     assert "stream" not in admitted
     assert _rows(control) == [("decisions", None)]
     request_id = str(admitted["request_id"])
-    entry = control._accounting.entry(request_id)  # noqa: SLF001
-    assert entry is not None and isinstance(entry.request, DecisionRequest)
-    assert entry.request.input_token_reservation > 0
-    assert entry.request.output_token_reservation > 0
-    assert entry.continuation is None
-    assert entry.guardrails is None
-    assert entry.throttle_redial_budgets == (0,)
+    started = json.loads(
+        control.start_attempt(json.dumps({"request_id": request_id, "attempt_ordinal": 0}))
+    )
+    ledger = cast("SQLiteAttemptLedger", control._components.ledger)
+    with connect_sqlite(ledger.database_path) as connection:
+        reserved = connection.execute(
+            "SELECT native_accounting_terms FROM gateway_attempts WHERE attempt_id=?",
+            (started["attempt_id"],),
+        ).fetchone()
+    assert reserved is not None
+    dispatch = json.loads(reserved[0])["dispatch"]
+    assert dispatch["reserved_input_tokens"] > 0 and dispatch["reserved_output_tokens"] > 0
+    assert control._accounting.native.owns_request(request_id)
+    control.abandon(json.dumps({"request_id": request_id}))
     assert raw_key not in json.dumps(admitted)
 
 
@@ -482,8 +489,16 @@ def test_decision_content_does_not_enter_durable_ledger(tmp_path: Path) -> None:
     control, raw_key = _control_plane(tmp_path)
     _admit(control, raw_key)
     ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
-    with sqlite3.connect(ledger.database_path) as connection:
-        persisted = "\\n".join(connection.iterdump())
+    with connect_sqlite(ledger.database_path) as connection:
+        tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        persisted = repr(
+            [
+                connection.execute(
+                    'SELECT * FROM "' + str(row[0]).replace('"', '""') + '"'
+                ).fetchall()
+                for row in tables
+            ]
+        )
     for canary in (
         "private-state-canary",
         "private-instructions-canary",
@@ -529,7 +544,7 @@ def test_admit_decisions_attributes_the_calling_app(tmp_path: Path) -> None:
             json.dumps({"raw_key": raw_key, "body": json.dumps(_body()), **headers})
         )
     ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         rows = connection.execute(
             "select client_app, user_agent from gateway_requests order by rowid"
         ).fetchall()
@@ -549,9 +564,14 @@ def test_self_hosted_house_rung_receives_the_organization_tag(tmp_path: Path) ->
     wire = route[0]
     assert isinstance(wire, dict)
     assert wire["url"] == "https://clef.example.test/v1/systemone"
-    entry = control._accounting.entry(str(admitted["request_id"]))  # noqa: SLF001
-    assert entry is not None
-    organization_id = str(entry.authorization.organization_id)
+    ledger = cast("SQLiteAttemptLedger", control._components.ledger)
+    with connect_sqlite(ledger.database_path) as connection:
+        row = connection.execute(
+            "SELECT organization_id FROM gateway_requests WHERE request_id=?",
+            (admitted["request_id"],),
+        ).fetchone()
+    assert row is not None
+    organization_id = str(row[0])
     expected = organization_tag(organization_tag_key("provider-secret-canary"), organization_id)
     assert wire["headers"] == {
         "Authorization": "Bearer provider-secret-canary",

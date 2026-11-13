@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -15,9 +14,10 @@ from typing import Literal
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
 from exp.runtime.gateway.native_bridge_test import _admit, _project_control_plane
-from exp.runtime.gateway.tests.parallel_input_guardrails_test import _Classifier, _engine
+from exp.runtime.gateway.tests.guardrail_fixture_test import _Classifier, _engine
 
 _PROMPT = "project-guardrail-embedding-canary"
 
@@ -75,7 +75,7 @@ def _body(surface: Literal["chat", "responses", "messages"]) -> str:
 
 def _ledger_counts(database_path: Path) -> tuple[int, int]:
     """Read durable request acceptance and generation attempt counts."""
-    with sqlite3.connect(database_path) as connection:
+    with connect_sqlite(database_path) as connection:
         requests = connection.execute("select count(*) from gateway_requests").fetchone()[0]
         attempts = connection.execute("select count(*) from gateway_attempts").fetchone()[0]
     return requests, attempts
@@ -118,7 +118,19 @@ def test_project_embedding_waits_for_input_approval(
                     with pytest.raises(NativeBridgeError):
                         future.result(timeout=5)
                     assert received == []
-                    assert _ledger_counts(manager.database_path) == (0, 0)
+                    assert _ledger_counts(manager.database_path) == (1, 0)
+                    assert control.close(timeout_seconds=2), "native report did not drain"
+                    with connect_sqlite(manager.database_path) as db:
+                        assert (
+                            db.execute("SELECT terminal_state FROM gateway_requests").fetchone()[0]
+                            == "failed"
+                        )
+                        assert (
+                            db.execute("SELECT COUNT(*) FROM gateway_input_moderation").fetchone()[
+                                0
+                            ]
+                            == 1
+                        )
             finally:
                 classifier.release.set()
                 try:

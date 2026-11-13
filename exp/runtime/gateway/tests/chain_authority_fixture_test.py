@@ -20,6 +20,7 @@ from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
+from exp_gateway_native import NativeSQLiteLedger
 
 from exp.common.core.artifacts import canonical_json_bytes
 from exp.common.models import (
@@ -40,6 +41,7 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
+from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.model_chain_authority import (
@@ -318,6 +320,16 @@ class ChainControlStore(SQLiteGatewayStore):
 
 class ChainAttemptLedger(SQLiteAttemptLedger):
     """Reuse exact production money/settlement logic after real test-host receipt checks."""
+
+    def __init__(self, database_path: Path, *, clock: GatewayClock | None = None) -> None:
+        """Use a test-only Rust authority with the production financial owner."""
+        super().__init__(database_path, clock=clock)
+        factory = getattr(NativeSQLiteLedger, "_test_chain_fixture", None)
+        if factory is None:
+            raise RuntimeError("Chain tests require a native build with --features test-support")
+        native = factory(str(database_path))
+        assert isinstance(native, NativeSQLiteLedger)
+        self._native = native
 
     @contextmanager
     def prepare_chain_authority(

@@ -77,7 +77,7 @@ def test_release_deferral_requires_unchanged_versions_and_a_combined_bump(
         *) return 1;;
       esac
     }
-    uv() { shift 2; "$TEST_PYTHON" "$@"; }
+    uv() { shift; if [ "${1:-}" = "--no-sync" ]; then shift; fi; shift; "$TEST_PYTHON" "$@"; }
     """
     result = subprocess.run(
         ["bash", "-euo", "pipefail", "-c", textwrap.dedent(stubs) + _version_gate()],

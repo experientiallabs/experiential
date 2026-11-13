@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-import json
-
 from exp.runtime.gateway.model_plan import stage_start_authorized
-from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_execution import select_route_deployments
-from exp.runtime.gateway.native_responses import continuation_route_binding, remember_turn
+from exp.runtime.gateway.native_responses import continuation_route_binding
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.protocol import NativeWireClient
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
-from exp.runtime.openai_protocol.state import BoundedContinuationStore, ContinuationRouteBinding
+from exp.runtime.openai_protocol.state import ContinuationRouteBinding
 
 
 def continuation_binding_error() -> OpenAIProtocolError:
@@ -65,28 +62,3 @@ def require_bound_wire_authority(
     observed = continuation_route_binding(route.deployment, resolved_wires[0][0])
     if observed != binding:
         raise continuation_binding_error()
-
-
-def remember_continuation(
-    accounting: NativeAttemptAccounting,
-    continuations: BoundedContinuationStore,
-    argument: str,
-) -> str:
-    """Retain one completed Responses turn against its winning route."""
-    data = json.loads(argument)
-    entry = accounting.entry(str(data["request_id"]))
-    if entry is None or entry.continuation is None:
-        return "{}"
-    context = entry.continuation
-    route_binding = None
-    if entry.active_attempt_id is not None:
-        depth = entry.attempt_depths.get(entry.active_attempt_id)
-        if depth is not None and depth < len(context.route_bindings):
-            route_binding = context.route_bindings[depth]
-    remember_turn(
-        continuations,
-        context=context,
-        data=data,
-        route_binding=route_binding,
-    )
-    return "{}"

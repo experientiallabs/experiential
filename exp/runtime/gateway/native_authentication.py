@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Protocol
 
-from exp.runtime.gateway.native_accounting import authority_error
+from exp.runtime.gateway.native_accounting_errors import authority_error
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 
 

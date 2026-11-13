@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+
+from exp_gateway_native import NativeInputInspection
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass, GatewayRequest
@@ -25,10 +29,13 @@ from exp.runtime.gateway.guardrails.deterministic import (
     native_input_request,
     native_output_plan,
 )
+from exp.runtime.gateway.guardrails.native_owner import input_registration
 from exp.runtime.gateway.guardrails.streaming import StreamSegment
 from exp.runtime.gateway.guardrails.subjects import ObservedSubjects
 
 if TYPE_CHECKING:
+    from exp_gateway_native import NativeInputInspection
+
     from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
     from exp.runtime.gateway.native_execution import InflightRequest
 
@@ -75,6 +82,12 @@ class GuardrailSession:
     deadline_monotonic: float
     request_id: str | None = None
     detectors: Mapping[str, NativeDetector] = field(default_factory=dict, repr=False)
+    native_execution: bool = field(default=False, repr=False)
+    native_input: NativeInputInspection | None = field(default=None, init=False, repr=False)
+    native_observation: NativeInputInspection | None = field(default=None, init=False, repr=False)
+    native_completed: list[NativeInputInspection] = field(
+        default_factory=list, init=False, repr=False
+    )
     _input: Future[None] | None = field(default=None, init=False, repr=False)
     _input_failure: GatewayFailure | None = field(default=None, init=False, repr=False)
     _input_approved_at: float | None = field(default=None, init=False, repr=False)
@@ -91,6 +104,8 @@ class GuardrailSession:
 
     def _observe_input(self, request: GatewayRequest) -> None:
         """Submit each complete context once without retaining its text in the session."""
+        if self.native_execution:
+            return
         observers = tuple(p for p in self.policies if p.mode == "observe" and p.input_checks)
         if not observers:
             return
@@ -159,6 +174,18 @@ class GuardrailSession:
         self, policy: GuardrailPolicy, request: GatewayRequest
     ) -> GatewayRequest:
         """Apply the same native or bounded adapter strategy during execution and validation."""
+        if self.native_execution and all(
+            check.action is not GuardrailAction.MODIFY for check in policy.input_checks
+        ):
+            inspection = NativeInputInspection(
+                json.dumps(input_registration(self, (request,), policies=(policy,))),
+                max(0.0, self.deadline_monotonic - time.monotonic()),
+            )
+            self.native_completed.append(inspection)
+            decision = json.loads(await asyncio.to_thread(inspection.wait_json))
+            if decision["action"] == "error":
+                raise GuardrailRejected(GatewayFailure.model_validate(decision["failure"]))
+            return request
         native = (
             native_input_request(
                 policy,
@@ -210,17 +237,35 @@ class GuardrailSession:
                 raise GuardrailRejected(denied_input_failure())
             return
         remaining: list[GatewayRequest] = []
+        distinct: list[GatewayRequest] = []
         for subject in subjects:
+            if subject not in distinct:
+                distinct.append(subject)
             self._observe_input(subject)
             if subject not in remaining and not any(subject == old for old, _ in self._inspected):
                 remaining.append(subject)
+        observers = tuple(p for p in self.policies if p.mode == "observe" and p.input_checks)
+        if self.native_execution and observers and self.native_observation is None:
+            self.native_observation = NativeInputInspection(
+                json.dumps(
+                    input_registration(self, tuple(distinct), policies=observers),
+                    ensure_ascii=False,
+                ),
+                max(0.0, self.deadline_monotonic - time.monotonic()),
+            )
         if not remaining or not any(p.input_checks for p in self.enforcing_policies):
             return
-        if self._input is not None:
+        if self._input is not None or self.native_input is not None:
             raise RuntimeError("guardrail input execution already started")
         if overlap and not all(self.can_overlap_input(subject) for subject in remaining):
             raise RuntimeError("guardrail input cannot overlap this request")
         self._input_approved_at = None
+        if overlap and self.native_execution:
+            self.native_input = NativeInputInspection(
+                json.dumps(input_registration(self, tuple(remaining)), ensure_ascii=False),
+                max(0.0, self.deadline_monotonic - time.monotonic()),
+            )
+            return
         self._input = start_on_native_loop(self._inspect_subjects(tuple(remaining)))
         if not overlap:
             try:
@@ -255,7 +300,7 @@ class GuardrailSession:
     @property
     def input_pending(self) -> bool:
         """Whether native delivery must await this session's input decision."""
-        return self._input is not None
+        return self._input is not None or self.native_input is not None
 
     def input_decision(self) -> JsonObject:
         """Poll approval without tying up a bridge worker or renewing its deadline."""
@@ -263,6 +308,8 @@ class GuardrailSession:
             return {"action": "error", "failure": self._input_failure.model_dump(mode="json")}
         if not self.enforcing_policies:
             return {"action": "allow"}
+        if self.native_input is not None:
+            return json.loads(self.native_input.decision_json())
         future = self._input
         if self._closed or (future is None and not self._approved_before_deadline()):
             return {"action": "error", "failure": denied_input_failure().model_dump(mode="json")}
@@ -304,6 +351,8 @@ class GuardrailSession:
         if failure is not None:
             self._input_failure = denied_input_failure(failure)
         self._closed = True
+        if self.native_input is not None:
+            self.native_input.cancel(None if failure is None else failure.model_dump_json())
         if self._input is not None:
             self._input.cancel()
 
@@ -350,6 +399,8 @@ class GuardrailSession:
 
     def inspect_output(self, completion: GuardrailCompletion) -> GuardrailCompletion:
         """Enforce every output policy before releasing a buffered completion."""
+        if self.native_input is not None:
+            self.native_input.wait_json()
         if self._input is not None and not self._input.done():
             try:
                 self._input.result(timeout=max(0, self.deadline_monotonic - time.monotonic()))

@@ -14,7 +14,9 @@ import pytest
 
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayFailure
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
+from exp.runtime.gateway.native_handoff import NativeRequestFactory
 from exp.runtime.gateway.native_videos import NativeVideosMixin
+from exp.runtime.gateway.tests.native_admission_fixture_test import AdmissionOnlyFactory
 
 
 class _Ledger:
@@ -39,6 +41,7 @@ class _Plane(NativeVideosMixin):
         """Bind a components stub with an optional video job store."""
         self._components = cast(Any, SimpleNamespace(video_jobs=video_jobs))
         self._write_ledger = cast(Any, _Ledger())
+        self._native_request_factory: NativeRequestFactory = AdmissionOnlyFactory()
         self._guardrails = None
         self._bind_videos(start_poller=False)
 

@@ -1,12 +1,12 @@
 """Durable local traffic supplies scoped canonical build evidence."""
 
 import json
-import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.common.traces.ingest.sources import TraceSourceError
 from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.capture_context import capture_context_document
@@ -72,7 +72,7 @@ def _experience(identity: str = "developer") -> CapturedExchange:
 def _database(path: Path, experiences: tuple[CapturedExchange, ...]) -> None:
     """Persist exact native-compatible rows, then close before independent ingestion."""
     path.touch(mode=0o600)
-    with sqlite3.connect(path) as connection:
+    with connect_sqlite(path) as connection:
         connection.execute(
             "CREATE TABLE gateway_captures (sequence INTEGER PRIMARY KEY, user_id TEXT, "
             "application_id TEXT, expires_at INTEGER, payload TEXT)"

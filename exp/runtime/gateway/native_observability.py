@@ -26,11 +26,9 @@ from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
 )
-from exp.runtime.gateway.native_accounting import (
-    authority_error as _authority_error,
-)
-from exp.runtime.gateway.native_accounting_recovery import recovery_drained
+from exp.runtime.gateway.native_accounting_errors import authority_error as _authority_error
 from exp.runtime.gateway.native_components import NativeGatewayComponents
+from exp.runtime.gateway.native_handoff import accounting_drained
 from exp.runtime.gateway.native_metrics_text import render_metrics_text
 from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report, usage_html
 
@@ -180,6 +178,7 @@ class NativeObservabilityMixin:
         throttles_surfaced, throttles_failed_over, throttle_backoffs, throttle_backoffs_forced = (
             self._accounting.throttle_cache_counters()
         )
+        moderation_records = json.loads(self._accounting.native.moderation_recording_json())
         control_plane: JsonObject = {
             "sweep_retained_settlements_replayed": retained_replayed,
             "sweep_abandoned_attempts_cancelled": abandoned_cancelled,
@@ -214,10 +213,16 @@ class NativeObservabilityMixin:
             "accounting_healthy": self._accounting.accounting_healthy,
             "accounting_fenced_organizations": len(self._accounting.fenced_organizations()),
             "observation_recording_dropped": (
-                0 if self._guardrails is None else self._guardrails.observation_recording_dropped
+                moderation_records["dropped"]
+                + (
+                    0
+                    if self._guardrails is None
+                    else self._guardrails.observation_recording_dropped
+                )
             ),
             "observation_recording_failed": (
-                0 if self._guardrails is None else self._guardrails.observation_recording_failed
+                moderation_records["failed"]
+                + (0 if self._guardrails is None else self._guardrails.observation_recording_failed)
             ),
         }
         return {"data_plane": data_plane, "control_plane": control_plane}
@@ -273,7 +278,7 @@ class NativeObservabilityMixin:
         Durable open video jobs still need this instance's poller. Explicit
         process close may preserve them for restart instead of waiting for renders.
         """
-        return recovery_drained(self._accounting) and (self._videos is None or self._videos.idle)
+        return accounting_drained(self._accounting) and (self._videos is None or self._videos.idle)
 
     def recover_accounting(self) -> None:
         """Run one bounded recovery pass when the host explicitly owns its scheduling.

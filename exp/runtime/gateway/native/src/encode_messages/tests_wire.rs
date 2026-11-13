@@ -60,7 +60,7 @@ fn zero_argument_tool_calls_encode_as_an_empty_object_on_both_paths() {
         .filter(|frame| frame.contains("\"input_json_delta\""))
         .map(|frame| {
             let data = frame.split("data: ").nth(1).expect("data line").trim();
-            let payload: Value = serde_json::from_str(data).expect("json frame");
+            let payload: Value = crate::lossless_json::from_str(data).expect("json frame");
             payload["delta"]["partial_json"]
                 .as_str()
                 .expect("partial_json")
@@ -107,7 +107,7 @@ fn thinking_text_and_a_long_signature_survive_both_paths_byte_for_byte() {
     let payloads: Vec<Value> = frames
         .iter()
         .filter_map(|frame| frame.split("data: ").nth(1))
-        .map(|data| serde_json::from_str(data.trim()).expect("json frame"))
+        .map(|data| crate::lossless_json::from_str(data.trim()).expect("json frame"))
         .collect();
     let delta_of = |kind: &str, field: &str| -> String {
         payloads

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -10,11 +11,13 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
+from exp_gateway_native import NativeSQLiteLedger
 from pydantic import Field, model_validator
 
 from exp.common.config.settings import GatewayResourceSettings
 from exp.common.core.artifacts import ContractModel, stable_id
 from exp.common.sqlite.connection import persistent_connection
+from exp.common.sqlite.native import native_connection
 from exp.runtime.gateway.attempt_costs import (
     LONG_CONTEXT_TIER_MARGIN_PERCENT as LONG_CONTEXT_TIER_MARGIN_PERCENT,
 )
@@ -179,6 +182,7 @@ class SQLiteBudgetStore:
             else GatewayResourceSettings(budget_snapshot_max_bytes=snapshot_max_bytes)
         ).budget_snapshot_max_bytes
         initialize_database(database_path, busy_timeout_ms=busy_timeout_ms)
+        self._native = NativeSQLiteLedger(database_path, busy_timeout_ms=busy_timeout_ms)
 
     def set_limit(
         self,
@@ -276,7 +280,11 @@ class SQLiteBudgetStore:
                     now,
                 ),
             )
-            _backfill_budget(connection, budget_id=budget_id)
+            self._native.apply(
+                "backfill_budget",
+                json.dumps({"budget_id": budget_id, "now": now}),
+                native_connection(connection),
+            )
             return True, self._read_limit(connection, budget_id)
 
     def limits(
@@ -518,201 +526,6 @@ def budget_period_start(period: str) -> str:
     return f"{period}-01T00:00:00+00:00"
 
 
-def require_attempt_budget(
-    connection: sqlite3.Connection,
-    *,
-    organization_id: str,
-    identity_id: str,
-    alias_id: str,
-    pool_id: str,
-    deployment_id: str,
-    attempt_id: str,
-    period_start: str,
-    maximum_cost_nano_usd: int | None,
-    root_pool_id: str | None = None,
-    request_id: str | None = None,
-    alias_revision_id: str | None = None,
-) -> None:
-    """Atomically require room beneath every limit applicable to one attempt.
-
-    A limit with ``strict_unknown_cost`` fails closed: it rejects an unpriced
-    attempt outright and rejects every attempt while unknown-cost attempts remain
-    unresolved. A default limit admits an unpriced attempt, records it as one
-    unknown-cost charge for later reconciliation, and keeps enforcing the hard
-    cap over every known-cost reservation and settlement. Request-wide gates run
-    before any skippable child or deployment refusal, regardless of scope-key order.
-    """
-    rows = connection.execute(
-        """
-        SELECT * FROM gateway_monthly_budgets
-        WHERE organization_id = ? AND period_start = ? AND (
-            scope_kind = 'team'
-            OR (scope_kind = 'identity' AND identity_id = ?)
-            OR (scope_kind = 'pool' AND alias_id = ? AND pool_id IN (?, ?))
-            OR (scope_kind = 'deployment' AND alias_id = ? AND pool_id = ?
-                AND deployment_id = ?)
-        )
-        ORDER BY CASE WHEN scope_kind IN ('team', 'identity')
-            OR (scope_kind = 'pool' AND pool_id = ?) THEN 0 ELSE 1 END,
-            scope_kind, scope_key
-        """,
-        (
-            organization_id,
-            period_start,
-            identity_id,
-            alias_id,
-            pool_id,
-            root_pool_id or pool_id,
-            alias_id,
-            pool_id,
-            deployment_id,
-            root_pool_id or pool_id,
-        ),
-    ).fetchall()
-    if not rows:
-        return
-    for row in rows:
-        scope_kind = BudgetScopeKind(str(row["scope_kind"]))
-        refusal = None
-        if request_id is not None and alias_revision_id is not None:
-            scope = _limit_from_row(row).scope
-            application: BudgetApplication = "shared"
-            if scope_kind in (BudgetScopeKind.POOL, BudgetScopeKind.DEPLOYMENT):
-                application = (
-                    "root" if scope.pool_id == (root_pool_id or pool_id) else "destination"
-                )
-                if pool_id == (root_pool_id or pool_id):
-                    application = "shared"
-            refusal = BudgetRefusalBinding(
-                request_id=request_id,
-                organization_id=organization_id,
-                alias_revision_id=alias_revision_id,
-                scope=scope,
-                application=application,
-            )
-        strict = bool(row["strict_unknown_cost"])
-        unknown = int(row["unknown_cost_attempts"])
-        charged = int(row["reserved_nano_usd"]) + int(row["settled_nano_usd"])
-        limit = int(row["limit_nano_usd"])
-        if strict and unknown:
-            raise BudgetReservationRejected(
-                scope_kind=scope_kind,
-                binding=refusal,
-                reason="monthly hard limit has prior attempts with unknown cost",
-            )
-        if maximum_cost_nano_usd is None:
-            if strict:
-                raise BudgetReservationRejected(
-                    scope_kind=scope_kind,
-                    binding=refusal,
-                    reason="monthly hard limit requires a known maximum attempt cost",
-                )
-            continue
-        if maximum_cost_nano_usd > max(0, limit - charged):
-            raise BudgetReservationRejected(
-                scope_kind=scope_kind,
-                binding=refusal,
-                reason=f"monthly {scope_kind.value} allocation is exhausted",
-            )
-    for row in rows:
-        if maximum_cost_nano_usd is None:
-            connection.execute(
-                """
-                UPDATE gateway_monthly_budgets
-                SET unknown_cost_attempts = unknown_cost_attempts + 1
-                WHERE budget_id = ?
-                """,
-                (str(row["budget_id"]),),
-            )
-            connection.execute(
-                """
-                INSERT INTO gateway_attempt_budget_charges (
-                    budget_id, attempt_id
-                ) VALUES (?, ?)
-                """,
-                (str(row["budget_id"]), attempt_id),
-            )
-            continue
-        connection.execute(
-            """
-            UPDATE gateway_monthly_budgets
-            SET reserved_nano_usd = reserved_nano_usd + ?
-            WHERE budget_id = ?
-            """,
-            (maximum_cost_nano_usd, str(row["budget_id"])),
-        )
-        connection.execute(
-            """
-            INSERT INTO gateway_attempt_budget_charges (
-                budget_id, attempt_id, reserved_nano_usd
-            ) VALUES (?, ?, ?)
-            """,
-            (str(row["budget_id"]), attempt_id, maximum_cost_nano_usd),
-        )
-
-
-def settle_attempt_budgets(
-    connection: sqlite3.Connection,
-    *,
-    attempt_id: str,
-    settled_nano_usd: int | None,
-) -> None:
-    """Move every applicable attempt charge from reserved or unknown to settled."""
-    rows = connection.execute(
-        """
-        SELECT c.budget_id, c.reserved_nano_usd, c.settled_nano_usd,
-               b.settled_nano_usd AS budget_settled_nano_usd
-        FROM gateway_attempt_budget_charges AS c
-        JOIN gateway_monthly_budgets AS b ON b.budget_id = c.budget_id
-        WHERE c.attempt_id = ?
-        """,
-        (attempt_id,),
-    ).fetchall()
-    for row in rows:
-        if row["settled_nano_usd"] is not None or settled_nano_usd is None:
-            continue
-        budget_id = str(row["budget_id"])
-        if int(row["budget_settled_nano_usd"]) + settled_nano_usd > MAXIMUM_NANO_USD:
-            raise ValueError("settled monthly gateway cost exceeds SQLite integer capacity")
-        reserved = None if row["reserved_nano_usd"] is None else int(row["reserved_nano_usd"])
-        if reserved is None:
-            update = connection.execute(
-                """
-                UPDATE gateway_monthly_budgets
-                SET unknown_cost_attempts = unknown_cost_attempts - 1,
-                    settled_nano_usd = settled_nano_usd + ?
-                WHERE budget_id = ? AND unknown_cost_attempts > 0
-                """,
-                (settled_nano_usd, budget_id),
-            )
-        else:
-            update = connection.execute(
-                """
-                UPDATE gateway_monthly_budgets
-                SET reserved_nano_usd = reserved_nano_usd - ?,
-                    settled_nano_usd = settled_nano_usd + ?
-                WHERE budget_id = ? AND reserved_nano_usd >= ?
-                """,
-                (
-                    reserved,
-                    settled_nano_usd,
-                    budget_id,
-                    reserved,
-                ),
-            )
-        if update.rowcount != 1:
-            raise RuntimeError("monthly budget counters are inconsistent")
-        charge = connection.execute(
-            """
-            UPDATE gateway_attempt_budget_charges SET settled_nano_usd = ?
-            WHERE budget_id = ? AND attempt_id = ? AND settled_nano_usd IS NULL
-            """,
-            (settled_nano_usd, budget_id, attempt_id),
-        )
-        if charge.rowcount != 1:
-            raise RuntimeError("attempt budget charge is already settled")
-
-
 def _remaining_from_row(
     connection: sqlite3.Connection,
     row: sqlite3.Row,
@@ -762,115 +575,6 @@ def _unknown_token_volume(
         (budget_id,),
     ).fetchone()
     return int(row["input_volume"]), int(row["output_volume"])
-
-
-def _backfill_budget(connection: sqlite3.Connection, *, budget_id: str) -> None:
-    """Bind prior attempts to a newly configured limit and materialize exact counters."""
-    row = connection.execute(
-        "SELECT * FROM gateway_monthly_budgets WHERE budget_id = ?",
-        (budget_id,),
-    ).fetchone()
-    if row is None:
-        raise RuntimeError("monthly budget disappeared before historical backfill")
-    period_start = str(row["period_start"])
-    predicate, parameters = _attempt_scope_predicate(row, period_start=period_start)
-    attempts = connection.execute(
-        f"""
-        SELECT a.attempt_id, a.budget_reserved_nano_usd,
-               a.budget_settled_nano_usd, a.estimated_cost_nano_usd
-        FROM gateway_attempts AS a
-        JOIN gateway_requests AS r ON r.request_id = a.request_id
-        WHERE {predicate} ORDER BY a.attempt_id
-        """,
-        parameters,
-    )
-    reserved_total = 0
-    settled_total = 0
-    unknown_total = 0
-    for attempt in attempts:
-        settled = _historical_settlement(attempt)
-        reserved = (
-            int(attempt["budget_reserved_nano_usd"])
-            if settled is None and attempt["budget_reserved_nano_usd"] is not None
-            else None
-        )
-        unknown = settled is None and reserved is None
-        reserved_total += reserved or 0
-        settled_total += settled or 0
-        unknown_total += int(unknown)
-        if reserved_total > MAXIMUM_NANO_USD or settled_total > MAXIMUM_NANO_USD:
-            raise ValueError("historical monthly gateway cost exceeds SQLite integer capacity")
-        connection.execute(
-            """
-            INSERT INTO gateway_attempt_budget_charges (
-                budget_id, attempt_id, reserved_nano_usd, settled_nano_usd
-            ) VALUES (?, ?, ?, ?)
-            """,
-            (budget_id, str(attempt["attempt_id"]), reserved, settled),
-        )
-    connection.execute(
-        """
-        UPDATE gateway_monthly_budgets
-        SET reserved_nano_usd = ?, settled_nano_usd = ?, unknown_cost_attempts = ?
-        WHERE budget_id = ?
-        """,
-        (reserved_total, settled_total, unknown_total, budget_id),
-    )
-
-
-def _historical_settlement(row: sqlite3.Row) -> int | None:
-    """Return one prior attempt's settled cost while preserving active reservations."""
-    if row["budget_settled_nano_usd"] is not None:
-        return int(row["budget_settled_nano_usd"])
-    if row["budget_reserved_nano_usd"] is not None:
-        return None
-    if row["estimated_cost_nano_usd"] is not None:
-        return int(row["estimated_cost_nano_usd"])
-    return None
-
-
-def _attempt_scope_predicate(
-    row: sqlite3.Row,
-    *,
-    period_start: str,
-) -> tuple[str, tuple[str, ...]]:
-    """Return one fixed SQL predicate and parameters for a stored scope."""
-    base = "a.organization_id = ? AND a.budget_period_start = ?"
-    organization_id = str(row["organization_id"])
-    kind = BudgetScopeKind(str(row["scope_kind"]))
-    if kind is BudgetScopeKind.TEAM:
-        return base, (organization_id, period_start)
-    if kind is BudgetScopeKind.IDENTITY:
-        return f"{base} AND r.identity_id = ?", (
-            organization_id,
-            period_start,
-            str(row["identity_id"]),
-        )
-    if kind is BudgetScopeKind.POOL:
-        # Charge the destination or the accepted revision's root, never the active alias.
-        return (
-            f"""{base} AND r.alias_id = ? AND (a.pool_id = ? OR EXISTS (
-            SELECT 1 FROM alias_revisions AS revision
-            WHERE revision.organization_id = r.organization_id
-              AND revision.alias_id = r.alias_id
-              AND revision.revision_id = r.alias_revision_id
-              AND revision.pool_id = ?
-        ))""",
-            (
-                organization_id,
-                period_start,
-                str(row["alias_id"]),
-                str(row["pool_id"]),
-                str(row["pool_id"]),
-            ),
-        )
-    return f"{base} AND r.alias_id = ? AND a.pool_id = ? AND a.deployment_id = ?", (
-        organization_id,
-        period_start,
-        str(row["alias_id"]),
-        str(row["pool_id"]),
-        str(row["deployment_id"]),
-    )
 
 
 def _limit_from_row(row: sqlite3.Row) -> MonthlyBudgetLimit:

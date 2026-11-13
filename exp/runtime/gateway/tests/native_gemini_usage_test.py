@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import socket
-import sqlite3
 import struct
 import threading
 import time
@@ -21,6 +20,7 @@ from exp.common.models import (
     GatewayTokenPrices,
     ModelCapabilities,
 )
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.catalog_authority import upsert_connection, upsert_singleton_deployment
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.tests.launch_test import _ServedGateway, _unused_port
@@ -222,7 +222,6 @@ def test_native_gemini_usage_reaches_response_and_one_durable_settlement(
     }.get(placement, (7, 2, 3, 8_300))
     unknown_meter = placement in {"none", "empty", "cache-only", "empty-cache-output"}
     requests: list[str] = []
-    settlements: list[JsonObject] = []
 
     class Provider(BaseHTTPRequestHandler):
         """Serve finite SSE with independently flushed Gemini frames."""
@@ -260,14 +259,6 @@ def test_native_gemini_usage_reaches_response_and_one_durable_settlement(
     monkeypatch.setenv("TEST_PROVIDER_KEY", "synthetic-key")
     manager, key = _configure(tmp_path)
     gateway = _ServedGateway(tmp_path, _unused_port())
-    settle = gateway.control_plane.settle
-
-    def record_settle(argument: str) -> str:
-        """Observe actual native settlement callbacks without replacing durable accounting."""
-        settlements.append(json.loads(argument))
-        return settle(argument)
-
-    monkeypatch.setattr(gateway.control_plane, "settle", record_settle)
     try:
         gateway.start()
         response = httpx.post(
@@ -317,10 +308,7 @@ def test_native_gemini_usage_reaches_response_and_one_durable_settlement(
         upstream.shutdown()
         upstream.server_close()
         worker.join(timeout=5)
-    assert len(settlements) == 1
-    assert settlements[0]["outcome"] == "completed"
-    assert settlements[0]["failure"] is None
-    with sqlite3.connect(manager.database_path) as connection:
+    with connect_sqlite(manager.database_path) as connection:
         rows = connection.execute(
             "SELECT state, input_tokens, output_tokens, cached_input_tokens, "
             "estimated_cost_nano_usd FROM gateway_attempts"
@@ -339,8 +327,6 @@ def test_native_gemini_drain_ends_bounded_and_settles_known_usage_once(
     """The serving worker closes a stalled trailer phase before one durable settlement."""
     closed = threading.Event()
     sent = threading.Event()
-    settled = threading.Event()
-    settlements: list[JsonObject] = []
     calls: list[str] = []
     body = b"".join(_chunks("same-chunk"))
 
@@ -389,7 +375,6 @@ def test_native_gemini_drain_ends_bounded_and_settles_known_usage_once(
     manager, key = _configure(tmp_path)
     gateway = _ServedGateway(tmp_path, _unused_port())
     admit = gateway.control_plane.admit
-    settle = gateway.control_plane.settle
     if ending == "deadline":
         monkeypatch.setattr(gateway.control_plane, "_request_timeout_seconds", 0.8)
 
@@ -400,15 +385,7 @@ def test_native_gemini_drain_ends_bounded_and_settles_known_usage_once(
             rung["timeout_seconds"] = 0.2 if ending == "phase-timeout" else 2.0
         return json.dumps(admission)
 
-    def record_settle(argument: str) -> str:
-        """Record exactly-once callback evidence while retaining normal accounting."""
-        settlements.append(json.loads(argument))
-        result = settle(argument)
-        settled.set()
-        return result
-
     monkeypatch.setattr(gateway.control_plane, "admit", bounded_admit)
-    monkeypatch.setattr(gateway.control_plane, "settle", record_settle)
     client: socket.socket | None = None
     try:
         gateway.start()
@@ -450,7 +427,7 @@ def test_native_gemini_drain_ends_bounded_and_settles_known_usage_once(
                 assert '"content":"hi"' in response.text.replace(" ", "")
             else:
                 assert '"finish_reason":"stop"' in response.text.replace(" ", "")
-        assert settled.wait(1), "data-plane settlement must precede the sweep"
+        _await_terminal(manager.database_path)
         assert time.monotonic() - started < 1.8
         if ending != "provider-break":
             assert closed.wait(0.5), "metadata drain must close its upstream transport"
@@ -462,11 +439,21 @@ def test_native_gemini_drain_ends_bounded_and_settles_known_usage_once(
         upstream.server_close()
         worker.join(timeout=5)
     assert len(calls) == 1
-    assert len(settlements) == 1
-    assert settlements[0]["outcome"] == "completed"
-    with sqlite3.connect(manager.database_path) as connection:
+    with connect_sqlite(manager.database_path) as connection:
         rows = connection.execute(
             "SELECT state, input_tokens, output_tokens, cached_input_tokens, "
             "estimated_cost_nano_usd FROM gateway_attempts"
         ).fetchall()
     assert rows == [("completed", 7, 2, 3, 8_300)]
+
+
+def _await_terminal(database_path: Path) -> None:
+    """Observe the real Rust write before the recovery sweep or shutdown can produce it."""
+    deadline = time.monotonic() + 1
+    with connect_sqlite(database_path) as connection:
+        while time.monotonic() < deadline:
+            rows = connection.execute("SELECT state FROM gateway_attempts").fetchall()
+            if rows == [("completed",)]:
+                return
+            time.sleep(0.01)
+    pytest.fail("The data plane did not settle its single attempt before recovery")

@@ -25,6 +25,7 @@ from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError, authority_error
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
+from exp.runtime.gateway.native_handoff import NativeRequestFactory
 from exp.runtime.gateway.video.contracts import render_deleted_object, render_video_object
 from exp.runtime.gateway.video.engine import VideoEngine
 from exp.runtime.gateway.video.output import VideoOutputStore
@@ -40,6 +41,7 @@ class _VideoPlane(Protocol):
 
     _components: NativeGatewayComponents
     _write_ledger: SyncWriteLedger
+    _native_request_factory: NativeRequestFactory
     _guardrails: GuardrailEngine | None
     _videos: VideoEngine | None
 
@@ -109,6 +111,7 @@ class NativeVideosMixin:
             else VideoEngine(
                 components=self._components,
                 ledger=self._write_ledger,
+                native_request_factory=self._native_request_factory,
                 jobs=jobs,
                 guardrails=self._guardrails,
                 outputs=outputs,

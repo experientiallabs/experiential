@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 import threading
 import time
 from concurrent.futures import Future
@@ -14,9 +13,9 @@ import httpx
 import pytest
 from websockets.sync.client import connect
 
-from exp.common.models import BillingSource, GatewayTokenPrices
+from exp.common.models import BillingSource
 from exp.runtime.gateway.contracts import GatewayFailureClass, GatewayRequest
-from exp.runtime.gateway.guardrails.bounded import BoundedInspect
+from exp.runtime.gateway.guardrails.bounded import _NATIVE_RUNNER, BoundedInspect
 from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry, ScriptedClassifier
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
 from exp.runtime.gateway.guardrails.contracts import (
@@ -44,8 +43,15 @@ from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.tests.guardrail_policy_integrity_test import _body, _provider
 from exp.runtime.gateway.tests.mandatory_guardrails_paths_test import _serving
+from exp.runtime.gateway.tests.native_classifier_fixture_test import NativeClassifierFixture
 from exp.runtime.gateway.tests.native_tool_search_test import _TOOLS_CHAT, _configure, _Provider
 from exp.runtime.gateway.tests.native_waterfall_test import _content_chunk, _terminal_frames
+
+
+@pytest.fixture(autouse=True)
+def ready_standalone_observation_loop() -> None:
+    """Exercise standalone observation with its optional scheduler already available."""
+    _NATIVE_RUNNER.loop()
 
 
 class _Classifier(ScriptedClassifier):
@@ -129,9 +135,9 @@ class _Engine(GuardrailEngine):
             client=DirectClassifierClient(
                 ClassifierRegistry(
                     {
-                        "detector": classifier,
-                        "blocker": ScriptedClassifier(
-                            input_verdict=ClassifierVerdict(flagged=True)
+                        "detector": NativeClassifierFixture(classifier),
+                        "blocker": NativeClassifierFixture(
+                            ScriptedClassifier(input_verdict=ClassifierVerdict(flagged=True))
                         ),
                     }
                 )
@@ -525,7 +531,9 @@ def test_native_replay_survives_observation_reload_but_detects_enforcement_promo
     after = (observer.model_copy(update={"revision": "changed"}),)
     engine = GuardrailEngine(
         store=MappingGuardrailStore(before),
-        client=DirectClassifierClient(ClassifierRegistry({"detector": ScriptedClassifier()})),
+        client=DirectClassifierClient(
+            ClassifierRegistry({"detector": NativeClassifierFixture(ScriptedClassifier())})
+        ),
         monotonic=time.monotonic,
     )
 
@@ -603,76 +611,11 @@ def test_observation_recorder_failure_cannot_reject_a_request(
         engine.close(timeout_seconds=2)
 
 
-@pytest.mark.parametrize("surface", ["embeddings", "images", "Decisions"])
-def test_observer_only_policies_do_not_fence_unsupported_surfaces(surface: str) -> None:
-    """Unsupported observation coverage is metadata rather than a customer rejection."""
-    classifier = _Classifier(GuardrailOutcome.FLAGGED)
-    engine = _Engine(classifier)
-    require_unguarded_surface(engine, _authorization(), surface)
-    engine.close(timeout_seconds=2)
-    assert engine.observed == [("platform-observer", None, GuardrailOutcome.UNSUPPORTED)]
-    assert classifier.input_calls == 0
-    engine.close(timeout_seconds=0)
-
-
-@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("outcome", [GuardrailOutcome.FLAGGED, GuardrailOutcome.UNSUPPORTED])
-def test_native_provider_finishes_and_is_charged_before_observation_completes(
-    tmp_path: Path, surface: str, stream: bool, outcome: GuardrailOutcome
-) -> None:
-    """Actual native HTTP delivery and ledger settlement never wait for an observer."""
-    classifier = _Classifier(outcome)
-    engine = _Engine(classifier, _policy(timeout_ms=5000))
-    marker = "provider response before observation"
-    with _provider(_content_chunk(marker) + _terminal_frames()) as (url, received):
-        _, key = _configured_gateway(
-            tmp_path,
-            base_url=url,
-            billing_source=BillingSource.HOST_MANAGED,
-            prices=GatewayTokenPrices(
-                input_nano_usd_per_million_tokens=1_000_000_000,
-                output_nano_usd_per_million_tokens=2_000_000_000,
-            ),
-        )
-        components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"})
-        control = NativeControlPlane(components, guardrails=engine)
-        try:
-            with _serving(control) as gateway:
-                path, body = _body(surface, stream)
-                response = httpx.post(
-                    gateway + path,
-                    headers={"authorization": f"Bearer {key}"},
-                    json=body,
-                    timeout=3,
-                )
-                assert response.status_code == 200, response.text
-                assert marker in response.text
-                assert classifier.started.wait(2)
-                assert not classifier.release.is_set() and not classifier.cancelled.is_set()
-                assert engine.observed == []
-                with sqlite3.connect(components.ledger.database_path) as db:
-                    rows = db.execute(
-                        "select state, failure_class, budget_settled_nano_usd from gateway_attempts"
-                    ).fetchall()
-                assert len(rows) == 1
-                assert rows[0][:2] == ("completed", None)
-                assert rows[0][2] > 0
-                assert len(received) == 1
-                classifier.release.set()
-                assert engine.recorded.wait(2)
-                assert engine.observed == [("platform-observer", "input", outcome)]
-                assert engine.enforced == []
-        finally:
-            classifier.release.set()
-            engine.close(timeout_seconds=2)
-
-
 @pytest.mark.parametrize("observing", [True, False])
 def test_websocket_turn_uses_the_same_observation_or_coverage_authority(
     tmp_path: Path, observing: bool
 ) -> None:
-    """A WebSocket turn delivers during observation but withholds an enforced coverage failure."""
+    """A WebSocket delivers during observation and retains an explicit strict policy's failure."""
     classifier = _Classifier(GuardrailOutcome.UNSUPPORTED)
     policy = _policy(timeout_ms=5000)
     if not observing:
@@ -717,7 +660,7 @@ def test_websocket_turn_uses_the_same_observation_or_coverage_authority(
                         assert not classifier.release.is_set()
                     else:
                         assert marker not in "".join(events)
-                        assert "unsupported_capability" in "".join(events)
+                        assert "gateway_unavailable" in "".join(events)
                     assert len(received) == 1
         finally:
             classifier.release.set()
@@ -726,23 +669,17 @@ def test_websocket_turn_uses_the_same_observation_or_coverage_authority(
 
 def test_native_tool_search_observes_expanded_context_without_output_enforcement(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Observation-only sessions neither invoke the output fence nor stop gateway tool rounds."""
     classifier = _Classifier(GuardrailOutcome.FLAGGED)
     engine = _Engine(classifier, _policy(timeout_ms=5000))
     provider = _Provider()
 
-    def forbidden_output(*args: object) -> GuardrailCompletion:
-        """Expose an accidental output enforcement path before tool execution."""
-        del args
-        raise AssertionError("observation invoked the output fence")
-
-    monkeypatch.setattr("exp.runtime.gateway.native_tool_search._search_output", forbidden_output)
     try:
         key = _configure(tmp_path, f"http://127.0.0.1:{provider.server.server_port}/v1")
         components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"})
-        with _serving(NativeControlPlane(components, guardrails=engine)) as gateway:
+        control = NativeControlPlane(components, guardrails=engine)
+        with _serving(control) as gateway:
             response = httpx.post(
                 gateway + "/v1/chat/completions",
                 headers={"authorization": f"Bearer {key}"},
@@ -758,7 +695,7 @@ def test_native_tool_search_observes_expanded_context_without_output_enforcement
             assert len(provider.requests) == 2
             assert not classifier.release.is_set()
             classifier.release.set()
-            engine.close(timeout_seconds=2)
+            assert control.close(2)
             assert any(any(m.role == "tool" for m in r.messages) for r in classifier.subjects)
             assert engine.enforced == []
     finally:

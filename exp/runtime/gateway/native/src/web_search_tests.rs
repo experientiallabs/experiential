@@ -59,7 +59,7 @@ fn frame_payload(frame: &str) -> Value {
         .lines()
         .find_map(|line| line.strip_prefix("data: "))
         .expect("data line");
-    serde_json::from_str(data).expect("frame payload is JSON")
+    crate::lossless_json::from_str(data).expect("frame payload is JSON")
 }
 
 #[test]
@@ -189,7 +189,7 @@ fn citation_shapes_nest_for_chat_and_flatten_for_responses() {
 
 #[test]
 fn admission_decodes_the_contract_shape_and_defaults_missing_fields() {
-    let decoded: WebSearchAdmission = serde_json::from_value(json!({
+    let decoded: WebSearchAdmission = crate::lossless_json::from_value(json!({
         "query": "q",
         "requests": 1,
         "results": [{"url": "https://a.example/", "title": "A"}],
@@ -199,13 +199,13 @@ fn admission_decodes_the_contract_shape_and_defaults_missing_fields() {
     assert_eq!(decoded.results[0].title, "A");
     // An admission from a control plane predating the vendor cost decodes as unreported.
     assert_eq!(decoded.cost_nano_usd, None);
-    let costed: WebSearchAdmission = serde_json::from_value(json!({
+    let costed: WebSearchAdmission = crate::lossless_json::from_value(json!({
         "requests": 1,
         "cost_nano_usd": 12_000_000,
     }))
     .expect("decodes");
     assert_eq!(costed.cost_nano_usd, Some(12_000_000));
-    let sparse: WebSearchAdmission = serde_json::from_value(json!({})).expect("defaults");
+    let sparse: WebSearchAdmission = crate::lossless_json::from_value(json!({})).expect("defaults");
     assert_eq!(sparse.requests, 0);
     assert!(sparse.results.is_empty());
 }
@@ -265,12 +265,12 @@ fn prelude_events_render_the_two_anthropic_blocks_under_a_stable_id() {
     };
     assert_eq!(delta, raw, "the whole input rides one delta");
     assert_eq!(
-        serde_json::from_str::<Value>(&raw).expect("input JSON"),
+        crate::lossless_json::from_str::<Value>(&raw).expect("input JSON"),
         json!({"query": "current stable Python"})
     );
     match &events[3] {
         Event::ServerToolResult { block, .. } => {
-            let block: Value = serde_json::from_str(block).expect("block JSON");
+            let block: Value = crate::lossless_json::from_str(block).expect("block JSON");
             assert_eq!(block["type"], json!("web_search_tool_result"));
             assert_eq!(block["tool_use_id"], json!(expected_id));
             assert_eq!(
@@ -627,7 +627,7 @@ fn responses_gateway_search_item_carries_query_and_sources_when_asked() {
     };
     assert_eq!(item_type, "web_search_call");
     assert_eq!(*output_index, RESPONSES_WEB_SEARCH_OUTPUT_INDEX);
-    let item: Value = serde_json::from_str(item).expect("item json");
+    let item: Value = crate::lossless_json::from_str(item).expect("item json");
     assert_eq!(item["action"]["type"], json!("search"));
     assert_eq!(item["action"]["query"], json!(search.query));
     let urls: Vec<&str> = item["action"]["sources"]

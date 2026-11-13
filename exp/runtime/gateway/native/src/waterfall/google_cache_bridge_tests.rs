@@ -1,126 +1,56 @@
-//! Cross-language integration with real admission, callback authority, and loopback HTTP.
+//! Real cache HTTP through the native request owner and native financial authority.
 
 use super::*;
-use crate::bridge::Bridge;
-use pyo3::prelude::*;
-use pyo3::types::PyModule;
+use crate::accounting::cache_bridge_fixture as native;
 use tokio::io::AsyncWriteExt;
 
-/// The only URL substitution is private test fixture state after official admission.
-const FIXTURE: &std::ffi::CStr = cr#"
-import json
-from dataclasses import replace
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
-from exp.runtime.gateway.native_explicit_cache_test import (
-    _Host, _authority, _control, _vertex_control, _admission, _start_first, _wire, _RESOURCE,
-)
-from exp.runtime.models.providers.google_cache import VertexCacheProject
-
-
-def setup(base, vertex):
-    """Build actual admission/accounting with a fake atomic cache-spend authority."""
-    temporary = TemporaryDirectory(prefix="exp-native-cache-bridge-")
-    authority = _authority()
-    if vertex:
-        authority = replace(authority, vertex_project=VertexCacheProject("fruit-project", "123456789"))
-    host = _Host(authority)
-    control, key = (_vertex_control if vertex else _control)(Path(temporary.name), host)
-    return temporary, host, control, key, base, vertex
-
-
-def admit(fixture):
-    """Admit and reserve on the real plane before substituting loopback-only URLs."""
-    temporary, host, control, key, base, vertex = fixture
-    admission = _admission(control, key)
-    wire = dict(_wire(admission))
-    assert wire["explicit_cache"] is True
-    assert wire["url"].startswith("https://aiplatform.googleapis.com/" if vertex else "https://generativelanguage.googleapis.com/")
-    entry = control._accounting.entry(admission["request_id"])
-    assert entry is not None and entry.explicit_cache_state is not None
-    state = entry.explicit_cache_state
-    binding = state.bindings[0]
-    assert binding is not None
-    root = "/v1/projects/fruit-project/locations/global" if vertex else "/v1beta"
-    models = "/publishers/google/models/" if vertex else "/models/"
-    state.bindings = (replace(binding, plan=replace(binding.plan, create_url=base + root + "/cachedContents")),)
-    wire["url"] = base + root + models + "gemini-2.5-pro:streamGenerateContent?alt=sse"
-    _start_first(control, admission)
-    return admission["request_id"], json.dumps(wire)
-
-
-def assert_accounted(fixture, expected_claims):
-    """Check real host callbacks recorded exactly one scoped reservation and create."""
-    temporary, host, control, key, base, vertex = fixture
-    assert host.claim_calls == expected_claims
-    assert len(host.authority_calls) == expected_claims
-    assert host.record_calls == 1 and len(host.offers) == len(host.results) == 1
-    offer = next(iter(host.offers.values()))
-    result = next(iter(host.results.values()))
-    assert result.operation_id == offer.operation_id
-    resource = "projects/123456789/locations/global/" + _RESOURCE if vertex else _RESOURCE
-    assert result.outcome == "ready" and result.resource_name == resource
-    assert result.total_tokens == 1536 and result.expire_time == offer.expires_at
-    assert result.create_time is not None
-    assert offer.requested_at - 2 <= result.create_time <= result.observed_at
-    assert result.create_time <= result.expire_time
-    assert host.reserved == offer.reservation_nano_usd > 0
-
-
-def cleanup(fixture):
-    """Close fixture-thread SQLite connections before removing its temporary directory."""
-    temporary, host, control, key, base, vertex = fixture
-    control.close_thread_resources("{}")
-    temporary.cleanup()
-"#;
-
-fn fixture(base: &str, vertex: bool) -> (Py<PyModule>, Py<PyAny>, Py<PyAny>) {
-    Python::initialize();
-    Python::attach(|py| {
-        let module = PyModule::from_code(
-            py,
-            FIXTURE,
-            c"google_cache_bridge_fixture.py",
-            c"google_cache_bridge_fixture",
-        )
-        .expect("project test dependencies must be available to the embedded interpreter");
-        let fixture = module
-            .getattr("setup")
-            .unwrap()
-            .call1((base, vertex))
-            .unwrap();
-        let control = fixture.get_item(2).unwrap().unbind();
-        (module.unbind(), fixture.unbind(), control)
-    })
+fn configuration(base: &str, vertex: bool) -> (Value, Value, DeploymentWire) {
+    // This fixture is exported from the real admission binder, without Python callbacks.
+    let case: Value = include_str!("../../tests/generated/cache.jsonl")
+        .lines()
+        .map(|line| crate::lossless_json::from_str::<Value>(line).unwrap())
+        .find(|case| case["kind"] == "callbacks" && case["host_kind"] == "creator")
+        .unwrap();
+    let mut configuration = case["configuration"].clone();
+    let mut authority = case["authority"].clone();
+    let root = if vertex {
+        "/v1/projects/fruit-project/locations/global"
+    } else {
+        "/v1beta"
+    };
+    let models = if vertex {
+        "/publishers/google/models/"
+    } else {
+        "/models/"
+    };
+    let plan = &mut configuration["bindings"][0]["plan"];
+    plan["create_url"] = json!(format!("{base}{root}/cachedContents"));
+    if vertex {
+        plan["resource_prefix"] = json!("projects/fruit-project/locations/global/cachedContents/");
+        authority["vertex_project"] =
+            json!({"endpoint_project":"fruit-project", "project_number":"123456789"});
+    }
+    let mut wire = tests::wire(&format!(
+        "{base}{root}{models}gemini-2.5-pro:streamGenerateContent?alt=sse"
+    ));
+    wire.deployment_id = "coding".into();
+    wire.upstream_payload = plan["create_payload"].clone();
+    wire.upstream_payload["generationConfig"] =
+        plan["generation_payload"]["generationConfig"].clone();
+    wire.upstream_payload["contents"]
+        .as_array_mut()
+        .unwrap()
+        .extend(
+            plan["generation_payload"]["contents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
+    (configuration, authority, wire)
 }
 
-fn admit(module: &Py<PyModule>, fixture: &Py<PyAny>) -> (String, DeploymentWire) {
-    Python::attach(|py| {
-        let (request_id, wire): (String, String) = module
-            .bind(py)
-            .getattr("admit")
-            .unwrap()
-            .call1((fixture.bind(py),))
-            .unwrap()
-            .extract()
-            .unwrap();
-        (request_id, serde_json::from_str(&wire).unwrap())
-    })
-}
-
-fn assert_accounted(module: &Py<PyModule>, fixture: &Py<PyAny>, expected_claims: u64) {
-    Python::attach(|py| {
-        module
-            .bind(py)
-            .getattr("assert_accounted")
-            .unwrap()
-            .call1((fixture.bind(py), expected_claims))
-            .unwrap();
-    });
-}
-
-/// Server echoes the absolute expiry supplied by the real Python create callback.
+/// Server echoes the absolute expiry supplied by the native spending authority.
 async fn loopback(resource: &'static str) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -129,7 +59,7 @@ async fn loopback(resource: &'static str) -> (String, tokio::task::JoinHandle<Ve
         for index in 0..3 {
             let (mut socket, _) = listener.accept().await.unwrap();
             let body = crate::waterfall::ladder_tests::read_request_body(&mut socket).await;
-            let body: Value = serde_json::from_str(&body).unwrap();
+            let body: Value = crate::lossless_json::from_str(&body).unwrap();
             let response = if index == 0 {
                 assert!(body.get("ttl").is_none());
                 assert!(body.get("expireTime").is_some());
@@ -158,8 +88,7 @@ async fn loopback(resource: &'static str) -> (String, tokio::task::JoinHandle<Ve
 }
 
 #[tokio::test]
-#[ignore = "requires project dependencies in the matching embedded Python; run with PYO3_PYTHON and PYTHONPATH"]
-async fn real_python_control_plane_creates_and_reuses_through_bridge() {
+async fn native_request_owner_creates_and_reuses_cache_without_python() {
     exercise_bridge(false).await;
     exercise_bridge(true).await;
 }
@@ -171,11 +100,12 @@ async fn exercise_bridge(vertex: bool) {
         "cachedContents/verified_test_resource"
     };
     let (base, server) = loopback(resource).await;
-    let (module, fixture, control) = fixture(&base, vertex);
-    let bridge = Bridge::new(control, 1).unwrap();
+    let (configuration, authority, original) = configuration(&base, vertex);
+    let host = native::host(authority);
     let http = crate::upstream::build_client(Duration::from_secs(1), false).unwrap();
     for expected_claims in 1..=2 {
-        let (request_id, original) = admit(&module, &fixture);
+        let request_id = format!("request-{expected_claims}");
+        let fixture = native::admit(configuration.clone(), host.clone(), &request_id);
         let cached = execute(
             &http,
             &original,
@@ -183,12 +113,19 @@ async fn exercise_bridge(vertex: bool) {
             Instant::now() + Duration::from_secs(10),
             false,
             EndpointPolicy::Loopback,
-            |method, argument| bridge.call(method, argument),
+            |method, argument| {
+                let fixture = fixture.clone();
+                async move {
+                    tokio::task::spawn_blocking(move || fixture.call(method, &argument))
+                        .await
+                        .unwrap()
+                }
+            },
         )
         .await
         .unwrap()
         .expect("the real host authorizes the recorded resource");
-        assert_accounted(&module, &fixture, expected_claims);
+        native::assert_accounted(&host, expected_claims, resource);
         assert!(original.upstream_payload.get("cachedContent").is_none());
         assert_eq!(cached.upstream_payload["cachedContent"], resource);
         assert_eq!(
@@ -228,13 +165,4 @@ async fn exercise_bridge(vertex: bool) {
     assert!(bodies[1..]
         .iter()
         .all(|body| !body.to_string().contains("private-inventory-prefix-canary")));
-    drop(bridge);
-    Python::attach(|py| {
-        module
-            .bind(py)
-            .getattr("cleanup")
-            .unwrap()
-            .call1((fixture.bind(py),))
-            .unwrap();
-    });
 }

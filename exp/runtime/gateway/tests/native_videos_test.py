@@ -43,6 +43,7 @@ from exp.common.models import (
     GatewayUnitPrices,
     ModelCapabilities,
 )
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.catalog_authority import upsert_connection, upsert_singleton_deployment
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
@@ -358,7 +359,7 @@ def _create(client: openai.OpenAI, **fields: object) -> Video:
 
 def _attempt(engine: _VideoEngine, *, latest: int = 0) -> sqlite3.Row:
     """Read one of the most recent ledger attempts (``latest=0`` is the newest)."""
-    with sqlite3.connect(engine.database) as connection:
+    with connect_sqlite(engine.database) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """

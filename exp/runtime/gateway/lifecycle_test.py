@@ -32,6 +32,7 @@ from exp.common.models import (
     load_model_catalog,
     write_model_catalog,
 )
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.catalog_authority import (
     upsert_connection,
     upsert_singleton_deployment,
@@ -992,7 +993,7 @@ def test_concurrent_authorization_survives_pool_recertification_hot_swap(
     assert len(results) + len(refused) == 48
     assert sum(alias == "solo" for alias, _revision in results) == 12
     assert _authorize(components, issued.raw_key, "chat") == "rev-chat-2"
-    with sqlite3.connect(manager.database_path) as connection:
+    with connect_sqlite(manager.database_path) as connection:
         assert connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0] == 0
     chat_revisions = {revision for alias, revision in results if alias == "chat"}

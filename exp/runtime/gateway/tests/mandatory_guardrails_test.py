@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import socket
-import sqlite3
 import threading
 import time
 from collections.abc import Mapping
@@ -17,6 +16,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelCapabilities
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.guardrails.bounded import BoundedInspect
 from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry
@@ -37,6 +37,7 @@ from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
 from exp.runtime.gateway.native_bridge_test import _admit, _chat_body
 from exp.runtime.gateway.native_server import serve_native_gateway
+from exp.runtime.gateway.tests.native_classifier_fixture_test import NativeClassifierFixture
 from exp.runtime.gateway.tests.native_waterfall_test import (
     _content_chunk,
     _sse_frame,
@@ -90,7 +91,12 @@ class _Guard(GuardrailEngine):
         super().__init__(
             store=MappingGuardrailStore((policy, *policies)),
             client=DirectClassifierClient(
-                ClassifierRegistry({**(adapters or {}), "platform": self})
+                ClassifierRegistry(
+                    {
+                        name: NativeClassifierFixture(adapter)
+                        for name, adapter in {**(adapters or {}), "platform": self}.items()
+                    }
+                )
             ),
             monotonic=time.monotonic,
             inspects=inspects,
@@ -115,7 +121,7 @@ class _Guard(GuardrailEngine):
         )
 
 
-def test_mandatory_input_refuses_before_durable_acceptance(tmp_path: Path) -> None:
+def test_mandatory_input_records_refusal_without_provider_dispatch(tmp_path: Path) -> None:
     """Missing optional policies cannot disable a host admission decision."""
     _, raw_key = _configured_gateway(tmp_path)
     components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "synthetic"})
@@ -124,8 +130,10 @@ def test_mandatory_input_refuses_before_durable_acceptance(tmp_path: Path) -> No
     with pytest.raises(NativeBridgeError):
         _admit(control, raw_key, _chat_body())
     assert len(guard.requests) == 1
-    with sqlite3.connect(components.ledger.database_path) as connection:
-        assert connection.execute("select count(*) from gateway_requests").fetchone()[0] == 0
+    with connect_sqlite(components.ledger.database_path) as connection:
+        assert connection.execute("select terminal_state from gateway_requests").fetchall() == [
+            ("failed",)
+        ]
         assert connection.execute("select count(*) from gateway_attempts").fetchone()[0] == 0
 
 
@@ -258,7 +266,7 @@ def test_real_native_output_policy_withholds_complete_response(
         assert len(guard.requests) == 1
         assert prefix not in result
         assert any("withhold-marker" in item.model_dump_json() for item in guard.completions)
-        with sqlite3.connect(components.ledger.database_path) as connection:
+        with connect_sqlite(components.ledger.database_path) as connection:
             rows = connection.execute(
                 "select state, failure_class from gateway_attempts"
             ).fetchall()

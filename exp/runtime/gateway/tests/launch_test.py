@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
-import sqlite3
 import threading
 import time
 from datetime import UTC, datetime
@@ -25,6 +24,7 @@ from exp.common.models import (
     GatewayTokenPrices,
     ModelCapabilities,
 )
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.catalog_authority import (
     upsert_connection,
     upsert_singleton_deployment,
@@ -575,7 +575,7 @@ def test_fresh_root_cli_certifies_lifecycle_and_executes_ordered_waterfall(
         assert quota_response.json()["error"]["code"] == "insufficient_quota"
         assert quota_response.json()["error"]["type"] == "insufficient_quota"
         assert _LoopbackProvider.calls == 5
-        connection = sqlite3.connect(tmp_path / "gateway" / "gateway.db")
+        connection = connect_sqlite(tmp_path / "gateway" / "gateway.db")
         try:
             attempts = connection.execute(
                 "SELECT deployment_id, route_depth, state FROM gateway_attempts "

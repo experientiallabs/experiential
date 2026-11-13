@@ -422,10 +422,9 @@ fn parse_steps(raw: &str, calls: &mut Vec<DsmlCall>) -> Result<(), Reject> {
             let raw_value = cursor.value()?;
             let value = match attribute(&next, "string") {
                 Some("true") => Value::String(raw_value.to_string()),
-                Some("false") => {
-                    serde_json::from_str(raw_value.trim()).map_err(|_| Reject::ParameterNotJson)?
-                }
-                _ => serde_json::from_str(raw_value.trim())
+                Some("false") => crate::lossless_json::from_str(raw_value.trim())
+                    .map_err(|_| Reject::ParameterNotJson)?,
+                _ => crate::lossless_json::from_str(raw_value.trim())
                     .unwrap_or_else(|_| Value::String(raw_value.to_string())),
             };
             arguments.insert(key, value);

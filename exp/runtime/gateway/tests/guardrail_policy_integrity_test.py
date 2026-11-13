@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import threading
 import time
 from collections.abc import Iterator
@@ -15,6 +14,7 @@ import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry, ScriptedClassifier
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
 from exp.runtime.gateway.guardrails.contracts import (
@@ -31,6 +31,7 @@ from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.tests.mandatory_guardrails_paths_test import _serving
+from exp.runtime.gateway.tests.native_classifier_fixture_test import NativeClassifierFixture
 from exp.runtime.gateway.tests.native_waterfall_test import (
     _content_chunk,
     _sse_frame,
@@ -109,7 +110,9 @@ def test_replay_claim_and_admission_must_share_the_same_policy_snapshot(
     detector = ScriptedClassifier()
     engine = GuardrailEngine(
         store=MappingGuardrailStore(before),
-        client=DirectClassifierClient(ClassifierRegistry({"fixture": detector})),
+        client=DirectClassifierClient(
+            ClassifierRegistry({"fixture": NativeClassifierFixture(detector)})
+        ),
         monotonic=time.monotonic,
     )
 
@@ -138,7 +141,7 @@ def test_replay_claim_and_admission_must_share_the_same_policy_snapshot(
             assert "policy changed during admission" in rejected.text
             assert received == []
             assert detector.input_calls == 0
-            with sqlite3.connect(components.ledger.database_path) as connection:
+            with connect_sqlite(components.ledger.database_path) as connection:
                 assert connection.execute("select count(*) from gateway_requests").fetchone() == (
                     0,
                 )
@@ -189,7 +192,9 @@ def test_rewritten_typed_refusal_is_delivered_as_a_completed_response(
                 ),
             )
         ),
-        client=DirectClassifierClient(ClassifierRegistry({"fixture": detector})),
+        client=DirectClassifierClient(
+            ClassifierRegistry({"fixture": NativeClassifierFixture(detector)})
+        ),
         monotonic=time.monotonic,
     )
     with _provider(frames) as (base_url, received):
@@ -220,7 +225,7 @@ def test_rewritten_typed_refusal_is_delivered_as_a_completed_response(
             assert terminal["status"] == "completed"
         assert len(received) == 1
         assert detector.output_calls == 1
-        with sqlite3.connect(components.ledger.database_path) as connection:
+        with connect_sqlite(components.ledger.database_path) as connection:
             assert connection.execute("select state from gateway_attempts").fetchall() == [
                 ("completed",)
             ]

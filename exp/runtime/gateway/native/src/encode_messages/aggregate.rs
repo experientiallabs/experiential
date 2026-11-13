@@ -155,8 +155,8 @@ pub fn completed_messages_body_with_reasoning(
                         slots.len() - 1
                     }
                 };
-                let parsed: Value =
-                    serde_json::from_str(citation).map_err(|_| PublicError::internal())?;
+                let parsed: Value = crate::lossless_json::from_str(citation)
+                    .map_err(|_| PublicError::internal())?;
                 let block = slots[position].as_mut().expect("text slot is filled");
                 match block.get_mut("citations") {
                     Some(Value::Array(citations)) => citations.push(parsed),
@@ -235,7 +235,7 @@ pub fn completed_messages_body_with_reasoning(
                     // The raw argument text was validated as one JSON object
                     // by the normalizer; preserve_order keeps its key order,
                     // so the parsed object serializes in the provider's order.
-                    let input: Value = serde_json::from_str(&call.raw_arguments)
+                    let input: Value = crate::lossless_json::from_str(&call.raw_arguments)
                         .map_err(|_| PublicError::internal())?;
                     slots[*position] = Some(json!({
                         "type": "tool_use",
@@ -253,7 +253,7 @@ pub fn completed_messages_body_with_reasoning(
                 // Provider-executed tool use anchors at its start position
                 // and never contributes to the tool_use stop reason.
                 if let Some(position) = server_positions.get(index) {
-                    let input: Value = serde_json::from_str(&call.raw_arguments)
+                    let input: Value = crate::lossless_json::from_str(&call.raw_arguments)
                         .map_err(|_| PublicError::internal())?;
                     slots[*position] = Some(json!({
                         "type": "server_tool_use",
@@ -265,7 +265,7 @@ pub fn completed_messages_body_with_reasoning(
             }
             Event::ServerToolResult { block, .. } => {
                 let parsed: Value =
-                    serde_json::from_str(block).map_err(|_| PublicError::internal())?;
+                    crate::lossless_json::from_str(block).map_err(|_| PublicError::internal())?;
                 slots.push(Some(parsed));
             }
             _ => {}

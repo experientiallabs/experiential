@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import json
 import threading
+import time
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,6 +27,7 @@ from exp.common.models import (
     GatewayTokenPrices,
     ModelCapabilities,
 )
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.catalog_authority import upsert_connection, upsert_singleton_deployment
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.tests.launch_test import _ServedGateway, _unused_port
@@ -87,7 +89,7 @@ _TEXT: list[JsonObject] = [
     }
 ]
 
-Served = tuple[str, str, list[JsonObject], list[JsonObject]]
+Served = tuple[str, str, list[JsonObject], Path]
 
 
 def _serve(
@@ -95,7 +97,6 @@ def _serve(
 ) -> Iterator[Served]:
     """Serve one Gemini alias whose upstream answers dial ``n`` with ``turns(n)``."""
     bodies: list[JsonObject] = []
-    settlements: list[JsonObject] = []
 
     class Provider(BaseHTTPRequestHandler):
         """Record each native request and stream the scripted answer."""
@@ -129,17 +130,14 @@ def _serve(
     monkeypatch.setenv("TEST_PROVIDER_KEY", "synthetic-key")
     key = _configure(tmp_path)
     gateway = _ServedGateway(tmp_path, _unused_port())
-    settle = gateway.control_plane.settle
-
-    def record_settle(argument: str) -> str:
-        """Observe native settlement callbacks without replacing accounting."""
-        settlements.append(json.loads(argument))
-        return settle(argument)
-
-    monkeypatch.setattr(gateway.control_plane, "settle", record_settle)
     gateway.start()
     try:
-        yield f"http://127.0.0.1:{gateway.port}/v1", key, bodies, settlements
+        yield (
+            f"http://127.0.0.1:{gateway.port}/v1",
+            key,
+            bodies,
+            GatewayManagement(tmp_path).database_path,
+        )
     finally:
         gateway.stop()
         upstream.shutdown()
@@ -221,7 +219,7 @@ def test_a_signed_image_reaches_the_caller_with_its_image_tokens_metered(
     image_lane: Served, stream: bool
 ) -> None:
     """The image arrives as an OpenRouter-style message image, metered apart from text."""
-    base, key, bodies, settlements = image_lane
+    base, key, bodies, database_path = image_lane
     response = _chat(base, key, stream)
     if stream:
         chunks = [
@@ -242,16 +240,32 @@ def test_a_signed_image_reaches_the_caller_with_its_image_tokens_metered(
     assert usage["completion_tokens_details"]["image_tokens"] == 1120
     generation = cast("JsonObject", bodies[0]["generationConfig"])
     assert generation["responseModalities"] == ["TEXT", "IMAGE"]
+    settlements = _terminals(database_path)
     assert len(settlements) == 1
     assert cast("JsonObject", settlements[0]["usage"])["image_output_tokens"] == 1120
 
 
 def test_a_malformed_function_call_is_redialed_on_the_same_lane(malformed_once: Served) -> None:
     """Google's sampling failure re-dials once and the caller sees the answer."""
-    base, key, bodies, settlements = malformed_once
+    base, key, bodies, database_path = malformed_once
     response = _chat(base, key, stream=False)
     assert response.json()["choices"][0]["message"]["content"] == "ok"
     assert len(bodies) == 2
-    assert [settlement["outcome"] for settlement in settlements] == ["failed", "completed"]
+    settlements = _terminals(database_path)
+    assert [settlement["state"] for settlement in settlements] == ["failed", "completed"]
     failure = cast("JsonObject", settlements[0]["failure"])
     assert failure["failure_class"] == "malformed_response"
+
+
+def _terminals(database_path: Path) -> list[JsonObject]:
+    """Read the immutable native receipts after the actual durable settlement."""
+    deadline = time.monotonic() + 3
+    with connect_sqlite(database_path) as connection:
+        while time.monotonic() < deadline:
+            rows = connection.execute(
+                "SELECT native_accounting_terminal FROM gateway_attempts ORDER BY attempt_ordinal"
+            ).fetchall()
+            if rows and all(row[0] is not None for row in rows):
+                return [json.loads(row[0]) for row in rows]
+            time.sleep(0.01)
+    pytest.fail("Native image accounting did not settle before its deadline")

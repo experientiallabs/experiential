@@ -23,7 +23,13 @@ from typing import Final, Literal
 import httpx
 from pydantic import Field, model_validator
 
-from exp.common.core.artifacts import ArtifactId, ContractModel, JsonValue, canonical_json_bytes
+from exp.common.core.artifacts import (
+    ArtifactId,
+    ContractModel,
+    JsonObject,
+    JsonValue,
+    canonical_json_bytes,
+)
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.decisions_contracts import (
     MAX_DECISION_INPUT_BYTES,
@@ -59,6 +65,7 @@ from exp.runtime.gateway.guardrails.http_json import (
     validate_bearer_env_name,
     validate_classifier_url,
 )
+from exp.runtime.gateway.guardrails.native_owner import NativeClassifierTransport
 
 _logger = logging.getLogger(__name__)
 
@@ -353,6 +360,64 @@ class DecisionModelClassifier:
         """
         del completion, check
         raise ClassifierCoverageError
+
+    def native_output_configuration(self) -> JsonObject:
+        """Preserve the input-only classifier's explicit output coverage refusal."""
+        return {"kind": "coverage_error"}
+
+    def native_input_configuration(
+        self, *, request: GatewayRequest, check: GuardrailCheck
+    ) -> JsonObject:
+        """Freeze the same bounded window, scoring rules, cache and transport authority."""
+        del check
+        state = classification_window(request, self._document.window)
+        if not state:
+            return {"kind": "allow"}
+        return self._native_configuration(state)
+
+    def native_input_template(self, *, check: GuardrailCheck) -> JsonObject:
+        """Retain the window and cache scope for every later native input subject."""
+        del check
+        return {
+            **self._native_configuration(""),
+            "window": self._document.window.model_dump(mode="json"),
+            "configuration_digest": self._digest,
+        }
+
+    def _native_configuration(self, state: str) -> JsonObject:
+        """Resolve one transport and score contract before native ownership starts."""
+
+        transport: JsonObject = {"public_only": False, "headers": {}}
+        if self._client is not None:
+            if not isinstance(self._client, NativeClassifierTransport):
+                message = "The classifier transport has no native egress contract"
+                raise ValueError(message)
+            transport = self._client.native_classifier_transport()
+        authorization = bearer_authorization_header(self._document.bearer_env)
+        scope = sha256(
+            canonical_json_bytes(
+                {"configuration": self._digest, "transport": transport, "bearer": authorization}
+            )
+        ).hexdigest()
+        return {
+            "kind": "decision_model",
+            "url": self._document.url,
+            "timeout_ms": self._document.timeout_ms,
+            "max_response_bytes": self._document.max_response_bytes,
+            "authorization": authorization,
+            "transport": transport,
+            "payload": DecisionRequest(state=state or " ", questions=self._questions).provider_body(
+                self._document.model
+            ),
+            "categories": {
+                name: category.model_dump(mode="json")
+                for name, category in self._document.categories.items()
+            },
+            "cache": self._document.cache.model_dump(mode="json"),
+            "cache_scope": scope,
+            "cache_key": sha256(self._digest.encode() + b"\n" + state.encode()).hexdigest(),
+            "subject_sha256": sha256(state.encode()).hexdigest(),
+        }
 
     async def _decide(self, state: str) -> dict[str, float]:
         """POST one SystemOne request and return every question's probability.

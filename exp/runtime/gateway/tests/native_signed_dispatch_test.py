@@ -1,17 +1,14 @@
 """End-to-end dispatch-time signing over the native engine's open retry.
 
-Body-signing dialects must sign immediately before every physical open
-attempt: a first attempt can consume minutes before a retryable failure, so
-reusing its headers on the retry could send an expired SigV4 signature. The
-native engine serves in a child process whose control plane rewrites the
-admitted Bedrock URL to a loopback upstream and stamps each ``sign_dispatch``
-invocation into the authorization header; the upstream kills the first
-connection before any response and serves a real binary event stream on the
-second, so the test proves the retry carried a freshly minted signature.
+Each retry signs its frozen body in Rust using a synthetic credential and a
+loopback endpoint frozen at admission. The upstream verifies both signatures
+against the exact received bytes and forces a new timestamp before the retry.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import signal
@@ -20,9 +17,11 @@ import subprocess
 import sys
 import time
 import zlib
+from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -80,58 +79,37 @@ from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 
 
-class _RewritingControlPlane:
-    \"\"\"Delegate to the real control plane, pointing Bedrock at loopback.
+from exp.runtime.models.providers.bedrock import BedrockClient
+from urllib.parse import quote, urlsplit
 
-    ``admit`` rewrites the admitted ConverseStream URL to the test upstream,
-    and ``sign_dispatch`` counts invocations into the authorization header so
-    the upstream observes exactly which signing call each attempt carried.
-    \"\"\"
+_original_converse = BedrockClient.converse_stream_url
+_original_invoke = BedrockClient.invoke_url
 
-    def __init__(self, inner, upstream_base):
-        \"\"\"Wrap one real control plane above the loopback upstream.\"\"\"
-        self._inner = inner
-        self._upstream_base = upstream_base
-        self._signatures = 0
+def _loopback(original, client):
+    \"\"\"Retain the real model path on the private synthetic provider.\"\"\"
+    url = original(client)
+    return f"http://127.0.0.1:{sys.argv[3]}" + url[url.index("/model/"):]
 
-    def __getattr__(self, name):
-        \"\"\"Delegate every other boundary callback unchanged.\"\"\"
-        return getattr(self._inner, name)
+BedrockClient.converse_stream_url = lambda self: _loopback(_original_converse, self)
+BedrockClient.invoke_url = lambda self: _loopback(_original_invoke, self)
 
-    def admit(self, argument):
-        \"\"\"Admit through the real control plane, then rewrite the route's URL.\"\"\"
-        result = self._inner.admit(argument)
-        parsed = json.loads(result)
-        route = parsed.get("route")
-        if isinstance(route, list):
-            for wire in route:
-                if isinstance(wire, dict) and wire.get("dialect") == "bedrock_converse_stream":
-                    wire["url"] = self._upstream_base + "/model/test/converse-stream"
-        return json.dumps(parsed, separators=(",", ":"))
+def _authority(self, *, url):
+    \"\"\"Export synthetic signing material directly to the native owner.\"\"\"
+    endpoint = urlsplit(url)
+    return {"kind": "sigv4", "default_chain": False, "profile": None,
+            "access_key": "fixture-access", "secret_key": "fixture-secret",
+            "session_token": None, "region": "us-east-1", "service": "bedrock",
+            "host": endpoint.netloc, "path": quote(endpoint.path, safe="/~"),
+            "query": "", "accept": "application/json" if url.endswith("/invoke")
+            else "application/vnd.amazon.eventstream"}
 
-    def sign_dispatch(self, argument):
-        \"\"\"Stamp one counted signature so each attempt is distinguishable.\"\"\"
-        json.loads(argument)
-        self._signatures += 1
-        return json.dumps(
-            {
-                "headers": {
-                    "authorization": f"AWS4-HMAC-SHA256 attempt-{self._signatures}",
-                    "content-type": "application/json",
-                }
-            },
-            separators=(",", ":"),
-        )
-
+BedrockClient.native_gateway_signing = _authority
 
 components = load_gateway_components(
     Path(sys.argv[1]),
     environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
 )
-control = _RewritingControlPlane(
-    NativeControlPlane(components),
-    f"http://127.0.0.1:{sys.argv[3]}",
-)
+control = NativeControlPlane(components)
 config = json.dumps(
     {
         "host": "127.0.0.1",
@@ -140,8 +118,37 @@ config = json.dumps(
         "graceful_timeout_seconds": 1.0,
     }
 )
-exp_gateway_native.serve(control, config)
+exp_gateway_native.serve(control, config, native_callbacks=control._accounting.native.callbacks())
 """
+
+
+def assert_native_signature(headers: Mapping[str, str], path: str, body: bytes) -> None:
+    """Independently verify the native SigV4 result over the received HTTP bytes."""
+    values = {name.lower(): value for name, value in headers.items()}
+    header = values["authorization"]
+    fields = dict(
+        item.split("=", 1) for item in header.removeprefix("AWS4-HMAC-SHA256 ").split(", ")
+    )
+    credential, scope = fields["Credential"].split("/", 1)
+    assert credential == "fixture-access"
+    signed = fields["SignedHeaders"]
+    canonical_headers = "".join(
+        f"{name}:{' '.join(values[name].split())}\n" for name in signed.split(";")
+    )
+    canonical = (
+        f"POST\n{quote(path, safe='/~')}\n\n{canonical_headers}\n"
+        f"{signed}\n{hashlib.sha256(body).hexdigest()}"
+    )
+    string_to_sign = (
+        f"AWS4-HMAC-SHA256\n{values['x-amz-date']}\n{scope}\n"
+        f"{hashlib.sha256(canonical.encode()).hexdigest()}"
+    )
+    key = b"AWS4fixture-secret"
+    for part in scope.split("/"):
+        key = hmac.digest(key, part.encode(), "sha256")
+    assert hmac.compare_digest(
+        fields["Signature"], hmac.digest(key, string_to_sign.encode(), "sha256").hex()
+    )
 
 
 class _FlakyBedrockUpstream(BaseHTTPRequestHandler):
@@ -153,11 +160,13 @@ class _FlakyBedrockUpstream(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
         """Record the signed header, then fail once and serve once."""
         length = int(self.headers.get("content-length", "0"))
-        self.rfile.read(length)
+        body = self.rfile.read(length)
+        assert_native_signature(dict(self.headers.items()), self.path, body)
         with _FlakyBedrockUpstream.lock:
             _FlakyBedrockUpstream.seen_authorizations.append(self.headers.get("authorization", ""))
             first = len(_FlakyBedrockUpstream.seen_authorizations) == 1
         if first:
+            time.sleep(1.1)  # Cross a signing timestamp boundary before retry.
             # Close before any response bytes: a retryable transport failure.
             self.close_connection = True
             self.connection.close()
@@ -274,10 +283,11 @@ def test_open_retry_signs_every_physical_attempt(tmp_path: Path) -> None:
         assert served.json()["choices"][0]["message"]["content"] == "signed"
         # One signing per physical attempt: the failed first open and its
         # retry each carried their own freshly minted headers.
-        assert _FlakyBedrockUpstream.seen_authorizations == [
-            "AWS4-HMAC-SHA256 attempt-1",
-            "AWS4-HMAC-SHA256 attempt-2",
-        ]
+        signatures = _FlakyBedrockUpstream.seen_authorizations
+        assert len(signatures) == 2 and signatures[0] != signatures[1]
+        assert all(
+            value.startswith("AWS4-HMAC-SHA256 Credential=fixture-access/") for value in signatures
+        )
         child.send_signal(signal.SIGTERM)
         assert child.wait(timeout=20) == 0
     finally:

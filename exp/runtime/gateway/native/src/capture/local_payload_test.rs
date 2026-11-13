@@ -2,7 +2,7 @@ use super::*;
 use serde_json::json;
 
 fn record() -> Record {
-    serde_json::from_value(json!({
+    crate::lossless_json::from_value(json!({
         "schema_version":1,"request":{"request_id":"request",
             "scope":{"organization_id":"org","identity_id":"user","application_id":"app"},
             "protocol":"responses","model_id":"model",
@@ -28,7 +28,7 @@ fn borrowed_payload_preserves_schema_content_sidecars_and_exact_limit() {
     let response = super::super::projection::CapturedResponse::completed_record(&record).unwrap();
     assert!(matches!(response, Cow::Borrowed(_)));
     let payload = encode(&record, &response, "experience-id", 8192).unwrap();
-    let actual: Value = serde_json::from_str(&payload).unwrap();
+    let actual: Value = crate::lossless_json::from_str(&payload).unwrap();
     assert_eq!(
         actual,
         json!({
@@ -86,16 +86,16 @@ fn episode_uses_explicit_body_identity_then_optional_session_header() {
     context["session_id"] = json!("harness-session");
     let response = json!({"id":"response","status":"completed","output":[]});
     let payload = encode(&record, &response, "experience-id", 8192).unwrap();
-    let actual: Value = serde_json::from_str(&payload).unwrap();
+    let actual: Value = crate::lossless_json::from_str(&payload).unwrap();
     assert_eq!(actual["episode_id"], "episode");
     assert!(actual["request"]["exp_capture_output"]["provider_reasoning"].is_null());
     Arc::make_mut(&mut record.request.context)["request"]["metadata"] = json!({});
     let payload = encode(&record, &response, "experience-id", 8192).unwrap();
-    let actual: Value = serde_json::from_str(&payload).unwrap();
+    let actual: Value = crate::lossless_json::from_str(&payload).unwrap();
     assert_eq!(actual["episode_id"], "harness-session");
     Arc::make_mut(&mut record.request.context)["session_id"] = Value::Null;
     let payload = encode(&record, &response, "experience-id", 8192).unwrap();
-    let actual: Value = serde_json::from_str(&payload).unwrap();
+    let actual: Value = crate::lossless_json::from_str(&payload).unwrap();
     assert!(actual["episode_id"].is_null());
 }
 
@@ -106,7 +106,8 @@ fn local_payload_persists_injected_probabilities_only_when_present() {
         .unwrap()
         .into_owned();
     let plain: Value =
-        serde_json::from_str(&encode(&record, &response, "experience-id", 8192).unwrap()).unwrap();
+        crate::lossless_json::from_str(&encode(&record, &response, "experience-id", 8192).unwrap())
+            .unwrap();
     assert!(plain["request"]["exp_capture_output"]
         .get("provider_logprobs")
         .is_none());
@@ -119,7 +120,8 @@ fn local_payload_persists_injected_probabilities_only_when_present() {
     });
     record.provider_logprobs = Some(captured);
     let marked: Value =
-        serde_json::from_str(&encode(&record, &response, "experience-id", 8192).unwrap()).unwrap();
+        crate::lossless_json::from_str(&encode(&record, &response, "experience-id", 8192).unwrap())
+            .unwrap();
     let stored = &marked["request"]["exp_capture_output"]["provider_logprobs"];
     assert_eq!(stored["logprobs_injected"], json!(true));
     assert_eq!(stored["content"][0]["token"], json!("a"));

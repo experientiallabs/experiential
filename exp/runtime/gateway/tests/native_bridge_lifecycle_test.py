@@ -46,8 +46,8 @@ _IDLE_SECONDS = 12.0
 # Each cached SQLite connection holds the database plus WAL descriptors, so
 # the fixed pool bounds the count at two per worker plus the group-commit
 # writer's dedicated connection, the driver main thread's setup cache, and the
-# video settlement poller's one long-lived thread.
-_DESCRIPTOR_CEILING = 2 * (_CALLBACK_PERMITS + 4)
+# video settlement poller's one long-lived thread and the native accounting writer.
+_DESCRIPTOR_CEILING = 2 * (_CALLBACK_PERMITS + 5)
 
 _DRIVER_SOURCE = textwrap.dedent(
     '''
@@ -76,6 +76,14 @@ _DRIVER_SOURCE = textwrap.dedent(
             components,
             request_timeout_seconds=config["request_timeout_seconds"],
         )
+        def reject_python_accounting(argument: str) -> str:
+            """Prove that serving never re-enters Python after admission."""
+            raise AssertionError("post-admission accounting entered Python")
+
+        for method in ("start_attempt", "settle", "price", "abandon", "remember", "sign_dispatch",
+                       "seal_reasoning_content", "guardrail_input_status", "enforce_output",
+                       "enforce_output_segment", "tool_search_round"):
+            setattr(control_plane, method, reject_python_accounting)
         last_error = None
         for _attempt in range(5):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -96,6 +104,7 @@ _DRIVER_SOURCE = textwrap.dedent(
                             "graceful_timeout_seconds": 2.0,
                         }
                     ),
+                    native_callbacks=control_plane.native_callbacks,
                 )
                 return
             except RuntimeError as error:

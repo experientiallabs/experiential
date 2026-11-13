@@ -92,7 +92,7 @@ fn locked_sqlite_and_lost_ack_retry_one_payload_without_losing_conversation() {
     .unwrap();
     let reader = Connection::open(&path).unwrap();
     reader.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let record: Record = serde_json::from_value(json!({
+    let record: Record = crate::lossless_json::from_value(json!({
         "schema_version":1,"request":{"request_id":"request",
         "scope":{"organization_id":"org","identity_id":"user","application_id":"app"},
         "protocol":"responses","model_id":"model","context":{"schema_version":1,
@@ -139,7 +139,7 @@ fn locked_sqlite_and_lost_ack_retry_one_payload_without_losing_conversation() {
         )
         .unwrap();
     assert_eq!(count, 1);
-    let saved: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    let saved: serde_json::Value = crate::lossless_json::from_str(&payload).unwrap();
     assert_eq!(saved["request"]["exp_context"], *context);
     assert_eq!(saved["request"]["exp_capture_output"]["response"], response);
     assert_eq!(

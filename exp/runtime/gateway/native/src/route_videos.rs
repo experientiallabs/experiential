@@ -59,7 +59,7 @@ async fn plane_json(state: &AppState, method: &'static str, payload: Value) -> R
         Ok(rendered) => rendered,
         Err(error) => return error_response(&error),
     };
-    match serde_json::from_str::<Value>(&rendered) {
+    match crate::lossless_json::from_str::<Value>(&rendered) {
         Ok(body) => json_response(StatusCode::OK, &body, &[]),
         Err(_) => error_response(&PublicError::internal()),
     }
@@ -169,7 +169,7 @@ async fn read_create(
     let bytes = axum::body::to_bytes(request.into_body(), limit)
         .await
         .map_err(|_| PublicError::request_too_large())?;
-    match serde_json::from_slice::<Value>(&bytes) {
+    match crate::lossless_json::from_slice::<Value>(&bytes) {
         Ok(Value::Object(fields)) => Ok((fields, None)),
         _ => Err(invalid(
             "The request body must be a JSON object or multipart form data.",
@@ -269,7 +269,7 @@ struct ContentFetch {
 
 /// Parse the plane's `{url, headers, content_type}` answer.
 fn content_fetch(rendered: &str) -> Option<ContentFetch> {
-    let parsed: Value = serde_json::from_str(rendered).ok()?;
+    let parsed: Value = crate::lossless_json::from_str(rendered).ok()?;
     let url = parsed.get("url")?.as_str()?.to_string();
     let headers = parsed
         .get("headers")

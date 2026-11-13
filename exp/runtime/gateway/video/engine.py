@@ -44,6 +44,7 @@ from exp.runtime.gateway.native_execution import (
     dispatchable_route_profiles,
     select_route_deployments,
 )
+from exp.runtime.gateway.native_handoff import NativeRequestFactory
 from exp.runtime.gateway.native_request_settlement import RequestSettlements
 from exp.runtime.gateway.native_settlement import gateway_updating_failure
 from exp.runtime.gateway.stream_contracts import (
@@ -60,6 +61,18 @@ from exp.runtime.gateway.video.contracts import (
     VideoStatus,
     video_ceiling_nano_usd,
     video_unit_rate,
+)
+from exp.runtime.gateway.video.errors import (
+    internal_failure as _internal_failure,
+)
+from exp.runtime.gateway.video.errors import (
+    storage_failure as _storage_failure,
+)
+from exp.runtime.gateway.video.errors import (
+    unavailable_error as _unavailable_error,
+)
+from exp.runtime.gateway.video.errors import (
+    unsupported_failure as _unsupported_failure,
 )
 from exp.runtime.gateway.video.output import VideoOutputStore
 from exp.runtime.gateway.video.providers import (
@@ -136,6 +149,7 @@ class VideoEngine:
         *,
         components: NativeGatewayComponents,
         ledger: SyncWriteLedger,
+        native_request_factory: NativeRequestFactory,
         jobs: VideoJobStore,
         guardrails: GuardrailEngine | None = None,
         clients: Mapping[str, VideoProviderClient] | None = None,
@@ -147,7 +161,8 @@ class VideoEngine:
 
         Args:
             components: Authority store, routes, and runtime catalogs.
-            ledger: The synchronous write ledger every surface settles through.
+            ledger: Cold SDK for the native financial implementation.
+            native_request_factory: Native authority retained for failed admission recovery.
             jobs: Durable job persistence.
             guardrails: Policy engine; a guarded identity is refused this surface.
             clients: Provider clients keyed by video dialect.
@@ -158,7 +173,6 @@ class VideoEngine:
         """
         self._components = components
         self._ledger = ledger
-        self._request_settlements = RequestSettlements(ledger)
         self._jobs = jobs
         self._guardrails = guardrails
         self._clients = dict(clients) if clients is not None else default_video_clients()
@@ -173,6 +187,7 @@ class VideoEngine:
         self._poll_stop = threading.Event()
         self._poller_lock = threading.Lock()
         self._poller: threading.Thread | None = None
+        self._request_settlements = RequestSettlements(native_request_factory)
 
     # -- create -----------------------------------------------------------------
 
@@ -862,7 +877,7 @@ class VideoEngine:
 
     def _retry_settlements(self) -> None:
         """Give each organization a bounded turn for delivery and superseded-job recovery."""
-        self._request_settlements.retry(_POLLER_BATCH)
+        self._request_settlements.retry()
         with self._pending_lock:
             selected = self._recovery.select(list(self._pending.values()), _POLLER_BATCH)
         for pending in selected:
@@ -931,21 +946,29 @@ class VideoEngine:
 
         with self._poller_lock:
             if self._poller is None:
-                self._poller = threading.Thread(
-                    target=loop, name="gateway-video-poller", daemon=True
-                )
-                self._poller.start()
+                thread = threading.Thread(target=loop, name="gateway-video-poller", daemon=True)
+                thread.start()
+                self._poller = thread
             return self._poller
 
     def close(self, timeout_seconds: float = 10.0) -> bool:
         """Join provider polling and exact-meter recovery before releasing the ledger."""
         if not 0 <= timeout_seconds <= 300:
             raise ValueError("video shutdown timeout must be between zero and 300 seconds")
+        deadline = time.monotonic() + timeout_seconds
         with self._pending_lock:
             self._poll_stop.set()
-        thread = self.start_poller()
+        with self._poller_lock:
+            thread = self._poller
+        if thread is None and self._recovery_drained():
+            return self._request_settlements.close(max(0.0, deadline - time.monotonic()))
+        thread = thread or self.start_poller()
         thread.join(timeout_seconds)
-        return not thread.is_alive() and self._recovery_drained()
+        return (
+            not thread.is_alive()
+            and self._recovery_drained()
+            and self._request_settlements.close(max(0.0, deadline - time.monotonic()))
+        )
 
     def _recovery_drained(self) -> bool:
         """Keep transport ownership for creates, active refreshes and retained terminal writes."""
@@ -961,38 +984,3 @@ class VideoEngine:
         restart. Idle host eviction must keep their poller alive instead.
         """
         return self._recovery_drained() and not self._jobs.open_jobs(limit=1)
-
-
-def _unsupported_failure() -> GatewayFailure:
-    """The terminal failure for an alias that does not generate video."""
-    return GatewayFailure(
-        failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
-        safe_message="the model alias does not generate video",
-    )
-
-
-def _storage_failure() -> GatewayFailure:
-    """The failure for a rung whose host upload destination could not be minted."""
-    return GatewayFailure(
-        failure_class=GatewayFailureClass.INTERNAL,
-        safe_message="the video output storage is unavailable",
-        failover_eligible=True,
-    )
-
-
-def _unavailable_error() -> OpenAIProtocolError:
-    """The 503 for a video whose serving provider or storage is unreachable now."""
-    return OpenAIProtocolError(
-        status_code=503,
-        code="unavailable_route",
-        message="The provider serving this video is not available; retry shortly.",
-        error_type="api_error",
-    )
-
-
-def _internal_failure() -> GatewayFailure:
-    """The terminal failure for a job row that could not be persisted."""
-    return GatewayFailure(
-        failure_class=GatewayFailureClass.INTERNAL,
-        safe_message="the video job could not be recorded",
-    )

@@ -19,6 +19,7 @@ from exp.common.models.catalog import (
 )
 from exp.common.models.catalog_prices import BilledUnitKind, GatewayUnitPrices
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
     BudgetScope,
@@ -48,7 +49,9 @@ from exp.runtime.gateway.ledger import (
     SQLiteAttemptLedger,
 )
 from exp.runtime.gateway.ledger_valuation import frozen_usage_cost
-from exp.runtime.gateway.native_accounting import NativeAttemptAccounting, NativeBridgeError
+from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
+from exp.runtime.gateway.native_continuation_store import NativeContinuationStore
 from exp.runtime.gateway.native_execution import InflightRequest, rung_load_key
 from exp.runtime.gateway.native_recovery_test import RecoveryHostFake
 from exp.runtime.gateway.routing import GatewayRoute
@@ -226,7 +229,7 @@ def test_disconnect_partial_usage_preserves_conservative_budget_exposure(
     finally:
         if writer is not None:
             writer.close()
-    with sqlite3.connect(store.database_path) as connection:
+    with connect_sqlite(store.database_path) as connection:
         assert connection.execute(
             "SELECT input_tokens, output_tokens, usage_source, estimated_cost_nano_usd, "
             "budget_settled_nano_usd FROM gateway_attempts WHERE attempt_id = ?",
@@ -310,7 +313,7 @@ def test_estimated_disconnect_usage_settles_at_its_priced_cost(
     finally:
         if writer is not None:
             writer.close()
-    with sqlite3.connect(store.database_path) as connection:
+    with connect_sqlite(store.database_path) as connection:
         row = connection.execute(
             "SELECT state, input_tokens, output_tokens, usage_source, estimated_cost_nano_usd, "
             "budget_settled_nano_usd FROM gateway_attempts WHERE attempt_id = ?",
@@ -345,11 +348,13 @@ def test_disconnect_cache_estimate_preserves_observed_write_budget_exposure(
 ) -> None:
     """Unknown write TTL keeps the full bound; known writes cannot become discounted reads."""
     clock = FakeLedgerClock()
+    clock.wall = datetime.now(UTC)
+    clock.monotonic_value = time.monotonic()
     store, ledger, key = _authority_fixture(tmp_path, clock)
     budgets = SQLiteBudgetStore(store.database_path, clock=clock)
     budgets.set_limit(
         organization_id="org-one",
-        period="2026-08",
+        period=clock.wall.strftime("%Y-%m"),
         scope=BudgetScope(kind=BudgetScopeKind.TEAM),
         limit_nano_usd=5_000,
     )
@@ -366,7 +371,9 @@ def test_disconnect_cache_estimate_preserves_observed_write_budget_exposure(
             )
         }
     )
-    request = _request("disconnect with provider cache writes")
+    request = _request("disconnect with provider cache writes").model_copy(
+        update={"maximum_output_tokens": 1000}
+    )
     authorization = store.authorize_request(
         raw_key=key,
         alias="coding",
@@ -375,23 +382,28 @@ def test_disconnect_cache_estimate_preserves_observed_write_budget_exposure(
     )
     snapshot = _execution(authorization)
     ledger.accept_request(authorization=authorization)
-    attempt_id = ledger.start_attempt(
-        snapshot=snapshot,
-        deployment=deployment,
-        attempt_ordinal=0,
-        route_depth=0,
-        maximum_cost_nano_usd=4_000,
+    accounting = NativeAttemptAccounting(
+        native_request_factory=ledger.native_request_factory(NativeContinuationStore()),
+        recovery_host=RecoveryHostFake(),
+        background_recovery=False,
     )
-    accounting = NativeAttemptAccounting(ledger, recovery_host=RecoveryHostFake())
     entry = InflightRequest(
         authorization=authorization,
         route=GatewayRoute(snapshot=snapshot, deployment=deployment, route_reason="direct"),
         request=request,
         deadline_monotonic=time.monotonic() + 30,
-        attempt_depths={attempt_id: 0},
-        active_attempt_id=attempt_id,
     )
     accounting.register(entry)
+    attempt_id = json.loads(
+        accounting.start_attempt(
+            json.dumps({"request_id": authorization.request_id, "attempt_ordinal": 0})
+        )
+    )["attempt_id"]
+    with connect_sqlite(store.database_path) as connection:
+        held = connection.execute(
+            "SELECT budget_reserved_nano_usd FROM gateway_attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()[0]
     accounting.loads.record_settle(
         rung_load_key(deployment),
         authorization.organization_id,
@@ -426,14 +438,14 @@ def test_disconnect_cache_estimate_preserves_observed_write_budget_exposure(
         }
     )
     if retry == "sweep":
-        with sqlite3.connect(store.database_path) as connection:
+        with connect_sqlite(store.database_path) as connection:
             connection.execute(
                 "CREATE TRIGGER fail_once BEFORE UPDATE ON gateway_attempts "
                 "BEGIN SELECT RAISE(ABORT, 'synthetic blocked write'); END"
             )
         with pytest.raises(NativeBridgeError):
             accounting.settle(payload)
-        with sqlite3.connect(store.database_path) as connection:
+        with connect_sqlite(store.database_path) as connection:
             connection.execute("DROP TRIGGER fail_once")
         accounting.sweep_expired()
     else:
@@ -442,8 +454,8 @@ def test_disconnect_cache_estimate_preserves_observed_write_budget_exposure(
     cost = None if hour_tokens is None else (2_001 if hour_tokens == 0 else 3_201)
     if cost is not None and reported_input:
         cost += 20
-    settled = 4_000 if cost is None else cost
-    with sqlite3.connect(store.database_path) as connection:
+    settled = held if cost is None else cost
+    with connect_sqlite(store.database_path) as connection:
         row = connection.execute(
             "SELECT input_tokens, cached_input_tokens, cache_creation_input_tokens, "
             "cache_creation_1h_input_tokens, usage_source, estimated_cost_nano_usd, "
@@ -461,13 +473,14 @@ def test_disconnect_cache_estimate_preserves_observed_write_budget_exposure(
         )
         assert connection.execute(
             "SELECT reserved_nano_usd, settled_nano_usd FROM gateway_attempt_budget_charges"
-        ).fetchone() == (4_000, settled)
-    remaining = budgets.remaining(organization_id="org-one", period="2026-08")[0]
+        ).fetchone() == (held, settled)
+    remaining = budgets.remaining(organization_id="org-one", period=clock.wall.strftime("%Y-%m"))[0]
     assert remaining.charged_nano_usd == settled
     assert remaining.remaining_nano_usd == 5_000 - settled
     assert ledger.usage(organization_id="org-one")[0].unknown_cost_attempts == int(cost is None)
     assert not entry.cache_recorded_attempts and not entry.recovery_recorded_attempts
-    assert not accounting.recovery._sessions
+    assert accounting.native.drained()
+    assert accounting.native.close()
     if cost is None:
         second = store.authorize_request(
             raw_key=key,
@@ -482,7 +495,7 @@ def test_disconnect_cache_estimate_preserves_observed_write_budget_exposure(
                 deployment=deployment,
                 attempt_ordinal=0,
                 route_depth=0,
-                maximum_cost_nano_usd=1_001,
+                maximum_cost_nano_usd=5_001 - held,
             )
 
 
@@ -540,7 +553,7 @@ def test_unknown_decision_keeps_budget_held_without_inventing_charge_or_usage(
     assert remaining.settled_nano_usd == 0
     assert remaining.remaining_nano_usd == 0
     assert remaining.unknown_cost_attempts == 0  # The held amount is known, actual cost is not.
-    with sqlite3.connect(store.database_path) as connection:
+    with connect_sqlite(store.database_path) as connection:
         assert connection.execute(
             "SELECT input_tokens, output_tokens, estimated_cost_nano_usd, "
             "budget_settled_nano_usd, usage_source FROM gateway_attempts WHERE attempt_id = ?",
@@ -564,7 +577,7 @@ def test_unknown_decision_keeps_budget_held_without_inventing_charge_or_usage(
             route_depth=0,
             maximum_cost_nano_usd=1,
         )
-    with sqlite3.connect(store.database_path) as connection:
+    with connect_sqlite(store.database_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone() == (1,)
     assert ledger.usage(organization_id="org-one")[0].unknown_cost_attempts == 1
     ledger.reconcile_decision_liability(attempt_id=attempt_id, assigned_cost_nano_usd=40)
@@ -575,7 +588,7 @@ def test_unknown_decision_keeps_budget_held_without_inventing_charge_or_usage(
     assert reconciled.reserved_nano_usd == 0
     assert reconciled.settled_nano_usd == 40
     assert reconciled.remaining_nano_usd == 60
-    with sqlite3.connect(store.database_path) as connection:
+    with connect_sqlite(store.database_path) as connection:
         assert connection.execute(
             "SELECT input_tokens, output_tokens, estimated_cost_nano_usd, "
             "budget_settled_nano_usd, usage_source FROM gateway_attempts WHERE attempt_id = ?",
@@ -641,7 +654,7 @@ def test_witnessed_decision_http_rejection_releases_without_observed_tokens(
     remaining = budgets.remaining(organization_id="org-one", period="2026-08")[0]
     assert remaining.reserved_nano_usd == remaining.settled_nano_usd == 0
     assert remaining.remaining_nano_usd == 100
-    with sqlite3.connect(store.database_path) as connection:
+    with connect_sqlite(store.database_path) as connection:
         assert connection.execute(
             "SELECT input_tokens, output_tokens, estimated_cost_nano_usd, "
             "budget_settled_nano_usd, usage_source FROM gateway_attempts WHERE attempt_id = ?",
@@ -733,7 +746,7 @@ def test_conversational_unknown_usage_keeps_its_existing_settlement(tmp_path: Pa
         decision_provider_rejected=True,
     )
     ledger.finish_attempt(attempt_id=attempt_id, terminal_event=event, failure=failure)
-    with sqlite3.connect(store.database_path) as connection:
+    with connect_sqlite(store.database_path) as connection:
         assert connection.execute(
             "SELECT budget_settled_nano_usd FROM gateway_attempts WHERE attempt_id = ?",
             (attempt_id,),
@@ -829,7 +842,7 @@ def test_attempt_retains_dispatch_billing_source_after_catalog_change(tmp_path: 
         failure=None,
     )
 
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         row = connection.execute(
             "SELECT billing_source, state FROM gateway_attempts WHERE attempt_id = ?",
@@ -1090,7 +1103,7 @@ def test_failed_attempt_terminalizes_its_parent_request(tmp_path: Path) -> None:
 
     ledger.finish_attempt(attempt_id=attempt_id, terminal_event=None, failure=failure)
 
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         request_state = connection.execute(
             "SELECT terminal_state FROM gateway_requests WHERE request_id = ?",
@@ -1132,7 +1145,7 @@ def test_failed_attempt_records_the_sanitized_provider_error_text(tmp_path: Path
 
     ledger.finish_attempt(attempt_id=attempt_id, terminal_event=None, failure=failure)
 
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         failure_class, failure_message = connection.execute(
             "SELECT failure_class, failure_message FROM gateway_attempts WHERE attempt_id = ?",
@@ -1170,7 +1183,7 @@ def test_failed_attempt_without_provider_detail_leaves_the_message_null(tmp_path
         ),
     )
 
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         failure_message = connection.execute(
             "SELECT failure_message FROM gateway_attempts WHERE attempt_id = ?",
@@ -1201,7 +1214,7 @@ def test_predispatch_failure_terminalizes_real_sqlite_request(tmp_path: Path) ->
         ),
     )
 
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         request_state = connection.execute(
             "SELECT terminal_state FROM gateway_requests WHERE request_id = ?",
@@ -1245,7 +1258,7 @@ def test_intermediate_attempt_can_settle_without_finalizing_parent(tmp_path: Pat
         finalize_request=False,
     )
 
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         states = connection.execute(
             """
@@ -1261,10 +1274,10 @@ def test_intermediate_attempt_can_settle_without_finalizing_parent(tmp_path: Pat
     assert states == (None, "failed")
 
 
-def test_concurrent_attempt_ordinal_conflict_rolls_back_without_blocking_retry(
+def test_concurrent_attempt_ordinal_replays_one_hold_without_blocking_retry(
     tmp_path: Path,
 ) -> None:
-    """One physical ordinal wins concurrently and the next ordinal remains writable."""
+    """Exact concurrent replays share one physical hold and the next ordinal is writable."""
     clock = FakeLedgerClock()
     store, ledger, raw_key = _authority_fixture(tmp_path, clock)
     authorization = store.authorize_request(
@@ -1291,7 +1304,8 @@ def test_concurrent_attempt_ordinal_conflict_rolls_back_without_blocking_retry(
         futures = tuple(executor.submit(start_first_ordinal) for _index in range(2))
         results = tuple(future.result(timeout=5) for future in futures)
     winners = tuple(result for result in results if result is not None)
-    assert len(winners) == 1
+    assert len(winners) == 2
+    assert len(set(winners)) == 1
     ledger.finish_attempt(
         attempt_id=winners[0],
         terminal_event=None,
@@ -1309,7 +1323,7 @@ def test_concurrent_attempt_ordinal_conflict_rolls_back_without_blocking_retry(
         route_depth=0,
     )
 
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         rows = connection.execute(
             "SELECT attempt_ordinal, route_depth FROM gateway_attempts ORDER BY attempt_ordinal"
@@ -1478,7 +1492,7 @@ def test_zero_attempt_refusal_reenters_the_same_key_after_reopen(tmp_path: Path)
     restarted.start_attempt(
         snapshot=_execution(retry), deployment=_deployment(), attempt_ordinal=0, route_depth=0
     )
-    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+    with connect_sqlite(tmp_path / "gateway.db") as connection:
         assert connection.execute("SELECT COUNT(*) FROM gateway_requests").fetchone()[0] == 2
         assert connection.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone()[0] == 1
 
@@ -1517,7 +1531,7 @@ def test_no_dispatch_certificate_never_covers_an_unknown_attempt(tmp_path: Path)
     )
     with pytest.raises(IdempotencyReplayUnavailableError):
         ledger.accept_request(authorization=retry)
-    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+    with connect_sqlite(tmp_path / "gateway.db") as connection:
         assert (
             connection.execute("SELECT state FROM gateway_attempts").fetchone()[0] == "dispatched"
         )
@@ -1640,7 +1654,7 @@ def test_crash_reconciliation_waits_for_deadline_and_cleanup_bound(tmp_path: Pat
         route_depth=0,
     )
 
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         assert (
             connection.execute(
@@ -1723,7 +1737,7 @@ def test_concurrent_multi_identity_wal_preserves_receipts_grants_and_attempts(
     assert len(usage) == 8
     assert sum(item.requests for item in usage) == 8
     assert sum(item.attempts for item in usage) == 8
-    connection = sqlite3.connect(path)
+    connection = connect_sqlite(path)
     try:
         assert connection.execute("SELECT COUNT(*) FROM operation_receipts").fetchone()[0] == 16
         assert connection.execute("SELECT COUNT(*) FROM identity_alias_grants").fetchone()[0] == 8
@@ -1766,7 +1780,7 @@ def test_accept_and_finish_persist_app_attribution_and_first_token_at(tmp_path: 
         first_token_at=first_token_at,
     )
 
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     connection.row_factory = sqlite3.Row
     try:
         attempt_row = connection.execute(
@@ -1812,7 +1826,7 @@ def test_first_token_and_app_attribution_default_to_null(tmp_path: Path) -> None
             safe_message="upstream unavailable",
         ),
     )
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     connection.row_factory = sqlite3.Row
     try:
         attempt_row = connection.execute(
@@ -2036,7 +2050,7 @@ def _spill_fixture(
 
 def _attempt_row(tmp_path: Path, attempt_id: str) -> sqlite3.Row:
     """Read one persisted attempt row for disclosure assertions."""
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     connection.row_factory = sqlite3.Row
     try:
         row = connection.execute(
@@ -2277,7 +2291,7 @@ def test_web_search_requests_are_accepted_and_not_yet_priced_by_the_local_ledger
     # Token pricing only: 2 x the 3_950 nano-USD an identical unmetered settle attributes.
     assert report[0].known_estimated_cost_nano_usd == 7_900
     assert report[0].unknown_cost_attempts == 0
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(gateway_attempts)")}
         states = connection.execute(
@@ -2354,7 +2368,7 @@ def test_tool_search_requests_are_accepted_and_not_yet_priced_by_the_local_ledge
     # Token pricing only: 2 x the 3_950 nano-USD an identical unmetered settle attributes.
     assert report[0].known_estimated_cost_nano_usd == 7_900
     assert report[0].unknown_cost_attempts == 0
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(gateway_attempts)")}
         states = connection.execute(

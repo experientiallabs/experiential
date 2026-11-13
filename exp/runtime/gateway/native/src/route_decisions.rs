@@ -48,6 +48,8 @@ const PROBABILITY_TOLERANCE: f64 = 1e-6;
 #[derive(Debug, Clone, Default, Deserialize)]
 struct DecisionsAdmission {
     request_id: String,
+    #[serde(default)]
+    native_accounting: Option<bool>,
     alias: String,
     alias_revision_id: String,
     exact_model_id: String,
@@ -55,12 +57,14 @@ struct DecisionsAdmission {
     route: Vec<DeploymentWire>,
     /// SystemOne question definitions keyed by question ID.
     #[serde(default)]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     questions: Map<String, Value>,
     /// Which decisions wire this admission dispatches; required, so a stale
     /// or malformed producer fails closed as wire drift.
     wire: DecisionWire,
     /// OpenAI question definitions, in request order (OpenAI and Google wires).
     #[serde(default)]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     openai_questions: Vec<Value>,
     maximum_total_attempts: u32,
     maximum_same_deployment_attempts: u32,
@@ -175,8 +179,22 @@ async fn serve(
             METRICS.record_escalation(classify_escalation(&reason));
             return error_response(&escalation_error(&reason));
         }
-        Err(Parsed::Drift(value)) => return wire_drift_response(&state, &value, started).await,
+        Err(Parsed::Drift(value)) => {
+            let bound = match crate::admission::bind_owner(&state, &value) {
+                Ok(state) => state,
+                Err(error) => return error_response(&error),
+            };
+            return wire_drift_response(&bound, &value, started).await;
+        }
         Err(Parsed::Malformed) => return error_response(&PublicError::internal()),
+    };
+    let mut owner = json!({"request_id": admission.request_id});
+    if let Some(native) = admission.native_accounting {
+        owner["native_accounting"] = json!(native);
+    }
+    let state = match crate::admission::bind_owner(&state, &owner) {
+        Ok(state) => state,
+        Err(error) => return error_response(&error),
     };
     drop(admission_text);
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
@@ -212,6 +230,7 @@ enum Parsed {
 #[derive(Deserialize)]
 struct EscalationProbe {
     #[serde(default)]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     escalate: Option<Value>,
 }
 
@@ -221,7 +240,7 @@ fn parse_admission(
     text: &str,
     expected_wires: &[DecisionWire],
 ) -> Result<DecisionsAdmission, Parsed> {
-    let Ok(probe) = serde_json::from_str::<EscalationProbe>(text) else {
+    let Ok(probe) = crate::lossless_json::from_str::<EscalationProbe>(text) else {
         return Err(Parsed::Malformed);
     };
     if let Some(reason) = probe.escalate {
@@ -229,10 +248,10 @@ fn parse_admission(
             reason.as_str().unwrap_or_default().to_string(),
         ));
     }
-    match serde_json::from_str::<DecisionsAdmission>(text) {
+    match crate::lossless_json::from_str::<DecisionsAdmission>(text) {
         Ok(admission) if expected_wires.contains(&admission.wire) => Ok(admission),
         _ => Err(Parsed::Drift(
-            serde_json::from_str(text).unwrap_or(Value::Null),
+            crate::lossless_json::from_str(text).unwrap_or(Value::Null),
         )),
     }
 }
@@ -301,7 +320,7 @@ async fn run_ladder(
                 return Err(error);
             }
         };
-        let started: StartResponse = match serde_json::from_str(&started_text) {
+        let started: StartResponse = match crate::lossless_json::from_str(&started_text) {
             Ok(started) => started,
             Err(_) => {
                 guard.abandon(&wire_failure()).await;
@@ -535,64 +554,10 @@ fn malformed(reason: &str) -> Failure {
 }
 
 /// Strict JSON parsing rejects duplicate keys at every depth, including answers.
-fn strict_json(bytes: &[u8]) -> Result<Value, Failure> {
-    struct Unique(Value);
-    impl<'de> Deserialize<'de> for Unique {
-        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            struct Visitor;
-            impl<'de> serde::de::Visitor<'de> for Visitor {
-                type Value = Unique;
-                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                    f.write_str("JSON with unique object keys")
-                }
-                fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Unique, E> {
-                    Ok(Unique(Value::from(value)))
-                }
-                fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Unique, E> {
-                    Ok(Unique(Value::from(value)))
-                }
-                fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Unique, E> {
-                    Ok(Unique(Value::from(value)))
-                }
-                fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Unique, E> {
-                    serde_json::Number::from_f64(value)
-                        .map(|number| Unique(Value::Number(number)))
-                        .ok_or_else(|| E::custom("non-finite JSON number"))
-                }
-                fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Unique, E> {
-                    Ok(Unique(Value::from(value)))
-                }
-                fn visit_unit<E: serde::de::Error>(self) -> Result<Unique, E> {
-                    Ok(Unique(Value::Null))
-                }
-                fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                    self,
-                    mut seq: A,
-                ) -> Result<Unique, A::Error> {
-                    let mut values = Vec::new();
-                    while let Some(Unique(value)) = seq.next_element()? {
-                        values.push(value);
-                    }
-                    Ok(Unique(Value::Array(values)))
-                }
-                fn visit_map<A: serde::de::MapAccess<'de>>(
-                    self,
-                    mut map: A,
-                ) -> Result<Unique, A::Error> {
-                    let mut values = Map::new();
-                    while let Some((key, Unique(value))) = map.next_entry::<String, Unique>()? {
-                        if values.insert(key, value).is_some() {
-                            return Err(serde::de::Error::custom("duplicate JSON key"));
-                        }
-                    }
-                    Ok(Unique(Value::Object(values)))
-                }
-            }
-            deserializer.deserialize_any(Visitor)
-        }
-    }
-    serde_json::from_slice::<Unique>(bytes)
-        .map(|value| value.0)
+pub(crate) fn strict_json(bytes: &[u8]) -> Result<Value, Failure> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| malformed("decision response is not UTF-8"))?;
+    crate::lossless_json::parse_unique(text, true)
         .map_err(|_| malformed("decision response is not strict JSON"))
 }
 

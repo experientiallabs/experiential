@@ -18,7 +18,6 @@ import json
 import os
 import signal
 import socket
-import sqlite3
 import subprocess
 import sys
 import time
@@ -41,6 +40,7 @@ from exp.common.models import (
     GatewayUnitPrices,
     ModelCapabilities,
 )
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.catalog_authority import (
     ConnectionConfig,
     upsert_connection,
@@ -48,6 +48,7 @@ from exp.runtime.gateway.catalog_authority import (
 )
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.tests.native_signed_dispatch_test import assert_native_signature
 
 pytest.importorskip("exp_gateway_native")
 
@@ -68,60 +69,36 @@ from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 
 
-class _RewritingControlPlane:
-    \"\"\"Delegate to the real control plane, pointing InvokeModel at loopback.\"\"\"
+from exp.runtime.models.providers.bedrock import BedrockClient
+from urllib.parse import quote, urlsplit
 
-    def __init__(self, inner, upstream_base):
-        \"\"\"Wrap one real control plane above the loopback upstream.\"\"\"
-        self._inner = inner
-        self._upstream_base = upstream_base
-        self._signatures = 0
+_original_converse = BedrockClient.converse_stream_url
+_original_invoke = BedrockClient.invoke_url
 
-    def __getattr__(self, name):
-        \"\"\"Delegate every other boundary callback unchanged.\"\"\"
-        return getattr(self._inner, name)
+def _loopback(original, client):
+    \"\"\"Retain the real model path on the private synthetic provider.\"\"\"
+    url = original(client)
+    return f"http://127.0.0.1:{sys.argv[3]}" + url[url.index("/model/"):]
 
-    def _rewrite(self, result):
-        \"\"\"Point each admitted InvokeModel rung at the upstream, keeping its path.\"\"\"
-        parsed = json.loads(result)
-        for wire in parsed.get("route") or []:
-            url = wire.get("url", "")
-            if url.endswith("/invoke"):
-                wire["url"] = self._upstream_base + url[url.index("/model/"):]
-        return json.dumps(parsed, separators=(",", ":"))
+BedrockClient.converse_stream_url = lambda self: _loopback(_original_converse, self)
+BedrockClient.invoke_url = lambda self: _loopback(_original_invoke, self)
 
-    def admit_images(self, argument):
-        \"\"\"Admit a generation for real, then rewrite its destination.\"\"\"
-        return self._rewrite(self._inner.admit_images(argument))
+def _authority(self, *, url):
+    \"\"\"Export synthetic signing material directly to the native owner.\"\"\"
+    endpoint = urlsplit(url)
+    return {"kind": "sigv4", "default_chain": False, "profile": None,
+            "access_key": "fixture-access", "secret_key": "fixture-secret",
+            "session_token": None, "region": "us-east-1", "service": "bedrock",
+            "host": endpoint.netloc, "path": quote(endpoint.path, safe="/~"),
+            "query": "", "accept": "application/json" if url.endswith("/invoke")
+            else "application/vnd.amazon.eventstream"}
 
-    def admit_image_edits(self, argument):
-        \"\"\"Admit an edit for real, then rewrite its destination.\"\"\"
-        return self._rewrite(self._inner.admit_image_edits(argument))
-
-    def sign_dispatch(self, argument):
-        \"\"\"Stamp one counted signature over the frozen body's length.\"\"\"
-        data = json.loads(argument)
-        self._signatures += 1
-        return json.dumps(
-            {
-                "headers": {
-                    "authorization": (
-                        f"AWS4-HMAC-SHA256 attempt-{self._signatures} bytes-{len(data['body'])}"
-                    ),
-                    "content-type": "application/json",
-                    "accept": "application/json",
-                }
-            },
-            separators=(",", ":"),
-        )
-
+BedrockClient.native_gateway_signing = _authority
 
 components = load_gateway_components(
     Path(sys.argv[1]), environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
 )
-control = _RewritingControlPlane(
-    NativeControlPlane(components), f"http://127.0.0.1:{sys.argv[3]}"
-)
+control = NativeControlPlane(components)
 config = json.dumps(
     {
         "host": "127.0.0.1",
@@ -130,7 +107,7 @@ config = json.dumps(
         "graceful_timeout_seconds": 1.0,
     }
 )
-exp_gateway_native.serve(control, config)
+exp_gateway_native.serve(control, config, native_callbacks=control._accounting.native.callbacks())
 """
 
 
@@ -170,6 +147,7 @@ class _StabilityUpstream(BaseHTTPRequestHandler):
         """Record the request and answer one image, a filter, or an error."""
         length = int(self.headers.get("content-length", "0"))
         raw = self.rfile.read(length)
+        assert_native_signature(dict(self.headers.items()), self.path, raw)
         body = json.loads(raw)
         with _StabilityUpstream.lock:
             _StabilityUpstream.seen.append(
@@ -298,7 +276,7 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Engine]:
 
 def _last_attempt(engine: _Engine) -> tuple[object, ...]:
     """Read the newest attempt's state, settlement, cost, and billed units."""
-    with sqlite3.connect(engine.root / "gateway" / "gateway.db") as connection:
+    with connect_sqlite(engine.root / "gateway" / "gateway.db") as connection:
         row = connection.execute(
             """
             SELECT state, budget_reserved_nano_usd, estimated_cost_nano_usd,
@@ -366,7 +344,7 @@ def test_official_client_generates_with_ultra_and_bills_one_image(engine: _Engin
         "output_format": "jpeg",
     }
     # The frozen body was signed immediately before the POST, over its exact bytes.
-    assert seen.authorization.endswith(f"bytes-{seen.raw_length}")
+    assert seen.authorization.startswith("AWS4-HMAC-SHA256 Credential=fixture-access/")
     # The variant records the requested size; the flat card prices it.
     assert _last_attempt(engine) == (
         "completed",

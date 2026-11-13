@@ -7,6 +7,7 @@ import pytest
 
 from exp.common.models.catalog import GatewayLongContextTier, GatewayTokenPrices
 from exp.common.models.catalog_prices import BilledUnitKind
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind, SQLiteBudgetStore
 from exp.runtime.gateway.contracts import GatewayEvent, GatewayEventKind, GatewayUsage
 from exp.runtime.gateway.ledger_test import (
@@ -231,7 +232,7 @@ def test_reservation_replay_rejects_changed_frozen_cache_write_rate(
 
 def test_usage_record_restores_unit_only_media_usage() -> None:
     """A settled speech attempt rereads its billed units, not ``None``."""
-    connection = sqlite3.connect(":memory:")
+    connection = connect_sqlite(Path(":memory:"))
     connection.row_factory = sqlite3.Row
     row = connection.execute(
         "SELECT NULL AS input_tokens, NULL AS output_tokens, NULL AS cached_input_tokens, "

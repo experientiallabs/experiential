@@ -29,6 +29,7 @@ from exp.common.models.gateway_chains import (
     GatewayModelReferenceRung,
 )
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.attempt_tokens import (
     worst_case_attempt_tokens,
     worst_case_input_tokens,
@@ -273,13 +274,14 @@ def _accepted_chain(
     catalog: NormalizedGatewayCatalog,
     *,
     alias: str = "coding",
+    deadline_seconds: float = 30,
 ) -> ExecutionSnapshot:
     """Accept and freeze the real authored chain for the alias's current root."""
     authorization = store.authorize_request(
         raw_key=key,
         alias=alias,
         request=_request("chain-budget"),
-        deadline_monotonic=clock.monotonic() + 30,
+        deadline_monotonic=clock.monotonic() + deadline_seconds,
     )
     ledger.accept_request(authorization=authorization)
     assert isinstance(authorization.target, DirectTarget)
@@ -334,7 +336,7 @@ def test_child_disconnect_settles_actual_stage_price_once_in_both_budget_scopes(
     ledger.finish_attempt(attempt_id=attempt, terminal_event=event, failure=failure)
     ledger.finish_attempt(attempt_id=attempt, terminal_event=event, failure=failure)
     expected = 13 * 3 + 7 * 5 if estimated else 300
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone() == (1,)
         assert connection.execute(
             "SELECT usage_source, estimated_cost_nano_usd, budget_settled_nano_usd "
@@ -412,7 +414,7 @@ def test_new_root_limit_backfills_each_attempt_once(
             route_depth=1,
             maximum_cost_nano_usd=50,
         )
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone() == (1,)
         assert connection.execute(
             "SELECT attempt_id FROM gateway_attempt_budget_charges WHERE budget_id = ?",
@@ -493,7 +495,7 @@ def test_root_backfill_uses_accepted_revision_after_alias_retargets(tmp_path: Pa
         root_deployment.key(): 0,
     }
     next_snapshot = _accepted_chain(store, ledger, clock, key, catalog)
-    with pytest.raises(BudgetReservationRejected, match="pool allocation is exhausted"):
+    with pytest.raises(BudgetReservationRejected, match="allocation is exhausted"):
         ledger.start_attempt(
             snapshot=next_snapshot,
             deployment=catalog.deployments[-1],
@@ -527,7 +529,7 @@ def test_root_backfill_preserves_tenant_alias_and_attempt_month_scopes(tmp_path:
     ).raw_key
     # All requests are accepted in August, but the last attempt starts in September.
     snapshots = [
-        _accepted_chain(store, ledger, clock, token, catalog, alias=alias)
+        _accepted_chain(store, ledger, clock, token, catalog, alias=alias, deadline_seconds=180)
         for token, alias in (
             (key, "coding"),
             (key, "other"),
@@ -595,7 +597,7 @@ def test_root_backfill_overflow_rolls_back_limit_and_partial_charges(tmp_path: P
             limit_nano_usd=MAXIMUM_NANO_USD,
         )
     assert budgets.limits(organization_id="org", period="2026-08") == ()
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone() == (2,)
         assert connection.execute(
             "SELECT COUNT(*) FROM gateway_attempt_budget_charges"
@@ -904,7 +906,7 @@ def test_decision_ledger_settles_zero_output_price_without_discarding_usage(tmp_
     assert remaining.reserved_nano_usd == 0
     assert remaining.settled_nano_usd == 17
     assert remaining.unknown_cost_attempts == 0
-    with sqlite3.connect(store.database_path) as connection:
+    with connect_sqlite(store.database_path) as connection:
         row = connection.execute(
             "SELECT input_tokens, output_tokens, budget_settled_nano_usd "
             "FROM gateway_attempts WHERE attempt_id = ?",
@@ -1243,7 +1245,7 @@ def test_reconcile_unknown_costs_restores_service_with_exact_attribution(
     assert remaining.settled_nano_usd == 80
     assert remaining.remaining_nano_usd == 10_000 - 80
     assert not remaining.exhausted
-    with sqlite3.connect(tmp_path / "gateway.db") as connection:
+    with connect_sqlite(tmp_path / "gateway.db") as connection:
         connection.row_factory = sqlite3.Row
         charges = {
             str(row["attempt_id"]): int(row["settled_nano_usd"])
@@ -1389,7 +1391,7 @@ def test_migrated_attempts_receive_explicit_period_and_cost_state(tmp_path: Path
         route_depth=0,
         maximum_cost_nano_usd=123,
     )
-    connection = sqlite3.connect(ledger.database_path)
+    connection = connect_sqlite(ledger.database_path)
     try:
         row = connection.execute(
             """

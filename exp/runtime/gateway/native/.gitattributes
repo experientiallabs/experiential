@@ -1,0 +1,4 @@
+# Reproducible contract corpora and Unicode/schema tables. Review their builders
+# and the native parity assertions; keep authored implementation in normal diffs.
+tests/generated/** linguist-generated=true
+src/generated/** linguist-generated=true

@@ -56,9 +56,11 @@ pub struct ServeConfig {
     #[serde(default = "default_max_active_requests")]
     pub max_active_requests: usize,
     #[serde(default = "default_request_timeout_seconds")]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub request_timeout_seconds: f64,
     /// Fail-fast bound on the TCP+TLS connect phase of every provider call.
     #[serde(default = "default_connect_timeout_seconds")]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub connect_timeout_seconds: f64,
     /// Restrict native provider sockets to public HTTPS destinations. Local
     /// embedders retain access to their own loopback/private model servers.
@@ -68,30 +70,36 @@ pub struct ServeConfig {
     /// never caps total generation time: once the first byte arrives, reads
     /// are paced by the deployment's own per-chunk timeout.
     #[serde(default = "default_time_to_first_byte_seconds")]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub time_to_first_byte_seconds: f64,
     /// Input-scaled first-byte allowance added on top of the flat bound, in
     /// seconds per million approximate input tokens (request bytes / 4), so
     /// a very large prompt's prefill is not misread as a dead lane.
     #[serde(default = "default_time_to_first_byte_seconds_per_million_input_tokens")]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub time_to_first_byte_seconds_per_million_input_tokens: f64,
     /// Fail-fast bound on the wait for a provider's first TOKEN (the first
     /// semantic event) after its headers arrived, flat part; the same
     /// per-million-input-tokens slope as the first-byte allowance is added.
     #[serde(default = "default_time_to_first_token_seconds")]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub time_to_first_token_seconds: f64,
     /// Bound on everything before the caller's first byte, across every
     /// attempt and failover, measured from the request's start. Kept under
     /// the edge proxy's 100 s origin timeout; zero or negative disables it.
     #[serde(default = "default_pre_first_byte_budget_seconds")]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub pre_first_byte_budget_seconds: f64,
     /// What a request's budget keeps beyond its route's longest AUTHORED
     /// first-byte allowance when that allowance raises the budget
     /// (`waterfall::pre_first_byte_budget`).
     #[serde(default = "default_pre_first_byte_reserve_seconds")]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub pre_first_byte_reserve_seconds: f64,
     /// The most an authored allowance may raise a request's budget to; zero
     /// or negative removes the ceiling.
     #[serde(default = "default_pre_first_byte_max_seconds")]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub pre_first_byte_max_seconds: f64,
     #[serde(default = "default_callback_permits")]
     pub callback_permits: usize,
@@ -101,11 +109,13 @@ pub struct ServeConfig {
     #[serde(default = "default_native_usage_enabled")]
     pub native_usage_enabled: bool,
     #[serde(default = "default_graceful_timeout_seconds")]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub graceful_timeout_seconds: f64,
     /// Release waiting requests by class (`Admission::priority_class`) with
     /// one class of aging per this many seconds (`permit_queue`). Absent
     /// keeps the FIFO semaphore.
     #[serde(default)]
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub permit_priority_aging_seconds: Option<f64>,
 }
 
@@ -466,7 +476,7 @@ async fn usage_json(State(state): State<AppState>, headers: HeaderMap) -> Respon
         Err(error) => return error_response(&error),
     };
     match state.bridge.call("usage_json", argument).await {
-        Ok(text) => match serde_json::from_str::<Value>(&text) {
+        Ok(text) => match crate::lossless_json::from_str::<Value>(&text) {
             Ok(payload) => json_response(StatusCode::OK, &payload, &[]),
             Err(_) => error_response(&PublicError::internal()),
         },
@@ -480,7 +490,7 @@ async fn usage_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
         Err(error) => return error_response(&error),
     };
     match state.bridge.call("usage_page", argument).await {
-        Ok(text) => match serde_json::from_str::<Value>(&text) {
+        Ok(text) => match crate::lossless_json::from_str::<Value>(&text) {
             Ok(payload) => match payload.get("html").and_then(Value::as_str) {
                 Some(html) => Response::builder()
                     .status(StatusCode::OK)
@@ -500,7 +510,7 @@ async fn usage_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
 /// programmatic python snapshot are one and the same.
 async fn metrics_json(State(state): State<AppState>) -> Response {
     match state.bridge.call("metrics_json", "{}".to_string()).await {
-        Ok(text) => match serde_json::from_str::<Value>(&text) {
+        Ok(text) => match crate::lossless_json::from_str::<Value>(&text) {
             Ok(payload) => json_response(StatusCode::OK, &payload, &[]),
             Err(_) => error_response(&PublicError::internal()),
         },
@@ -513,7 +523,7 @@ async fn metrics_json(State(state): State<AppState>) -> Response {
 /// unwraps the `text` field and stamps the exposition content type.
 async fn metrics_text(State(state): State<AppState>) -> Response {
     match state.bridge.call("metrics_text", "{}".to_string()).await {
-        Ok(text) => match serde_json::from_str::<Value>(&text) {
+        Ok(text) => match crate::lossless_json::from_str::<Value>(&text) {
             Ok(payload) => match payload.get("text").and_then(Value::as_str) {
                 Some(exposition) => Response::builder()
                     .status(StatusCode::OK)
@@ -538,7 +548,7 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Response {
     };
     let argument = compact_json(&json!({"raw_key": raw_key}));
     match state.bridge.call("models", argument).await {
-        Ok(text) => match serde_json::from_str::<Value>(&text) {
+        Ok(text) => match crate::lossless_json::from_str::<Value>(&text) {
             Ok(payload) => json_response(StatusCode::OK, &payload, &[]),
             Err(_) => error_response(&PublicError::internal()),
         },
@@ -557,7 +567,7 @@ async fn model_detail(
     };
     let argument = compact_json(&json!({"raw_key": raw_key, "model_id": model_id}));
     match state.bridge.call("model_detail", argument).await {
-        Ok(text) => match serde_json::from_str::<Value>(&text) {
+        Ok(text) => match crate::lossless_json::from_str::<Value>(&text) {
             Ok(payload) => json_response(StatusCode::OK, &payload, &[]),
             Err(_) => error_response(&PublicError::internal()),
         },

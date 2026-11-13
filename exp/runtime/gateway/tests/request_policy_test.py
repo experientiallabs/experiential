@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -15,10 +15,12 @@ import anthropic
 import httpx
 import openai
 import pytest
+from exp_gateway_native import NativeAccounting
 from websockets.sync.client import connect
 
+import exp.runtime.gateway.native_accounting as accounting_module
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.health import DeploymentHealthRegistry
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.native_bridge_test import _configured_pool_gateway
 from exp.runtime.gateway.tests.launch_test import _ServedGateway, _unused_port
 from exp.runtime.gateway.tests.native_tool_search_test import _TOOLS_CHAT, _configure, _Provider
@@ -102,10 +104,21 @@ def serving(
     monkeypatch.setenv("TEST_PROVIDER_KEY", "synthetic-provider-key")
     origin = f"http://127.0.0.1:{provider.server.server_port}/v1"
     manager, key = _configured_pool_gateway(root, base_urls=(origin, origin))
-    gateway = _ServedGateway(root, _unused_port())
-    gateway.control_plane._accounting._health = DeploymentHealthRegistry(
-        failure_threshold=health_threshold
-    )  # noqa: SLF001
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            accounting_module,
+            "NativeAccounting",
+            partial(
+                NativeAccounting,
+                health_policy_json=json.dumps(
+                    {
+                        "failure_threshold": health_threshold,
+                    }
+                ),
+            ),
+        )
+        gateway = _ServedGateway(root, _unused_port())
     try:
         gateway.start()
         yield gateway, key, provider, manager.database_path
@@ -169,7 +182,7 @@ def test_single_attempt_is_one_physical_http_dispatch(
             )
         assert provider.calls == ["alpha-model-exact"]
         assert "gateway" not in provider.bodies[0]
-        with sqlite3.connect(database) as connection:
+        with connect_sqlite(database) as connection:
             rows = connection.execute("select state from gateway_attempts").fetchall()
         assert rows == [("failed",)]
 
@@ -275,7 +288,7 @@ def test_websocket_close_during_backoff_cancels_before_another_dispatch(
                 time.sleep(0.01)
         time.sleep(2.1)
         assert provider.calls == ["alpha-model-exact"]
-        with sqlite3.connect(database) as connection:
+        with connect_sqlite(database) as connection:
             assert connection.execute("select count(*) from gateway_attempts").fetchone() == (1,)
 
 

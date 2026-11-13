@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -33,6 +32,7 @@ from exp.common.models import (
 )
 from exp.common.models.gateway_catalog_test import unavailable_child_catalog
 from exp.common.models.gateway_chains import GatewayDeploymentRung, GatewayModelChain
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway import model_chain_authority as authority
 from exp.runtime.gateway.catalog_authority import authored_snapshot_path, snapshot_current_catalog
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget
@@ -62,6 +62,7 @@ from exp.runtime.gateway.tests.chain_authority_fixture_test import (
     chain_components,
     publish_chain_fixture,
 )
+from exp.runtime.gateway.tests.native_admission_fixture_test import AdmissionRecords
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.openai_protocol import decode_chat
 
@@ -240,7 +241,7 @@ def test_nonchat_remote_chain_refuses_before_stock_acceptance(
         )
 
     ledger = cast(SQLiteAttemptLedger, components.ledger)
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         assert connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0] == 0
 
@@ -253,6 +254,7 @@ def test_nonchat_plain_remote_and_mixed_catalog_keep_exact_model_serving(
     surface: Literal["embeddings", "images", "decisions"],
     chain_policy: Literal["absent", "empty", "unrelated"],
     configured_host: bool,
+    admission_records: AdmissionRecords,
 ) -> None:
     """Ordinary roots dispatch once per call, with fresh host checks when configured."""
 
@@ -300,7 +302,7 @@ def test_nonchat_plain_remote_and_mixed_catalog_keep_exact_model_serving(
     argument = json.dumps({"raw_key": key, "body": json.dumps(body), "idempotency_key": "same"})
     for index in range(2):
         admitted = json.loads(getattr(control, f"admit_{surface}")(argument))
-        entry = control._accounting.entry(admitted["request_id"])
+        entry = admission_records.get(control._accounting, admitted["request_id"])
         assert entry is not None and not entry.route.snapshot.model_stages
         assert entry.route.snapshot.exact_model_id == "root-model"
         assert entry.route.snapshot.deployment_ids == ("root",)
@@ -317,7 +319,7 @@ def test_nonchat_plain_remote_and_mixed_catalog_keep_exact_model_serving(
         assert started["route_depth"] == 0
         control.abandon(json.dumps({"request_id": admitted["request_id"]}))
         assert host.calls == (index + 1 if configured_host else 0)
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         assert connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0] == 2
         assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0] == 2
 
@@ -361,7 +363,7 @@ def test_nonchat_cached_receiptless_plain_authority_still_checks_host_floor(
             json.loads(error.value.public_error_json)["code"] == "model_chain_authority_unavailable"
         )
     assert host.calls == 2
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         assert connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0] == 0
 
@@ -768,7 +770,7 @@ def test_configured_serving_limit_accepts_valid_direct_catalog_above_64_mib(
             route_depth=0,
             maximum_cost_nano_usd=0,
         )
-        with sqlite3.connect(manager.database_path) as connection:
+        with connect_sqlite(manager.database_path) as connection:
             assert connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0] == 1
             assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0] == 1
     finally:
@@ -827,7 +829,7 @@ def test_small_serving_limit_refuses_before_serving_work(tmp_path: Path, entrypo
                     )
                 )
         assert "1-byte" in str(error.value) and "settings.toml" in str(error.value)
-    with sqlite3.connect(manager.database_path) as connection:
+    with connect_sqlite(manager.database_path) as connection:
         assert connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0] == 0
 
@@ -917,7 +919,7 @@ def test_chain_preflight_fences_exact_database_and_file_changes(
             ledger._transaction() as connection,
         ):
             ledger.apply_accept_request(connection, authorization=auth, chain_preflight=proof)
-    with sqlite3.connect(manager.database_path) as connection:
+    with connect_sqlite(manager.database_path) as connection:
         assert connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0] == 0
 
 
@@ -998,7 +1000,7 @@ def test_preflight_budget_exhaustion_is_timeout_and_releases_permit(tmp_path: Pa
                 ledger.apply_accept_request(connection, authorization=auth, chain_preflight=proof)
         assert error.value.failure.failure_class == "timeout"
     assert proof._closed and all(item._closed for item in proof.files)
-    with sqlite3.connect(manager.database_path) as connection:
+    with connect_sqlite(manager.database_path) as connection:
         assert connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0] == 0
     ledger.accept_request(authorization=auth)
 
@@ -1439,7 +1441,7 @@ def test_preexisting_unsafe_chain_cannot_reenter_local_serving(
         assert (
             json.loads(error.value.public_error_json)["code"] == "model_chain_authority_unavailable"
         )
-    with sqlite3.connect(manager.database_path) as connection:
+    with connect_sqlite(manager.database_path) as connection:
         assert connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone()[0] == 0
 
@@ -1483,7 +1485,7 @@ def test_local_lifecycle_never_falls_back_past_populated_active_policy(tmp_path:
     )
     with pytest.raises(GatewayLifecycleError, match="no granted active alias"):
         load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "test-only"})
-    with sqlite3.connect(manager.database_path) as connection:
+    with connect_sqlite(manager.database_path) as connection:
         assert connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0] == 0
 
 

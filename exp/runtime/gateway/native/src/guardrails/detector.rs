@@ -8,10 +8,9 @@
 //!
 //! This module never logs subjects, matches, or replacements.
 
-use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 
-use crate::guardrails::syntax::to_rust_syntax;
+use super::matcher::Matcher;
 
 /// Largest subject this detector inspects, in UTF-8 bytes.
 pub const MAX_TEXT_BYTES: usize = 1_048_576;
@@ -76,24 +75,22 @@ impl DetectorLimit {
 }
 
 /// One compiled expression plus whether it needs Luhn candidate validation.
+#[derive(Clone)]
 struct CompiledPattern {
-    expression: Regex,
+    expression: Matcher,
     card: bool,
 }
 
 /// A compiled authored rule: every expression plus the literal replacement.
+#[derive(Clone)]
 pub struct Detector {
     patterns: Vec<CompiledPattern>,
     replacement: String,
 }
 
 /// Compile one expression under the shared program-size bound.
-fn compile(pattern: &str) -> Result<Regex, String> {
-    let translated = to_rust_syntax(pattern).map_err(|reason| reason.to_string())?;
-    RegexBuilder::new(&translated)
-        .size_limit(COMPILE_SIZE_LIMIT)
-        .build()
-        .map_err(|_| "expression is not supported by the native detector".to_string())
+fn compile(pattern: &str) -> Result<Matcher, String> {
+    Matcher::compile(pattern, false, COMPILE_SIZE_LIMIT)
 }
 
 /// Whether a 13 to 19 digit candidate is a nonuniform valid Luhn number.
@@ -125,7 +122,7 @@ impl Detector {
         if spec.replacement.is_empty() || spec.replacement.chars().count() > 128 {
             return Err("replacement must contain 1 to 128 characters".to_string());
         }
-        let mut patterns = Vec::with_capacity(spec.patterns.len() + spec.builtin_patterns.len());
+        let mut patterns = Vec::with_capacity(spec.patterns.len() + 3);
         for pattern in &spec.patterns {
             if pattern.is_empty() || pattern.len() > MAX_PATTERN_BYTES {
                 return Err("each expression must contain 1 to 1024 UTF-8 bytes".to_string());
@@ -135,7 +132,11 @@ impl Detector {
                 card: false,
             });
         }
+        let mut builtin_names = std::collections::HashSet::new();
         for name in &spec.builtin_patterns {
+            if !builtin_names.insert(name) {
+                return Err("builtin families must be unique".to_string());
+            }
             let pattern = builtin_pattern(name).ok_or("unknown builtin family")?;
             patterns.push(CompiledPattern {
                 expression: compile(pattern)?,
@@ -151,6 +152,11 @@ impl Detector {
         })
     }
 
+    /// Conservative cache charge: every compiled expression can use its full limit.
+    pub fn cache_bytes(&self) -> usize {
+        self.patterns.len() * COMPILE_SIZE_LIMIT + self.replacement.len()
+    }
+
     /// Return the rewritten subject, or `None` when nothing matched.
     ///
     /// Overlapping spans are merged before replacement so one rule cannot
@@ -163,11 +169,11 @@ impl Detector {
         let mut rewritten = String::with_capacity(text.len());
         let mut position = 0usize;
         for (start, end) in spans {
-            rewritten.push_str(&text[position..start]);
+            rewritten.push_str(&text[position.min(text.len())..start.min(text.len())]);
             rewritten.push_str(&self.replacement);
             position = end;
         }
-        rewritten.push_str(&text[position..]);
+        rewritten.push_str(&text[position.min(text.len())..]);
         Ok(Some(rewritten))
     }
 
@@ -185,12 +191,15 @@ impl Detector {
         let mut spans: Vec<(usize, usize)> = Vec::new();
         let mut matches = 0usize;
         for pattern in &self.patterns {
-            for found in pattern.expression.find_iter(text) {
+            for (start, end) in pattern
+                .expression
+                .spans(text, MAX_MATCHES - matches)
+                .map_err(|_| DetectorLimit::Matches)?
+            {
                 matches += 1;
                 if matches > MAX_MATCHES {
                     return Err(DetectorLimit::Matches);
                 }
-                let (start, end) = (found.start(), found.end());
                 if start == end {
                     continue;
                 }
@@ -266,6 +275,35 @@ fn merge(mut spans: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn re2_redaction_and_coverage_match_python() {
+        for (i, line) in include_str!("../../tests/generated/regex.jsonl")
+            .lines()
+            .enumerate()
+        {
+            let case: serde_json::Value = crate::lossless_json::from_str(line).unwrap();
+            let pattern = case["pattern"].as_str().unwrap();
+            let rule = detector(&[pattern], &[], "[REDACTED]");
+            let text = case["text"].as_str().unwrap();
+            let actual = rule.redact(text);
+            if case["error"] == true {
+                assert!(actual.is_err(), "case {i} {pattern}");
+                continue;
+            }
+            let actual = actual.unwrap();
+            assert_eq!(
+                actual.is_some(),
+                case["flagged"].as_bool().unwrap(),
+                "case {i} {pattern}"
+            );
+            assert_eq!(
+                actual.as_deref().unwrap_or(text),
+                case["rewritten"].as_str().unwrap(),
+                "case {i} {pattern}"
+            );
+        }
+    }
 
     /// Build one detector from custom expressions and built-in families.
     fn detector(patterns: &[&str], builtins: &[&str], replacement: &str) -> Detector {

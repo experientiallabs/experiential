@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from hashlib import sha256
 
 from exp.runtime.gateway.guardrails.contracts import (
     CategoryScore,
@@ -24,12 +26,47 @@ class ObservationRecord:
         check: Frozen check identity, capability and authored action, or a policy outcome.
         outcome: Observed result, including unsupported and skipped coverage.
         latency_seconds: Measured bounded inspection duration.
+        request_id: Optional authenticated request identity for missed surface coverage.
+        surface: Unsupported API surface, without any request content.
     """
 
     policy: GuardrailPolicy
     check: GuardrailCheck | None
     outcome: GuardrailOutcome
     latency_seconds: float
+    request_id: str | None = None
+    surface: str | None = None
+
+    def log_coverage(self) -> None:
+        """Correlate missed surface coverage without retaining content or raw revision text."""
+        if self.request_id is not None:
+            logging.getLogger(__name__).info(
+                "guardrail coverage request_id=%s surface=%s policy_id=%s revision_sha256=%s "
+                "mode=%s status=%s outcome=%s",
+                self.request_id,
+                self.surface,
+                self.policy.policy_id,
+                sha256(self.policy.revision.encode()).hexdigest(),
+                self.policy.mode,
+                "observed" if self.policy.mode == "observe" else "failed_open",
+                self.outcome.value,
+            )
+
+    def log_outcome(self) -> None:
+        """Emit the default content-free observation when no host sink overrides it."""
+        logging.getLogger(__name__).info(
+            "guardrail observation policy_id=%s revision=%s organization_id=%s identity_id=%s "
+            "check_id=%s capability=%s would_action=%s outcome=%s latency_ms=%.1f",
+            self.policy.policy_id,
+            self.policy.revision,
+            self.policy.organization_id,
+            self.policy.identity_id,
+            None if self.check is None else self.check.check_id,
+            None if self.check is None else self.check.capability.value,
+            None if self.check is None else self.check.action.value,
+            self.outcome.value,
+            self.latency_seconds * 1000,
+        )
 
 
 @dataclass(frozen=True)

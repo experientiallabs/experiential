@@ -35,6 +35,7 @@ from exp.common.models import (
     NormalizedGatewayCatalog,
 )
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind, SQLiteBudgetStore
 from exp.runtime.gateway.catalog_authority import upsert_connection, upsert_singleton_deployment
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
@@ -382,7 +383,7 @@ def _settled(engine: _ServingEngine, request_id: str) -> tuple[sqlite3.Row, list
     """Wait for one request and its attempts to reach a durable terminal."""
     deadline = time.monotonic() + 3.0
     while True:
-        with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+        with connect_sqlite(GatewayManagement(engine.root).database_path) as connection:
             connection.row_factory = sqlite3.Row
             request = connection.execute(
                 "SELECT * FROM gateway_requests WHERE request_id = ?", (request_id,)
@@ -450,12 +451,12 @@ def test_a_rejected_credential_fails_over_to_the_certified_backup(engine: _Servi
 
 def test_an_answer_outside_the_question_fails_closed(engine: _ServingEngine) -> None:
     """A typed choice the request never offered is malformed, never relayed."""
-    with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+    with connect_sqlite(GatewayManagement(engine.root).database_path) as connection:
         before = {row[0] for row in connection.execute("SELECT request_id FROM gateway_requests")}
     response = _post(engine, _body("malformed"))
     assert response.status_code == 502, response.text
     assert "canary" not in response.text
-    with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+    with connect_sqlite(GatewayManagement(engine.root).database_path) as connection:
         [request_id] = {
             row[0] for row in connection.execute("SELECT request_id FROM gateway_requests")
         } - before
@@ -466,10 +467,10 @@ def test_an_answer_outside_the_question_fails_closed(engine: _ServingEngine) -> 
 
 def _refused(engine: _ServingEngine, model: str) -> tuple[httpx.Response, sqlite3.Row]:
     """POST a decision for ``model`` and read the one request it accepted and failed."""
-    with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+    with connect_sqlite(GatewayManagement(engine.root).database_path) as connection:
         before = {row[0] for row in connection.execute("SELECT request_id FROM gateway_requests")}
     response = _post(engine, _body(model=model))
-    with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+    with connect_sqlite(GatewayManagement(engine.root).database_path) as connection:
         [request_id] = {
             row[0] for row in connection.execute("SELECT request_id FROM gateway_requests")
         } - before

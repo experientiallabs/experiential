@@ -23,7 +23,7 @@ impl Sink for MemorySink {
 
     fn write(&mut self, record: &Self::Prepared) -> Result<(), ()> {
         self.0
-            .send(serde_json::from_str(record).map_err(|_| ())?)
+            .send(crate::lossless_json::from_str(record).map_err(|_| ())?)
             .map_err(|_| ())
     }
 }
@@ -107,7 +107,7 @@ impl Sink for HeldSink {
             Err(())
         } else {
             self.records
-                .send(serde_json::from_str(record).map_err(|_| ())?)
+                .send(crate::lossless_json::from_str(record).map_err(|_| ())?)
                 .map_err(|_| ())
         }
     }
@@ -271,7 +271,7 @@ async fn numeric_sources_preserve_wide_integers_in_json_sse_and_wire() {
         assert!(collector.finish_relay(
             "request",
             super::super::relay::Relay {
-                metadata: serde_json::from_value(json!({
+                metadata: crate::lossless_json::from_value(json!({
                     "wire_request": {"method":"POST", "body_bytes":SOURCE.len()},
                     "headers":[], "timing":{}, "relay_completed":true,
                     "client_disconnected":false
@@ -313,7 +313,7 @@ async fn numeric_sources_preserve_wide_integers_in_json_sse_and_wire() {
             CapturedResponse::Json { source_json, .. } => source_json.unwrap(),
             CapturedResponse::Sse { source_json, .. } => {
                 let frames: Vec<Box<RawValue>> =
-                    serde_json::from_str(&source_json.unwrap()).unwrap();
+                    crate::lossless_json::from_str(&source_json.unwrap()).unwrap();
                 assert_eq!(frames.len(), 2);
                 frames[0].get().to_owned()
             }
@@ -331,7 +331,7 @@ async fn relay_metadata_rendezvous_preserves_wire_and_does_not_duplicate_replays
         assert!(!collector.claim_relay("request"));
         assert!(!collector.claim_relay("unknown"));
         let metadata = || super::super::relay::Relay {
-            metadata: serde_json::from_value(json!({
+            metadata: crate::lossless_json::from_value(json!({
                 "wire_request": {"method":"POST", "path":"/v1/chat/completions",
                     "headers":[["authorization","<redacted>"]], "body_bytes":14},
                 "headers":[["x-gateway-provider","Experiential Cloud"]],
@@ -403,8 +403,8 @@ async fn json_capture_preserves_wire_bytes_and_normalizes_only_the_stored_copy()
     assert_eq!(body["a\u{fffd}~1"], 1);
     assert_eq!(body["text"], "a\u{fffd}b");
     assert_eq!(
-        serde_json::from_str::<Value>(&source_json.unwrap()).unwrap(),
-        serde_json::from_slice::<Value>(original).unwrap()
+        crate::lossless_json::from_str::<Value>(&source_json.unwrap()).unwrap(),
+        crate::lossless_json::from_slice::<Value>(original).unwrap()
     );
 }
 
@@ -451,7 +451,10 @@ fn nested_nul_keys_and_values_preserve_exact_source_and_do_not_merge_keys() {
     let mut value = json!([{"nested":{"a\0":1,"a\u{fffd}":2,"text":"x\0y"}}]);
     let original = value.clone();
     let source = lossless_projection(&mut value).unwrap();
-    assert_eq!(serde_json::from_str::<Value>(&source).unwrap(), original);
+    assert_eq!(
+        crate::lossless_json::from_str::<Value>(&source).unwrap(),
+        original
+    );
     assert_eq!(value[0]["nested"]["a\u{fffd}"], 2);
     assert_eq!(value[0]["nested"]["a\u{fffd}~1"], 1);
     assert_eq!(value[0]["nested"]["text"], "x\u{fffd}y");
@@ -492,7 +495,7 @@ async fn encoded_sse_budget_includes_lossless_sidecar_and_keeps_exact_prefix() {
         panic!()
     };
     assert!(truncated);
-    let restored: Vec<Value> = serde_json::from_str(&source_json.unwrap()).unwrap();
+    let restored: Vec<Value> = crate::lossless_json::from_str(&source_json.unwrap()).unwrap();
     assert_eq!(restored, vec![json!({"text":"first\0"})]);
     assert_eq!(frames, vec![json!({"text":"first\u{fffd}"})]);
 }
@@ -502,7 +505,7 @@ async fn encoded_sse_budget_includes_wide_numeric_sources_and_keeps_exact_prefix
     const SOURCE: &str = r#"{"value":1208925819614629174706177}"#;
     let prefix = CapturedResponse::Sse {
         status: 200,
-        frames: vec![serde_json::from_str(SOURCE).unwrap()],
+        frames: vec![crate::lossless_json::from_str(SOURCE).unwrap()],
         truncated: true,
         client_disconnected: false,
         source_json: Some(format!("[{SOURCE}]")),

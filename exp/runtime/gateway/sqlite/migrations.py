@@ -10,13 +10,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from exp.common.sqlite.connection import connect_database
+from exp.common.sqlite.native import connect
 from exp.runtime.gateway.sqlite.cache_write_migration import migrate_cache_write
 from exp.runtime.gateway.sqlite.nano_usd_migration import (
     NanoUsdMigrationError,
     migrate_money_to_nano_usd,
 )
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 
 
 class GatewaySchemaError(RuntimeError):
@@ -804,6 +805,14 @@ _MIGRATIONS: dict[int, tuple[MigrationStep, ...]] = {
         "ALTER TABLE gateway_attempts ADD COLUMN accounting_recovery INTEGER NOT NULL "
         "DEFAULT 0 CHECK (accounting_recovery IN (0, 1))",
     ),
+    33: (
+        "ALTER TABLE gateway_attempts ADD COLUMN native_accounting_terms TEXT",
+        "ALTER TABLE gateway_attempts ADD COLUMN native_accounting_terminal TEXT",
+        "CREATE TABLE gateway_input_moderation ("
+        "request_id TEXT REFERENCES gateway_requests(request_id) ON DELETE CASCADE, "
+        "inspection_id TEXT NOT NULL, organization_id TEXT NOT NULL, "
+        "recorded_at TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(request_id, inspection_id))",
+    ),
     24: (  # plan sign-in kind: part of the connection identity digest, so it rides the revision
         "ALTER TABLE provider_connection_revisions ADD COLUMN subscription TEXT "
         "CHECK (subscription IN ('chatgpt', 'anthropic'))",
@@ -929,8 +938,8 @@ def _backup_database(path: Path, version: int) -> Path:
     backup = path.with_name(f"{path.name}.backup-v{version}-{stamp}")
     descriptor = os.open(backup, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(descriptor)
-    source = sqlite3.connect(path)
-    destination = sqlite3.connect(backup)
+    source = connect(path, mode="ro")
+    destination = connect(backup, mode="rw")
     try:
         source.backup(destination)
     finally:

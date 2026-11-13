@@ -15,6 +15,7 @@ import pytest
 
 from exp.common.models.catalog import BillingSource, GatewayDeploymentMetadata, GatewayTokenPrices
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway import model_chain_authority as authority
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -238,7 +239,7 @@ def test_group_preflight_handles_close_after_every_outcome(tmp_path: Path, outco
         for proof in proofs
         for file in proof.files
     )
-    with sqlite3.connect(core.database_path) as connection:
+    with connect_sqlite(core.database_path) as connection:
         count = connection.execute("SELECT count(*) FROM gateway_requests").fetchone()[0]
     assert count == (1 if outcome in ("success", "cancelled") else 0)
     with pytest.raises(RuntimeError, match="closed"):
@@ -301,7 +302,9 @@ def test_group_writer_classifies_bytes_before_begin(tmp_path: Path) -> None:
     def classify(content: bytes) -> dict[str, object]:
         """Probe actual writer-lock availability around each real catalog parse."""
         nonlocal reads
-        with sqlite3.connect(core.database_path, timeout=0) as connection:
+        if isinstance(content, str):
+            return original(content)
+        with connect_sqlite(core.database_path, busy_timeout_ms=0) as connection:
             connection.execute("BEGIN IMMEDIATE")
             connection.rollback()
         reads += 1
@@ -355,7 +358,7 @@ def test_full_request_lifecycle_commits_durably_through_group_writer(tmp_path: P
 
     attempt_id = asyncio.run(lifecycle())
     grouped.close()
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     connection.row_factory = sqlite3.Row
     row = connection.execute(
         "SELECT state, route_reason, input_tokens, output_tokens FROM gateway_attempts"
@@ -393,7 +396,7 @@ def test_failed_operation_rolls_back_alone_and_batch_siblings_commit(tmp_path: P
 
     asyncio.run(mixed_batch())
     grouped.close()
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     count = connection.execute("SELECT COUNT(*) FROM gateway_requests").fetchone()[0]
     connection.close()
     assert int(count) == 1
@@ -419,7 +422,7 @@ def test_concurrent_writes_share_batches_and_all_become_durable(tmp_path: Path) 
 
     asyncio.run(accept_many())
     grouped.close()
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     count = connection.execute("SELECT COUNT(*) FROM gateway_requests").fetchone()[0]
     connection.close()
     assert int(count) == 64
@@ -445,7 +448,7 @@ def test_cancelled_caller_keeps_writer_running_and_write_durable(tmp_path: Path)
 
     asyncio.run(cancel_then_continue())
     grouped.close()
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     count = connection.execute("SELECT COUNT(*) FROM gateway_requests").fetchone()[0]
     connection.close()
     assert int(count) == 2
@@ -503,7 +506,7 @@ def test_sync_facade_commits_full_lifecycle_durably_without_an_event_loop(
     )
     facade.flush()
     grouped.close()
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     connection.row_factory = sqlite3.Row
     row = connection.execute(
         "SELECT state, input_tokens, output_tokens FROM gateway_attempts WHERE attempt_id = ?",
@@ -530,7 +533,7 @@ def test_sync_facade_raises_the_original_failure_and_stays_usable(tmp_path: Path
     survivor = _authorize(store, clock, raw_key, "survivor-prompt")
     facade.accept_request(authorization=survivor)
     grouped.close()
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     count = connection.execute("SELECT COUNT(*) FROM gateway_requests").fetchone()[0]
     connection.close()
     assert int(count) == 1
@@ -567,7 +570,7 @@ def test_concurrent_sync_threads_all_commit_exactly_once(tmp_path: Path) -> None
         thread.join(timeout=15)
     grouped.close()
     assert errors == []
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     request_ids = [
         str(row[0])
         for row in connection.execute("SELECT request_id FROM gateway_requests").fetchall()
@@ -641,7 +644,7 @@ def test_zero_attempt_certificate_waits_for_committed_terminal_state(
             worker.start()
             assert applied.wait(10)
             assert results == []
-            with sqlite3.connect(tmp_path / "gateway.db") as reader:
+            with connect_sqlite(tmp_path / "gateway.db") as reader:
                 assert reader.execute(
                     "SELECT terminal_state FROM gateway_requests WHERE request_id = ?",
                     (authorization.request_id,),
@@ -650,7 +653,7 @@ def test_zero_attempt_certificate_waits_for_committed_terminal_state(
             worker.join(10)
             assert not worker.is_alive()
         assert results == [True]
-        with sqlite3.connect(tmp_path / "gateway.db") as reader:
+        with connect_sqlite(tmp_path / "gateway.db") as reader:
             assert reader.execute(
                 "SELECT terminal_state FROM gateway_requests WHERE request_id = ?",
                 (authorization.request_id,),
@@ -696,7 +699,7 @@ def test_rolled_back_terminal_write_never_returns_zero_attempt_certificate(tmp_p
                 facade.finish_request(
                     authorization=authorization, failure=failure, certify_no_effects=True
                 )
-        with sqlite3.connect(tmp_path / "gateway.db") as reader:
+        with connect_sqlite(tmp_path / "gateway.db") as reader:
             assert reader.execute(
                 "SELECT terminal_state FROM gateway_requests WHERE request_id = ?",
                 (authorization.request_id,),
@@ -730,7 +733,7 @@ def test_batch_machinery_failure_fails_blocked_callers_and_writer_recovers(
     survivor = _authorize(store, clock, raw_key, "post-failure-prompt")
     facade.accept_request(authorization=survivor)
     grouped.close()
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     count = connection.execute("SELECT COUNT(*) FROM gateway_requests").fetchone()[0]
     connection.close()
     assert int(count) == 1
@@ -745,7 +748,7 @@ def test_writer_wide_transaction_failure_is_unwritable_until_storage_recovers(
     core = SQLiteAttemptLedger(tmp_path / "gateway.db", clock=clock, busy_timeout_ms=50)
     grouped = GroupCommitAttemptLedger(core)
     facade = SyncGroupCommitLedger(grouped)
-    holder = sqlite3.connect(tmp_path / "gateway.db", timeout=0)
+    holder = connect_sqlite(tmp_path / "gateway.db", busy_timeout_ms=0)
     try:
         assert grouped.writable()
         holder.execute("BEGIN IMMEDIATE")
@@ -966,7 +969,7 @@ def test_facades_forward_upstream_provider_only_to_a_host_hook_that_accepts_it(
         facade.flush()
         grouped.close()
     assert recorded == [{"attempt_id": attempt_id, "finalize": True}]
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         assert connection.execute(
             "SELECT state, upstream_provider FROM gateway_attempts WHERE attempt_id = ?",
@@ -1001,7 +1004,7 @@ def test_facades_forward_upstream_provider_only_to_a_host_hook_that_accepts_it(
     )
     facade.flush()
     grouped.close()
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         assert connection.execute(
             "SELECT upstream_provider FROM gateway_attempts WHERE attempt_id = ?", (attempt_id,)
@@ -1092,7 +1095,7 @@ def test_async_facade_withholds_upstream_provider_from_a_legacy_host_hook(
         attempt_id = asyncio.run(lifecycle())
         grouped.close()
     assert recorded == [attempt_id]
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         assert connection.execute(
             "SELECT state, upstream_provider FROM gateway_attempts WHERE attempt_id = ?",
@@ -1289,7 +1292,7 @@ def test_sync_facade_forwards_web_search_requests_only_to_a_host_hook_that_accep
     assert recorded[0]["web_search_requests"] == 2
     assert "web_search_requests" not in recorded[1]
 
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         rows = connection.execute(
             "SELECT attempt_id, state, upstream_provider FROM gateway_attempts ORDER BY attempt_id"
@@ -1343,7 +1346,7 @@ def test_async_facade_withholds_web_search_requests_from_a_pre_meter_host_hook(
         attempt_id = asyncio.run(lifecycle())
         grouped.close()
     assert recorded == [{"attempt_id": attempt_id, "upstream_provider": "Azure"}]
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         assert connection.execute(
             "SELECT state, upstream_provider FROM gateway_attempts WHERE attempt_id = ?",
@@ -1413,7 +1416,7 @@ def test_sync_facade_forwards_tool_search_requests_only_to_a_host_hook_that_acce
     assert "tool_search_requests" not in recorded[1]
     assert recorded[1]["web_search_requests"] == 2
 
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         rows = connection.execute(
             "SELECT attempt_id, state, upstream_provider FROM gateway_attempts ORDER BY attempt_id"
@@ -1470,7 +1473,7 @@ def test_async_facade_withholds_tool_search_requests_from_a_pre_meter_host_hook(
     assert recorded == [
         {"attempt_id": attempt_id, "upstream_provider": "Azure", "web_search_requests": 1}
     ]
-    connection = sqlite3.connect(tmp_path / "gateway.db")
+    connection = connect_sqlite(tmp_path / "gateway.db")
     try:
         assert connection.execute(
             "SELECT state, upstream_provider FROM gateway_attempts WHERE attempt_id = ?",

@@ -139,7 +139,7 @@ fn a_malformed_channel_marks_the_retained_prefix_truncated() {
 
 #[test]
 fn rung_identity_separates_connections_without_keeping_header_values() {
-    let mut wire: crate::waterfall::DeploymentWire = serde_json::from_value(json!({
+    let mut wire: crate::waterfall::DeploymentWire = crate::lossless_json::from_value(json!({
         "provider":"p","deployment_id":"d","dialect":"openai_compatible","url":"https://x",
         "headers":{"authorization":"Bearer one"},"timeout_seconds":1.0,"idempotency_key":"k"
     }))
@@ -187,7 +187,7 @@ fn clearing_a_sidecar_returns_everything_it_was_charged() {
 #[test]
 fn only_a_route_with_an_injectable_rung_reserves_a_sidecar() {
     let rung = |id: &str, eligible: bool, byok: bool, dialect: &str| {
-        let mut wire: crate::waterfall::DeploymentWire = serde_json::from_value(json!({
+        let mut wire: crate::waterfall::DeploymentWire = crate::lossless_json::from_value(json!({
             "provider":"p","deployment_id":id,"dialect":dialect,"url":"https://route",
             "headers":{},"timeout_seconds":1.0,"idempotency_key":"k"
         }))

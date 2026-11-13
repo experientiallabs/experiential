@@ -32,6 +32,7 @@ from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPl
 from exp.runtime.gateway.native_bridge_test import _admit, _chat_body, _control_plane
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.tests.native_classifier_fixture_test import NativeClassifierFixture
 
 
 def _engine(
@@ -71,7 +72,9 @@ def _engine(
     )
     return GuardrailEngine(
         store=MappingGuardrailStore((policy,)),
-        client=DirectClassifierClient(ClassifierRegistry({"scripted": classifier})),
+        client=DirectClassifierClient(
+            ClassifierRegistry({"scripted": NativeClassifierFixture(classifier)})
+        ),
         monotonic=lambda: 0.0,
     )
 
@@ -337,7 +340,7 @@ def test_unknown_request_segment_fails_closed(tmp_path: Path) -> None:
     control, raw_key = _native_with_engine(tmp_path, _stream_engine())
     _admit(control, raw_key, _chat_body(stream=True))
 
-    decision = json.loads(
+    with pytest.raises(NativeBridgeError) as rejected:
         control.enforce_output_segment(
             json.dumps(
                 {
@@ -348,7 +351,4 @@ def test_unknown_request_segment_fails_closed(tmp_path: Path) -> None:
                 }
             )
         )
-    )
-    assert decision["action"] == "error"
-    assert "release" not in decision
-    assert decision["failure"]["failure_class"] == "unavailable"
+    assert json.loads(rejected.value.public_error_json)["status_code"] == 500

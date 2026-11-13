@@ -43,6 +43,7 @@ import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.lifecycle_test import (
     _activate_alias_for_escalation_policy,
     _configured_gateway,
@@ -113,13 +114,6 @@ _DRIVER_SOURCE = textwrap.dedent(
                 admission["route"][0]["timeout_seconds"] = 1.5
             return json.dumps(admission)
 
-        def settle(self, argument: str) -> str:
-            """Observe every settlement and delay one write to expose close ordering."""
-            data = json.loads(argument)
-            with open(os.environ["SETTLEMENT_LOG"], "a") as sink:
-                sink.write(json.dumps(data) + "\\n")
-            time.sleep(0.3)
-            return super().settle(argument)
 
 
     def main() -> None:
@@ -159,6 +153,7 @@ _DRIVER_SOURCE = textwrap.dedent(
                             "graceful_timeout_seconds": 2.0,
                         }
                     ),
+                    native_callbacks=control_plane._accounting.native.callbacks(),
                 )
                 return
             except RuntimeError as error:
@@ -170,7 +165,7 @@ _DRIVER_SOURCE = textwrap.dedent(
 
     if __name__ == "__main__":
         main()
-    '''
+'''
 ).strip()
 
 
@@ -381,7 +376,6 @@ class _ServingEngine:
     port: int
     raw_key: str
     database_path: Path
-    settlement_log: Path
     stderr_log: Path
 
     @property
@@ -467,8 +461,6 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
     stderr_log = root / "driver-stderr.log"
     environment = dict(os.environ)
     environment["TEST_PROVIDER_KEY"] = "provider-secret-canary"
-    settlement_log = root / "settlements.jsonl"
-    environment["SETTLEMENT_LOG"] = str(settlement_log)
     stderr_sink = stderr_log.open("wb")
     process = subprocess.Popen(  # noqa: S603 - the interpreter runs our generated driver.
         [sys.executable, str(driver), config],
@@ -519,7 +511,6 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
             port=port,
             raw_key=raw_key,
             database_path=manager.database_path,
-            settlement_log=settlement_log,
             stderr_log=stderr_log,
         )
     finally:
@@ -583,7 +574,7 @@ def _attempt(engine: _ServingEngine, request_id: str) -> sqlite3.Row:
     """Await exactly one durable terminal row without relying on sweep cleanup."""
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
-        with sqlite3.connect(engine.database_path) as connection:
+        with connect_sqlite(engine.database_path) as connection:
             connection.row_factory = sqlite3.Row
             rows = connection.execute(
                 "SELECT * FROM gateway_attempts WHERE request_id = ?", (request_id,)
@@ -592,6 +583,14 @@ def _attempt(engine: _ServingEngine, request_id: str) -> sqlite3.Row:
             return rows[0]
         time.sleep(0.02)
     pytest.fail(f"one terminal attempt missing for {request_id}")
+
+
+def _request_ids(engine: _ServingEngine) -> set[str]:
+    """Read native durable request identities without a Python settlement callback."""
+    with connect_sqlite(engine.database_path) as connection:
+        return {
+            str(row[0]) for row in connection.execute("SELECT request_id FROM gateway_attempts")
+        }
 
 
 @pytest.mark.parametrize("surface", ["chat", "messages"])
@@ -612,9 +611,20 @@ def test_quiet_disconnect_closes_transport_before_settlement(
     while b"usable partial answer" not in received:
         received += client.recv(4096)
     started = time.monotonic()
-    _abort(client)
-    assert _PROVIDER_CLOSED[prompt].wait(0.25), "provider socket outlived delayed settlement"
-    assert time.monotonic() - started < 0.3
+    with connect_sqlite(engine.database_path) as locked:
+        locked.execute("BEGIN IMMEDIATE")
+        _abort(client)
+        assert _PROVIDER_CLOSED[prompt].wait(0.25), (
+            "provider socket outlived blocked Rust settlement"
+        )
+        assert time.monotonic() - started < 0.3
+        assert (
+            locked.execute(
+                "SELECT terminal_at FROM gateway_attempts WHERE request_id = ?", (request_id,)
+            ).fetchone()[0]
+            is None
+        )
+        locked.commit()
     row = _attempt(engine, request_id)
     assert row["state"] == "cancelled"
     assert row["failure_class"] == "cancelled"
@@ -625,13 +635,6 @@ def test_quiet_disconnect_closes_transport_before_settlement(
         assert row["input_tokens"] > 0
         assert row["output_tokens"] == _tokens("usable partial answer")
     assert row["usage_source"] == "estimated"
-    payloads = [json.loads(line) for line in engine.settlement_log.read_text().splitlines()]
-    writes = [entry for entry in payloads if entry["request_id"] == request_id]
-    assert len(writes) == 1
-    assert writes[0]["dispatched"] is True
-    assert writes[0]["usage_incomplete_due_to_disconnect"] is True
-    assert writes[0]["streamed_output"]["text"] == "usable partial answer"
-    assert writes[0]["streamed_output"]["reasoning"] == ""
 
 
 @pytest.mark.parametrize("surface", ["chat", "messages"])
@@ -650,10 +653,6 @@ def test_partial_meter_disconnect_estimates_the_unreported_output(
     assert row["input_tokens"] == 19
     assert row["output_tokens"] == _tokens("usable partial answer")
     assert row["usage_source"] == "estimated"
-    writes = [json.loads(line) for line in engine.settlement_log.read_text().splitlines()]
-    own = [entry for entry in writes if entry["request_id"] == request_id]
-    assert len(own) == 1
-    assert own[0]["usage_incomplete_due_to_disconnect"] is True
 
 
 @pytest.mark.parametrize("surface", ["chat", "messages"])
@@ -742,12 +741,7 @@ def test_preheaders_disconnect_preserves_observed_unknown_and_closes_socket(
 ) -> None:
     """Cancel initial request while its committed token and public headers are still pending."""
     prompt = "beforeheaders-known" if known else "beforeheaders-no-token"
-    previous = set()
-    if engine.settlement_log.exists():
-        previous = {
-            json.loads(line)["request_id"]
-            for line in engine.settlement_log.read_text().splitlines()
-        }
+    previous = _request_ids(engine)
     cancelled_before = _terminal_attempts(engine, "cancelled")
     client = socket.create_connection((_HOST, engine.port), timeout=5)
     client.sendall(_raw_chat_request(engine.raw_key, _chat_payload(prompt, stream=True)))
@@ -759,23 +753,13 @@ def test_preheaders_disconnect_preserves_observed_unknown_and_closes_socket(
     assert _await_cancelled_attempts(
         engine, minimum=cancelled_before + 1, deadline=time.monotonic() + 2
     )
-    payloads = [json.loads(line) for line in engine.settlement_log.read_text().splitlines()]
-    current = [entry for entry in payloads if entry["request_id"] not in previous]
+    current = _request_ids(engine) - previous
     assert len(current) == 1
-    assert current[0]["dispatched"] is True
-    assert current[0]["usage_incomplete_due_to_disconnect"] is True
-    assert current[0]["usage"] == (
-        {
-            "input_tokens": 19,
-            "output_tokens": 7,
-            "cached_input_tokens": None,
-            "cache_creation_input_tokens": None,
-            "cache_creation_1h_input_tokens": None,
-            "reasoning_tokens": None,
-        }
-        if known
-        else None
-    )
+    row = _attempt(engine, current.pop())
+    assert row["usage_source"] == "estimated"
+    assert row["state"] == "cancelled"
+    assert row["input_tokens"] == 19 if known else row["input_tokens"] > 0
+    assert row["output_tokens"] == (7 if known else 0)
 
 
 @pytest.mark.parametrize("surface", ["chat", "messages"])
@@ -785,11 +769,7 @@ def test_private_preheaders_disconnect_stops_uncommitted_provider(
 ) -> None:
     """Private progress stays uncommitted while caller loss still closes its transport."""
     prompt = f"hidden-preheaders-{surface}"
-    previous = (
-        {json.loads(line)["request_id"] for line in engine.settlement_log.read_text().splitlines()}
-        if engine.settlement_log.exists()
-        else set()
-    )
+    previous = _request_ids(engine)
     body = json.loads(_chat_payload(prompt, stream=True))
     body["max_tokens"] = 128
     request = _raw_chat_request(engine.raw_key, json.dumps(body).encode())
@@ -809,16 +789,13 @@ def test_private_preheaders_disconnect_stops_uncommitted_provider(
     assert _await_cancelled_attempts(
         engine, minimum=cancelled_before + 1, deadline=time.monotonic() + 2
     )
-    current = [
-        entry
-        for line in engine.settlement_log.read_text().splitlines()
-        if (entry := json.loads(line))["request_id"] not in previous
-    ]
+    current = _request_ids(engine) - previous
     assert len(current) == 1
-    assert current[0]["dispatched"] is True
-    assert current[0]["usage_incomplete_due_to_disconnect"] is True
-    assert current[0]["usage"]["input_tokens"] == 19
-    assert current[0]["usage"]["output_tokens"] == 0
+    row = _attempt(engine, current.pop())
+    assert row["usage_source"] == "estimated"
+    assert row["state"] == "cancelled"
+    assert row["input_tokens"] == 19
+    assert row["output_tokens"] == row["reasoning_tokens"] == _tokens("private canary")
     assert _PROVIDER_CALLS[prompt] == 1
     assert "private canary" not in engine.stderr_log.read_text()
 
@@ -840,10 +817,6 @@ def test_repeated_partial_answer_drops_settle_the_same_streamed_estimate(
         assert row["usage_source"] == "estimated"
         meters.add((row["input_tokens"], row["output_tokens"]))
         assert _PROVIDER_CALLS[prompt] == 1
-        writes = [json.loads(line) for line in engine.settlement_log.read_text().splitlines()]
-        own = [entry for entry in writes if entry["request_id"] == request_id]
-        assert len(own) == 1
-        assert own[0]["usage_incomplete_due_to_disconnect"] is True
     assert len(meters) == 1
     assert next(iter(meters))[1] == _tokens("usable partial answer")
 

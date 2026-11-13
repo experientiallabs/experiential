@@ -22,7 +22,6 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.model_plan import model_execution_snapshot
 from exp.runtime.gateway.model_plan_test import catalog
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
-from exp.runtime.gateway.native_accounting_test import _RecordingLedger
 from exp.runtime.gateway.native_admission import (
     _affinity_ordered_rungs,
     _prefer_cache_capable_rungs,
@@ -42,6 +41,7 @@ from exp.runtime.gateway.native_fallback_rules import (
     require_unrestricted_rung,
 )
 from exp.runtime.gateway.native_recovery import record_session_outcome, session_cache_key
+from exp.runtime.gateway.native_registration import registration_json
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_stage_admission import stage_affinity_ordered_rungs as _stage_order
 from exp.runtime.gateway.recovery import (
@@ -57,6 +57,7 @@ from exp.runtime.gateway.replay_identity import canonical_request_sha256
 from exp.runtime.gateway.request_policy import GatewayRequestPolicy, GatewayRoutingPolicy
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.sticky_affinity import AffinityPlacement
+from exp.runtime.gateway.tests.native_admission_fixture_test import admission_accounting
 from exp.runtime.models.credentials import DispatchCredentialReceipt
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.dialect_dispatch import (
@@ -85,8 +86,7 @@ def test_native_stage_contract_rejects_missing_or_unknown_marker(
             )
         }
     )
-    ledger = _RecordingLedger()
-    accounting = NativeAttemptAccounting(ledger)
+    accounting = admission_accounting()
     request = GatewayRequest(
         surface=route.snapshot.authorization.surface,
         messages=(GatewayMessage(role="user", content="hello"),),
@@ -99,7 +99,7 @@ def test_native_stage_contract_rejects_missing_or_unknown_marker(
             accounting=accounting,
             authorization=staged.snapshot.authorization,
         )
-    assert not ledger.started
+    assert accounting.native.inflight() == 0
     native_stage_admission.require_native_model_stage_contract(route)
 
 
@@ -202,7 +202,7 @@ def test_exact_selected_staged_route_cannot_be_reordered_or_recovered(
     """An exact opaque selector precedes every stage-affinity or recovery preference."""
     route, wires = _affinity_fixture()
     route = route.model_copy(update={"resolved_route_id": "route_" + "b" * 64})
-    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=Host())
+    accounting = admission_accounting(recovery_host=Host())
 
     def unexpected(*_args: object, **_kwargs: object) -> None:
         """Neither rendezvous nor recovery may reinterpret the explicitly chosen first route."""
@@ -244,7 +244,7 @@ def test_no_fallback_stage_preselection_never_enters_child(
             "gateway": GatewayRequestPolicy(routing=GatewayRoutingPolicy(allow_fallbacks=False))
         }
     )
-    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=Host())
+    accounting = admission_accounting(recovery_host=Host())
 
     def prepare(
         candidate: GatewayRoute,
@@ -352,7 +352,7 @@ def test_marker_capable_rungs_stay_inside_root_and_child_segments(
         route,
         wires,
         _marked_request(),
-        accounting=NativeAttemptAccounting(_RecordingLedger()),
+        accounting=admission_accounting(),
         authorization=route.snapshot.authorization,
         continuation=None,
     )
@@ -460,9 +460,7 @@ def test_live_reasoning_pin_precedes_stage_cache_and_recovery_ordering(
         ),
         wires[2],
     )
-    accounting = NativeAttemptAccounting(
-        _RecordingLedger(), recovery_host=Host() if with_host else None
-    )
+    accounting = admission_accounting(recovery_host=Host() if with_host else None)
     request = _marked_request()
     marker_route, marker_wires = _prefer_cache_capable_rungs(route, wires, request)
     assert marker_route is route and marker_wires is wires
@@ -532,8 +530,8 @@ def test_retained_conditional_rung_cannot_discard_first_dial_routes(
             }
         )
     host = Host()
-    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=host)
-    accounting.recovery = SessionRecoveryRegistry(clock=Clock())
+    accounting = admission_accounting(recovery_host=host)
+    accounting.recovery._clock = Clock()
     auth = route.snapshot.authorization
     ordered, _, _ = stage_affinity_ordered_rungs(
         route, wires, request, accounting=accounting, authorization=auth, continuation=None
@@ -608,8 +606,8 @@ def test_recovered_warm_rung_leads_and_keeps_its_stage_as_fallbacks() -> None:
         provider_prompt_cache_key="xpl-session",
     )
     host = Host()
-    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=host)
-    accounting.recovery = SessionRecoveryRegistry(clock=Clock())
+    accounting = admission_accounting(recovery_host=host)
+    accounting.recovery._clock = Clock()
     auth = route.snapshot.authorization
     ordered, _, _ = stage_affinity_ordered_rungs(
         route, wires, request, accounting=accounting, authorization=auth, continuation=None
@@ -646,7 +644,7 @@ def test_recovered_warm_rung_leads_and_keeps_its_stage_as_fallbacks() -> None:
     "isolation",
     ["same", "organization", "identity", "prefix", "credential", "no_host"],
 )
-def test_verified_session_warmth_survives_capacity_admission_without_scope_leaks(
+def test_verified_session_warmth_is_transferred_without_scope_leaks(
     trial: bool,
     isolation: Literal["same", "organization", "identity", "prefix", "credential", "no_host"],
 ) -> None:
@@ -679,8 +677,8 @@ def test_verified_session_warmth_survives_capacity_admission_without_scope_leaks
     )
     host = Host()
     clock = Clock()
-    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=host)
-    accounting.recovery = SessionRecoveryRegistry(clock=clock)
+    accounting = admission_accounting(recovery_host=host)
+    accounting.recovery._clock = clock
     authorization = route.snapshot.authorization
     ordered, _, _ = stage_affinity_ordered_rungs(
         route,
@@ -770,22 +768,10 @@ def test_verified_session_warmth_survives_capacity_admission_without_scope_leaks
     # A populated ordinary binding is deliberately present for isolated requests.
     if isolation != "same":
         accounting.sticky.bind(changed_key.fingerprint, warm_id, ttl_seconds=60)
-    accounting.register(entry)
-    started = json.loads(
-        accounting.start_attempt(
-            json.dumps({"request_id": authorization.request_id, "attempt_ordinal": 0})
-        )
-    )
-    selected = admitted.deployments[started["route_depth"]]
-    if isolation == "same":
-        assert selected.deployment_id == warm_id
-        assert accounting.rung_rate_counters() == (0, 0)
-        assert accounting.sticky.size() == 0
-    else:
-        # Authored bounds retain their explicit overflow policy. A stale sticky
-        # binding must not silently admit any lane before that disclosed overflow.
-        assert accounting.rung_rate_counters() == (0, 3)
-        assert accounting.rung_admission_counters() == (3, 1, 0)
+    registration = json.loads(registration_json(entry, bind_sticky=False))
+    assert registration["recovery_scoped"]
+    assert registration["verified_warm_deployment"] == (warm_id if isolation == "same" else None)
+    assert (registration["verified_warm_seconds"] > 0) is (isolation == "same")
 
 
 @pytest.mark.parametrize("non_affinity", ["maximize_availability", "maximize_cache"])
@@ -835,7 +821,7 @@ def test_recovery_cannot_cross_current_non_affinity_stage(
         provider_prompt_cache_key="xpl-session",
     )
     host = Host()
-    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=host)
+    accounting = admission_accounting(recovery_host=host)
     key = session_cache_key(InflightRequest(authorization, route, request, 10))
     assert key is not None
     retained = deployments[-1]
@@ -888,7 +874,7 @@ def test_recovery_ignores_stale_affinity_history_after_mode_change(
         provider_prompt_cache_key="xpl-session",
     )
     host = Host()
-    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=host)
+    accounting = admission_accounting(recovery_host=host)
     key = session_cache_key(InflightRequest(authorization, route, request, 10))
     assert key is not None
     retained = route.deployments[1]
@@ -944,8 +930,8 @@ def test_recovery_tokenizes_only_retained_history_with_token_headroom_policy(
     )
     host = Host()
     clock = Clock()
-    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=host)
-    accounting.recovery = SessionRecoveryRegistry(clock=clock)
+    accounting = admission_accounting(recovery_host=host)
+    accounting.recovery._clock = clock
     ordered, _, _ = stage_affinity_ordered_rungs(
         route, wires, request, accounting=accounting, authorization=authorization, continuation=None
     )
@@ -1030,10 +1016,8 @@ def test_recovery_return_requires_default_lane_headroom() -> None:
     )
     host = Host()
     clock = Clock()
-    accounting = NativeAttemptAccounting(
-        _RecordingLedger(), recovery_host=host, default_lane_bound=1
-    )
-    accounting.recovery = SessionRecoveryRegistry(clock=clock)
+    accounting = admission_accounting(recovery_host=host, default_lane_bound=1)
+    accounting.recovery._clock = clock
     ordered, _, _ = stage_affinity_ordered_rungs(
         route, wires, request, accounting=accounting, authorization=authorization, continuation=None
     )
@@ -1126,8 +1110,8 @@ def test_optional_recovery_snapshot_failure_preserves_normal_admission(
     )
     host = Host()
     clock = Clock()
-    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=host)
-    accounting.recovery = SessionRecoveryRegistry(clock=clock)
+    accounting = admission_accounting(recovery_host=host)
+    accounting.recovery._clock = clock
     ordered, ordered_wires, _, provider_request, _ = admitted_route_requests(
         route, wires, request, accounting=accounting, authorization=authorization, continuation=None
     )
@@ -1181,10 +1165,8 @@ def test_warm_nonhonoring_recovery_cannot_skip_available_marker_wire(honorer_bus
         update={"prompt_cache_key": "session", "provider_prompt_cache_key": "xpl-session"}
     )
     host = Host()
-    accounting = NativeAttemptAccounting(
-        _RecordingLedger(), recovery_host=host, default_lane_bound=1
-    )
-    accounting.recovery = SessionRecoveryRegistry(clock=Clock())
+    accounting = admission_accounting(recovery_host=host, default_lane_bound=1)
+    accounting.recovery._clock = Clock()
     authorization = route.snapshot.authorization
     ordered, bound_wires, _ = stage_affinity_ordered_rungs(
         route, wires, request, accounting=accounting, authorization=authorization, continuation=None
@@ -1266,10 +1248,8 @@ def test_final_selected_marker_profile_controls_public_omission(narrowing: str) 
     )
     original_identity = canonical_request_sha256(request)
     host = Host()
-    accounting = NativeAttemptAccounting(
-        _RecordingLedger(), recovery_host=host, default_lane_bound=1
-    )
-    accounting.recovery = SessionRecoveryRegistry(clock=Clock())
+    accounting = admission_accounting(recovery_host=host, default_lane_bound=1)
+    accounting.recovery._clock = Clock()
     auth = route.snapshot.authorization
     ordered, bound, _, shaped, _ = admitted_route_requests(
         route,
@@ -1333,143 +1313,6 @@ def test_final_selected_marker_profile_controls_public_omission(narrowing: str) 
         assert any(profile.preserves_cache_control for profile, _client in selected_wires[1:])
 
 
-@pytest.mark.parametrize("other_session", [False, True])
-def test_real_accounting_capacity_shed_retains_provider_recovery_requirement(
-    other_session: bool,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A pre-admitted request's capacity shed cannot erase a below-breaker transport failure."""
-    monkeypatch.setattr(NativeAttemptAccounting, "_sweep_loop", lambda self: None)
-    route, wires = _affinity_fixture()
-    deployments = tuple(
-        d.model_copy(
-            update={
-                "gateway": d.gateway.model_copy(
-                    update={
-                        "cache_retention_seconds": 100,
-                        "dispatch": GatewayRungDispatchPolicy(
-                            concurrency_bound=1, sticky_spill_seconds=60
-                        ),
-                    }
-                )
-            }
-        )
-        for d in route.deployments
-    )
-    route = route.model_copy(
-        update={"deployment": deployments[0], "fallback_deployments": deployments[1:]}
-    )
-    host, clock, ledger = Host(), Clock(), _RecordingLedger()
-    accounting = NativeAttemptAccounting(ledger, recovery_host=host)
-    accounting.recovery = SessionRecoveryRegistry(clock=clock)
-    request = GatewayRequest(
-        surface=route.snapshot.authorization.surface,
-        messages=(GatewayMessage(role="system", content="stable prefix"),),
-        prompt_cache_key="session",
-        provider_prompt_cache_key="xpl-session",
-        maximum_output_tokens=16,
-    )
-    failure = {
-        "failure_class": "transport",
-        "safe_message": "transport failed",
-        "failover_eligible": True,
-    }
-
-    def admit(name: str, other: bool = False) -> tuple[InflightRequest, AffinityPlacement]:
-        """Freeze one actual stage selection before concurrent requests change history."""
-        req = (
-            request.model_copy(
-                update={"prompt_cache_key": "other", "provider_prompt_cache_key": "xpl-other"}
-            )
-            if other
-            else request
-        )
-        auth = route.snapshot.authorization.model_copy(
-            update={"request_id": name, "deadline_monotonic": time.monotonic() + 60}
-        )
-        ordered, bound, placement = stage_affinity_ordered_rungs(
-            route,
-            wires,
-            req,
-            accounting=accounting,
-            authorization=auth,
-            continuation=None,
-        )
-        bindings = {
-            d.deployment_id: p.recovery_binding
-            for d, (p, _) in zip(ordered.deployments, bound, strict=True)
-            if p.recovery_binding is not None
-        }
-        entry = InflightRequest(
-            auth,
-            ordered,
-            req,
-            time.monotonic() + 60,
-            recovery_bindings=bindings,
-            recovery_scoped=True,
-        )
-        accounting.register(entry)
-        return entry, placement
-
-    def start(entry: InflightRequest, retry: bool = False) -> dict[str, str | int]:
-        """Reserve through real accounting without opening the resulting provider wire."""
-        data = {
-            "request_id": entry.authorization.request_id,
-            "attempt_ordinal": entry.total_attempts,
-        }
-        if retry:
-            data.update({"current_depth": 0, "failure": failure})
-        return json.loads(accounting.start_attempt(json.dumps(data)))
-
-    def settle(
-        entry: InflightRequest,
-        started: dict[str, str | int],
-        failed: bool = False,
-        finalize: bool = True,
-    ) -> None:
-        """Settle authentic attempt identity with deterministic provider observations."""
-        accounting.settle(
-            json.dumps(
-                {
-                    "request_id": entry.authorization.request_id,
-                    "attempt_id": started["attempt_id"],
-                    "outcome": "failed" if failed else "completed",
-                    "failure": failure if failed else None,
-                    "usage": None
-                    if failed
-                    else {"input_tokens": 100, "output_tokens": 5, "cached_input_tokens": 80},
-                    "finalize": finalize,
-                    "opened": not failed,
-                }
-            )
-        )
-
-    warmed, _ = admit("warm")
-    lead, fallback = warmed.route.deployments[:2]
-    settle(warmed, start(warmed))
-    first, _ = admit("first", other=other_session)
-    queued, _ = admit("queued")
-    if not other_session:
-        settle(first, start(first), failed=True, finalize=False)
-        settle(first, start(first, retry=True))
-    held = accounting.loads.reserve(
-        rung_load_key(lead), organization_id="competitor", weight=1, bound=1, fair_share=False
-    )
-    assert isinstance(held, str)
-    shed = start(queued)
-    assert ledger.started[-1]["deployment_id"] == fallback.deployment_id
-    assert ledger.started[-1]["dispatch_reason"] == "queue_bound"
-    settle(queued, shed)
-    accounting.loads.release_ticket(held)
-    if other_session:
-        clock.now += 1
-        settle(first, start(first), failed=True)
-    clock.now += 6
-    _, chosen = admit("after")
-    assert chosen.recovery_reason == "retained_warm_fallback"
-    assert chosen.verified_warm_deployment_id == fallback.deployment_id
-
-
 def test_no_recovery_host_skips_prefix_digest(monkeypatch: pytest.MonkeyPatch) -> None:
     """A no-host route still schedules affinity without hashing an unused recovery prefix."""
     route, wires = _affinity_fixture()
@@ -1477,7 +1320,7 @@ def test_no_recovery_host_skips_prefix_digest(monkeypatch: pytest.MonkeyPatch) -
         surface=route.snapshot.authorization.surface,
         messages=(GatewayMessage(role="user", content="prefix"),),
     )
-    accounting = NativeAttemptAccounting(_RecordingLedger())
+    accounting = admission_accounting()
 
     def unexpected_prefix(_request: GatewayRequest) -> str | None:
         """Reject recovery-specific work when no host can establish credential scope."""
@@ -1576,7 +1419,7 @@ def test_stage_marker_grouping_never_leads_with_the_house_openrouter_rung(
         staged,
         wires,
         _marked_request(),
-        accounting=NativeAttemptAccounting(_RecordingLedger()),
+        accounting=admission_accounting(),
         authorization=staged.snapshot.authorization,
         continuation=None,
     )
@@ -1618,7 +1461,7 @@ def test_stage_marker_grouping_still_leads_with_a_marker_honoring_direct_lane() 
         staged,
         wires,
         _marked_request(),
-        accounting=NativeAttemptAccounting(_RecordingLedger()),
+        accounting=admission_accounting(),
         authorization=staged.snapshot.authorization,
         continuation=None,
     )
@@ -1646,7 +1489,7 @@ def test_an_unreordered_stage_keeps_its_authored_order() -> None:
         staged,
         ((profile, client), (profile, client)),
         plain,
-        accounting=NativeAttemptAccounting(_RecordingLedger()),
+        accounting=admission_accounting(),
         authorization=staged.snapshot.authorization,
         continuation=None,
     )

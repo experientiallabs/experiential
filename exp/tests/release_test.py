@@ -664,6 +664,7 @@ def _installed_release_driver() -> None:
         bank_bytes,
     )
     from exp.common.routing.features import ROUTER_FEATURE_SCHEMA_SHA256
+    from exp.common.sqlite.native import connect as connect_sqlite
     from exp.optimize.router.judging.contracts import ManualJudgeTraceReviewArtifact
     from exp.optimize.router.judging.service import prepare_manual_judge_calibration
     from exp.runtime.gateway.catalog_authority import (
@@ -1508,7 +1509,7 @@ def _installed_release_driver() -> None:
         Returns:
             Attempt rows ordered by durable creation identity.
         """
-        with sqlite3.connect(database) as connection:
+        with connect_sqlite(database) as connection:
             connection.row_factory = sqlite3.Row
             rows = connection.execute(
                 """
@@ -2083,7 +2084,7 @@ def _installed_release_driver() -> None:
         assert keyed_replay.content == keyed_first.content
         assert len(state.snapshot()) == physical_before_replay
 
-        with sqlite3.connect(gateway_database) as connection:
+        with connect_sqlite(gateway_database) as connection:
             assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
         assert gateway_database.with_name("gateway.db-wal").exists()
 
@@ -2537,6 +2538,8 @@ def _installed_release_driver() -> None:
     project_secondary_before = state.count_containing("project-secondary-model")
     import exp_gateway_native
 
+    assert not hasattr(exp_gateway_native.NativeSQLiteLedger, "_test_chain_fixture")
+
     project_components = load_gateway_components(
         project_root,
         environment={"P9_LOOPBACK_PROVIDER_KEY": provider_secret},
@@ -2602,7 +2605,7 @@ def _installed_release_driver() -> None:
     assert learned_client.embed_calls == 0
     assert learned_client.complete_calls == 0
     assert not (project_root / "projects").exists()
-    with sqlite3.connect(project_manager.database_path) as connection:
+    with connect_sqlite(project_manager.database_path) as connection:
         project_attempts = connection.execute(
             """
             SELECT attempt_ordinal, route_depth, exact_model_id, billing_source, state
@@ -3079,7 +3082,7 @@ def _installed_release_driver() -> None:
             for artifact_id in support_store.artifacts.list_ids()
         )
         project_before_public_replay = canonical_json_bytes(support_store.load_project())
-        with sqlite3.connect(gateway_database) as connection:
+        with connect_sqlite(gateway_database) as connection:
             gateway_requests_before_public_replay = connection.execute(
                 "SELECT COUNT(*) FROM gateway_requests"
             ).fetchone()[0]
@@ -3125,14 +3128,17 @@ def _installed_release_driver() -> None:
             (artifact_id, support_store.artifacts.read(artifact_id))
             for artifact_id in support_store.artifacts.list_ids()
         ) == (artifacts_before_public_replay)
-        with sqlite3.connect(gateway_database) as connection:
+        with connect_sqlite(gateway_database) as connection:
             gateway_requests_after_public_replay = connection.execute(
                 "SELECT COUNT(*) FROM gateway_requests"
             ).fetchone()[0]
             gateway_attempts_after_public_replay = connection.execute(
                 "SELECT COUNT(*) FROM gateway_attempts"
             ).fetchone()[0]
-        assert gateway_requests_after_public_replay == gateway_requests_before_public_replay + 3
+        assert gateway_requests_after_public_replay == gateway_requests_before_public_replay + 3, (
+            gateway_requests_before_public_replay,
+            gateway_requests_after_public_replay,
+        )
         assert gateway_attempts_after_public_replay == gateway_attempts_before_public_replay + 3
         one_result = run_cli(
             "build",
@@ -3434,7 +3440,7 @@ def test_windows_authority_gate_executes_kernel_cases_without_weakening_capture(
     assert '("skipped", "failure", "error")' in windows
     for job in ("  gate:\n", "  w16-darwin-evidence:\n"):
         assert 'UV_PYTHON: "3.13"' in workflow.split(job, 1)[1].split("    steps:", 1)[0]
-    assert "uv run pytest -q exp/runtime/capture exp/cli/capture" in workflow
+    assert "uv run --no-sync pytest -q exp/runtime/capture exp/cli/capture" in workflow
 
 
 def test_installed_wheel_no_spend_release_evidence(tmp_path: Path) -> None:
@@ -3702,17 +3708,19 @@ if __name__ == "__main__" and os.environ.get("EXP_INSTALLED_RELEASE_EVIDENCE") =
     _installed_release_driver()
 
 
-def test_buffer_advisory_exception_is_bound_to_the_reviewed_source() -> None:
-    """Changing the dependency invalidates the narrow false-positive exception."""
+def test_buffer_versions_need_no_advisory_exception() -> None:
+    """Both digest generations stay outside the corrected upstream affected range."""
+    from packaging.version import Version
+
     root = Path(__file__).resolve().parents[2]
     policy = tomllib.loads((root / ".gitlab/ci/osv-scanner.toml").read_text())
-    if not any(item["id"] == "GHSA-qwgh-2vcv-g2f7" for item in policy["IgnoredVulns"]):
-        return
+    assert not any(item["id"] == "GHSA-qwgh-2vcv-g2f7" for item in policy["IgnoredVulns"])
     lock = tomllib.loads((root / "exp/runtime/gateway/native/Cargo.lock").read_text())
     buffers = [item for item in lock["package"] if item["name"] == "block-buffer"]
-    assert len(buffers) == 1
-    assert buffers[0]["version"] == "0.10.4"
-    assert buffers[0]["source"] == "registry+https://github.com/rust-lang/crates.io-index"
-    assert (
-        buffers[0]["checksum"] == "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
-    )
+    assert buffers
+    # https://github.com/advisories/GHSA-qwgh-2vcv-g2f7 (corrected 2026-10-30):
+    # 0.10.x is unaffected; the AWS SDK's 0.12.1 generation contains the fix.
+    for buffer in buffers:
+        assert buffer["source"] == "registry+https://github.com/rust-lang/crates.io-index"
+        version = Version(buffer["version"])
+        assert version < Version("0.11.0") or version >= Version("0.12.1")

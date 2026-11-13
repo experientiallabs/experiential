@@ -14,6 +14,7 @@ from pathlib import Path
 
 from exp.common.project.sqlite_schema import initialize_project_schema
 from exp.common.sqlite.connection import enable_wal_mode, set_busy_deadline
+from exp.common.sqlite.native import connect
 from exp.common.sqlite.schema import validate_content_tables
 from exp.common.sqlite.writers import writer_turn
 
@@ -108,12 +109,7 @@ def project_connection(
         elif path.is_symlink():
             raise ValueError("Content database must not be a symlink.")
         mode = "rw" if write else "ro"
-        connection = sqlite3.connect(
-            f"{path.as_uri()}?mode={mode}",
-            uri=True,
-            timeout=max(0.0, remaining_s),
-            isolation_level=None,
-        )
+        connection = connect(path, mode=mode, busy_timeout_ms=max(0, int(remaining_s * 1000)))
         try:
             connection.execute("PRAGMA foreign_keys=ON")
             validate_content_tables(connection)

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 from typing import cast
 
@@ -16,6 +15,7 @@ from exp.common.models import (
     GatewayTokenPrices,
     ModelCapabilities,
 )
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.catalog_authority import upsert_connection, upsert_singleton_deployment
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -29,6 +29,7 @@ from exp.runtime.gateway.native_accounting import NativeBridgeError
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_decisions_test import _control_plane as _systemone_control_plane
 from exp.runtime.gateway.openai_decisions_contracts import OpenAIDecisionRequest
+from exp.runtime.gateway.tests.native_admission_fixture_test import AdmissionRecords
 
 _PRICES = GatewayTokenPrices(
     input_nano_usd_per_million_tokens=100_000_000,
@@ -138,7 +139,7 @@ def _admit(control: NativeControlPlane, raw_key: str, body: JsonObject | None = 
 def _rows(control: NativeControlPlane) -> list[tuple[str, str | None]]:
     """Read durable API surfaces and terminal states, not content-bearing traffic."""
     ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
-    with sqlite3.connect(ledger.database_path) as connection:
+    with connect_sqlite(ledger.database_path) as connection:
         return connection.execute(
             "select api_surface, terminal_state from gateway_requests order by rowid"
         ).fetchall()
@@ -150,7 +151,7 @@ def _public_error(error: NativeBridgeError) -> JsonObject:
 
 
 def test_admission_builds_the_openai_decisions_wire_with_input_only_reservation(
-    tmp_path: Path,
+    tmp_path: Path, admission_records: AdmissionRecords
 ) -> None:
     """The admitted wire targets OpenAI's own /decisions endpoint on the decisions surface."""
     control, raw_key = _control_plane(tmp_path)
@@ -170,7 +171,7 @@ def test_admission_builds_the_openai_decisions_wire_with_input_only_reservation(
     assert "questions" not in admitted
     assert admitted["maximum_same_deployment_attempts"] == 1
     assert _rows(control) == [("decisions", None)]
-    entry = control._accounting.entry(str(admitted["request_id"]))  # noqa: SLF001
+    entry = admission_records.get(control._accounting, str(admitted["request_id"]))  # noqa: SLF001
     assert entry is not None and isinstance(entry.request, OpenAIDecisionRequest)
     assert entry.request.input_token_reservation > 2048
     assert entry.request.output_token_reservation == 0

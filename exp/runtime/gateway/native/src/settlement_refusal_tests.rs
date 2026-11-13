@@ -10,7 +10,7 @@ async fn a_refused_terminal_write_answers_with_the_control_planes_error() {
         pyo3::types::PyModule::from_code(py, c"class Refused(Exception):\n public_error_json = '{\"status_code\":503,\"code\":\"accounting_refused\",\"message\":\"Request accounting refused this request. Retry it.\",\"error_type\":\"api_error\",\"param\":null,\"retry_after_seconds\":1}'\nclass Plane:\n def __init__(self): self.settles = 0\n def settle(self, argument):\n  self.settles += 1\n  raise Refused()\n def abandon(self, argument): raise RuntimeError('ledger write lost')\n def close_thread_resources(self, argument): return '{}'\n", c"refused_plane.py", c"refused_plane")
             .unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
     });
-    let bridge = Arc::new(Bridge::new(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
+    let bridge = Arc::new(Bridge::scripted(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
     let mut guard = AttemptGuard::new(
         bridge.clone(),
         Arc::new(AtomicUsize::new(0)),

@@ -8,7 +8,7 @@ from exp.common.traces.ingest.persistence_test import _source
 
 
 def test_file_ingestion_is_independent_of_runtime_and_simulation(tmp_path: Path) -> None:
-    """A fresh Python process can ingest and restore tool traces using common alone."""
+    """Ingestion uses common and the shared SQLite extension without Python runtime modules."""
     result = subprocess.run(
         [
             sys.executable,
@@ -30,7 +30,7 @@ assert all(trace.tools[0].name == "lookup" for trace in restored.traces)
 assert not any(
     name == prefix or name.startswith(prefix + ".")
     for name in sys.modules
-    for prefix in ("exp.runtime", "exp.simulation", "exp.optimize", "exp.cli", "exp_gateway_native")
+    for prefix in ("exp.runtime", "exp.simulation", "exp.optimize", "exp.cli")
 )
 """,
             str(_source(tmp_path)),

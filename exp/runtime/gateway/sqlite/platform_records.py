@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 
 from exp.common.models import BillingSource
 from exp.common.models.catalog_prices import BilledUnitKind
-from exp.runtime.gateway.auth import utc_text
 from exp.runtime.gateway.contracts import (
     DirectTarget,
     GatewayFailureClass,
@@ -19,7 +18,6 @@ from exp.runtime.gateway.ledger_valuation import usage_source_label
 from exp.runtime.gateway.platform import (
     AliasRevisionRecord,
     AttemptReservationRecord,
-    AttemptReservationRequest,
     AttemptSettlementRecord,
     AttemptSettlementRequest,
     AttemptTerminalState,
@@ -239,128 +237,6 @@ def reservation_record(
         reserved_nano_usd=optional_int(row["budget_reserved_nano_usd"]),
         started_at=required_datetime(row["started_at"]),
     )
-
-
-def require_reservation_replay(
-    row: sqlite3.Row,
-    *,
-    request: AttemptReservationRequest,
-) -> AttemptReservationRecord:
-    """Return an exact natural-key replay or reject changed accounting input.
-
-    Args:
-        row: Existing durable attempt joined to its accepted request.
-        request: Requested reservation to compare with frozen evidence.
-
-    Returns:
-        The original reservation when every accounting input matches.
-
-    Raises:
-        ValueError: Any identity, pricing, or reservation input differs.
-    """
-    record = reservation_record(row, organization_id=request.organization_id)
-    authorization = request.snapshot.authorization
-    stage = request.snapshot.stage_for_depth(request.route_depth)
-    prices = request.deployment.gateway.prices
-    expected = (
-        authorization.request_id,
-        authorization.identity_id,
-        authorization.virtual_key_id,
-        authorization.alias_revision_id,
-        authorization.surface.value,
-        authorization.canonical_request_sha256,
-        authorization.caller_operation_sha256,
-        authorization.catalog_sha256,
-        stage.pool_id,
-        stage.exact_model_id,
-        request.deployment.deployment_id,
-        request.deployment.provider,
-        request.deployment.billing_source,
-        request.deployment.gateway.pricing_source,
-        (
-            None
-            if request.deployment.gateway.pricing_effective_at is None
-            else utc_text(request.deployment.gateway.pricing_effective_at)
-        ),
-        prices.input_nano_usd_per_million_tokens,
-        prices.cached_input_nano_usd_per_million_tokens,
-        prices.cache_creation_input_nano_usd_per_million_tokens,
-        prices.cache_creation_1h_input_nano_usd_per_million_tokens,
-        prices.output_nano_usd_per_million_tokens,
-        prices.reasoning_nano_usd_per_million_tokens,
-        (None if prices.long_context is None else prices.long_context.input_threshold_tokens),
-        (
-            None
-            if prices.long_context is None
-            else prices.long_context.input_nano_usd_per_million_tokens
-        ),
-        (
-            None
-            if prices.long_context is None
-            else prices.long_context.cached_input_nano_usd_per_million_tokens
-        ),
-        (
-            None
-            if prices.long_context is None
-            else prices.long_context.cache_creation_input_nano_usd_per_million_tokens
-        ),
-        (
-            None
-            if prices.long_context is None
-            else prices.long_context.cache_creation_1h_input_nano_usd_per_million_tokens
-        ),
-        (
-            None
-            if prices.long_context is None
-            else prices.long_context.output_nano_usd_per_million_tokens
-        ),
-        (
-            None
-            if prices.long_context is None
-            else prices.long_context.reasoning_nano_usd_per_million_tokens
-        ),
-        None if prices.units is None else prices.units.model_dump_json(),
-        request.attempt_ordinal,
-        request.route_depth,
-        request.maximum_cost_nano_usd,
-    )
-    actual = (
-        record.request_id,
-        record.identity_id,
-        str(row["key_id"]),
-        record.alias_revision_id,
-        str(row["api_surface"]),
-        str(row["canonical_request_sha256"]),
-        (None if row["caller_operation_sha256"] is None else str(row["caller_operation_sha256"])),
-        record.catalog_sha256,
-        record.pool_id,
-        record.exact_model_id,
-        record.deployment_id,
-        record.provider,
-        record.billing_source,
-        None if row["pricing_source"] is None else str(row["pricing_source"]),
-        (None if row["pricing_effective_at"] is None else str(row["pricing_effective_at"])),
-        record.input_rate,
-        record.cached_input_rate,
-        record.cache_creation_input_rate,
-        record.cache_creation_1h_input_rate,
-        record.output_rate,
-        record.reasoning_rate,
-        record.long_context_threshold_tokens,
-        record.long_context_input_rate,
-        record.long_context_cached_input_rate,
-        record.long_context_cache_creation_input_rate,
-        record.long_context_cache_creation_1h_input_rate,
-        record.long_context_output_rate,
-        record.long_context_reasoning_rate,
-        None if row["unit_prices"] is None else str(row["unit_prices"]),
-        record.attempt_ordinal,
-        record.route_depth,
-        record.reserved_nano_usd,
-    )
-    if actual != expected:
-        raise ValueError("attempt reservation replay differs from durable accounting input")
-    return record
 
 
 def required_datetime(value: object) -> datetime:

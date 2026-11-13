@@ -405,7 +405,7 @@ fn chat_projection(events: &[Event]) -> (Vec<serde_json::Value>, serde_json::Val
         .iter()
         .filter_map(|frame| frame.strip_prefix("data: "))
         .filter(|data| data.trim() != "[DONE]")
-        .map(|data| serde_json::from_str(data).expect("chat chunk JSON"))
+        .map(|data| crate::lossless_json::from_str(data).expect("chat chunk JSON"))
         .collect();
     let aggregate =
         crate::encode::completed_chat_body_with_ignored("request", "alias", 0, events, &[], false)
@@ -423,7 +423,8 @@ fn empty_tool_max_tokens_never_invents_arguments_or_a_completed_call() {
             let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
             let mut events = Vec::new();
             for frame in tool_argument_stream("max_tokens", "") {
-                let payload: serde_json::Value = serde_json::from_str(&frame.data).unwrap();
+                let payload: serde_json::Value =
+                    crate::lossless_json::from_str(&frame.data).unwrap();
                 if (!block_stop && payload["type"] == "content_block_stop")
                     || (!empty_delta && payload["type"] == "content_block_delta")
                 {
@@ -464,7 +465,8 @@ fn message_stop_requires_a_final_reason_without_inventing_tool_arguments() {
             let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
             let mut events = Vec::new();
             for mut event in tool_argument_stream("tool_use", "") {
-                let mut payload: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+                let mut payload: serde_json::Value =
+                    crate::lossless_json::from_str(&event.data).unwrap();
                 if !block_stop && payload["type"] == "content_block_stop" {
                     continue;
                 }
@@ -525,7 +527,7 @@ fn zero_argument_tool_completes_only_after_a_normal_final_reason() {
         let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
         let mut events = Vec::new();
         for frame in tool_argument_stream(reason, "") {
-            let payload: serde_json::Value = serde_json::from_str(&frame.data).unwrap();
+            let payload: serde_json::Value = crate::lossless_json::from_str(&frame.data).unwrap();
             let next = normalizer.feed(&frame).expect("zero-argument tool");
             if payload["type"] == "content_block_stop" {
                 assert!(
@@ -565,7 +567,8 @@ fn complete_argument_objects_still_finish_at_block_stop_without_buffering() {
             let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
             let mut events = Vec::new();
             for frame in tool_argument_stream(reason, arguments) {
-                let payload: serde_json::Value = serde_json::from_str(&frame.data).unwrap();
+                let payload: serde_json::Value =
+                    crate::lossless_json::from_str(&frame.data).unwrap();
                 let next = normalizer.feed(&frame).expect("complete argument object");
                 if payload["type"] == "content_block_stop" {
                     assert!(
@@ -602,7 +605,7 @@ fn partial_argument_bytes_reach_chat_immediately_and_remain_verbatim_on_length()
             crate::encode::ChatSseEncoder::new_with_ignored("request", "alias", 0, false, vec![]);
         encoder.start().unwrap();
         for frame in tool_argument_stream("max_tokens", partial) {
-            let payload: serde_json::Value = serde_json::from_str(&frame.data).unwrap();
+            let payload: serde_json::Value = crate::lossless_json::from_str(&frame.data).unwrap();
             if !block_stop && payload["type"] == "content_block_stop" {
                 continue;
             }
@@ -614,7 +617,8 @@ fn partial_argument_bytes_reach_chat_immediately_and_remain_verbatim_on_length()
                         matches!(event, Event::ToolArgumentsDelta { delta, .. } if delta == partial)
                     );
                     let chunk: serde_json::Value =
-                        serde_json::from_str(wire[0].strip_prefix("data: ").unwrap()).unwrap();
+                        crate::lossless_json::from_str(wire[0].strip_prefix("data: ").unwrap())
+                            .unwrap();
                     assert_eq!(
                         chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
                         partial
@@ -733,7 +737,7 @@ fn tool_search_result_blocks_carry_verbatim_and_round_trip() {
         .lines()
         .find_map(|line| line.strip_prefix("data: "))
         .expect("data line");
-    let payload: serde_json::Value = serde_json::from_str(data).expect("json");
+    let payload: serde_json::Value = crate::lossless_json::from_str(data).expect("json");
     assert_eq!(payload["content_block"], block);
     assert_eq!(
         crate::encode::compact_json(&payload["content_block"]),

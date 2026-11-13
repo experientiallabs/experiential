@@ -11,8 +11,10 @@ const DROPPED: &str = "body_dropped_for_memory";
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Metadata {
+    #[serde(default, deserialize_with = "crate::lossless_json::deserialize")]
     pub wire_request: Option<Value>,
     pub headers: Vec<[String; 2]>,
+    #[serde(deserialize_with = "crate::lossless_json::deserialize")]
     pub timing: Value,
     pub relay_completed: bool,
     pub client_disconnected: bool,
@@ -78,7 +80,7 @@ impl Relay {
         if let Some(wire) = wire.as_mut().and_then(Value::as_object_mut) {
             let (kind, body) = if self.body.is_empty() {
                 ("empty", Value::Null)
-            } else if let Ok(body) = serde_json::from_slice::<Value>(&self.body) {
+            } else if let Ok(body) = crate::lossless_json::from_slice::<Value>(&self.body) {
                 if super::response::contains_wide_number(&body) {
                     wire.insert(
                         "body_source_json".into(),

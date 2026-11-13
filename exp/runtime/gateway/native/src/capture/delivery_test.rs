@@ -243,7 +243,7 @@ fn limits() -> Limits {
 }
 
 fn record(id: &str) -> Record {
-    serde_json::from_value(serde_json::json!({
+    crate::lossless_json::from_value(serde_json::json!({
         "schema_version":1,
         "request": {"request_id":id,
             "scope":{"organization_id":"org","identity_id":"identity","application_id":"app"},
@@ -691,9 +691,11 @@ fn record_with_probabilities(id: &str) -> Record {
     value
 }
 
+type RefuseProbability = Box<dyn Fn(&Record, usize) -> bool + Send>;
+
 /// Prepares a record unless the policy refuses it; writes what it prepared.
 struct ProbabilitySink {
-    refuse: Box<dyn Fn(&Record, usize) -> bool + Send>,
+    refuse: RefuseProbability,
     calls: Arc<std::sync::atomic::AtomicUsize>,
     written: mpsc::Sender<bool>,
 }
@@ -717,7 +719,7 @@ impl Sink for ProbabilitySink {
     }
 }
 
-fn deliver_probabilities(refuse: Box<dyn Fn(&Record, usize) -> bool + Send>) -> bool {
+fn deliver_probabilities(refuse: RefuseProbability) -> bool {
     let (written, observed) = mpsc::channel();
     let delivery = Delivery::new(
         limits(),

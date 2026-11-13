@@ -254,7 +254,8 @@ fn gemini_thought_signatures_ride_function_call_items_as_extra_content() {
             .filter(|frame| frame.contains(event_type))
             .map(|frame| {
                 let data = frame.split("data: ").nth(1).expect("frame data");
-                serde_json::from_str::<Value>(data.trim()).expect("frame json")["item"].clone()
+                crate::lossless_json::from_str::<Value>(data.trim()).expect("frame json")["item"]
+                    .clone()
             })
             .collect()
     };

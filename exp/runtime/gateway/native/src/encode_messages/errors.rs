@@ -51,7 +51,7 @@ mod tests {
     #[test]
     fn a_bridge_authority_refusal_renders_as_a_retryable_overloaded_error() {
         // The exact JSON the Python boundary attaches for a bare store refusal.
-        let error: PublicError = serde_json::from_str(
+        let error: PublicError = crate::lossless_json::from_str(
             r#"{"status_code":503,"code":"gateway_authority_unavailable",
                 "message":"The gateway could not confirm serving authority for this request.",
                 "error_type":"api_error","param":null,"retry_after_seconds":5}"#,

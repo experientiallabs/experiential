@@ -42,7 +42,7 @@ from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 from exp.runtime.gateway.guardrails.store_test import _authorization
 from exp.runtime.gateway.guardrails.subjects import observation_subject_bytes
 from exp.runtime.gateway.native_capture import capture_unavailable_failure
-from exp.runtime.gateway.tests.parallel_input_guardrails_test import _Classifier, _engine
+from exp.runtime.gateway.tests.guardrail_fixture_test import _Classifier, _engine
 from exp.runtime.gateway.tool_contracts import GatewayProviderNativeTool
 
 

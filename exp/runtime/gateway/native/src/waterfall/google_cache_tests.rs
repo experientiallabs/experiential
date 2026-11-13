@@ -27,7 +27,7 @@ impl Host {
         self.calls
             .lock()
             .unwrap()
-            .push((method, serde_json::from_str(&argument).unwrap()));
+            .push((method, crate::lossless_json::from_str(&argument).unwrap()));
         self.replies
             .lock()
             .unwrap()
@@ -49,7 +49,7 @@ impl Host {
 }
 
 pub(super) fn wire(url: &str) -> DeploymentWire {
-    serde_json::from_value(json!({
+    crate::lossless_json::from_value(json!({
         "provider": "google", "deployment_id": "deployment", "dialect": "gemini_generate_content",
         "url": url, "headers": {"x-goog-api-key": "test-secret", "Idempotency-Key": "generation-only"},
         "timeout_seconds": 1.0, "idempotency_key": "generation-op", "explicit_cache": true,
@@ -177,7 +177,7 @@ async fn default_off_and_ineligible_paths_make_no_callback_or_http() {
         .await
         .unwrap()
         .is_none());
-    let minimal: DeploymentWire = serde_json::from_value(json!({
+    let minimal: DeploymentWire = crate::lossless_json::from_value(json!({
         "provider":"google", "deployment_id":"deployment", "dialect":"gemini_generate_content",
         "url":"invalid", "headers":{}, "timeout_seconds":1.0, "idempotency_key":"op",
         "automatic_cache_written_tokens": 999

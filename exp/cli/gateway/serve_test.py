@@ -351,6 +351,7 @@ def test_unbindable_port_fails_before_any_ready_receipt(
             reconciled_unknown_attempts=0,
             request_timeout_seconds=120.0,
             guardrail_detectors={},
+            native_callbacks=None,
             close=lambda *, timeout_seconds: True,
         ),
     )

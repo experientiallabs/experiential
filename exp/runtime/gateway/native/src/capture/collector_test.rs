@@ -18,7 +18,7 @@ impl Sink for MemorySink {
 
     fn write(&mut self, record: &Self::Prepared) -> Result<(), ()> {
         self.0
-            .send(serde_json::from_str(record).map_err(|_| ())?)
+            .send(crate::lossless_json::from_str(record).map_err(|_| ())?)
             .map_err(|_| ())
     }
 }
@@ -122,7 +122,8 @@ fn winning_metrics_and_gemini_parts_survive_storage_without_public_reasoning() {
     let record = &records[0];
     assert!(record.provider_reasoning.is_none());
     let restored: Vec<serde_json::Value> =
-        serde_json::from_str(record.gemini_thought_parts_source_json.as_ref().unwrap()).unwrap();
+        crate::lossless_json::from_str(record.gemini_thought_parts_source_json.as_ref().unwrap())
+            .unwrap();
     assert_eq!(restored[0], *part);
     let metrics = record.metrics.as_ref().unwrap();
     assert!(metrics.usage_complete);
@@ -436,7 +437,8 @@ fn provider_reasoning_is_lossless_bounded_and_requires_response_eligibility() {
     let records = drain(&collector, receiver);
     assert_eq!(records.len(), 2);
     let restored: String =
-        serde_json::from_str(records[0].provider_reasoning_source_json.as_ref().unwrap()).unwrap();
+        crate::lossless_json::from_str(records[0].provider_reasoning_source_json.as_ref().unwrap())
+            .unwrap();
     assert_eq!(restored, "first\0second雪");
     assert!(records[1].provider_reasoning.is_none());
 }
@@ -473,7 +475,8 @@ fn raw_tool_arguments_survive_projection_but_never_response_denial() {
     let records = drain(&collector, receiver);
     assert_eq!(records.len(), 2);
     let calls: serde_json::Value =
-        serde_json::from_str(records[0].provider_tool_calls_json.as_ref().unwrap()).unwrap();
+        crate::lossless_json::from_str(records[0].provider_tool_calls_json.as_ref().unwrap())
+            .unwrap();
     assert_eq!(calls[0]["raw_arguments"], "{  \"x\" : \"雪\"  }");
     assert_eq!(calls[1]["raw_arguments"], "freeform\0text");
     assert!(records[1].provider_tool_calls_json.is_none());

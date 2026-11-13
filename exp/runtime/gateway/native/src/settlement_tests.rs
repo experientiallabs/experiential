@@ -21,7 +21,7 @@ fn graceful_retirement_is_only_an_unopened_health_hint() {
             WebSearchMeter::default(),
             0,
         );
-        let value: Value = serde_json::from_str(&argument).unwrap();
+        let value: Value = crate::lossless_json::from_str(&argument).unwrap();
         assert_eq!(
             value.get("graceful_transport_retirement"),
             (!opened).then_some(&json!(true))
@@ -38,7 +38,7 @@ fn serialized_failure_cannot_invent_a_graceful_retirement_hint() {
     let mut value = serde_json::to_value(&failure).unwrap();
     assert!(value.get("graceful_transport_retirement").is_none());
     value["graceful_transport_retirement"] = json!(true);
-    let decoded: Failure = serde_json::from_value(value).unwrap();
+    let decoded: Failure = crate::lossless_json::from_value(value).unwrap();
     assert!(!decoded.graceful_transport_retirement);
 }
 
@@ -49,7 +49,7 @@ async fn denied_input_retry_keeps_the_meter_without_abandoning_the_attempt() {
         pyo3::types::PyModule::from_code(py, c"import json\nclass Plane:\n def __init__(self): self.writes = []; self.abandons = []\n def settle(self, argument):\n  self.writes.append(json.loads(argument))\n  raise RuntimeError('temporary ledger failure')\n def abandon(self, argument):\n  self.abandons.append(json.loads(argument))\n  return '{}'\n def close_thread_resources(self, argument): return '{}'\n", c"retry_input_plane.py", c"retry_input_plane")
             .unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
     });
-    let bridge = Arc::new(Bridge::new(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
+    let bridge = Arc::new(Bridge::scripted(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
     let mut guard = AttemptGuard::new(
         bridge.clone(),
         Arc::new(AtomicUsize::new(0)),
@@ -80,7 +80,7 @@ async fn denied_input_retry_keeps_the_meter_without_abandoning_the_attempt() {
             .extract()
             .unwrap()
     });
-    let writes: Vec<Value> = serde_json::from_str(&writes).unwrap();
+    let writes: Vec<Value> = crate::lossless_json::from_str(&writes).unwrap();
     assert_eq!(writes.len(), 4);
     assert!(writes.iter().all(|write| write == &writes[0]));
     assert_eq!(writes[0]["usage"]["input_tokens"], 13);
@@ -111,7 +111,7 @@ async fn parsed_usage_wins_stale_consumer_usage_on_local_failure() {
         pyo3::types::PyModule::from_code(py, c"import json\nclass Plane:\n def __init__(self): self.writes = []\n def settle(self, argument):\n  self.writes.append(json.loads(argument))\n  return '{}'\n def close_thread_resources(self, argument): return '{}'\n", c"stale_plane.py", c"stale_plane")
             .unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
     });
-    let bridge = Arc::new(Bridge::new(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
+    let bridge = Arc::new(Bridge::scripted(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
     for (ordinal, fresh) in [Some(7), None].into_iter().enumerate() {
         let mut guard = AttemptGuard::new(
             bridge.clone(),
@@ -149,7 +149,7 @@ async fn parsed_usage_wins_stale_consumer_usage_on_local_failure() {
             .extract()
             .unwrap()
     });
-    let writes: Value = serde_json::from_str(&writes).unwrap();
+    let writes: Value = crate::lossless_json::from_str(&writes).unwrap();
     assert_eq!(writes[0]["usage"]["output_tokens"], 7);
     assert!(writes[1]["usage"]["output_tokens"].is_null());
 }
@@ -161,7 +161,7 @@ async fn observed_terminal_wins_disconnect_once_and_rebind_clears_facts() {
         pyo3::types::PyModule::from_code(py, c"import json\nclass Plane:\n def __init__(self): self.writes = []\n def settle(self, argument):\n  self.writes.append(json.loads(argument))\n  return '{}'\n def close_thread_resources(self, argument): return '{}'\n", c"cancel_plane.py", c"cancel_plane")
             .unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
     });
-    let bridge = Arc::new(Bridge::new(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
+    let bridge = Arc::new(Bridge::scripted(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
     let mut guard = AttemptGuard::new(
         bridge.clone(),
         Arc::new(AtomicUsize::new(0)),
@@ -188,7 +188,7 @@ async fn observed_terminal_wins_disconnect_once_and_rebind_clears_facts() {
             .extract()
             .unwrap()
     });
-    let writes: Value = serde_json::from_str(&writes).unwrap();
+    let writes: Value = crate::lossless_json::from_str(&writes).unwrap();
     assert_eq!(writes.as_array().unwrap().len(), 1);
     assert_eq!(writes[0]["outcome"], "completed");
     assert_eq!(writes[0]["usage"]["output_tokens"], 7);
@@ -235,7 +235,7 @@ async fn observed_terminal_wins_disconnect_once_and_rebind_clears_facts() {
                 .extract()
                 .unwrap()
         });
-        let latest: Value = serde_json::from_str(&latest).unwrap();
+        let latest: Value = crate::lossless_json::from_str(&latest).unwrap();
         assert_eq!(latest["usage_incomplete_due_to_disconnect"], dispatched);
         assert_eq!(latest["dispatched"], dispatched);
         assert_eq!(latest["failure"]["failure_class"], "cancelled");
@@ -266,7 +266,7 @@ async fn dispatched_cancellation_carries_streamed_output_only_without_a_terminal
         pyo3::types::PyModule::from_code(py, c"import json\nclass Plane:\n def __init__(self): self.writes = []\n def settle(self, argument):\n  self.writes.append(json.loads(argument))\n  return '{}'\n def close_thread_resources(self, argument): return '{}'\n", c"streamed_plane.py", c"streamed_plane")
             .unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
     });
-    let bridge = Arc::new(Bridge::new(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
+    let bridge = Arc::new(Bridge::scripted(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
     for (name, terminal) in [("cut", false), ("done", true)] {
         let mut guard = AttemptGuard::new(
             bridge.clone(),
@@ -302,7 +302,7 @@ async fn dispatched_cancellation_carries_streamed_output_only_without_a_terminal
             .extract()
             .unwrap()
     });
-    let writes: Value = serde_json::from_str(&writes).unwrap();
+    let writes: Value = crate::lossless_json::from_str(&writes).unwrap();
     assert_eq!(writes[0]["usage_incomplete_due_to_disconnect"], true);
     assert!(writes[0]["usage"].is_null());
     assert_eq!(writes[0]["streamed_output"]["text"], "Hello, world");
@@ -323,7 +323,7 @@ async fn usage_less_truncation_carries_its_streamed_output_for_an_estimate() {
         pyo3::types::PyModule::from_code(py, c"import json\nclass Plane:\n def __init__(self): self.writes = []\n def settle(self, argument):\n  self.writes.append(json.loads(argument))\n  return '{}'\n def close_thread_resources(self, argument): return '{}'\n", c"unreported_plane.py", c"unreported_plane")
             .unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
     });
-    let bridge = Arc::new(Bridge::new(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
+    let bridge = Arc::new(Bridge::scripted(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
     for (name, terminal, reported) in [
         ("truncated", Event::Incomplete, false),
         ("unreported", Event::Completed, false),
@@ -366,7 +366,7 @@ async fn usage_less_truncation_carries_its_streamed_output_for_an_estimate() {
             .extract()
             .unwrap()
     });
-    let writes: Value = serde_json::from_str(&writes).unwrap();
+    let writes: Value = crate::lossless_json::from_str(&writes).unwrap();
     assert_eq!(writes[0]["usage_unreported_truncation"], true);
     assert_eq!(writes[0]["streamed_output"]["text"], "Packet 1470 of the");
     // Any other usage-less ending keeps the unknown-meter policy, and a
@@ -417,7 +417,7 @@ fn settle_argument_retains_cache_write_counts_and_unknowns() {
             WebSearchMeter::default(),
             0,
         );
-        let parsed: Value = serde_json::from_str(&argument).expect("valid json");
+        let parsed: Value = crate::lossless_json::from_str(&argument).expect("valid json");
         assert_eq!(parsed["usage"]["cache_creation_input_tokens"], json!(count));
     }
 }
@@ -438,12 +438,12 @@ fn settle_argument_bills_web_searches_only_on_the_finalizing_settlement() {
             None,
             None,
             WebSearchMeter {
-                requests: requests,
+                requests,
                 ..WebSearchMeter::default()
             },
             0,
         );
-        serde_json::from_str(&argument).expect("valid json")
+        crate::lossless_json::from_str(&argument).expect("valid json")
     };
     assert_eq!(settle(true, 1)["web_search_requests"], json!(1));
     // A failed rung's non-finalizing settlement never bills the search a
@@ -470,7 +470,7 @@ fn settle_argument_carries_web_search_results_and_vendor_cost_beside_the_count()
             meter,
             0,
         );
-        serde_json::from_str(&argument).expect("valid json")
+        crate::lossless_json::from_str(&argument).expect("valid json")
     };
     let costed = WebSearchMeter {
         requests: 1,
@@ -524,7 +524,7 @@ fn settle_argument_bills_tool_search_rounds_only_on_the_finalizing_settlement() 
             WebSearchMeter::default(),
             rounds,
         );
-        serde_json::from_str(&argument).expect("valid json")
+        crate::lossless_json::from_str(&argument).expect("valid json")
     };
     assert_eq!(settle(true, 2)["tool_search_requests"], json!(2));
     // The search-call turns settle non-finalizing and never bill the
@@ -563,7 +563,7 @@ fn settle_argument_preserves_upstream_provider_and_cache_ttl_usage_together() {
         WebSearchMeter::default(),
         0,
     );
-    let parsed: Value = serde_json::from_str(&named).expect("valid json");
+    let parsed: Value = crate::lossless_json::from_str(&named).expect("valid json");
     assert_eq!(
         parsed["upstream_provider"],
         Value::String("Azure".to_string())
@@ -586,7 +586,7 @@ fn settle_argument_preserves_upstream_provider_and_cache_ttl_usage_together() {
         WebSearchMeter::default(),
         0,
     );
-    let parsed: Value = serde_json::from_str(&unnamed).expect("valid json");
+    let parsed: Value = crate::lossless_json::from_str(&unnamed).expect("valid json");
     assert_eq!(parsed["upstream_provider"], Value::Null);
 }
 
@@ -608,7 +608,7 @@ fn settle_argument_carries_first_token_at_only_when_observed() {
         WebSearchMeter::default(),
         0,
     );
-    let parsed: Value = serde_json::from_str(&with_token).expect("valid json");
+    let parsed: Value = crate::lossless_json::from_str(&with_token).expect("valid json");
     assert_eq!(
         parsed["first_token_at"],
         Value::String("2023-11-14T22:13:20.500+00:00".to_string())
@@ -630,7 +630,7 @@ fn settle_argument_carries_first_token_at_only_when_observed() {
         WebSearchMeter::default(),
         0,
     );
-    let parsed: Value = serde_json::from_str(&without).expect("valid json");
+    let parsed: Value = crate::lossless_json::from_str(&without).expect("valid json");
     assert_eq!(parsed["first_token_at"], Value::Null);
 }
 
@@ -655,7 +655,7 @@ fn settle_argument_carries_the_sanitized_provider_detail_on_a_failed_attempt() {
         WebSearchMeter::default(),
         0,
     );
-    let parsed: Value = serde_json::from_str(&argument).expect("valid json");
+    let parsed: Value = crate::lossless_json::from_str(&argument).expect("valid json");
     assert_eq!(parsed["failure"]["failure_class"], "invalid_request");
     assert_eq!(
         parsed["failure"]["provider_detail"],
@@ -681,7 +681,7 @@ fn settle_argument_carries_the_sanitized_provider_detail_on_a_failed_attempt() {
         WebSearchMeter::default(),
         0,
     );
-    let parsed: Value = serde_json::from_str(&owned_argument).expect("valid json");
+    let parsed: Value = crate::lossless_json::from_str(&owned_argument).expect("valid json");
     assert_eq!(
         parsed["failure"]["failure_class"],
         "provider_authentication"
@@ -705,7 +705,7 @@ fn settle_argument_carries_the_sanitized_provider_detail_on_a_failed_attempt() {
         WebSearchMeter::default(),
         0,
     );
-    let parsed: Value = serde_json::from_str(&bare_argument).expect("valid json");
+    let parsed: Value = crate::lossless_json::from_str(&bare_argument).expect("valid json");
     assert_eq!(parsed["failure"]["provider_detail"], Value::Null);
 }
 
@@ -736,7 +736,7 @@ fn settle_argument_carries_rate_limit_facts_when_harvested() {
         WebSearchMeter::default(),
         0,
     );
-    let parsed: Value = serde_json::from_str(&argument).expect("valid json");
+    let parsed: Value = crate::lossless_json::from_str(&argument).expect("valid json");
     assert_eq!(parsed["failure"]["retry_after_seconds"], 3_600);
     assert_eq!(parsed["rate_limit_headers"]["retry-after"], "3600");
     assert_eq!(
@@ -760,7 +760,7 @@ fn settle_argument_carries_rate_limit_facts_when_harvested() {
         WebSearchMeter::default(),
         0,
     );
-    let parsed: Value = serde_json::from_str(&success).expect("valid json");
+    let parsed: Value = crate::lossless_json::from_str(&success).expect("valid json");
     assert_eq!(parsed["rate_limit_headers"]["retry-after"], "3600");
     let bare = settle_argument(
         "req",
@@ -777,7 +777,7 @@ fn settle_argument_carries_rate_limit_facts_when_harvested() {
         WebSearchMeter::default(),
         0,
     );
-    let parsed: Value = serde_json::from_str(&bare).expect("valid json");
+    let parsed: Value = crate::lossless_json::from_str(&bare).expect("valid json");
     assert_eq!(parsed["rate_limit_headers"], Value::Null);
 }
 
@@ -824,7 +824,7 @@ fn settle_argument_keeps_a_reported_zero_image_count_and_omits_an_unreported_one
             WebSearchMeter::default(),
             0,
         );
-        serde_json::from_str(&argument).expect("valid json")
+        crate::lossless_json::from_str(&argument).expect("valid json")
     };
     assert_eq!(settle(Some(0))["usage"]["image_output_tokens"], json!(0));
     assert_eq!(
@@ -860,7 +860,7 @@ fn settle_argument_carries_the_twelve_hour_write_subset_only_when_observed() {
             WebSearchMeter::default(),
             0,
         );
-        serde_json::from_str::<Value>(&argument).expect("valid json")["usage"].clone()
+        crate::lossless_json::from_str::<Value>(&argument).expect("valid json")["usage"].clone()
     };
     assert_eq!(settle(&usage)["cache_creation_12h_input_tokens"], 3_247);
     usage.cache_creation_12h_input_tokens = None;
@@ -898,12 +898,12 @@ fn recorded_calls(plane: &Py<PyAny>) -> Vec<(String, Value)> {
             .extract()
             .unwrap()
     });
-    serde_json::from_str::<Vec<(String, Value)>>(&calls).unwrap()
+    crate::lossless_json::from_str::<Vec<(String, Value)>>(&calls).unwrap()
 }
 
 /// A guard bound to one dispatched attempt that observed final usage.
 fn priced_guard(plane: &Py<PyAny>) -> AttemptGuard {
-    let bridge = Arc::new(Bridge::new(Python::attach(|py| plane.clone_ref(py)), 4).unwrap());
+    let bridge = Arc::new(Bridge::scripted(Python::attach(|py| plane.clone_ref(py)), 4).unwrap());
     let mut guard = AttemptGuard::new(
         bridge,
         Arc::new(AtomicUsize::new(0)),

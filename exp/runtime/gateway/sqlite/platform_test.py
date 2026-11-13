@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -19,6 +18,7 @@ from exp.common.models.gateway_catalog import (
     NormalizedGatewayCatalog,
 )
 from exp.common.models.gateway_chains import ModelExecutionStage
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway import (
     ActivateAliasRevisionCommand,
     AttemptAccountingAuthority,
@@ -431,7 +431,7 @@ def test_naturally_idempotent_mutations_are_tenant_scoped_and_unreceipted(
     with pytest.raises(ValueError, match="historical inactive revision"):
         platform.mutate_alias(alias)
 
-    with sqlite3.connect(platform.database_path) as database:
+    with connect_sqlite(platform.database_path) as database:
         assert database.execute("SELECT COUNT(*) FROM operation_receipts").fetchone()[0] == 0
 
 
@@ -1030,7 +1030,7 @@ def test_child_stage_reservation_replays_without_replacing_root_authority(tmp_pa
     changed_authority = snapshot.model_copy(
         update={"authorization": authorization.model_copy(update={"identity_id": "other"})}
     )
-    with pytest.raises(ValueError, match="differs from durable accounting input"):
+    with pytest.raises(ValueError, match="authority differs from accepted request"):
         platform.reserve_attempt(child_request.model_copy(update={"snapshot": changed_authority}))
     changed_tenant = snapshot.model_copy(
         update={"authorization": authorization.model_copy(update={"organization_id": "org-two"})}
@@ -1060,7 +1060,7 @@ def test_child_stage_reservation_replays_without_replacing_root_authority(tmp_pa
     assert settlement.reservation == child
     assert settlement.settled_nano_usd == 15
     assert platform.reserve_attempt(child_request) == child
-    with sqlite3.connect(platform.database_path) as connection:
+    with connect_sqlite(platform.database_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone() == (2,)
         assert connection.execute(
             "SELECT organization_id, identity_id, key_id, alias_id, alias_revision_id "

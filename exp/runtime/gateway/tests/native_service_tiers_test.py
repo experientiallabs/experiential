@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +23,7 @@ from exp.common.models.catalog import (
     GatewayLongContextTier,
     GatewayServiceTierPrices,
 )
+from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.catalog_authority import upsert_connection, upsert_singleton_deployment
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.tests.launch_test import _ServedGateway, _unused_port
@@ -223,7 +223,7 @@ def test_real_native_tier_settlement(
         upstream.shutdown()
         upstream.server_close()
         thread.join(timeout=5)
-    with sqlite3.connect(manager.database_path) as connection:
+    with connect_sqlite(manager.database_path) as connection:
         row = connection.execute(
             "SELECT state, estimated_cost_nano_usd, budget_settled_nano_usd, "
             "service_tier_settlement, cache_creation_input_tokens, "

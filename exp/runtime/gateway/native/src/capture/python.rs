@@ -6,12 +6,10 @@ use std::time::{Duration, Instant};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
-use serde::Deserialize;
-use serde_json::{value::RawValue, Value};
 
 use super::collector::{Collector, Configuration};
 use super::delivery::Sink;
-use super::record::{Record, Request};
+use super::record::Record;
 
 /// Python view of the same response evidence used by the gateway's local sink.
 #[pyclass(frozen, module = "exp_gateway_native")]
@@ -46,12 +44,6 @@ impl CaptureResponse {
 }
 
 struct PythonSink(Py<PyAny>);
-
-#[derive(Deserialize)]
-struct ContextSource<'a> {
-    #[serde(borrow)]
-    context: &'a RawValue,
-}
 
 const BATCH_RECORDS: usize = 64;
 const BATCH_BYTES: usize = 2 * 1024 * 1024;
@@ -288,7 +280,7 @@ impl CaptureCollector {
         if !sink.bind(py).is_callable() {
             return Err(PyValueError::new_err("capture batch sink must be callable"));
         }
-        let config: Configuration = serde_json::from_str(config_json)
+        let config: Configuration = crate::lossless_json::from_str(config_json)
             .map_err(|_| PyValueError::new_err("invalid capture configuration"))?;
         py.detach(|| {
             let spill = config
@@ -317,7 +309,7 @@ impl CaptureCollector {
     /// Use the same collector and delivery worker with a native local SQLite sink.
     #[staticmethod]
     fn sqlite(py: Python<'_>, config_json: &str, local_json: &str) -> PyResult<Option<Self>> {
-        let config: Configuration = serde_json::from_str(config_json)
+        let config: Configuration = crate::lossless_json::from_str(config_json)
             .map_err(|_| PyValueError::new_err("invalid capture configuration"))?;
         config.validate().map_err(PyValueError::new_err)?;
         if config.settlement_required {
@@ -325,7 +317,7 @@ impl CaptureCollector {
                 "local capture cannot require hosted settlement",
             ));
         }
-        let local: super::local::CaptureConfiguration = serde_json::from_str(local_json)
+        let local: super::local::CaptureConfiguration = crate::lossless_json::from_str(local_json)
             .map_err(|_| PyValueError::new_err("invalid local capture configuration"))?;
         if config.delivery.maximum_records != local.queue_capacity {
             return Err(PyValueError::new_err("local delivery bounds must match"));
@@ -351,7 +343,7 @@ impl CaptureCollector {
         if !sink.bind(py).is_callable() {
             return Err(PyValueError::new_err("capture sink must be callable"));
         }
-        let config: Configuration = serde_json::from_str(config_json)
+        let config: Configuration = crate::lossless_json::from_str(config_json)
             .map_err(|_| PyValueError::new_err("invalid capture configuration"))?;
         py.detach(|| Collector::new(config, PythonSink(sink)))
             .map(|collector| Self {
@@ -368,38 +360,7 @@ impl CaptureCollector {
     /// Borrow immutable UTF-8 bytes without widening and re-encoding a Python string.
     fn begin_bytes(&self, py: Python<'_>, request_json: &[u8]) -> bool {
         let collector = self.inner.clone();
-        py.detach(|| {
-            if !collector.config.truncate_request
-                && request_json.len() > collector.config.maximum_request_bytes
-            {
-                return collector.skip();
-            }
-            let Ok(mut request) = serde_json::from_slice::<Request>(request_json) else {
-                return collector.skip();
-            };
-            // The ordinary JSON projection uses finite-width numbers. Keep the
-            // original context only for exceptional numeric values, using the
-            // same lossless sidecar consumed by capture ingestion. Do not change
-            // the gateway's global number representation to repair capture.
-            if request
-                .context
-                .get("source_json")
-                .is_none_or(Value::is_null)
-                && super::response::contains_wide_number(&request.context)
-            {
-                let Ok(source) = serde_json::from_slice::<ContextSource>(request_json) else {
-                    return collector.skip();
-                };
-                let Some(context) = Arc::make_mut(&mut request.context).as_object_mut() else {
-                    return collector.skip();
-                };
-                context.insert(
-                    "source_json".into(),
-                    Value::String(source.context.get().to_owned()),
-                );
-            }
-            collector.begin(request)
-        })
+        py.detach(|| super::admission::begin(&collector, request_json))
     }
 
     /// Freeze resolved model provenance before response collection begins.
@@ -425,7 +386,7 @@ impl CaptureCollector {
             if metadata_json.len() > 65536 || body.len() > 4 * 1024 * 1024 {
                 return false;
             }
-            let Ok(metadata) = serde_json::from_str(metadata_json) else {
+            let Ok(metadata) = crate::lossless_json::from_str(metadata_json) else {
                 return false;
             };
             self.inner

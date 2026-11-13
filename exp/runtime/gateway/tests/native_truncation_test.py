@@ -73,11 +73,12 @@ _DRIVER_SOURCE = textwrap.dedent(
                     "graceful_timeout_seconds": 2.0,
                 }
             ),
+            native_callbacks=control_plane._accounting.native.callbacks(),
         )
 
 
     main()
-    '''
+'''
 )
 
 
