@@ -4389,7 +4389,21 @@ def _record_native_moderation_losses(control: NativeControlPlane) -> None:
         inspection.wait_json()
     assert owner.close(timeout_seconds=2)
     counters = json.loads(owner.moderation_recording_json())
+    telemetry = counters.pop("telemetry")
     assert counters == {"dropped": 1, "failed": 1, "pending": 0}
+    assert telemetry["totals"].pop("duration_ms") >= 0
+    assert telemetry == {
+        "dropped": 0,
+        "totals": {
+            "dimensions": None,
+            "samples": 2,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "errors": 0,
+            "classifier_latency_seconds": 0.0,
+            "score_buckets": {},
+        },
+    }
 
 
 def test_metrics_expose_native_recording_losses_without_python_guardrails(tmp_path: Path) -> None:
