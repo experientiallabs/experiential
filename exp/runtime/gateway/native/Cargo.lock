@@ -854,7 +854,7 @@ dependencies = [
 
 [[package]]
 name = "exp-gateway-native"
-version = "0.3.190"
+version = "0.3.190-rc.1"
 dependencies = [
  "aws-config",
  "aws-credential-types",

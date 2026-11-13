@@ -22,10 +22,13 @@ on both hosts: each host can independently start a publishing pipeline.
   Installed-wheel SDK evidence and a Python 3.13 Capture smoke test gate
   publication. PRs and main pushes build without publishing.
 
-A protected `v<version>` tag whose commit is reachable from main publishes
-through the `pypi` environment. Its version must equal `pyproject.toml`, the
-Python and Cargo native versions must agree, and a deferred native release
-marker blocks publication. Manual runs default to a build of the selected
+A protected `v<version>` tag publishes through the `pypi` environment. Stable
+tags must be reachable from main. Protected `vX.Y.ZrcN` tags can publish a
+reviewed branch candidate before merge, through the same wheel and smoke checks.
+The tag version must equal `pyproject.toml`. Python and Cargo native versions
+must agree, including PEP 440 `X.Y.ZrcN` and SemVer `X.Y.Z-rc.N` spellings.
+Stable flagship releases require stable native wheels. A deferred native release
+marker blocks all publication. Manual runs default to a build of the selected
 ref. A publishing replay must run from protected main, select
 `latest-release`, and explicitly enable `publish`. It resolves the latest
 GitHub release to an immutable commit before any build job starts.
