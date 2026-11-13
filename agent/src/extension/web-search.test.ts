@@ -5,9 +5,10 @@ import { citationsOf, createWebSearchTool } from "./web-search.js";
 const gateway: GatewayConfig = { kind: "hosted", baseUrl: "https://gw.example/v1", apiKey: "xpl_k" };
 
 function reply(body: unknown, init: ResponseInit = {}) {
-  const seen: { url: string; body: Record<string, unknown>; auth: string }[] = [];
+  const seen: { url: string; body: Record<string, unknown>; auth: string; headers: Record<string, string> }[] = [];
   const fetch = (async (url: string, request?: RequestInit) => {
-    seen.push({ url, body: JSON.parse(String(request?.body)), auth: (request?.headers as Record<string, string>).authorization ?? "" });
+    const headers = request?.headers as Record<string, string>;
+    seen.push({ url, body: JSON.parse(String(request?.body)), auth: headers.authorization ?? "", headers });
     return new Response(JSON.stringify(body), init);
   }) as typeof globalThis.fetch;
   return { fetch, seen };
@@ -44,6 +45,14 @@ describe("web_search", () => {
       fetch: reply({ choices: [{ message: { content: "x" } }] }, { headers: { "x-experiential-ignored-parameters": "web_search_options" } }).fetch
     }).execute("c", { query: "q" }, undefined, undefined, undefined as never);
     expect((ignored as { isError?: boolean }).isError).toBe(true);
+  });
+
+  it("sends the gateway's trace headers with its call", async () => {
+    const { fetch, seen } = reply({ choices: [{ message: { content: "ok" } }] });
+    const traced: GatewayConfig = { ...gateway, headers: { "X-Explabs-Tags": '{"conversation":"c","turn":"t"}' } };
+    await createWebSearchTool({ gateway: traced, model: "m", fetch }).execute("c", { query: "q" }, undefined, undefined, undefined as never);
+    expect(seen[0]?.headers["X-Explabs-Tags"]).toBe('{"conversation":"c","turn":"t"}');
+    expect(seen[0]?.auth).toBe("Bearer xpl_k");
   });
 
   it("deduplicates citations and ignores malformed annotations", () => {
