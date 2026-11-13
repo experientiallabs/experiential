@@ -667,7 +667,7 @@ PROTOCOLS = (
         "exp.optimize.evaluation.variance.crosstalk:CROSSTALK_PROTOCOL",
         "crosstalk-probe-v1",
         ("exp.optimize.evaluation.variance.crosstalk",),
-        "a1ec0982a884e5651380fd2007490706b2893db884da8bdfe4df3f0aca243503",
+        "7b76f2182f3b9e7e260b60b3642a9737c12f84e152187be08cc6741271d16f94",
     ),
     Protocol(
         "exp.optimize.evaluation.variance.pipeline_spec:PIPELINE_PROTOCOL",
