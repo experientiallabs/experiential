@@ -18,6 +18,7 @@ from exp.runtime.openai_protocol.client_field_repairs import (
     OUTPUT_PHASE_DROPPED,
     OUTPUT_STATUS_DROPPED,
     PROMPT_CACHE_RETENTION_IGNORED,
+    REASONING_SUMMARY_IGNORED,
     RESPONSES_ARGUMENTS_DECODED,
     RESPONSES_ARGUMENTS_SERIALIZED,
     SEED_IGNORED,
@@ -607,3 +608,24 @@ def test_responses_usage_is_still_refused_by_name() -> None:
         decode_responses({"model": "m", "input": "hi", "usage": {"include": True}})
     assert error.value.detail.code == "unsupported_parameter"
     assert error.value.detail.param == "usage"
+
+
+@pytest.mark.parametrize("summary", ("auto", "concise", "detailed", "none"))
+def test_chat_reasoning_summary_is_dropped_with_disclosure(summary: str) -> None:
+    """The Responses ``reasoning.summary`` serves on Chat and keeps the other keys."""
+    decoded = decode_chat({**_CHAT_BASE, "reasoning": {"effort": "high", "summary": summary}})
+    reference = decode_chat({**_CHAT_BASE, "reasoning": {"effort": "high"}})
+    assert decoded.request.reasoning_effort == reference.request.reasoning_effort
+    assert REASONING_SUMMARY_IGNORED in decoded.request.ignored_parameters
+
+
+def test_chat_reasoning_summary_null_is_removed_silently() -> None:
+    decoded = decode_chat({**_CHAT_BASE, "reasoning": {"summary": None}})
+    assert decoded.request.ignored_parameters == ()
+
+
+@pytest.mark.parametrize("summary", ("verbose", 3, True, ["auto"]))
+def test_chat_reasoning_summary_garbage_is_a_typed_400(summary: JsonValue) -> None:
+    with pytest.raises(OpenAIProtocolError) as caught:
+        decode_chat({**_CHAT_BASE, "reasoning": {"summary": summary}})
+    assert caught.value.detail.param == "reasoning.summary"
