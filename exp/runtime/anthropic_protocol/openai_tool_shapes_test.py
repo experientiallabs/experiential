@@ -186,3 +186,13 @@ def test_an_unknown_tool_choice_keeps_the_wire_refusal(choice: JsonValue) -> Non
     repaired, disclosures = fold_openai_tool_shapes({"tool_choice": choice})
     assert repaired["tool_choice"] == choice
     assert disclosures == ()
+
+
+def test_an_untyped_chat_wrapper_folds_as_chat_defaults_it() -> None:
+    """A Chat tool without ``type`` (Chat's default is ``function``) folds the same way."""
+    untyped: JsonObject = {"function": _CHAT_TOOL["function"]}
+    repaired, disclosures = fold_openai_tool_shapes({"tools": [untyped]})
+    assert repaired["tools"] == [_CUSTOM_TOOL]
+    assert disclosures == (OPENAI_FUNCTION_TOOL_TRANSLATED,)
+    decoded = decode_messages_count_tokens(_count_body(tools=[untyped]))
+    assert [tool.name for tool in decoded.request.tools] == ["search"]

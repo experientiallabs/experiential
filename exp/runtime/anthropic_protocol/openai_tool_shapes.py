@@ -14,10 +14,12 @@ names before the manifest and the wire models read the body, with disclosure.
 The OpenAI ``tool_choice`` spellings are folded the same way, because a client
 that sends Chat tools sends Chat's selector beside them.
 
-Only an entry whose ``type`` is ``function`` and whose keys are exactly one of
-the two OpenAI shapes is folded; anything else is left for the wire model's
-own named refusal. ``function`` is no Anthropic tool type, so a fold can never
-reinterpret a valid Messages declaration.
+Only an entry whose ``type`` is ``function`` (or omitted beside a Chat
+``function`` body, which Chat defaults to ``function``) and whose keys are
+exactly one of the two OpenAI shapes is folded; anything else is left for the
+wire model's own named refusal. ``function`` is neither an Anthropic tool type
+nor a Messages tool field, so a fold can never reinterpret a valid Messages
+declaration.
 """
 
 from __future__ import annotations
@@ -68,7 +70,10 @@ def _declaration(tool: JsonObject) -> JsonObject | None:
         The declaration with any tool annotations merged in, when ``tool`` is
         exactly the nested (Chat) or flat (Responses) shape, else ``None``.
     """
-    if tool.get("type") != "function":
+    # Chat defaults an omitted ``type`` to ``function``; a ``function`` body is
+    # no Messages tool field, so the untyped Chat wrapper is unambiguous too.
+    nested_untyped = "type" not in tool and "function" in tool
+    if tool.get("type") != "function" and not nested_untyped:
         return None
     annotations = {key: value for key, value in tool.items() if key in _ANNOTATION_KEYS}
     if "function" in tool:
