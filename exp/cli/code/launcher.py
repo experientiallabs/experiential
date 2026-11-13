@@ -1,7 +1,7 @@
 """Launch exp-code, the Node.js agent, against a local or hosted Experiential gateway.
 
 ``exp code`` runs the exact exp-code release this CLI was released with, through
-``npx --yes exp-code@<version>``. ``EXP_CODE_DIR`` points at a built checkout of the
+``npx --yes @experiential-labs/exp-code@<version>``. ``EXP_CODE_DIR`` points at a built checkout of the
 ``agent/`` package instead, for development. A local ``exp`` gateway is used when its
 virtual key is in ``EXP_GATEWAY_KEY`` and it answers on loopback; otherwise the hosted
 gateway is used with ``EXP_API_KEY``, ``EXPLABS_API_KEY``, or the ``exp login`` credential.
@@ -37,8 +37,8 @@ from exp.common.auth import ProviderAuthStore, ProviderAuthStoreError
 
 # The exp-code release this CLI launches. It must equal "version" in agent/package.json;
 # launcher_test.py enforces that, so a release bumps both in one change.
-EXP_CODE_VERSION = "0.1.3"
-EXP_CODE_PACKAGE = "exp-code"
+EXP_CODE_VERSION = "0.1.4"
+EXP_CODE_PACKAGE = "@experiential-labs/exp-code"
 MINIMUM_NODE_VERSION = (22, 19, 0)
 LOCAL_PROBE_TIMEOUT_SECONDS = 1.5
 NODE_ENV = "EXP_CODE_NODE"

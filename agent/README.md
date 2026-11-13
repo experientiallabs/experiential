@@ -22,12 +22,12 @@ exp-code needs Node.js 22.19 or newer.
 
 ```bash
 exp code                       # through the Experiential CLI (recommended)
-npx exp-code                   # or directly
-npm install -g exp-code        # or installed globally
+npx @experiential-labs/exp-code   # or directly
+npm install -g @experiential-labs/exp-code   # or installed globally
 ```
 
 `exp code` runs the exp-code release pinned by your installed `experiential` package (through
-`npx --yes exp-code@<version>`), points it at the right gateway, and passes every argument on.
+`npx --yes @experiential-labs/exp-code@<version>`), points it at the right gateway, and passes every argument on.
 For development, `EXP_CODE_DIR=/path/to/agent exp code` runs a built checkout instead.
 
 ## Gateway setup
@@ -114,7 +114,7 @@ never plant one. Extensions, prompt templates, and themes are never loaded from 
 directory, which the model can write.
 
 The protocol is files under the session directory (types in `src/runner/protocol.ts`, exported
-as `exp-code/protocol`):
+as `@experiential-labs/exp-code/protocol`):
 
 | File | Direction | Contents |
 |---|---|---|
