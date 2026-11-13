@@ -6,7 +6,7 @@ name: agent-release
 #   exp-code-runner.mjs.sha256  its digest
 #   exp-code-protocol.ts        the runner's file and push protocol (RunSpec, RunEvent, ...)
 # Consumers pin a version and verify the digest. When the NPM_TOKEN secret exists, the same
-# build is also published to npm as `exp-code`.
+# build is also published to npm as `@experiential-labs/exp-code`.
 on:
   push:
     tags: ["exp-code-v*"]
