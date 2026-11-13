@@ -78,7 +78,7 @@ impl InputGate {
         let group = |c: &Check| {
             if c.policy["mode"] == "observe" {
                 2
-            } else if c.policy["input_fail_open"] == true || c.policy["protected"] == false {
+            } else if c.policy["input_fail_open"] == true {
                 1
             } else {
                 0
@@ -351,10 +351,7 @@ impl InputGate {
 
     #[cfg(test)]
     pub fn grace(&self) -> Option<Duration> {
-        self.checks
-            .iter()
-            .all(|(_, fail_open)| *fail_open)
-            .then_some(self.grace)
+        (self.strict_count == 0).then_some(self.grace)
     }
 
     /// Wake on completion or cancellation, without occupying a bridge worker.
@@ -630,8 +627,7 @@ async fn inspect_until_ready(
     ready: &mut tokio::sync::watch::Receiver<Option<Instant>>,
 ) -> (Result<Value, ()>, &'static str) {
     let deadline = Instant::now() + budget;
-    let grace = (check.policy["mode"] != "observe"
-        && (check.policy["input_fail_open"] == true || check.policy["protected"] == false))
+    let grace = (check.policy["mode"] != "observe" && check.policy["input_fail_open"] == true)
         .then(|| {
             Duration::from_millis(
                 check.policy["input_max_wait_ms"]

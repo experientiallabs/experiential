@@ -205,6 +205,35 @@ fn expired_strict_inspection_records_its_unavailable_decision() {
 }
 
 #[tokio::test]
+async fn unprotected_checks_require_explicit_opt_in_to_response_grace() {
+    let (url, received, release, server) = server("{\"flagged\":true}", 200);
+    let mut check = check(&url, false);
+    check.policy["input_fail_open"] = json!(false);
+    check.policy["input_max_wait_ms"] = json!(0);
+    let gate = InputGate::start(vec![check], 5.0).unwrap();
+    received.recv_timeout(Duration::from_secs(3)).unwrap();
+    gate.begin_response(Instant::now());
+    assert_eq!(gate.grace(), None);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), gate.wait_strict())
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), gate.wait_async())
+            .await
+            .is_err()
+    );
+    release.send(()).unwrap();
+    let decision = tokio::time::timeout(Duration::from_secs(2), gate.wait_strict())
+        .await
+        .unwrap();
+    assert_eq!(decision["action"], "error");
+    assert_eq!(gate.wait_async().await["moderation"]["status"], "denied");
+    server.join().unwrap();
+}
+
+#[tokio::test]
 async fn response_timeout_releases_and_cancels_moderation_without_waiving_provider_usage() {
     let (url, received, release, server) = server("{\"flagged\":true}", 200);
     let mut check = check(&url, true);
