@@ -1,6 +1,6 @@
 {
   "name": "@experiential-labs/exp-code",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Experiential's open-source coding and cowork agent: run it in any folder to read files, write and run code, search the web, and produce documents, on any model through the Experiential gateway.",
   "type": "module",
   "license": "Apache-2.0",

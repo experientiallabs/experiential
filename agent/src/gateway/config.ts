@@ -1,8 +1,9 @@
 /**
  * Where exp-code sends model calls: the hosted Experiential gateway or a local `exp` gateway.
  *
- * The selection is read from the environment only, so the same binary works when launched by
- * `exp code`, from a shell, or inside a sandbox. Keys never travel through command-line arguments.
+ * The selection is read from the environment first, so the same binary works when launched by
+ * `exp code`, from a shell, or inside a sandbox; without a key there, the key `exp-code login`
+ * saved is used. Keys never travel through command-line arguments.
  */
 
 /** Provider id under which the gateway's models are registered in Pi. */
@@ -27,8 +28,19 @@ export interface GatewayConfig {
   headers?: Readonly<Record<string, string>>;
 }
 
-/** The outcome of reading the environment: a config, or the reason there is none. */
-export type GatewayResolution = { config: GatewayConfig; problem?: undefined } | { config: null; problem: string };
+/** Where the key came from: an environment variable or the key `exp-code login` saved. */
+export type GatewayKeySource = "env" | "saved";
+
+/** The outcome of resolving the gateway: a config and its key's source, or the reason there is none. */
+export type GatewayResolution =
+  | { config: GatewayConfig; source: GatewayKeySource; problem?: undefined; missingKey?: undefined }
+  | { config: null; problem: string; source?: undefined; /** True when the only problem is that no key exists. */ missingKey: boolean };
+
+/** The saved login, as resolution needs it (see auth/credentials.ts). */
+export interface SavedGatewayKey {
+  hostedKey: string;
+  baseUrl?: string;
+}
 
 /** Environment variables that select and authorize the gateway. */
 export const GATEWAY_ENV = {
@@ -43,40 +55,53 @@ export const GATEWAY_ENV = {
 } as const;
 
 const MISSING_KEY_HELP =
-  "No Experiential gateway key found. Set EXP_API_KEY to an xpl_ key for the hosted gateway, " +
-  "set EXP_GATEWAY_KEY for a local `exp` gateway, or launch through `exp code`, which uses your `exp login` credential.";
+  "No Experiential gateway key found. Run `exp-code login` to sign in through your browser, " +
+  "or set EXP_API_KEY to an xpl_ key for the hosted gateway (EXP_GATEWAY_KEY for a local `exp` gateway).";
+
+/** Drop trailing slashes in linear time (a regex like `/\/+$/` backtracks on long slash runs). */
+export function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end -= 1;
+  return value.slice(0, end);
+}
 
 /** Remove trailing slashes so path joins stay predictable. */
 export function trimBaseUrl(url: string): string {
-  return url.trim().replace(/\/+$/, "");
+  return trimTrailingSlashes(url.trim());
 }
 
 /**
- * Resolve the gateway from environment variables.
+ * Resolve the gateway from environment variables, then the saved login.
  *
- * An explicit `EXP_CODE_GATEWAY` wins. Otherwise a hosted key selects the hosted gateway and a
- * local key selects the local one; with neither, there is no gateway and the reason says how to
- * provide one.
+ * An explicit `EXP_CODE_GATEWAY` wins. Otherwise a hosted key in the environment selects the
+ * hosted gateway, a local key the local one, and with neither the key `exp-code login` saved
+ * selects the hosted gateway. With none of them there is no gateway and the reason says how to
+ * provide one. The environment always wins over the saved login.
  */
-export function resolveGateway(env: NodeJS.ProcessEnv): GatewayResolution {
-  const hostedKey = env[GATEWAY_ENV.hostedKey]?.trim() ?? "";
+export function resolveGateway(env: NodeJS.ProcessEnv, saved: SavedGatewayKey | null = null): GatewayResolution {
+  const envHostedKey = env[GATEWAY_ENV.hostedKey]?.trim() ?? "";
   const localKey = env[GATEWAY_ENV.localKey]?.trim() ?? "";
+  const savedKey = saved?.hostedKey.trim() ?? "";
   const requested = env[GATEWAY_ENV.kind]?.trim().toLowerCase() ?? "";
   if (requested !== "" && requested !== "hosted" && requested !== "local") {
-    return { config: null, problem: `${GATEWAY_ENV.kind} must be "hosted" or "local", not "${requested}".` };
+    return { config: null, problem: `${GATEWAY_ENV.kind} must be "hosted" or "local", not "${requested}".`, missingKey: false };
   }
   let kind: GatewayKind;
   if (requested === "hosted" || requested === "local") kind = requested;
-  else if (hostedKey !== "") kind = "hosted";
+  else if (envHostedKey !== "") kind = "hosted";
   else if (localKey !== "") kind = "local";
-  else return { config: null, problem: MISSING_KEY_HELP };
+  else if (savedKey !== "") kind = "hosted";
+  else return { config: null, problem: MISSING_KEY_HELP, missingKey: true };
 
-  const apiKey = kind === "hosted" ? hostedKey : localKey;
+  const source: GatewayKeySource = kind === "hosted" && envHostedKey === "" ? "saved" : "env";
+  const apiKey = kind === "hosted" ? envHostedKey || savedKey : localKey;
   if (apiKey === "") {
     const variable = kind === "hosted" ? GATEWAY_ENV.hostedKey : GATEWAY_ENV.localKey;
-    return { config: null, problem: `${GATEWAY_ENV.kind}=${kind} needs ${variable}. ${MISSING_KEY_HELP}` };
+    return { config: null, problem: `${GATEWAY_ENV.kind}=${kind} needs ${variable}. ${MISSING_KEY_HELP}`, missingKey: true };
   }
   const override = env[GATEWAY_ENV.baseUrl]?.trim() ?? "";
-  const baseUrl = trimBaseUrl(override !== "" ? override : kind === "hosted" ? HOSTED_GATEWAY_BASE_URL : LOCAL_GATEWAY_BASE_URL);
-  return { config: { kind, baseUrl, apiKey } };
+  const savedBase = source === "saved" ? (saved?.baseUrl?.trim() ?? "") : "";
+  const fallback = kind === "hosted" ? HOSTED_GATEWAY_BASE_URL : LOCAL_GATEWAY_BASE_URL;
+  const baseUrl = trimBaseUrl(override !== "" ? override : savedBase !== "" ? savedBase : fallback);
+  return { config: { kind, baseUrl, apiKey }, source };
 }

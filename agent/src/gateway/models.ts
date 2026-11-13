@@ -107,7 +107,10 @@ export function parseModelListing(body: unknown): ListedModel[] {
 export function toProviderModel(listed: ListedModel, config: GatewayConfig, wireOverride?: GatewayWireApi): ProviderModelConfig {
   const api = chooseWireApi(listed.id, config.kind, wireOverride);
   const contextWindow = listed.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
-  const maxTokens = Math.min(listed.maxTokens ?? DEFAULT_MAX_TOKENS, contextWindow);
+  // The output reservation and the prompt share one window: a small-window model (8K) asked for
+  // its whole window as output can never fit the agent's prompt. Reserve at most half the window,
+  // whatever the listing allows.
+  const maxTokens = Math.max(1, Math.min(listed.maxTokens ?? DEFAULT_MAX_TOKENS, Math.floor(contextWindow / 2)));
   return {
     type: "chat",
     id: listed.id,
