@@ -48,7 +48,7 @@ describe("gateway models", () => {
   it("builds Pi models with defaults and the right base URL per wire", () => {
     expect(toProviderModel({ id: "plain" }, hosted)).toMatchObject({ id: "plain", api: "openai-completions", baseUrl: hosted.baseUrl, contextWindow: DEFAULT_CONTEXT_WINDOW, input: ["text"], reasoning: false });
     expect(toProviderModel({ id: "claude-x" }, hosted)).toMatchObject({ api: "anthropic-messages", baseUrl: "https://gw.example", reasoning: true });
-    expect(toProviderModel({ id: "m", contextWindow: 8_000, maxTokens: 50_000 }, hosted)).toMatchObject({ maxTokens: 8_000 });
+    expect(toProviderModel({ id: "m", contextWindow: 8_000, maxTokens: 50_000 }, hosted)).toMatchObject({ maxTokens: 4_000 });
   });
 
   it("fetches with the key, caches in memory and on disk without storing the key", async () => {
@@ -86,5 +86,15 @@ describe("listing cache key", () => {
     expect(cacheKey({ ...base, apiKey: "xpl_zzzzzzzSECRET-1" })).not.toBe(a);
     expect(cacheKey({ ...base, apiKey: "local-virtual-key" })).toBe(cacheKey({ ...base, apiKey: "another-local-key" }));
     expect(cacheKey({ ...base, baseUrl: "http://127.0.0.1:8080/v1", apiKey: "xpl_abcdefgSECRET-1" })).not.toBe(a);
+  });
+});
+
+describe("output reservation", () => {
+  it("never reserves more than half the context window, so the prompt always fits", () => {
+    const config = { kind: "hosted" as const, baseUrl: "https://gw.example/v1", apiKey: "xpl_k" };
+    expect(toProviderModel({ id: "small", contextWindow: 8192 }, config)).toMatchObject({ maxTokens: 4096 });
+    expect(toProviderModel({ id: "small-listed", contextWindow: 8192, maxTokens: 8192 }, config)).toMatchObject({ maxTokens: 4096 });
+    expect(toProviderModel({ id: "big", contextWindow: 400_000, maxTokens: 128_000 }, config)).toMatchObject({ maxTokens: 128_000 });
+    expect(toProviderModel({ id: "default", contextWindow: 1_000_000 }, config)).toMatchObject({ maxTokens: 32_000 });
   });
 });
