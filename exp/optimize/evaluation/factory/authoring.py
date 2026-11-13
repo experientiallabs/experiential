@@ -61,7 +61,7 @@ class AuthorSettings(ContractModel):
     reasoning_effort: ReasoningEffort | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
-    maximum_input_bytes: int = Field(default=128000, ge=512, le=512000)
+    maximum_input_bytes: int = Field(default=128000, ge=512, le=4_000_000)
     maximum_physical_attempts: int = Field(default=3, ge=1, le=10)
     deadline: AwareDatetime
 
