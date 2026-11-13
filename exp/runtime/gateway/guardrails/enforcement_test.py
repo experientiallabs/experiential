@@ -1072,6 +1072,45 @@ def test_unprotected_identity_skips_a_failed_check() -> None:
     assert result.messages[0].content == "hello"
 
 
+@pytest.mark.parametrize("expired", [False, True])
+def test_serial_modify_fail_open_preserves_input_without_waiving_output(expired: bool) -> None:
+    """Missing or timed-out modification returns the original input under an explicit opt-in."""
+    engine, _classifier = _engine(
+        classifier=_RaisingClassifier(),
+        checks=(
+            _check("input", action=GuardrailAction.MODIFY),
+            _check("output", stage=GuardrailCheckStage.OUTPUT, action=GuardrailAction.MODIFY),
+        ),
+        protected=True,
+    )
+    policy = engine.policies_for(_authorization())[0].model_copy(
+        update={"input_fail_open": True, "input_execution": "before_dispatch"}
+    )
+    original = _request("unchanged")
+    deadline = 0.0 if expired else 200.0
+    try:
+        assert (
+            _awaited(
+                engine.enforce_input(
+                    policy=policy,
+                    request=original,
+                    deadline_monotonic=deadline,
+                )
+            )
+            == original
+        )
+        with pytest.raises(GuardrailRejected):
+            _awaited(
+                engine.enforce_output(
+                    policy=policy,
+                    completion=GuardrailCompletion(text="output"),
+                    deadline_monotonic=deadline,
+                )
+            )
+    finally:
+        engine.close(timeout_seconds=2)
+
+
 def test_expired_deadline_fail_closes_for_protected_identities() -> None:
     """A check that starts after the request deadline is an error."""
     clock = _Clock()

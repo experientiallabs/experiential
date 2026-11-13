@@ -254,3 +254,54 @@ fn reinspection_retains_classifier_scores_cache_hits_and_failures() {
     assert_eq!(rows.len(), 1);
     assert!(rows[0]["moderation"]["observations"][0]["classifier_kind"].is_null());
 }
+
+#[test]
+fn failed_open_modifications_record_the_effective_action_and_underlying_outcome() {
+    for (adapter, timeout, outcome) in [
+        (json!({"kind":"unavailable"}), 1000, "unavailable"),
+        (json!({"kind":"coverage_error"}), 1000, "unsupported"),
+        (
+            json!({"kind":"keyword","needles":["secret"]}),
+            1000,
+            "uncertain",
+        ),
+        (json!({"kind":"allow"}), 0, "unavailable"),
+    ] {
+        let (factory, records) = sink();
+        let mut case: Value = crate::lossless_json::from_str(
+            include_str!("../../tests/generated/input_programs.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        case["checks"][0]["policy"]["protected"] = json!(true);
+        case["checks"][0]["policy"]["input_fail_open"] = json!(true);
+        case["checks"][0]["check"]["action"] = json!("modify");
+        case["checks"][0]["check"]["timeout_ms"] = json!(timeout);
+        case["checks"][0]["adapter"] = adapter;
+        let checks: Vec<Check> = crate::lossless_json::from_value(case["checks"].clone()).unwrap();
+        let subject: super::search_subject::Subject =
+            crate::lossless_json::from_value(case["subject"].clone()).unwrap();
+        let result = super::inspection_http::runtime()
+            .unwrap()
+            .block_on(super::input_program::enforce(
+                &checks[..1],
+                &subject,
+                Instant::now() + Duration::from_secs(5),
+                Some(&factory),
+            ))
+            .unwrap();
+        assert_eq!(result.request, subject.request);
+        assert!(factory
+            .reports
+            .drain(Instant::now() + Duration::from_secs(2)));
+        let rows = records.0.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["moderation"]["status"], "failed_open");
+        let record = &rows[0]["moderation"]["observations"][0];
+        assert_eq!(record["action"], "allow");
+        assert_eq!(record["would_action"], "modify");
+        assert_eq!(record["outcome"], outcome);
+    }
+}

@@ -134,15 +134,21 @@ impl Factory {
         let Some(reporter) = self.reporter() else {
             return;
         };
-        let action = result["failure"]["safe_details"]["action"]
-            .as_str()
-            .or_else(|| result["action"].as_str())
-            .unwrap_or("error");
+        let failed_open = result["failed_open"] == true;
+        let action = if failed_open {
+            "allow"
+        } else {
+            result["failure"]["safe_details"]["action"]
+                .as_str()
+                .or_else(|| result["action"].as_str())
+                .unwrap_or("error")
+        };
         let unavailable = result["failure"]["failure_class"] == "unavailable";
+        let unsupported = result["failure"]["failure_class"] == "unsupported_capability";
         let checkless = result["failure"].is_object()
             && result["failure"]["safe_details"]["check_id"].is_null();
         reporter.submit(&json!({"moderation": {
-            "status": if unavailable {"unavailable"} else if action == "block" || action == "error" {"denied"} else {"allowed"},
+            "status": if failed_open {"failed_open"} else if unavailable {"unavailable"} else if action == "block" || action == "error" {"denied"} else {"allowed"},
             "observations": [{"policy_id":check.policy["policy_id"], "revision":check.policy["revision"],
                 "check_id":if checkless {Value::Null} else {check.check["check_id"].clone()},
                 "adapter_id":if checkless {Value::Null} else {check.check["adapter_id"].clone()},
@@ -152,7 +158,7 @@ impl Factory {
                 "would_action":check.check["action"],
                 "classifier_kind":result["classifier_kind"], "scores":result["scores"],
                 "cached":result["cached"], "subject_sha256":result["subject_sha256"],
-                "outcome":if unavailable {"unavailable"} else if action == "allow" {"allow"} else {"flagged"},
+                "outcome":if unavailable {"unavailable"} else if unsupported {"unsupported"} else if failed_open {"uncertain"} else if action == "allow" {"allow"} else {"flagged"},
                 "latency_ms":started.elapsed().as_secs_f64() * 1000.0}]
         }}));
     }

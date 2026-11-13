@@ -123,7 +123,10 @@ def require_unguarded_surface(
         engine.record_unsupported_observations(
             policies, request_id=authorization.request_id, surface=surface
         )
-    if any(policy.mode == "enforce" and not policy.input_fail_open for policy in policies):
+    if any(
+        policy.mode == "enforce" and (policy.output_checks or not policy.input_fail_open)
+        for policy in policies
+    ):
         raise NativeBridgeError(
             OpenAIProtocolError(
                 status_code=400,

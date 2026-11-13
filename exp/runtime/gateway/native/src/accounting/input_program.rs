@@ -196,6 +196,12 @@ async fn recorded(
                 Err(failure) => failure.clone(),
             }
         };
+        if result.is_ok()
+            && decision["failure"].is_object()
+            && check.policy["input_fail_open"] == true
+        {
+            decision["failed_open"] = json!(true);
+        }
         if let Some(fields) = classification.as_object() {
             for (key, value) in fields {
                 decision[key] = value.clone();
@@ -308,6 +314,7 @@ mod tests {
                     &subject,
                     Instant::now() + Duration::from_secs(1),
                     &mut Value::Null,
+                    &mut Value::Null,
                 ))
                 .unwrap();
             assert_eq!(actual.request, subject.request);
@@ -329,6 +336,7 @@ mod tests {
                 &check,
                 &subject,
                 Instant::now() + Duration::from_secs(1),
+                &mut Value::Null,
                 &mut Value::Null,
             ))
             .err()

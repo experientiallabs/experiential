@@ -224,13 +224,15 @@ def _applied(
 
 
 def _uncertain(policy: GuardrailPolicy, check: GuardrailCheck) -> None:
-    """Fail closed for a protected policy, or skip the uncertain check.
+    """Apply the input policy when a deterministic check cannot produce a verdict.
 
     Raises:
-        GuardrailRejected: The policy is protected.
+        GuardrailRejected: The policy is protected and input fail-open is disabled.
     """
-    _record(policy, check, GuardrailAction.ERROR)
-    if policy.protected:
+    _record(
+        policy, check, GuardrailAction.ALLOW if policy.input_fail_open else GuardrailAction.ERROR
+    )
+    if policy.protected and not policy.input_fail_open:
         raise GuardrailRejected(
             GatewayFailure(
                 failure_class=GatewayFailureClass.UNAVAILABLE,

@@ -430,10 +430,14 @@ def test_the_native_input_chain_refuses_matched_tool_arguments() -> None:
         )
 
 
-def test_the_native_input_chain_fails_closed_on_an_overrun_scan() -> None:
-    """A scan that finishes past its authored budget never returns a verdict."""
+@pytest.mark.parametrize("fail_open", [False, True])
+def test_the_native_input_chain_obeys_uncertainty_policy_on_an_overrun_scan(
+    fail_open: bool,
+) -> None:
+    """A late modifying scan preserves the input only under explicit fail-open policy."""
     engine = engine_from_document(_adapter(builtin_patterns=["email"]))
     policy = engine.policies_for(_authorization("org", "identity"))[0]
+    policy = policy.model_copy(update={"input_fail_open": fail_open})
     assert policy is not None
     detectors = compile_native_detectors(engine.deterministic_specifications)
     ticks = iter((0.0, 0.0, 5.0))
@@ -442,15 +446,31 @@ def test_the_native_input_chain_fails_closed_on_an_overrun_scan() -> None:
         """Advance past the authored 500 ms budget during the scan itself."""
         return next(ticks)
 
-    with pytest.raises(GuardrailRejected) as exc:
-        native_input_request(
-            policy,
-            detectors,
-            _request(content="alice@example.com"),
-            monotonic=_clock,
-            deadline_monotonic=1e12,
-        )
-    assert exc.value.failure.failure_class.value == "unavailable"
+    request = _request(content="alice@example.com")
+    try:
+        if fail_open:
+            assert (
+                native_input_request(
+                    policy,
+                    detectors,
+                    request,
+                    monotonic=_clock,
+                    deadline_monotonic=1e12,
+                )
+                == request
+            )
+        else:
+            with pytest.raises(GuardrailRejected) as exc:
+                native_input_request(
+                    policy,
+                    detectors,
+                    request,
+                    monotonic=_clock,
+                    deadline_monotonic=1e12,
+                )
+            assert exc.value.failure.failure_class.value == "unavailable"
+    finally:
+        engine.close(timeout_seconds=2)
 
 
 def test_the_native_input_chain_declines_a_hosted_adapter() -> None:

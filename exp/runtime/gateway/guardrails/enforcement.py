@@ -22,6 +22,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     ClassifierVerdict,
     GuardrailAction,
     GuardrailCheck,
+    GuardrailCheckStage,
     GuardrailCompletion,
     GuardrailOutcome,
     GuardrailPolicy,
@@ -871,8 +872,10 @@ class GuardrailEngine:
         latency_seconds: float = 0.0,
     ) -> ClassifierVerdict | None:
         """Apply fail-closed or skip-and-continue for an uncertain check."""
-        self._decision(policy, check, GuardrailAction.ERROR, outcome, latency_seconds)
-        if policy.protected and policy.mode == "enforce":
+        fail_open = check.stage is GuardrailCheckStage.INPUT and policy.input_fail_open
+        action = GuardrailAction.ALLOW if fail_open else GuardrailAction.ERROR
+        self._decision(policy, check, action, outcome, latency_seconds)
+        if policy.protected and policy.mode == "enforce" and not fail_open:
             raise GuardrailRejected(
                 GatewayFailure(
                     failure_class=GatewayFailureClass.UNAVAILABLE,
