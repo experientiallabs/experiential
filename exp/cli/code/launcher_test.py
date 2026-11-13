@@ -168,7 +168,7 @@ def test_no_gateway_explains_both_paths() -> None:
 
 
 def test_command_runs_the_pinned_release_through_npx() -> None:
-    """The default command is `npx --yes @experiential-labs/exp-code@<version>` with arguments passed through."""
+    """The default command is `npx --yes @experiential-labs/exp-code@<version>` plus arguments."""
     command = exp_code_command(
         NODE, ["-p", "hi", "--mode", "json"], {}, which=_which({"npx": "/opt/node/bin/npx"})
     )

@@ -1,9 +1,9 @@
 """Launch exp-code, the Node.js agent, against a local or hosted Experiential gateway.
 
 ``exp code`` runs the exact exp-code release this CLI was released with, through
-``npx --yes @experiential-labs/exp-code@<version>``. ``EXP_CODE_DIR`` points at a built checkout of the
-``agent/`` package instead, for development. A local ``exp`` gateway is used when its
-virtual key is in ``EXP_GATEWAY_KEY`` and it answers on loopback; otherwise the hosted
+``npx --yes @experiential-labs/exp-code@<version>``. ``EXP_CODE_DIR`` points at a built
+checkout of the ``agent/`` package instead, for development. A local ``exp`` gateway is
+used when its virtual key is in ``EXP_GATEWAY_KEY`` and it answers on loopback; otherwise the hosted
 gateway is used with ``EXP_API_KEY``, ``EXPLABS_API_KEY``, or the ``exp login`` credential.
 The key reaches exp-code only through its environment.
 """
