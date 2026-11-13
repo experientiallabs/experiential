@@ -42,6 +42,7 @@ from exp.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     JsonObject,
+    sha256_json,
     stable_id,
 )
 from exp.common.core.locks import CoordinationLock
@@ -52,6 +53,7 @@ from exp.optimize.evaluation.continuations.job import (
     continuation_result_reference,
     execute_continuation_job,
 )
+from exp.optimize.evaluation.variance.bounded import run_keyed
 from exp.optimize.evaluation.variance.judged import EpisodeJudge, judge_study, slot_rewards
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.simulation.continuations import (
@@ -74,6 +76,9 @@ CROSSTALK_EXEMPLARS_TYPE = "crosstalk-exemplars"
 """Artifact type of one saved exemplar set."""
 
 MAXIMUM_SYSTEM_PROMPT_CHARACTERS = 20_000
+
+CROSSTALK_CONCURRENCY = 6
+"""Most target arms run at once; each study's rollouts still share the run's rollout gate."""
 """The chat actor's system prompt ceiling; a context-delivered block must fit inside it."""
 
 Arm = Literal["none", "random", "top"]
@@ -484,17 +489,29 @@ def run_crosstalk_probe(
             ExemplarSet(arm="random", exemplars=_exemplars(source_run, source.rewards, drawn)),
         )
         refs = tuple(_save_exemplars(project, identity, item, code_revision) for item in sets)
-        arms: list[ArmResult] = []
+        cells: list[tuple[int, Arm, ProbeTarget, ContinuationJob]] = []
         for index, target in enumerate(spec.targets):
             jobs: dict[Arm, ContinuationJob] = {"none": target.job}
             for item, reference in zip(sets, refs, strict=True):
                 job = backend.deliver(target, item, reference, spec)
                 require_matched(target.job, job)
                 jobs[item.arm] = job
-            for arm in ("none", "random", "top"):
-                run = backend.run(jobs[arm])
-                judged = backend.judge(run, target, jobs[arm])
-                arms.append(_arm(index, arm, run, judged))
+            cells.extend((index, arm, target, jobs[arm]) for arm in ("none", "random", "top"))
+
+        def measured(index: int, arm: Arm, target: ProbeTarget, job: ContinuationJob) -> ArmResult:
+            """Run and judge one target arm."""
+            run = backend.run(job)
+            return _arm(index, arm, run, backend.judge(run, target, job))
+
+        # Target arms are independent jobs, so they run at once (arms with the same job run in
+        # order on one worker); results keep target and arm order.
+        arms = list(
+            run_keyed(
+                [lambda cell=cell: measured(*cell) for cell in cells],
+                [sha256_json(cell[3].model_dump(mode="json")) for cell in cells],
+                min(len(cells), CROSSTALK_CONCURRENCY) or 1,
+            )
+        )
         contrasts = (
             _contrast("top_vs_none", arms, "none", spec),
             _contrast("top_vs_random", arms, "random", spec),
