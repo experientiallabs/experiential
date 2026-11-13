@@ -154,6 +154,10 @@ def _chosen_points(
     for tier in mining.tiers:
         report = reports[tier.tier]
         order = family_order(context.project.artifacts, mining.blast, report)
+        if not order and authoring.unscored_families:
+            # No tier fails naturally from this tier's points: re-authoring and nudges are what
+            # can widen the decision, so its selected points still become candidates.
+            order = report.ranking
         candidates.extend((tier, point) for point in order[: authoring.families_per_tier])
     if authoring.maximum_families is None or len(candidates) <= authoring.maximum_families:
         return candidates
@@ -162,7 +166,7 @@ def _chosen_points(
         rank = {
             row.point_id: row.rank
             for row in load_blast_ranking(context.project.artifacts, mining.blast)
-            if row.score is not None
+            if row.score is not None or authoring.unscored_families
         }
 
     def key(item: tuple[int, tuple[TierMining, int]]) -> tuple[int, int]:

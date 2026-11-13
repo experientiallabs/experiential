@@ -471,6 +471,9 @@ class AuthoringSettings(ContractModel):
         families_per_tier: Highest-ranked points of each tier's run turned into families.
         maximum_families: Keep only this many families across tiers, by blast-radius rank
             (None keeps every tier's); cuts the serial family stage.
+        unscored_families: When a tier has no point with a scored blast radius (no tier
+            fails naturally), author families from its selected points anyway, so re-authoring
+            and nudges can widen the decision; admission still requires proven divergence.
         maximum_variants: Most scenarios one family may author; more is refused before any
             world is authored, so the up-front price stays an upper bound.
         repeats: Pairs per selection contrast.
@@ -517,6 +520,7 @@ class AuthoringSettings(ContractModel):
     ladder_strengths: tuple[NudgeStrength, ...] = ("strong", "medium", "weak")
     families_per_tier: int = Field(default=1, ge=1, le=8, strict=True)
     maximum_families: int | None = Field(default=None, ge=1, le=40, strict=True)
+    unscored_families: bool = False
     maximum_variants: int = Field(default=4, ge=2, le=16, strict=True)
     repeats: int = Field(default=8, ge=1, le=100, strict=True)
     confirmation_repeats: int = Field(default=8, ge=1, le=100, strict=True)
