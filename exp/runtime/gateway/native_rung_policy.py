@@ -619,10 +619,10 @@ def record_attempt_health(
     if graceful_transport_retirement(settlement, failure):
         # Retiring a connection says nothing about provider health. Release
         # a probe without clearing prior real failures or recording success.
-        health.release_probe(key)
+        health.release_probe(key, attempt_id)
         return
     if opened:
-        health.dispatch_opened(key)
+        health.dispatch_opened(key, attempt_id)
     if failure is not None:
         policy = deployment.gateway.dispatch
         if failure.failure_class == GatewayFailureClass.THROTTLED and (
@@ -637,9 +637,9 @@ def record_attempt_health(
             # rediscovers headroom. Only admission-participating rungs reserve
             # through the registry, providing a real window and enforcing the ceiling.
             loads.record_throttle(rung_load_key(deployment))
-        health.failed(key, failure)
+        health.failed(key, failure, attempt_id)
     else:
-        health.succeeded(key)
+        health.succeeded(key, attempt_id)
     exhausted = settlement_rate_limit(settlement).exhausted_reset_after_seconds
     if exhausted is not None:
         health.exhausted(key, exhausted)

@@ -34,7 +34,7 @@ from exp.runtime.gateway.failover_pass import (
     sideways_claim,
 )
 from exp.runtime.gateway.guardrails.session import discard_guardrails
-from exp.runtime.gateway.health import DeploymentHealthRegistry
+from exp.runtime.gateway.health import DeploymentHealthRegistry, claim_route_from
 from exp.runtime.gateway.lane_saturation import lane_saturated_failure, overflow_target
 from exp.runtime.gateway.ledger import AttemptRejectedError
 from exp.runtime.gateway.model_chain_authority import require_bound_model_chain_authority
@@ -59,7 +59,6 @@ from exp.runtime.gateway.native_execution import (
     THROTTLE_SURFACED_CACHE_PRESERVING,
     InflightRequest,
     ThrottleDisposition,
-    claim_route_from,
     deployment_health_key,
     dispatch_disclosure,
 )
@@ -475,6 +474,7 @@ class NativeAttemptAccounting:
                     keys,
                     current_depth if tool_search_round or reasoning_repair else 0,
                     (current_depth,) if reasoning_repair else ladder,
+                    throttle_probe=True,
                 )
             if reasoning_repair:
                 ladder = (current_depth,)
@@ -700,6 +700,7 @@ class NativeAttemptAccounting:
                 self._count_throttle_disposition(disposition)
             elif throttle_backoff:
                 self._count_throttle_disposition(THROTTLE_BACKOFF)
+            self._health.bind_throttle_probe(keys[candidate], attempt_id)
             if self.recovery_host is None:
                 bind_sticky_dispatch(self._sticky, entry, deployment)
             observe_reserved_attempt(self.recovery_host, entry, attempt_id, deployment)

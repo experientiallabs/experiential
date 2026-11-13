@@ -1282,9 +1282,11 @@ def test_a_fully_throttled_route_exhausts_as_throttled_not_provider_internal() -
     unavailable", misfiling a 429 storm as an outage.
     """
     registry, ledger, entry = _registry()
+    # The provider stated its wait, so no paced probe passes the window.
     throttle = GatewayFailure(
         failure_class=GatewayFailureClass.THROTTLED,
         safe_message="provider throttled the request",
+        retry_after_seconds=20,
     )
     for deployment in entry.route.deployments:
         registry.health.failed(deployment_health_key(entry.authorization, deployment), throttle)
@@ -1309,6 +1311,42 @@ def test_a_fully_throttled_route_exhausts_as_throttled_not_provider_internal() -
     assert public.retry_after_seconds == retry_after
     assert [failure.failure_class.value for failure in ledger.finished_requests] == ["throttled"]
     assert registry.entry("request-one") is None
+
+
+def test_a_lone_lane_dispatches_the_next_request_after_one_hintless_429() -> None:
+    """One 429 with no Retry-After on a single-lane model no longer refuses it.
+
+    Each such 429 used to suppress the lane for the default window on its
+    worker, refusing every caller at zero attempts while the provider kept
+    serving. The next first dial now takes a paced probe bound to its attempt.
+    """
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)  # type: ignore[arg-type]
+    route = _route((_deployment("mp-lone-lane", connection_sha256="b" * 64),))
+    entry = InflightRequest(
+        authorization=route.snapshot.authorization,
+        route=route,
+        request=_request(),
+        deadline_monotonic=time.monotonic() + 30,
+    )
+    registry.register(entry)
+    registry.health.failed(
+        deployment_health_key(entry.authorization, entry.route.deployment),
+        GatewayFailure(
+            failure_class=GatewayFailureClass.THROTTLED,
+            safe_message="provider throttled the request: http 429",
+        ),
+    )
+
+    started = _start(registry, ordinal=0)
+
+    assert started.get("exhausted") is not True
+    assert started["route_depth"] == 0
+    assert [row["route_depth"] for row in ledger.started] == [0]
+    assert not ledger.finished_requests
+    key = deployment_health_key(entry.authorization, entry.route.deployment)
+    registry.health.succeeded(key, str(started["attempt_id"]))
+    assert registry.health.claim(key)
 
 
 _PINNED_ROUTE_ID = "route_" + "d" * 64

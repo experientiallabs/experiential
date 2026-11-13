@@ -44,10 +44,14 @@ from exp.runtime.gateway.contracts import (
     GatewayFailure,
     GatewayFailureClass,
 )
-from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
+from exp.runtime.gateway.health import (
+    DeploymentHealthKey,
+    DeploymentHealthRegistry,
+    claim_route_from,
+)
 from exp.runtime.gateway.lane_ejection import DEAD_LANE_FAILURES
 from exp.runtime.gateway.lane_saturation import lane_saturated_failure
-from exp.runtime.gateway.native_execution import InflightRequest, claim_route_from
+from exp.runtime.gateway.native_execution import InflightRequest
 from exp.runtime.gateway.native_fallback_rules import route_fallback_rules, untried_depths
 from exp.runtime.gateway.rung_admission import RungShed
 
