@@ -14,6 +14,8 @@ from exp_gateway_native import CaptureCollector, NativeCallbacks
 
 from exp.common.sqlite.native import connect
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
+from exp.runtime.gateway.guardrails.contracts import GuardrailOutcome
+from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.ledger_test import (
     FakeLedgerClock,
@@ -23,12 +25,17 @@ from exp.runtime.gateway.ledger_test import (
     _request,
 )
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
-from exp.runtime.gateway.native_capture import CaptureConfiguration, CaptureController
+from exp.runtime.gateway.native_capture import (
+    CaptureConfiguration,
+    CaptureController,
+    PendingCapture,
+)
 from exp.runtime.gateway.native_continuation_store import NativeContinuationStore
 from exp.runtime.gateway.native_execution import InflightRequest
 from exp.runtime.gateway.native_handoff import NativeRequestHandoff, accounting_drained, uses_native
 from exp.runtime.gateway.native_sqlite import SQLiteRequestFactory
 from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.tests.guardrail_observation_test import _Classifier, _Engine, _policy
 
 
 def _prepared(tmp_path: Path) -> tuple[SQLiteRequestFactory, InflightRequest, SQLiteAttemptLedger]:
@@ -173,6 +180,78 @@ def test_failed_handoff_releases_capture_without_a_provider_dispatch(
     finally:
         assert accounting.close()
         collector.close(1)
+
+
+@pytest.mark.parametrize("stage", ["capture", "serialize", "register"])
+@pytest.mark.parametrize("completed", [False, True])
+def test_failed_handoff_retains_the_enforcing_inspection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str, completed: bool
+) -> None:
+    """Every pre-transfer failure keeps one enforcement report and its telemetry."""
+    underlying, entry, ledger = _prepared(tmp_path)
+    classifier = _Classifier(GuardrailOutcome.FLAGGED)
+    policy = _policy(timeout_ms=5000).model_copy(
+        update={"mode": "enforce", "input_execution": "parallel"}
+    )
+    engine = _Engine(classifier, policy)
+    session = GuardrailSession(
+        engine, (policy,), time.monotonic() + 10, request_id=str(entry.authorization.request_id)
+    )
+    entry.guardrails = session
+    assert isinstance(entry.request, GatewayRequest)
+    entry.pending_capture = PendingCapture(entry.request, None)
+    collector = CaptureCollector(CaptureConfiguration().model_dump_json(), lambda _record: None)
+    capture = CaptureController(collector, application_for=lambda _auth: "fixture")
+    accounting = NativeAttemptAccounting(
+        native_request_factory=underlying, background_recovery=False, capture=capture
+    )
+
+    def fail(*_args: object, **_kwargs: object) -> str:
+        """Inject a failure before the native request owner accepts the handoff."""
+        raise ValueError("handoff fixture failed")
+
+    if stage == "capture":
+        monkeypatch.setattr(capture, "prepare", fail)
+    else:
+        monkeypatch.setattr(
+            "exp.runtime.gateway.native_registration.registration_json",
+            fail if stage == "serialize" else lambda *_args, **_kwargs: "{}",
+        )
+
+    def prepare() -> None:
+        """Start a genuine native inspection before reaching the failing stage."""
+        assert isinstance(entry.request, GatewayRequest)
+        session.prepare_dispatch((entry.request,), overlap=True)
+        assert session.native_input is not None
+        assert classifier.started.wait(2)
+        if completed:
+            classifier.release.set()
+            session.native_input.wait_json()
+
+    try:
+        with pytest.raises(ValueError):
+            accounting.register(entry, prepare=prepare)
+        classifier.release.set()
+        assert accounting.close(timeout_seconds=2)
+        with connect(ledger.database_path) as connection:
+            reports = connection.execute("SELECT result FROM gateway_input_moderation").fetchall()
+            assert len(reports) == 1
+            observation = json.loads(reports[0][0])["observations"][0]
+            assert observation["mode"] == "enforce"
+            assert observation["outcome"] == ("flagged" if completed else "cancelled")
+            assert connection.execute("SELECT terminal_state FROM gateway_requests").fetchall() == [
+                ("failed",)
+            ]
+            assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone() == (0,)
+        counters = json.loads(accounting.native.moderation_recording_json())
+        assert counters["telemetry"]["totals"]["samples"] == 1
+        assert counters["failed"] == counters["dropped"] == counters["pending"] == 0
+        assert session.native_input is None
+    finally:
+        classifier.release.set()
+        accounting.close(timeout_seconds=2)
+        collector.close(1)
+        engine.close(timeout_seconds=2)
 
 
 @pytest.mark.parametrize("cleanup_fails", [False, True])
