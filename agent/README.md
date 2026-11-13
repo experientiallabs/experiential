@@ -1,20 +1,21 @@
 # exp-code
 
-exp-code is Experiential's open-source coding and cowork agent. It is
-[Pi's coding agent](https://github.com/earendil-works/pi/tree/main/packages/coding-agent)
-(`@earendil-works/pi-coding-agent`, an exact-pinned dependency, not a fork) with three things
-preloaded:
+exp-code is Experiential's open-source coding and cowork agent. Run it in any folder and it
+reads your files, writes and runs code, searches the web, and hands back finished work: code,
+reports, spreadsheets, decks and PDFs. It is the same agent that powers Chat on the
+Experiential platform.
 
-- **The Experiential gateway as a model provider.** Models come from the gateway's
-  `GET /v1/models`; every call goes through your local `exp` gateway or the hosted one.
-- **The exp-code extension.** Cowork tools (`todo_write`, `ask_user`, `web_search`,
-  `web_fetch`), a cowork section in the system prompt, and document skills for Word, Excel,
+- **Every model on the Experiential gateway.** Models come from the gateway's
+  `GET /v1/models`; every call goes through your local `exp` gateway or the hosted one, with
+  its cost reported per turn.
+- **Cowork tools.** A visible task list (`todo_write`), clarifying questions (`ask_user`), web
+  search and page reading (`web_search`, `web_fetch`), and document skills for Word, Excel,
   PowerPoint, PDF, charts, and data analysis.
+- **A full terminal agent.** An interactive terminal UI, sessions you can continue, automatic
+  context compaction, `/model` to switch models, your own extensions, skills and MCP servers,
+  and print, JSON and RPC modes for scripts.
 - **A headless runner.** A file-protocol runner that executes one agent run inside a sandbox,
   for products that host agent sessions.
-
-Everything else is Pi: the terminal UI, sessions, compaction, `/model`, extensions, skills,
-MCP, print mode, JSON mode, and RPC mode all work as Pi documents them.
 
 ## Install
 
@@ -61,10 +62,8 @@ settled cost, which exp-code shows as the cost of the turn.
 ## Configuration directory
 
 exp-code keeps its own configuration in `~/.exp-code/agent` (settings, saved credentials,
-sessions, extensions, skills), separate from any Pi installation, by setting Pi's
-`PI_CODING_AGENT_DIR` before Pi loads. Project files keep Pi's conventions (`AGENTS.md`, and
-`.pi/` for project settings and resources), so a project can share them with Pi. Telemetry
-(`PI_TELEMETRY`) and the version check (`PI_SKIP_VERSION_CHECK`) are off unless you set them.
+sessions, extensions, skills). In a project it reads `AGENTS.md` for instructions and `.pi/`
+for project settings and resources. Telemetry and the update check are off.
 
 ## Modes
 
@@ -77,9 +76,8 @@ exp-code --model experiential/<alias>     # pick a model
 exp-code -c                               # continue the last session
 ```
 
-See Pi's [CLI](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/cli.md),
-[JSON](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/json.md), and
-[RPC](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md) docs.
+The full flag list, and the JSON and RPC formats, are in the upstream docs linked under
+[Built on Pi](#built-on-pi).
 
 ## The extension
 
@@ -122,7 +120,7 @@ as `@experiential-labs/exp-code/protocol`):
 | `runs/<runId>/events.jsonl` | out | One `RunEvent` per line, `seq` from 1, append-only: `run_start`, `user_message`, `text`, `thinking`, `tool_start`, `tool_update`, `tool_end`, `todo`, `question`, `turn`, `files`, `error`, `run_end`. |
 | `runs/<runId>/inbox.jsonl` | in | `{"type":"steer","text":...}` or `{"type":"stop"}`, each with an optional `requestId`; a repeated `requestId` is ignored. |
 | `runs/<runId>/status.json` | out | `RunStatus` with a heartbeat every 5 seconds. |
-| `session.jsonl` | both | Pi's session file: the transcript, with compaction, carried across runs. |
+| `session.jsonl` | both | The session file: the transcript, with compaction, carried across runs. |
 | `runs/<runId>/runner.json` | internal | Recovery state: restart count, interrupted calls, inbox position. |
 
 Behavior worth knowing:
@@ -159,3 +157,16 @@ Pushing the tag runs `.github/workflows/agent-release.yml`: it tests and bundles
 attaches `exp-code-runner.mjs` (the self-contained sandbox runner), its `.sha256`, and
 `exp-code-protocol.ts` (the runner protocol) to a GitHub release, so a host can pin a version
 and verify the file it runs. With an `NPM_TOKEN` secret configured it also publishes to npm.
+
+## Built on Pi
+
+exp-code is built on [Pi's coding agent](https://github.com/earendil-works/pi/tree/main/packages/coding-agent)
+(`@earendil-works/pi-coding-agent`, exact-pinned) and extends it with the Experiential gateway
+provider, the cowork tools and skills, and the sandbox runner. The terminal UI, sessions,
+compaction, extensions, skills, MCP and the print, JSON and RPC modes work as Pi documents
+them: see its [CLI](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/cli.md),
+[JSON](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/json.md), and
+[RPC](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md) docs.
+exp-code sets Pi's `PI_CODING_AGENT_DIR` to `~/.exp-code/agent` before Pi loads, so it never
+shares state with a Pi installation, and leaves `PI_TELEMETRY` and `PI_SKIP_VERSION_CHECK` off
+unless you set them.

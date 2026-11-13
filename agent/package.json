@@ -1,7 +1,7 @@
 {
   "name": "@experiential-labs/exp-code",
-  "version": "0.1.4",
-  "description": "Experiential's open-source coding and cowork agent, built on Pi's coding agent and served through the Experiential gateway.",
+  "version": "0.1.5",
+  "description": "Experiential's open-source coding and cowork agent: run it in any folder to read files, write and run code, search the web, and produce documents, on any model through the Experiential gateway.",
   "type": "module",
   "license": "Apache-2.0",
   "repository": {
@@ -12,7 +12,7 @@
   "keywords": [
     "coding-agent",
     "agent",
-    "pi",
+    "cowork",
     "experiential",
     "cli"
   ],
