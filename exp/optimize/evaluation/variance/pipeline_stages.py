@@ -165,6 +165,8 @@ from exp.simulation.rules.recall import RecallPolicy
 
 __all__ = ["MINING_STAGE", "RULES_STAGE", "TRACEML_STAGE"]
 
+NO_USABLE_SELECTION = "no judge produced a usable selection"
+"""A tier failure that leaves the tier out instead of stopping the stage."""
 TIER_LOCK_RETRIES = 30
 """Retries of a tier whose start collided with a shared non-blocking lock."""
 TIER_LOCK_BACKOFF_SECONDS = 2.0
@@ -908,7 +910,18 @@ class _MiningStage:
                 pool.submit(contextvars.copy_context().run, mine, alias) for alias in pickable
             ]
             wait(futures)
-        for future in futures:
+        survivors = []
+        for alias, future in zip(pickable, futures, strict=True):
+            error = future.exception()
+            if isinstance(error, ValueError) and NO_USABLE_SELECTION in str(error):
+                # Like a tier with no qualified point, a tier whose selectors picked nothing
+                # usable is left out; the other tiers' error mining proceeds.
+                logger.warning("tier %s left out of error mining: %s", alias, error)
+                continue
+            survivors.append(future)
+        if not survivors:
+            raise ValueError(f"{NO_USABLE_SELECTION} in any tier")
+        for future in survivors:
             tier = future.result()
             tiers.append(tier)
             references.extend((tier.report, tier.judged_group, tier.job.study.checkpoint))

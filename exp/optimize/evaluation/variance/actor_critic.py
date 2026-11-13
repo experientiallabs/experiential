@@ -30,6 +30,7 @@ Harbor starts. Unknown outcomes stay explicit and are never redrawn.
 
 from __future__ import annotations
 
+import logging
 import random
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -134,6 +135,8 @@ PICK_RULE = (
     "are never picked, so this is not an unconditional draw over every attempted trajectory"
 )
 """The trajectory pick's eligibility rule, saved verbatim in every report."""
+
+logger = logging.getLogger(__name__)
 
 
 class ActorCriticSpec(ContractModel):
@@ -584,6 +587,10 @@ def run_actor_critic(
             sorted({p.step for d in judges if d.selection is not None for p in d.selection.points})
         )
         if not chosen:
+            for row in judges:
+                logger.warning(
+                    "selector draw %s gave no usable selection: %s", row.draw, row.failure
+                )
             raise ValueError("no judge produced a usable selection; inspect the saved draws")
         schedule = None
         if gate is not None and record is not None:
