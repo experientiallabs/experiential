@@ -49,11 +49,13 @@ from exp.runtime.models.providers.wire_messages import anthropic_blocks, respons
     "payload", ["x" * 8192, "\x00" * 1024, "\U0001f642" * 1536], ids=["ascii", "escaped", "utf8"]
 )
 @pytest.mark.parametrize("protected", [True, False])
+@pytest.mark.parametrize("fail_open", [False, True])
 def test_private_tool_context_is_bounded_before_local_projection(
     execution: str,
     field: str,
     payload: str,
     protected: bool,
+    fail_open: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Private examples and callers cannot bypass authored bounds in either execution path."""
@@ -69,7 +71,7 @@ def test_private_tool_context_is_bounded_before_local_projection(
     assert request_content_bytes(request) < 4096
     engine = engine_from_document(_adapter(builtin_patterns=["email"]))
     policy = engine.policies_for(_authorization("org", "identity"))[0].model_copy(
-        update={"protected": protected, "max_request_bytes": 4096}
+        update={"protected": protected, "max_request_bytes": 4096, "input_fail_open": fail_open}
     )
     detectors = compile_native_detectors(engine.deterministic_specifications)
     projected: list[bool] = []
@@ -81,6 +83,18 @@ def test_private_tool_context_is_bounded_before_local_projection(
 
     monkeypatch.setattr(text_coverage, "canonical_json_bytes", forbidden_projection)
     try:
+        if fail_open:
+            if execution == "async":
+                result = asyncio.run(
+                    engine.enforce_input(policy=policy, request=request, deadline_monotonic=1e12)
+                )
+            else:
+                result = native_input_request(
+                    policy, detectors, request, monotonic=lambda: 0.0, deadline_monotonic=1e12
+                )
+            assert result is request
+            assert not projected
+            return
         with pytest.raises(GuardrailRejected) as rejected:
             if execution == "async":
                 asyncio.run(
@@ -160,14 +174,34 @@ def test_native_and_python_match_exact_tool_error_wire_text(
 
 @pytest.mark.parametrize("field", UNSUPPORTED_TEXT_INPUTS)
 @pytest.mark.parametrize("protected", [True, False])
-def test_native_and_python_input_refuse_incomplete_coverage(field: str, protected: bool) -> None:
-    """The native fast path cannot turn a Python coverage failure into a partial allow."""
+@pytest.mark.parametrize("fail_open", [False, True])
+def test_native_and_python_input_apply_incomplete_coverage_policy(
+    field: str, protected: bool, fail_open: bool
+) -> None:
+    """Unsupported modifying scans retain the original request only with explicit fail-open."""
     engine = engine_from_document(_adapter(builtin_patterns=["email"]))
     policy = engine.policies_for(_authorization("org", "identity"))[0].model_copy(
-        update={"protected": protected}
+        update={"protected": protected, "input_fail_open": fail_open}
     )
     detectors = compile_native_detectors(engine.deterministic_specifications)
     request = unsupported_text_request(field)
+    if fail_open:
+        try:
+            assert (
+                asyncio.run(
+                    engine.enforce_input(policy=policy, request=request, deadline_monotonic=1e12)
+                )
+                is request
+            )
+            assert (
+                native_input_request(
+                    policy, detectors, request, monotonic=lambda: 0.0, deadline_monotonic=1e12
+                )
+                is request
+            )
+        finally:
+            engine.close(timeout_seconds=2)
+        return
     with pytest.raises(GuardrailRejected) as python:
         asyncio.run(engine.enforce_input(policy=policy, request=request, deadline_monotonic=1e12))
     with pytest.raises(GuardrailRejected) as native:

@@ -121,7 +121,11 @@ def native_input_request(
     if any(check.adapter_id not in detectors for check in policy.input_checks):
         return None
     if request_exceeds_inspection_limit(request, policy.max_request_bytes):
-        _record(policy, None, GuardrailAction.ERROR)
+        _record(
+            policy, None, GuardrailAction.ALLOW if policy.input_fail_open else GuardrailAction.ERROR
+        )
+        if policy.input_fail_open:
+            return request
         raise GuardrailRejected(coverage_failure())
     current = request
     for check in policy.input_checks:
@@ -137,6 +141,9 @@ def native_input_request(
         try:
             messages, flagged, immutable_match = _redacted_messages(detector, current)
         except ClassifierCoverageError:
+            if policy.input_fail_open:
+                _uncertain(policy, check)
+                continue
             _record(policy, check, GuardrailAction.ERROR)
             raise GuardrailRejected(coverage_failure(check_id=check.check_id)) from None
         except ValueError:

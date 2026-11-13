@@ -319,8 +319,9 @@ class GuardrailEngine:
         self.input_invocations += 1
         limit = self._input_limit(policy)
         if limit is not None and request_exceeds_inspection_limit(request, limit):
-            self._decision(policy, None, GuardrailAction.ERROR, GuardrailOutcome.UNSUPPORTED, 0.0)
-            if policy.mode == "observe":
+            action = GuardrailAction.ALLOW if policy.input_fail_open else GuardrailAction.ERROR
+            self._decision(policy, None, action, GuardrailOutcome.UNSUPPORTED, 0.0)
+            if policy.mode == "observe" or policy.input_fail_open:
                 return request
             raise GuardrailRejected(coverage_failure())
         current = request
@@ -806,6 +807,10 @@ class GuardrailEngine:
                 retention=retention,
             )
         except ClassifierCoverageError:
+            if check.stage is GuardrailCheckStage.INPUT and policy.input_fail_open:
+                return self._uncertain(
+                    policy, check, GuardrailOutcome.UNSUPPORTED, self._monotonic() - started
+                )
             self._decision(
                 policy,
                 check,

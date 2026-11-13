@@ -38,6 +38,7 @@ from exp.runtime.gateway.guardrails.classifiers import (
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient, InspectingClassifier
 from exp.runtime.gateway.guardrails.contracts import (
     CategoryScore,
+    ClassifierCoverageError,
     ClassifierVerdict,
     GuardrailAction,
     GuardrailCapabilityKind,
@@ -87,6 +88,11 @@ class _Clock:
 class _RaisingClassifier(ScriptedClassifier):
     """Adapter that fails every inspection."""
 
+    def __init__(self, error_type: type[Exception] = RuntimeError) -> None:
+        """Choose whether inspection is unavailable or lacks subject coverage."""
+        super().__init__()
+        self._error_type = error_type
+
     async def inspect_input(
         self,
         *,
@@ -96,7 +102,7 @@ class _RaisingClassifier(ScriptedClassifier):
         """Raise instead of returning a verdict."""
         del request, check
         self.input_calls += 1
-        raise RuntimeError("classifier unavailable")
+        raise self._error_type()
 
     async def inspect_output(
         self,
@@ -107,7 +113,7 @@ class _RaisingClassifier(ScriptedClassifier):
         """Raise instead of returning a verdict."""
         del completion, check
         self.output_calls += 1
-        raise RuntimeError("classifier unavailable")
+        raise self._error_type()
 
 
 class _HungAsyncClassifier:
@@ -1073,10 +1079,13 @@ def test_unprotected_identity_skips_a_failed_check() -> None:
 
 
 @pytest.mark.parametrize("expired", [False, True])
-def test_serial_modify_fail_open_preserves_input_without_waiving_output(expired: bool) -> None:
+@pytest.mark.parametrize("error_type", [RuntimeError, ClassifierCoverageError])
+def test_serial_modify_fail_open_preserves_input_without_waiving_output(
+    expired: bool, error_type: type[Exception]
+) -> None:
     """Missing or timed-out modification returns the original input under an explicit opt-in."""
     engine, _classifier = _engine(
-        classifier=_RaisingClassifier(),
+        classifier=_RaisingClassifier(error_type),
         checks=(
             _check("input", action=GuardrailAction.MODIFY),
             _check("output", stage=GuardrailCheckStage.OUTPUT, action=GuardrailAction.MODIFY),
