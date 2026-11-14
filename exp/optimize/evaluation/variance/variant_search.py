@@ -59,6 +59,7 @@ from exp.optimize.evaluation.variance.authors import (
     SCENARIO_PROMPT,
     SCENARIO_TOOL,
     review_scenarios,
+    target_addendum,
 )
 from exp.optimize.evaluation.variance.contracts import (
     ActorView,
@@ -336,7 +337,7 @@ def _round(
         spec.author,
         spec.profile,
         role="search",
-        instruction=SCENARIO_PROMPT + SEARCH_ADDENDUM,
+        instruction=SCENARIO_PROMPT + SEARCH_ADDENDUM + target_addendum("scenario"),
         stance=(stance, SEARCH_STANCES[stance]),
         documents=documents,
         overview=overview,

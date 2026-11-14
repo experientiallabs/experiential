@@ -313,6 +313,34 @@ class ScenarioDraft(ContractModel):
         return self
 
 
+
+def variant_target() -> int | None:
+    """Target variant count for a sweep arm (EXP_TARGET_VARIANTS), or None for the default."""
+    import os
+
+    raw = os.environ.get("EXP_TARGET_VARIANTS")
+    return int(raw) if raw and raw.isdigit() and int(raw) >= 2 else None
+
+
+def target_addendum(role: str) -> str:
+    """The prompt addendum that asks an author for the sweep arm's variant count."""
+    target = variant_target()
+    if target is None:
+        return ""
+    if role == "decision":
+        return (
+            f"\nTARGET: the scenario author must build {target} distinct, coherent variants of "
+            "this decision. Declare enough grounded variation (several axes and permitted values: "
+            "the deciding fact's value, what evidence the actor has seen or can probe, conflicting "
+            "signals, and instruction variation where allowed) to support that many, while every "
+            "axis still changes which option is correct.\n"
+        )
+    return (
+        f"\nTARGET: return exactly {target} scenarios (this overrides two to eight), spread across "
+        "the declared axes and values so the set covers the decision from several directions; "
+        "each must still satisfy every requirement.\n"
+    )
+
 def authors_protocol_sha256() -> str:
     """Return the identity of the author prompts and their answer schemas.
 
@@ -323,6 +351,7 @@ def authors_protocol_sha256() -> str:
     return sha256_json(
         {
             "protocol": AUTHORS_PROTOCOL,
+            **({"target_variants": variant_target()} if variant_target() else {}),
             "briefing_review": briefing_review_sha256(),
             "decision_state": DECISION_STATE_PROMPT,
             "scenarios": SCENARIO_PROMPT,
@@ -408,7 +437,7 @@ def decision_state_request(
             ),
         }
     return _request(
-        DECISION_STATE_PROMPT,
+        DECISION_STATE_PROMPT + target_addendum("decision"),
         payload,
         tool=DECISION_STATE_TOOL,
         schema=DecisionStateAnswer.model_json_schema(),
@@ -652,7 +681,7 @@ def scenario_request(
         "actor_view": None if view is None else view.model_dump(mode="json"),
     }
     return _request(
-        SCENARIO_PROMPT,
+        SCENARIO_PROMPT + target_addendum("scenario"),
         payload,
         tool=SCENARIO_TOOL,
         schema=ScenarioSet.model_json_schema(),
