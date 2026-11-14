@@ -619,7 +619,10 @@ def ladder_measurer(
             code_revision=code_revision,
         )
         if reference is None or result is None:
-            return why or "no measure"
+            stops = "; ".join(
+                f"{row.scenario_id}: {row.stopped}" for row in variants if row.stopped
+            )
+            return (why or "no measure") + (f" [variants stopped: {stops}]" if stops else "")
         return reference, result
 
     return measure

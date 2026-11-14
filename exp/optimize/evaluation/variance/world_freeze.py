@@ -104,7 +104,7 @@ from exp.simulation.rules.properties import (
 )
 from exp.simulation.rules.workloads import boundary_workloads
 
-WORLD_FREEZE_PROTOCOL = "world-freeze-v3"
+WORLD_FREEZE_PROTOCOL = "world-freeze-v4"
 """Version of the freeze checks and compatibility review; change it whenever either changes."""
 
 FREEZE_TYPE = "world-freeze"
