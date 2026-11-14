@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import math
 import os
+import random
 import sqlite3
 import sys
 import time
@@ -568,7 +569,28 @@ class HostProviderAdmission:
         )
 
     def _release(self, token: str, provider: str, slot: AdmissionSlot, *, probing: bool) -> None:
-        """Delete one held slot and apply its outcome; an unobserved probe reopens."""
+        """Delete one held slot and apply its outcome, retrying while the database is locked.
+
+        A release must eventually land, or the slot leaks and the host's capacity shrinks; under
+        high concurrency the 30 s busy timeout can still expire, so lock refusals back off and
+        retry instead of failing the call whose work already finished.
+        """
+        delay = 0.05
+        for attempt in range(60):
+            try:
+                self._release_once(token, provider, slot, probing=probing)
+                return
+            except sqlite3.OperationalError as error:
+                text = str(error)
+                if ("locked" not in text and "busy" not in text) or attempt == 59:
+                    raise
+                time.sleep(delay + random.random() * delay)
+                delay = min(delay * 2, 2.0)
+
+    def _release_once(
+        self, token: str, provider: str, slot: AdmissionSlot, *, probing: bool
+    ) -> None:
+        """One release transaction."""
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
