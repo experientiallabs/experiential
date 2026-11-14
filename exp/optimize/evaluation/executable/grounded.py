@@ -81,7 +81,6 @@ from exp.runtime.environments.worlds import ExecutableWorldRuntime, WorldBackend
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.call_evidence import call_consumer
-from exp.runtime.models.deadlines import dispatch_deadline
 from exp.runtime.models.providers.admitted_transport import (
     AdmittedJsonTransport,
     require_admitted_transport,
@@ -567,9 +566,7 @@ def _runtime(
         HttpxJsonTransport(),
         artifacts=project.artifacts,
         code_revision=revision,
-        deadline=dispatch_deadline(
-            spec.deadline if provider_grant is None else provider_grant.limits.deadline
-        ),
+        deadline=spec.deadline if provider_grant is None else provider_grant.limits.deadline,
         ledger=DispatchLedger(
             project.artifacts.project_directory / (identity + "-world.sqlite"),
             spec.maximum_physical_attempts
@@ -622,9 +619,7 @@ def _runtime(
         ).for_task(spec.task)
     )
 
-    deadline = dispatch_deadline(
-        spec.deadline if provider_grant is None else provider_grant.limits.deadline
-    )
+    deadline = spec.deadline if provider_grant is None else provider_grant.limits.deadline
     completion = StructuredCompletion(
         client=predictor.client,
         plan=CompletionPlan(

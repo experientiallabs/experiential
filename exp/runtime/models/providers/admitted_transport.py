@@ -22,6 +22,7 @@ from exp.common.models import ModelCatalog
 from exp.common.project import ArtifactStore, ArtifactStoreError, artifact_input
 from exp.common.project.request_budget import validate_provider_response
 from exp.runtime.models.call_evidence import current_call_intent, current_consumer
+from exp.runtime.models.deadlines import dispatch_deadline
 from exp.runtime.models.providers.attempt_timeouts import ATTEMPT_TIMEOUT_PROTOCOL
 from exp.runtime.models.providers.backpressure import (
     AdmissionSlot,
@@ -172,7 +173,9 @@ class AdmittedJsonTransport(JsonHttpTransport):
         self._capacity_rounds, self._sleep = capacity_rounds, sleep
         if deadline.tzinfo is None:
             raise ValueError("transport deadline must be timezone-aware")
-        self._inner, self._ledger, self._deadline = inner, ledger, deadline
+        # An operator extension (EXP_RUNTIME_DEADLINE) may push a frozen deadline later; it
+        # changes when calls may dispatch, never a saved definition or identity.
+        self._inner, self._ledger, self._deadline = inner, ledger, dispatch_deadline(deadline)
         self._admission = admission or HostProviderAdmission.for_host()
         self._route = route
         self._before_claim = before_claim

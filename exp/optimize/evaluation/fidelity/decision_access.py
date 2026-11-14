@@ -9,6 +9,7 @@ from exp.common.core.artifacts import ArtifactEnvelope, JsonObject, stable_id
 from exp.common.project import ProjectStore
 from exp.common.project.errors import ArtifactAlreadyExistsError
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
+from exp.runtime.models.deadlines import dispatch_deadline
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.models.registry import ResolvedModel
@@ -53,6 +54,7 @@ def decision_caller(
     if profile.dialect != "typesafe_systemone" or not profile.decisions_url:
         raise ValueError("JEV alias does not expose the native decision wire")
     transport = transport.priced_as(resolved.alias)
+    deadline = dispatch_deadline(deadline)
 
     def decide(request: DecisionRequest) -> JsonObject:
         """Dispatch one decision; physical attempts share the run's ledger and deadline.

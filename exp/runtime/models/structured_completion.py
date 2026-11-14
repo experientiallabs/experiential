@@ -39,6 +39,7 @@ from exp.runtime.models.call_evidence import (
     current_call_intent,
     current_consumer,
 )
+from exp.runtime.models.deadlines import dispatch_deadline
 
 _JSON_OBJECT = TypeAdapter(JsonObject)
 
@@ -132,7 +133,9 @@ class StructuredCompletion:
         self.plan = plan
         self._client, self._budget = client, budget
         self._artifacts, self._clock = artifacts, clock or _utc_now
-        self._deadline = plan.deadline if window is None else max(plan.deadline, window)
+        self._deadline = dispatch_deadline(
+            plan.deadline if window is None else max(plan.deadline, window)
+        )
 
     @property
     def model_identity(self) -> str:
