@@ -70,6 +70,7 @@ from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 from exp.runtime.gateway.native_execution import select_route_deployments
 from exp.runtime.gateway.native_fallback_rules import rung_rules
 from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.surfaces import prompt_parameter
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.generation_parameter_validation import (
@@ -360,7 +361,7 @@ def narrow_to_capable_rungs(
             TOOLS_RUNG_DISCLOSURE,
             disclosures,
         )
-    content_field = "input" if request.surface == GatewayApiSurface.RESPONSES else "messages"
+    content_field = prompt_parameter(request.surface)
     for label, serves in _media_requirements(request):
         route, resolved_wires = _narrow(
             route,

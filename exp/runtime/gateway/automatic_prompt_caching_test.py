@@ -1,4 +1,4 @@
-"""Tests for gateway-added Anthropic prompt caching on Chat and Responses requests."""
+"""Tests for gateway-added Anthropic prompt caching on Chat, Responses and generateContent."""
 
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.native_rungs import build_rung_dispatch
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.tool_contracts import GatewayToolDefinition
+from exp.runtime.google_protocol.requests import decode_generate_content
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
 
@@ -156,6 +157,22 @@ def _responses() -> GatewayRequest:
                 {"role": "user", "content": "Now open the first one."},
             ],
         }
+    ).request
+
+
+def _generate_content() -> GatewayRequest:
+    """A generateContent request with a system instruction and two user turns."""
+    return decode_generate_content(
+        {
+            "systemInstruction": {"parts": [{"text": _SYSTEM}]},
+            "contents": [
+                {"role": "user", "parts": [{"text": "List the files."}]},
+                {"role": "model", "parts": [{"text": "Listing them now."}]},
+                {"role": "user", "parts": [{"text": "Now open the first one."}]},
+            ],
+        },
+        model="claude-haiku",
+        stream=True,
     ).request
 
 
@@ -514,3 +531,12 @@ def test_placement_is_idempotent_and_refuses_unknown_wires() -> None:
     }
     with pytest.raises(ValueError, match="no placement"):
         with_automatic_prompt_caching({}, "openai_compatible")
+
+
+def test_a_generate_content_request_gets_the_same_checkpoint_as_chat() -> None:
+    """The Google surface has no block marker either, so its callers get the gateway's caching."""
+    rung = _rung("anthropic", setting=True)
+    request = _generate_content()
+    assert automatic_prompt_caching_applies(rung, _ANTHROPIC, request, _AUTHORIZATION, environ={})
+    assert _payload(rung, _ANTHROPIC, request)["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in _payload(_rung("anthropic", setting=False), _ANTHROPIC, request)

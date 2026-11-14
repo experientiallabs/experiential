@@ -16,7 +16,7 @@ from exp.runtime.gateway.sqlite.nano_usd_migration import (
     migrate_money_to_nano_usd,
 )
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 
 
 class GatewaySchemaError(RuntimeError):
@@ -803,6 +803,16 @@ _MIGRATIONS: dict[int, tuple[MigrationStep, ...]] = {
     32: (  # trusted local cleanup, distinct from an immutable provider failure
         "ALTER TABLE gateway_attempts ADD COLUMN accounting_recovery INTEGER NOT NULL "
         "DEFAULT 0 CHECK (accounting_recovery IN (0, 1))",
+    ),
+    33: (  # the Gemini generateContent surface (exp.runtime.google_protocol), CHECK-only rewrite
+        "PRAGMA writable_schema = ON",
+        "UPDATE sqlite_master SET sql = replace(sql, "
+        "'''speech'', ''transcription'', ''video'')', "
+        "'''speech'', ''transcription'', ''video'', ''generate_content'')') "
+        "WHERE type = 'table' AND name = 'gateway_requests'",
+        "PRAGMA writable_schema = RESET",
+        "CREATE TABLE gateway_schema_refresh_v33 (noop INTEGER) STRICT",
+        "DROP TABLE gateway_schema_refresh_v33",
     ),
     24: (  # plan sign-in kind: part of the connection identity digest, so it rides the revision
         "ALTER TABLE provider_connection_revisions ADD COLUMN subscription TEXT "

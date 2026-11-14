@@ -82,6 +82,12 @@ pub(crate) struct Admission {
     /// reports nothing before its final chunk; display-only, never settled.
     #[serde(default)]
     pub input_token_estimate: Option<u64>,
+    /// The caller asked for thought summaries
+    /// (`generationConfig.thinkingConfig.includeThoughts`); generateContent
+    /// admissions carry it so the encoder renders `thought: true` parts
+    /// only when asked, as Google does. Absent everywhere else.
+    #[serde(default)]
+    pub include_thoughts: bool,
     /// The caller's own output cap (`max_tokens`, `max_completion_tokens`
     /// or `max_output_tokens`, normalized by the control plane), absent when
     /// the request is uncapped. The waterfall reads it to classify a `stop`
@@ -387,6 +393,19 @@ pub(crate) async fn acquire_permit(
     deadline: Instant,
     priority_class: Option<u8>,
 ) -> Result<crate::dispatch_capacity::DispatchPermit, Box<Response>> {
+    acquire_permit_with(state, guard, deadline, priority_class, error_response).await
+}
+
+/// [`acquire_permit`] with the refusal rendered in the surface's own envelope
+/// (`render`: the OpenAI envelope on the OpenAI routes, Google's on the
+/// Gemini routes).
+pub(crate) async fn acquire_permit_with(
+    state: &AppState,
+    guard: &mut AttemptGuard,
+    deadline: Instant,
+    priority_class: Option<u8>,
+    render: fn(&PublicError) -> Response,
+) -> Result<crate::dispatch_capacity::DispatchPermit, Box<Response>> {
     let permit_wait_started = Instant::now();
     let acquire = state.dispatch_capacity.acquire(
         guard.bridge.execution.as_ref(),
@@ -407,7 +426,7 @@ pub(crate) async fn acquire_permit(
                 _ => FailureClass::Internal,
             };
             guard.abandon(&Failure::new(class, &error.message)).await;
-            Err(Box::new(error_response(&error)))
+            Err(Box::new(render(&error)))
         }
         Err(_) => {
             let failure = Failure::new(
@@ -416,7 +435,7 @@ pub(crate) async fn acquire_permit(
             );
             let error = failure.public_error();
             guard.abandon(&failure).await;
-            Err(Box::new(error_response(&error)))
+            Err(Box::new(render(&error)))
         }
     }
 }

@@ -196,7 +196,12 @@ def authorize_serving_model_chains(
         inspected = True
     if not inspected:
         raise ModelChainAuthorityError("selected serving graph cannot be classified")
-    if required and authorization.surface not in ("chat_completions", "responses", "messages"):
+    if required and authorization.surface not in (
+        "chat_completions",
+        "responses",
+        "messages",
+        "generate_content",
+    ):
         raise ModelChainAuthorityError(
             "selected model-chain policy is unsupported on this non-conversational surface"
         )

@@ -1,14 +1,15 @@
-"""Gateway-added Anthropic prompt caching for Chat Completions and Responses callers.
+"""Gateway-added Anthropic prompt caching for Chat, Responses and generateContent callers.
 
 Anthropic's API, Claude on Vertex AI, Claude on Azure AI Foundry and Claude on
 Amazon Bedrock cache a prompt prefix only where the request marks one. A client
 that speaks the Messages protocol (Claude Code) marks its prompts itself, but an
-OpenAI-style client sending Chat Completions or Responses requests almost never
-does, so every turn of its agent loop pays the full input price on a prefix the
-provider would have served from cache. Providers that cache prefixes on their
-own (OpenAI, DeepSeek) give the same clients most of their input from cache.
+OpenAI-style or Google-style client sending Chat Completions, Responses or
+generateContent requests never does (those wires have no block marker), so every
+turn of its agent loop pays the full input price on a prefix the provider would
+have served from cache. Providers that cache prefixes on their own (OpenAI,
+DeepSeek) give the same clients most of their input from cache.
 
-When a Chat Completions or Responses request carries no cache marker of its own
+When such a request carries no cache marker of its own
 and is dispatched to a rung on the Anthropic Messages wire or the Bedrock
 Converse wire, this module asks the provider for automatic caching at the
 five-minute lifetime:
@@ -81,7 +82,14 @@ FRAMING_TOKENS_PER_TOOL = 64
 CACHING_WIRES = frozenset({"anthropic_messages", "bedrock_converse_stream"})
 """The wires whose cache checkpoints this module knows how to place."""
 
-_AUTOMATIC_SURFACES = frozenset({GatewayApiSurface.CHAT_COMPLETIONS, GatewayApiSurface.RESPONSES})
+_AUTOMATIC_SURFACES = frozenset(
+    {
+        GatewayApiSurface.CHAT_COMPLETIONS,
+        GatewayApiSurface.RESPONSES,
+        GatewayApiSurface.GENERATE_CONTENT,
+    }
+)
+"""The provider-neutral conversational surfaces whose clients never mark a prefix themselves."""
 _OFF_VALUES = frozenset({"0", "false", "off", "no"})
 # The advisor server tool switches its own prompt caching with this key.
 _SERVER_TOOL_CACHING = "caching"
@@ -154,7 +162,7 @@ def automatic_prompt_caching_applies(
             ``os.environ``.
 
     Returns:
-        True only for a Chat Completions or Responses request with no caller
+        True only for a Chat Completions, Responses or generateContent request with no caller
         cache marker, not routed under zero data retention, on a caching wire,
         with caching allowed by the organization, the operator and the rung,
         and a prompt that could reach the smallest cacheable prefix.

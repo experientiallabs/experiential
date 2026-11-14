@@ -26,6 +26,7 @@ pub(crate) enum Protocol {
     ChatCompletions,
     Responses,
     Messages,
+    GenerateContent,
 }
 
 /// Effective input supplied by the authenticated, post-guardrail admission seam.
@@ -45,6 +46,7 @@ impl Request {
             Protocol::ChatCompletions => "chat_completions",
             Protocol::Responses => "responses",
             Protocol::Messages => "messages",
+            Protocol::GenerateContent => "generate_content",
         };
         r#"{"request_id":,"scope":{"organization_id":,"identity_id":,"application_id":},"protocol":,"model_id":,"context":}"#.len()
             + string_bytes(&self.request_id)

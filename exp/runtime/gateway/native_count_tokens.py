@@ -42,10 +42,11 @@ class NativeCountTokensMixin:
 
         Args:
             argument: JSON object with ``raw_key``, ``body`` (raw request body
-                text), and the optional ``anthropic_beta`` header list. The
-                body is Anthropic's count request (prompt-side fields, no
-                ``max_tokens``), decoded by the count entrypoint of the shared
-                Messages decoder ``/v1/messages`` admits through.
+                text), the optional ``anthropic_beta`` header list, and the
+                optional ``surface`` (``messages``, the default, or
+                ``generate_content`` with the path ``model``). The body is the
+                surface's count request, decoded by the count entrypoint of
+                the same decoder its generation route admits through.
 
         Returns:
             JSON object with ``input_tokens`` (the counted prompt before any
@@ -58,10 +59,13 @@ class NativeCountTokensMixin:
                 no-oracle 404).
         """
         data = json.loads(argument)
+        surface = str(data.get("surface", "messages"))
         try:
             decoded = decode_native_count_tokens_body(
                 data["body"],
                 anthropic_beta=optional_text(data.get("anthropic_beta")),
+                surface=surface,
+                model=optional_text(data.get("model")),
             )
         except NativeDecodeError as exc:
             raise NativeBridgeError(exc.error) from exc
@@ -73,8 +77,12 @@ class NativeCountTokensMixin:
         disclosures = dict.fromkeys(
             (*decoded.request.ignored_parameters, COUNT_TOKENS_ESTIMATE_DISCLOSURE)
         )
+        counted = counted_input_tokens(decoded.request)
+        # Google's shape (``totalTokens``) on the Gemini surface, Anthropic's
+        # (``input_tokens``) on Messages; the same estimate and disclosure.
+        count_field = "totalTokens" if surface == "generate_content" else "input_tokens"
         body = {
-            "input_tokens": counted_input_tokens(decoded.request),
+            count_field: counted,
             "x-experiential-ignored-parameters": list(disclosures),
         }
         return json.dumps(body, separators=(",", ":"))

@@ -19,6 +19,7 @@ class NativeDecodeMixin:
         idempotency_key: str | None = None,
         client_request_id: str | None = None,
         anthropic_beta: str | None = None,
+        model: str | None = None,
     ) -> DecodedGatewayRequest:
         """Preserve protocol failures as sanitized native bridge errors.
 
@@ -33,6 +34,7 @@ class NativeDecodeMixin:
                 idempotency_key=idempotency_key,
                 client_request_id=client_request_id,
                 anthropic_beta=anthropic_beta,
+                model=model,
             )
         except NativeDecodeError as exc:
             raise NativeBridgeError(exc.error) from exc

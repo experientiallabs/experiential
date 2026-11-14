@@ -12,6 +12,7 @@ results, and plans do not live here.
 | `reference/gateway-architecture.md` | Operational local gateway contracts, certified exact-model routing, ownership boundaries, and compatibility locks. |
 | `reference/gateway-responses-input-items.md` | Responses input items without a canonical message (agent messages, compaction, configuration updates, item references): validation and per-wire treatment. |
 | `reference/gateway-anthropic-protocol.md` | The Anthropic Messages surface: block decoding, thinking, cache markers, attachments, server tools, and stream usage. |
+| `reference/gateway-google-protocol.md` | The Gemini generateContent surface: part decoding, function calls and signatures, thinking controls, Google's SSE and error envelope, and the model listing. |
 | `reference/gateway-media-surfaces.md` | The embeddings, images, speech, and transcription surfaces, how each lane bills, and the per-unit price card. |
 | `reference/gateway-egress.md` | Public HTTPS provider destinations, connection-time address checks, standalone defaults, and transport coverage boundaries. |
 | `reference/model-chains.md` | Ordered cross-model stages, mandatory hosted authority, bounded recovery and unsupported local-chain serving. |

@@ -51,14 +51,20 @@ pub(crate) async fn bind_execution(
         return next.run(request).await;
     }
     let messages = path == "/v1/messages" || path == "/v1/messages/count_tokens";
+    let gemini = path.starts_with("/v1beta/");
     let token = if messages {
         crate::route_messages::messages_api_key(request.headers())
+    } else if gemini {
+        crate::route_generate_content::generate_content_api_key(request.headers(), request.uri())
     } else {
         bearer_key(request.headers())
     };
     let execution = match token.and_then(|token| bindings.claim(&token)) {
         Ok(execution) => execution,
         Err(error) if messages => return crate::route_messages::messages_error_response(&error),
+        Err(error) if gemini => {
+            return crate::route_generate_content::google_error_response(&error)
+        }
         Err(error) => return error_response(&error),
     };
     // Task-local storage is needed only while the handler extracts its state.

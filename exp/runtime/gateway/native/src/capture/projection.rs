@@ -50,7 +50,7 @@ impl<'a> CapturedResponse<'a> {
         let completed = match protocol {
             Protocol::Responses => body["status"] == "completed",
             Protocol::Messages => body["stop_reason"].as_str().is_some_and(|v| !v.is_empty()),
-            Protocol::ChatCompletions => terminal(protocol, &body),
+            Protocol::ChatCompletions | Protocol::GenerateContent => terminal(protocol, &body),
         };
         Self {
             body,
@@ -70,6 +70,11 @@ impl<'a> CapturedResponse<'a> {
             Protocol::Responses => event.is_some_and(|v| v["type"] == "response.completed"),
             Protocol::Messages => frames.iter().any(|v| v["type"] == "message_stop"),
             Protocol::ChatCompletions => frames.iter().any(|v| v.as_str() == Some("[DONE]")),
+            Protocol::GenerateContent => frames.iter().any(|v| {
+                v["candidates"][0]["finishReason"]
+                    .as_str()
+                    .is_some_and(|r| !r.is_empty())
+            }),
         };
         let mut valid = true;
         let body = match protocol {
@@ -89,6 +94,11 @@ impl<'a> CapturedResponse<'a> {
                     && frames
                         .first()
                         .is_some_and(|v| v.get("id").is_some() && v.get("model").is_some());
+                Some(Cow::Owned(body))
+            }
+            Protocol::GenerateContent => {
+                let (body, assembled) = super::gemini::assemble(frames);
+                valid = assembled;
                 Some(Cow::Owned(body))
             }
         };
@@ -171,6 +181,12 @@ fn terminal(protocol: Protocol, body: &Value) -> bool {
                 && choices
                     .iter()
                     .all(|v| v["finish_reason"].as_str().is_some_and(|v| !v.is_empty()))
+        }),
+        Protocol::GenerateContent => body["candidates"].as_array().is_some_and(|candidates| {
+            !candidates.is_empty()
+                && candidates
+                    .iter()
+                    .all(|v| v["finishReason"].as_str().is_some_and(|v| !v.is_empty()))
         }),
     }
 }

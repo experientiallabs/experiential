@@ -90,7 +90,7 @@ class CapturedExchange(ContractModel):
     episode_id: Identifier | None = None
     parent_response_id: Identifier | None = None
     scope: LocalCaptureScope
-    protocol: Literal["chat_completions", "responses", "messages"]
+    protocol: Literal["chat_completions", "responses", "messages", "generate_content"]
     captured_at: AwareDatetime
     request: JsonObject
     response: JsonObject

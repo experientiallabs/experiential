@@ -51,6 +51,7 @@ def model_execution_snapshot(
         "chat_completions",
         "responses",
         "messages",
+        "generate_content",
     ):
         return direct
     chain = next((c for c in catalog.model_chains if c.model_id == root_pool.exact_model_id), None)

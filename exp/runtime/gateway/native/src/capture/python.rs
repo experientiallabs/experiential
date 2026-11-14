@@ -33,6 +33,7 @@ impl CaptureResponse {
             "responses" => Protocol::Responses,
             "chat" => Protocol::ChatCompletions,
             "messages" => Protocol::Messages,
+            "generate_content" => Protocol::GenerateContent,
             _ => return Err(PyValueError::new_err("unknown capture protocol")),
         };
         let (body_json, completed, events_json) =

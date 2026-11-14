@@ -368,3 +368,21 @@ def test_ciphertext_inside_a_verbatim_item_is_not_counted_as_text() -> None:
     bare: JsonObject = {"type": "context_compaction", "id": "cc_1"}
     sealed: JsonObject = {**bare, "encrypted_content": "Z" * 1_000_000}
     assert prompt_text_bytes(_request(sealed)) == prompt_text_bytes(_request(bare))
+
+
+def test_generate_content_rejections_name_geminis_own_fields() -> None:
+    """A Google-surface caller is told about ``contents`` and its ``maxOutputTokens`` field."""
+    route = _route(_deployment("box", 1_000))
+    surface = GatewayApiSurface.GENERATE_CONTENT
+    with pytest.raises(ProviderParameterError) as prompt:
+        context_window_compatible_indexes(route, _request(_tokens(2_001), surface))
+    assert prompt.value.param == "contents"
+    capped = GatewayRequest(
+        surface=surface,
+        messages=(GatewayMessage(role="user", content=_tokens(10)),),
+        maximum_output_tokens=5_000,
+        maximum_output_tokens_parameter="generationConfig.maxOutputTokens",
+    )
+    with pytest.raises(ProviderParameterError) as ceiling:
+        context_window_compatible_indexes(route, capped)
+    assert ceiling.value.param == "generationConfig.maxOutputTokens"

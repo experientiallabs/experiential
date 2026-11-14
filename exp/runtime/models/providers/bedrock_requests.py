@@ -23,6 +23,7 @@ from exp.runtime.gateway.contracts import (
     GatewayToolDefinition,
 )
 from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
+from exp.runtime.gateway.surfaces import prompt_parameter
 from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice, GatewayCustomToolChoice
 from exp.runtime.models.providers.anthropic_tool_compat import anthropic_input_schema
 from exp.runtime.models.providers.audios import reject_audio_part
@@ -276,7 +277,11 @@ def _require_inline_media_within_payload(
                 "This model route accepts requests of at most 25 MB including inline "
                 "image and video data. Send fewer or smaller files or less text."
             ),
-            param="messages",
+            param=(
+                prompt_parameter(request.surface)
+                if isinstance(request, GatewayRequest)
+                else "messages"
+            ),
             code="invalid_parameter",
         )
 

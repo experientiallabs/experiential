@@ -108,7 +108,8 @@ pub(crate) fn unknown_route_error() -> PublicError {
         404,
         "unknown_route",
         "Unknown route. The gateway serves /v1/models, /v1/chat/completions, \
-         /v1/responses, /v1/messages, /v1/messages/count_tokens, /health/live, \
+         /v1/responses, /v1/messages, /v1/messages/count_tokens, \
+         /v1beta/models/{model}:generateContent, /health/live, \
          /health/ready, /metrics, /metrics.json, /usage, and /usage.json.",
         "invalid_request_error",
     )

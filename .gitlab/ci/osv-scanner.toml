@@ -31,22 +31,22 @@ reason = "Same brotli 1.2.0 advisory as GHSA-9v8h-qqgm-4m35, published separatel
 
 [[IgnoredVulns]]
 id = "GHSA-pcg2-g6cj-q92c"
-ignoreUntil = 2026-11-14
-reason = "tornado 6.5.10, capture extra only (via exp-mitmproxy). The fix (6.6) needs a relock, which currently fails on the mitmproxy_rs GitHub/GitLab URL conflict; fix the relock, take tornado 6.6.1 and delete this entry and the next three."
+ignoreUntil = 2026-11-21
+reason = "tornado 6.5.10, capture extra only (via exp-mitmproxy): the advisories are in tornado.web request handling, which nothing here serves. exp-mitmproxy 12.2.3.post3 pins tornado==6.5.10 exactly, so the fix (6.6.1) needs an exp-mitmproxy release relaxing that pin, and 6.6.1 (2026-11-09) leaves the lock's 7-day exclude-newer span on 2026-11-16; then relock, take 6.6.1 and delete this entry and the next three."
 
 [[IgnoredVulns]]
 id = "GHSA-pw9p-v7r6-gx4p"
-ignoreUntil = 2026-11-14
+ignoreUntil = 2026-11-21
 reason = "Same tornado 6.5.10 capture-only exposure as GHSA-pcg2-g6cj-q92c."
 
 [[IgnoredVulns]]
 id = "GHSA-r4j5-9xpp-3985"
-ignoreUntil = 2026-11-14
+ignoreUntil = 2026-11-21
 reason = "Same tornado 6.5.10 capture-only exposure as GHSA-pcg2-g6cj-q92c."
 
 [[IgnoredVulns]]
 id = "GHSA-5cjw-f85j-cv6r"
-ignoreUntil = 2026-11-14
+ignoreUntil = 2026-11-21
 reason = "Same tornado 6.5.10 capture-only exposure as GHSA-pcg2-g6cj-q92c (open redirect in tornado.web redirects, which nothing here serves). Its fix (6.6.1) cannot be relocked yet: exp-mitmproxy 12.2.3.post3 pins tornado==6.5.10 exactly, and 6.6.1 (2026-11-09) is inside the lock's 7-day exclude-newer span."
 
 [[IgnoredVulns]]
