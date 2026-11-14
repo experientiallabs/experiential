@@ -125,8 +125,22 @@ Empty turn content follows Anthropic's own rule: every turn must carry content "
 optional final assistant message". A trailing assistant turn whose content is `""` or only empty
 text blocks is an empty prefill, which Anthropic treats as no prefill; the decoder drops it with
 `messages.assistant->dropped(empty_final_prefill)` (both `/v1/messages` and
-`/v1/messages/count_tokens`). An empty turn anywhere else, any role, stays a typed 400 naming
-the turn (`messages.<n>`).
+`/v1/messages/count_tokens`). A `system` turn inside `messages` with empty content renders
+nothing at its position and is dropped with `messages.system->dropped(empty)`. An empty user or
+assistant turn anywhere else stays a typed 400 naming the turn (`messages.<n>`).
+
+Per-message effort (beta `mid-conversation-output-config-2026-07-01`): a `system` turn may carry
+`output_config.effort`, usually with empty content, which Claude Code sends whenever a session's
+effort changes. No dispatch wire has a positional effort, so the decoder resolves the level that
+governs the reply this request generates (a turn directly after a user turn with new input governs
+that reply; one anywhere else takes effect at the next user turn with new input; tool-result-only
+user turns are not new input; the latest level in effect wins) and serves the request with it as
+the top-level `output_config.effort`, disclosed as
+`messages.output_config.effort->output_config.effort`. A level that has not taken effect by the
+reply leaves the top-level value unchanged. A system turn may omit `content` (read as empty), and `"output_config": null` reads as absent. Otherwise its `output_config` is closed: only an optional `effort` of `low`,
+`medium`, `high`, `xhigh` or `max`; any other key or value is a named 400 at
+`messages.<n>.output_config.<key>`. `output_config` on a user or assistant turn is dropped
+with `messages.output_config->dropped(unknown_message_field)`.
 
 An OpenAI function tool in `tools`, Chat's nested `{"type": "function", "function": {name,
 description, parameters, strict}}` or Responses' flat `{"type": "function", name, ...}`, is the

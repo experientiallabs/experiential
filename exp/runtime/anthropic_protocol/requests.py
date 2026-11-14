@@ -38,7 +38,7 @@ from exp.common.models.content import (
     TextContentPart,
 )
 from exp.common.models.model import ToolCall
-from exp.runtime.anthropic_protocol import passthrough_fields
+from exp.runtime.anthropic_protocol import passthrough_fields, per_message_effort
 from exp.runtime.anthropic_protocol.gateway_reasoning import (
     EMPTY_GATEWAY_BLOCK,
     gateway_reasoning_block,
@@ -469,6 +469,7 @@ def _decode(
     # Clients stamp their own bookkeeping on the turns they replay; a key no
     # turn defines is removed with disclosure rather than failing the whole
     # conversation. Content blocks and top-level fields stay strict.
+    payload, system_turns = per_message_effort.take_system_turn_effort(payload)
     payload, unknown_disclosures = drop_unknown_message_keys(payload, _MESSAGE_KEYS)
     # Media the gateway cannot forward fails every replay of a history that
     # carries it, so history copies degrade to disclosed placeholders.
@@ -497,6 +498,8 @@ def _decode(
     prefill_disclosures: tuple[str, ...] = ()
     last_index = len(request.messages) - 1
     for index, message in enumerate(request.messages):
+        if index in system_turns.empty:
+            continue  # renders nothing; its effort is resolved over every turn
         if (
             index == last_index
             and _is_empty_prefill(message)
@@ -529,15 +532,12 @@ def _decode(
     parallel_tool_calls: bool | None = None
     if request.tool_choice is not None and request.tool_choice.disable_parallel_tool_use:
         parallel_tool_calls = False
+    output_config, turn_disclosures = per_message_effort.served_output_config(payload, system_turns)
     channels = resolve_reasoning_channels(
         request.reasoning,
         max_tokens=request.max_tokens,
         thinking=cast(JsonObject, payload["thinking"]) if request.thinking is not None else None,
-        output_config=(
-            cast(JsonObject, payload["output_config"])
-            if request.output_config is not None
-            else None
-        ),
+        output_config=output_config,
     )
     _require_thinking_budget_below_max_tokens(channels.thinking_config, request.max_tokens)
     try:
@@ -586,6 +586,7 @@ def _decode(
                 *media_disclosures,
                 *document_disclosures,
                 *prefill_disclosures,
+                *turn_disclosures,
                 *stream_disclosures,
                 *tool_shape_disclosures,
                 *dropped_beta_disclosures,
