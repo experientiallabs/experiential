@@ -126,6 +126,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--protocol", choices=("v1", "v2"), default="v1")
     parser.add_argument("--rules-document", type=Path, help="v2: supporting specifications (MD)")
     parser.add_argument("--coverage", type=Path, help="v2: coverage dimensions (JSON)")
+    parser.add_argument("--verdicts", choices=("four", "ynu"), default="four",
+                        help="v2: met/violated/insufficient/n.a., or yes/no/unsure")
     args = parser.parse_args(argv)
 
     project = ProjectStore(args.root, args.project)
@@ -380,7 +382,7 @@ def _run_v2(args, out, task, error_context, sources, attempts, scratch, author, 
     specifications = args.rules_document.read_text() if args.rules_document else None
     coverage = json.loads(args.coverage.read_text()) if args.coverage else None
     author.settings = author.settings.model_copy(update={"output_tokens": 32768, "maximum_input_bytes": 4_000_000})
-    judge.settings = judge.settings.model_copy(update={"maximum_input_bytes": 4_000_000, "output_tokens": 32768})
+    judge.settings = judge.settings.model_copy(update={"maximum_input_bytes": 4_000_000, "output_tokens": 65536})
     rubric, rubric_file, authored = v2.freeze_rubric_v2(
         out, task=task, trace_analysis=error_context, specifications=specifications,
         coverage=coverage, context_sources=sources, caller=author, decide=decide,
@@ -389,7 +391,7 @@ def _run_v2(args, out, task, error_context, sources, attempts, scratch, author, 
     say(f"v2 rubric {'authored' if authored else 'reused'}: {rubric_file} "
         f"({len(rubric.body.criteria)} criteria, review flags on "
         f"{sum(bool(r.flags) for r in rubric.review)})")  # fmt: skip
-    folder = out / "judgments-v2" / rubric.sha256[:16]
+    folder = out / f"judgments-v2-{args.verdicts}" / rubric.sha256[:16]
 
     def one(item):  # noqa: ANN001, ANN202
         tier, study_id, index, evidence = item
@@ -401,7 +403,8 @@ def _run_v2(args, out, task, error_context, sources, attempts, scratch, author, 
             return v2.AttemptVerdict.model_validate_json(path.read_bytes())
         try:
             row = v2.judge_attempt_v2(rubric, task, evidence, tier=tier, study=study_id,
-                                      branch=index, decide=decide, caller=judge)  # fmt: skip
+                                      branch=index, decide=decide, caller=judge, output_tokens=judge.settings.output_tokens,
+                                      space=args.verdicts)  # fmt: skip
         except Exception as error:  # noqa: BLE001 - an unscored row, retried on rerun
             say(f"  {tier} b{index}: unavailable ({type(error).__name__}: {str(error)[:160]})")
             return v2.AttemptVerdict(rubric_sha256=rubric.sha256, tier=tier, study=study_id,
@@ -418,7 +421,7 @@ def _run_v2(args, out, task, error_context, sources, attempts, scratch, author, 
     report["rubric_file"] = str(rubric_file)
     report["groups"] = dict(groups)
     report["attempts"] = [row.model_dump(mode="json") for row in rows]
-    stem = f"report-v2-{args.task}-{rubric.sha256[:16]}"
+    stem = f"report-v2-{args.verdicts}-{args.task}-{rubric.sha256[:16]}"
     (out / f"{stem}.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     say(f"report: {out / stem}.json")
     say(json.dumps({k: report[k] for k in ("tiers", "pass_rate", "clef_verdicts",
