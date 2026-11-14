@@ -356,7 +356,7 @@ class MiningSettings(ContractModel):
     )
     workers: int = Field(default=3, ge=1, le=32, strict=True)
     simulator_retries: int = Field(default=2, ge=0, le=4, strict=True)
-    active_rollouts: int = Field(default=12, ge=1, le=128, strict=True)
+    active_rollouts: int = Field(default=12, ge=1, le=1024, strict=True)
     qualification: PointQualification | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
