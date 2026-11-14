@@ -12,11 +12,12 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import MAXIMUM_DOCUMENTS_PER_REQUEST, TextContentPart
-from exp.runtime.anthropic_protocol.per_message_effort import PER_MESSAGE_EFFORT_DISCLOSURE
+from exp.runtime.anthropic_protocol.per_message_effort import (
+    EMPTY_SYSTEM_TURN_DROPPED,
+    PER_MESSAGE_EFFORT_DISCLOSURE,
+)
 from exp.runtime.anthropic_protocol.requests import (
     EMPTY_FINAL_ASSISTANT_DROPPED,
-    EMPTY_SYSTEM_TURN_DROPPED,
-    NON_SYSTEM_OUTPUT_CONFIG_DROPPED,
     decode_messages,
     decode_messages_count_tokens,
 )
@@ -1527,7 +1528,9 @@ def test_output_config_on_a_user_turn_is_dropped_with_disclosure() -> None:
         _body(messages=[{"role": "user", "content": "hi", "output_config": {"effort": "low"}}])
     )
     assert decoded.request.reasoning_effort is None
-    assert decoded.request.ignored_parameters == (NON_SYSTEM_OUTPUT_CONFIG_DROPPED,)
+    assert decoded.request.ignored_parameters == (
+        "messages.output_config->dropped(unknown_message_field)",
+    )
 
 
 def test_empty_user_and_assistant_turns_keep_their_named_400() -> None:

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.anthropic_protocol.per_message_effort import (
     PER_MESSAGE_EFFORT_DISCLOSURE,
     TurnFacts,
     governing_effort,
+    take_system_turn_effort,
     with_governing_effort,
 )
 
@@ -70,3 +72,33 @@ def test_folding_replaces_only_the_effort() -> None:
 def test_folding_without_a_change_discloses_nothing() -> None:
     assert with_governing_effort({"effort": "low"}, "low") == ({"effort": "low"}, ())
     assert with_governing_effort(None, None) == (None, ())
+
+
+def test_a_body_without_system_turn_effort_is_returned_unchanged() -> None:
+    payload: JsonObject = {"messages": [{"role": "user", "content": "hi", "output_config": {}}]}
+    taken, turns = take_system_turn_effort(payload)
+    assert taken is payload
+    assert turns.empty == frozenset()
+
+
+def test_system_turn_effort_is_consumed_and_empty_turns_are_named() -> None:
+    payload: JsonObject = {
+        "messages": [
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t"}]},
+            {"role": "system", "content": [], "output_config": {"effort": "low"}},
+            {"role": "system", "content": [{"type": "text", "text": "", "cache_control": {}}]},
+        ]
+    }
+    payload_messages = payload["messages"]
+    assert isinstance(payload_messages, list)
+    taken, turns = take_system_turn_effort(payload)
+    assert taken["messages"] == [
+        payload_messages[0],
+        {"role": "system", "content": []},
+        payload_messages[2],
+    ]
+    # A marked empty block is left to its typed refusal, not dropped.
+    assert turns.empty == frozenset({1})
+    # Tool results alone are not new user input.
+    assert turns.facts[0].new_input is False
+    assert turns.facts[1].effort == "low"

@@ -30,10 +30,18 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final, Literal
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, JsonValue
+from exp.runtime.openai_protocol.errors import invalid_field
 
 PER_MESSAGE_EFFORT_DISCLOSURE: Final = "messages.output_config.effort->output_config.effort"
 """Disclosed when a system turn's effort governs the reply in place of the top-level one."""
+
+EMPTY_SYSTEM_TURN_DROPPED: Final = "messages.system->dropped(empty)"
+"""Disclosed when a ``system`` turn in ``messages`` with no content is dropped.
+
+An effort-only turn renders nothing at its position (its effort is resolved
+over the whole conversation), and neither does a bare empty system turn.
+Empty user and assistant turns keep their named 400."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,3 +112,129 @@ def with_governing_effort(
     if effort is None or (output_config is not None and output_config.get("effort") == effort):
         return output_config, ()
     return {**(output_config or {}), "effort": effort}, (PER_MESSAGE_EFFORT_DISCLOSURE,)
+
+
+@dataclass(frozen=True, slots=True)
+class SystemTurns:
+    """What the decoder needs from the request's ``system`` turns.
+
+    Attributes:
+        facts: One :class:`TurnFacts` per turn, in order.
+        empty: Indexes of system turns with no content to render.
+    """
+
+    facts: tuple[TurnFacts, ...]
+    empty: frozenset[int]
+
+
+def take_system_turn_effort(payload: JsonObject) -> tuple[JsonObject, SystemTurns]:
+    """Read and remove ``output_config`` from the request's ``system`` turns.
+
+    Runs before the unknown-key pass, so a system turn's ``output_config`` is
+    consumed here rather than disclosed as unknown; on user and assistant
+    turns, which no provider defines it for, it stays for that pass. The
+    turns' content is left for the strict wire models to validate.
+
+    Args:
+        payload: Parsed request body.
+
+    Returns:
+        The body without system-turn ``output_config`` keys (the original
+        object when there are none) and the turns' facts.
+
+    Raises:
+        OpenAIProtocolError: A system turn's ``output_config`` is not an object.
+    """
+    raw_messages = payload.get("messages")
+    if not isinstance(raw_messages, list):
+        return payload, SystemTurns(facts=(), empty=frozenset())
+    facts: list[TurnFacts] = []
+    empty: set[int] = set()
+    messages: list[JsonValue] = []
+    for index, message in enumerate(raw_messages):
+        if not isinstance(message, dict) or message.get("role") not in (
+            "user",
+            "assistant",
+            "system",
+        ):
+            messages.append(message)
+            facts.append(TurnFacts(role="assistant", new_input=False, effort=None))
+            continue
+        role = message["role"]
+        content = message.get("content")
+        effort: str | None = None
+        if role == "system":
+            if _renders_nothing(content):
+                empty.add(index)
+            if "output_config" in message:
+                config = message["output_config"]
+                if not isinstance(config, dict):
+                    raise invalid_field(
+                        f"messages.{index}.output_config", "output_config must be an object."
+                    )
+                value = config.get("effort")
+                effort = value if isinstance(value, str) else None
+                message = {key: item for key, item in message.items() if key != "output_config"}
+        messages.append(message)
+        facts.append(
+            TurnFacts(
+                role=role,
+                new_input=isinstance(content, str)
+                or (
+                    isinstance(content, list)
+                    and any(
+                        not (isinstance(block, dict) and block.get("type") == "tool_result")
+                        for block in content
+                    )
+                ),
+                effort=effort,
+            )
+        )
+    turns = SystemTurns(facts=tuple(facts), empty=frozenset(empty))
+    if messages == raw_messages:
+        return payload, turns
+    return {**payload, "messages": messages}, turns
+
+
+def _renders_nothing(content: JsonValue) -> bool:
+    """Whether a system turn's raw content has nothing to render.
+
+    An empty string, an empty block list, or only empty text blocks with no
+    cache marker and no citations (a marked empty block keeps its typed
+    refusal). Anything else, valid or not, is left to the wire models.
+    """
+    if isinstance(content, str):
+        return not content
+    if not isinstance(content, list):
+        return False
+    return all(
+        isinstance(block, dict)
+        and block.get("type") == "text"
+        and block.get("text") == ""
+        and block.get("cache_control") is None
+        and not block.get("citations")
+        and set(block) <= {"type", "text", "cache_control", "citations"}
+        for block in content
+    )
+
+
+def served_output_config(
+    payload: JsonObject, turns: SystemTurns
+) -> tuple[JsonObject | None, tuple[str, ...]]:
+    """Return the top-level ``output_config`` to serve and the turns' disclosures.
+
+    Args:
+        payload: The validated request body.
+        turns: What :func:`take_system_turn_effort` read from it.
+
+    Returns:
+        The caller's ``output_config`` with the governing per-message effort
+        folded in, and the disclosures for dropped empty system turns and the
+        folded effort.
+    """
+    raw = payload.get("output_config")
+    config, disclosures = with_governing_effort(
+        raw if isinstance(raw, dict) else None, governing_effort(turns.facts)
+    )
+    dropped = (EMPTY_SYSTEM_TURN_DROPPED,) if turns.empty else ()
+    return config, (*dropped, *disclosures)
