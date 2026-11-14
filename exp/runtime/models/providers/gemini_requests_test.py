@@ -11,7 +11,6 @@ from exp.common.models.model import ReasoningEffort
 from exp.common.tasks import ToolSchema
 from exp.runtime.models.providers.gemini_requests import (
     GEMINI_MISSING_TOOL_RESULT,
-    GEMINI_SYNTHETIC_CALL_ID_PREFIX,
     GEMINI_THOUGHT_SIGNATURE_BYPASS,
     gemini_generate_request,
     gemini_model_path,
@@ -562,15 +561,16 @@ def test_the_callers_include_thoughts_decides_within_the_display_switch(
 
 def test_google_issued_call_ids_replay_only_when_asked_and_never_when_minted() -> None:
     """Gemini-surface histories echo Google's ids; gateway-minted ids and other surfaces do not."""
+    # The second id looks exactly like a minted one; only the flag decides.
     calls = (
-        ToolCall(call_id="abc123", name="lookup", arguments={}),
-        ToolCall(call_id=f"{GEMINI_SYNTHETIC_CALL_ID_PREFIX}0-1", name="lookup", arguments={}),
+        ToolCall(call_id="gemini-call-9-9", name="lookup", arguments={}),
+        ToolCall(call_id="gemini-call-0-1", name="lookup", arguments={}, call_id_minted=True),
     )
     request = ModelRequest(
         messages=(
             ModelMessage(role="user", content="go"),
             ModelMessage(role="assistant", assistant_action=AssistantAction(tool_calls=calls)),
-            ModelMessage(role="tool", content="a", tool_call_id="abc123"),
+            ModelMessage(role="tool", content="a", tool_call_id="gemini-call-9-9"),
             ModelMessage(role="tool", content="b", tool_call_id=calls[1].call_id),
         ),
     )
@@ -578,10 +578,10 @@ def test_google_issued_call_ids_replay_only_when_asked_and_never_when_minted() -
         "list[JsonObject]", gemini_generate_request("g", request, replay_call_ids=True)["contents"]
     )
     model_parts = cast("list[JsonObject]", replayed[1]["parts"])
-    assert cast("JsonObject", model_parts[0]["functionCall"])["id"] == "abc123"
+    assert cast("JsonObject", model_parts[0]["functionCall"])["id"] == "gemini-call-9-9"
     assert "id" not in cast("JsonObject", model_parts[1]["functionCall"])
     user_parts = cast("list[JsonObject]", replayed[2]["parts"])
-    assert cast("JsonObject", user_parts[0]["functionResponse"])["id"] == "abc123"
+    assert cast("JsonObject", user_parts[0]["functionResponse"])["id"] == "gemini-call-9-9"
     assert "id" not in cast("JsonObject", user_parts[1]["functionResponse"])
     plain = cast("list[JsonObject]", gemini_generate_request("g", request)["contents"])
     assert "id" not in cast(

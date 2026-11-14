@@ -104,6 +104,7 @@ def test_decode_full_sdk_request_is_lossless() -> None:
         {"a": 1},
         "c2tpcA==",
     )
+    assert call.call_id_minted is False
     assert request.messages[3].tool_call_id == "call-1"
     assert request.messages[3].content == "ok"
     assert request.tools[0].name == "search"
@@ -134,7 +135,7 @@ def test_snake_case_spellings_and_schema_enums_decode() -> None:
                 "response_mime_type": "application/json",
                 "response_schema": {
                     "type": "OBJECT",
-                    "properties": {"n": {"type": "INTEGER", "nullable": True}},
+                    "properties": {"n": {"type": "INTEGER", "nullable": True, "enum": [1]}},
                 },
             },
             "tool_config": {"function_calling_config": {"mode": "NONE"}},
@@ -147,10 +148,10 @@ def test_snake_case_spellings_and_schema_enums_decode() -> None:
     assert request.maximum_output_tokens == 8
     assert request.tool_choice == "none"
     assert request.structured_text is not None
-    # Google's OpenAPI ``nullable`` becomes the JSON Schema null union.
+    # Google's OpenAPI ``nullable`` becomes a null alternative to the whole node.
     assert request.structured_text.json_schema == {
         "type": "object",
-        "properties": {"n": {"type": ["integer", "null"]}},
+        "properties": {"n": {"anyOf": [{"type": "integer", "enum": [1]}, {"type": "null"}]}},
     }
     assert request.structured_text_parameter == "generationConfig.responseSchema"
 
@@ -192,6 +193,7 @@ def test_function_responses_pair_by_name_order_without_ids() -> None:
     ).request
     calls = request.messages[1].tool_calls
     assert [call.name for call in calls] == ["a", "b"]
+    assert all(call.call_id_minted for call in calls)
     tools = [message for message in request.messages if message.role == "tool"]
     assert [(message.tool_call_id, message.content) for message in tools] == [
         (calls[1].call_id, "B"),

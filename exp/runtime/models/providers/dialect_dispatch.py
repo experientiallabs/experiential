@@ -769,7 +769,14 @@ def dialect_stream_payload(
         if budget is not None:
             generation = payload["generationConfig"]
             assert isinstance(generation, dict)
-            generation["thinkingConfig"] = {"thinkingBudget": budget}
+            # The numeric budget replaces any level; a Google caller's explicit
+            # includeThoughts stays (never beside budget 0, which Vertex refuses).
+            selector = (
+                {"includeThoughts": True}
+                if provider_request.include_thoughts and budget != 0
+                else {}
+            )
+            generation["thinkingConfig"] = {**selector, "thinkingBudget": budget}
         return payload
     if profile.dialect == "bedrock_converse_stream":
         return bedrock_converse_stream_payload(

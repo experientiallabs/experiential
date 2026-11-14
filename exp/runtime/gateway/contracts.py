@@ -387,9 +387,8 @@ class GatewayMessage(ContractModel):
         if self.provider_text_blocks:
             if self.role == "tool":
                 raise ValueError("text blocks are not valid for tool messages")
-            # The carrier never changes semantics: its text must flatten to
-            # this message's canonical content (message runs join adjacent
-            # parts directly; system blocks join with one blank line).
+            # The carrier never changes semantics: its text must flatten to this
+            # content (runs join adjacent parts; system blocks join with a blank line).
             texts = [str(block.get("text", "")) for block in self.provider_text_blocks]
             if (self.content or "") not in ("".join(texts), "\n\n".join(texts)):
                 raise ValueError("provider text blocks must flatten to the message content")
@@ -462,6 +461,9 @@ class GatewayRequest(ContractModel):
             defines zero and -1 semantics. Excluded from serialization, retained in replay identity.
         reasoning_effort_parameter: Optional exact caller spelling of the effort control;
             omission uses the surface default when reporting unsupported parameters.
+        structured_text_parameter: Optional exact caller spelling of the structured-output
+            schema field (default None, excluded from serialization); errors and routing
+            disclosures name it, else the surface default.
         gateway: Optional request routing/retry policy; excluded from provider serialization.
     """
 
@@ -643,11 +645,9 @@ class GatewayRequest(ContractModel):
     include_usage: bool = False
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
     metadata: JsonObject = Field(default_factory=dict)
-    # End-user attribution / cache hints from the OpenAI request. Captured for
-    # gateway-side attribution and never forwarded verbatim. `safety_identifier`
-    # is the current stable end-user identifier; `user` its deprecated predecessor;
-    # `prompt_cache_key` a same-prefix cache-routing hint (never an identity) that
-    # reaches the provider only as the namespaced `provider_prompt_cache_key`.
+    # OpenAI end-user attribution / cache hints, captured and never forwarded verbatim:
+    # `safety_identifier` (current), `user` (deprecated), `prompt_cache_key` (a routing
+    # hint, never an identity; reaches the provider only as `provider_prompt_cache_key`).
     safety_identifier: str | None = Field(default=None, max_length=1024)
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)

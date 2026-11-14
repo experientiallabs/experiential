@@ -34,7 +34,7 @@ use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::respond::{
     bearer_key, client_ip, complete_visible_refusal, escalation_error, json_response,
     outward_event, price_stream_end, read_body, send_bounded, settle_stream_end, sse_body_response,
-    with_app_identity,
+    stream_outcome, with_app_identity, StreamOutcome,
 };
 use crate::respond::{log_stream_exit, stream_delivery::Delivery};
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
@@ -876,39 +876,38 @@ async fn stream_response(
                     }
                 }
                 terminal = Some(event.clone());
-                // Refusal output anywhere on the stream: raw (`visible_refusal`),
-                // already encoded, or released by a guardrail with this terminal.
-                let refusal_output = visible_refusal
-                    || encoder.refusal_seen()
-                    || outward_events.iter().any(|released| {
-                        matches!(
-                            released,
-                            Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
-                        )
-                    });
-                let settled = if refusal_output && !matches!(event, Event::Failed(_)) {
-                    // No refusal part here: the encoder answers Google's error frame
-                    // and the ledger records the typed refusal, as the aggregate does.
-                    // Checked first: a content-free refusal also looks empty.
-                    guard
-                        .price_or_settle(
-                            "failed",
-                            usage.as_ref(),
-                            &tool_names,
-                            Some(&refusal_failure().boundary()),
-                        )
-                        .await
-                } else if empty_completion {
-                    guard
-                        .price_or_settle(
-                            "failed",
-                            usage.as_ref(),
-                            &tool_names,
-                            Some(&Failure::empty_completion()),
-                        )
-                        .await
-                } else {
-                    price_stream_end(&mut guard, &event, usage.as_ref(), &tool_names).await
+                let outcome = stream_outcome(
+                    &event,
+                    visible_refusal || encoder.refusal_seen(),
+                    &outward_events,
+                    empty_completion,
+                );
+                let settled = match outcome {
+                    StreamOutcome::Refusal => {
+                        // No refusal part on this surface: the encoder answers Google's
+                        // error frame and the ledger records the typed refusal.
+                        guard
+                            .price_or_settle(
+                                "failed",
+                                usage.as_ref(),
+                                &tool_names,
+                                Some(&refusal_failure().boundary()),
+                            )
+                            .await
+                    }
+                    StreamOutcome::EmptyCompletion => {
+                        guard
+                            .price_or_settle(
+                                "failed",
+                                usage.as_ref(),
+                                &tool_names,
+                                Some(&Failure::empty_completion()),
+                            )
+                            .await
+                    }
+                    StreamOutcome::Terminal => {
+                        price_stream_end(&mut guard, &event, usage.as_ref(), &tool_names).await
+                    }
                 };
                 if !settled {
                     log_stream_exit(&request_id, "settlement_unavailable");

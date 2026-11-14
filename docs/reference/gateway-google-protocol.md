@@ -32,8 +32,8 @@ when absent; any other declared type is refused), `functionCall` parts (with the
 canonical call so Gemini lanes replay both), `functionResponse` parts (paired by `id`, else by
 name order as Gemini pairs them; a lone `result`/`content`/`output` string is the tool text,
 anything else compact JSON), `systemInstruction`, `functionDeclarations` (`parametersJsonSchema`
-or the upper-case `Schema` form, converted; Google's `nullable` becomes a JSON Schema null type
-union), `toolConfig.functionCallingConfig` (`AUTO`, `ANY`,
+or the upper-case `Schema` form, converted; Google's `nullable` becomes a JSON Schema `anyOf` with
+`{"type": "null"}` beside the whole node, so sibling constraints keep applying to the non-null branch), `toolConfig.functionCallingConfig` (`AUTO`, `ANY`,
 `NONE`, `allowedFunctionNames`; `VALIDATED` reads as `AUTO` with disclosure), and
 `generationConfig` sampling (`temperature`, `topP`, `topK`; `presencePenalty` and `frequencyPenalty`
 reach a lane only where its catalog says the model accepts them, else they drop with disclosure),
