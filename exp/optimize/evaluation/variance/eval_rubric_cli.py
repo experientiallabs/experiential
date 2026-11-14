@@ -123,6 +123,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--concurrency", type=int, default=3)
     parser.add_argument("--max-usd", type=float, default=10.0)
     parser.add_argument("--dry-run", action="store_true", help="build inputs, call no model")
+    parser.add_argument("--protocol", choices=("v1", "v2"), default="v1")
+    parser.add_argument("--rules-document", type=Path, help="v2: supporting specifications (MD)")
+    parser.add_argument("--coverage", type=Path, help="v2: coverage dimensions (JSON)")
     args = parser.parse_args(argv)
 
     project = ProjectStore(args.root, args.project)
@@ -290,6 +293,9 @@ def main(argv: list[str] | None = None) -> int:
 
     author = LiveCaller(scratch, author_settings, run, revision)
     judge = LiveCaller(scratch, judge_settings, run, revision)
+    if args.protocol == "v2":
+        return _run_v2(args, out, task, error_context, sources, attempts, scratch, author, judge,
+                       concurrency, groups)
     with operation_spend_scope():
         ceiling = operation_spend_ceiling(scratch, f"dv-eval-{run}")
         ceiling.authorize(
@@ -360,6 +366,64 @@ def main(argv: list[str] | None = None) -> int:
     (out / f"{stem}.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     (out / f"{stem}.md").write_text(ev.markdown_report(report, rubric), encoding="utf-8")
     say(f"report: {out / stem}.json and .md; calls {report['calls_this_run']}")
+    return 0
+
+
+def _run_v2(args, out, task, error_context, sources, attempts, scratch, author, judge,  # noqa: ANN001, PLR0913
+            concurrency, groups) -> int:
+    """Author, review and freeze the v2 rubric, judge every attempt, write the report."""
+    from exp.optimize.evaluation.variance import eval_rubric_v2 as v2
+    from exp.simulation.mining.decisions import DecisionsTraceTagger
+
+    model = RuntimeModelCatalog(load_model_catalog(scratch.model_catalog_path)).resolve("clef")
+    decide = DecisionsTraceTagger.for_alias(model, maximum_concurrency=32)._decide
+    specifications = args.rules_document.read_text() if args.rules_document else None
+    coverage = json.loads(args.coverage.read_text()) if args.coverage else None
+    author.settings = author.settings.model_copy(update={"output_tokens": 32768, "maximum_input_bytes": 4_000_000})
+    judge.settings = judge.settings.model_copy(update={"maximum_input_bytes": 4_000_000, "output_tokens": 32768})
+    rubric, rubric_file, authored = v2.freeze_rubric_v2(
+        out, task=task, trace_analysis=error_context, specifications=specifications,
+        coverage=coverage, context_sources=sources, caller=author, decide=decide,
+        author_alias=args.author,
+    )  # fmt: skip
+    say(f"v2 rubric {'authored' if authored else 'reused'}: {rubric_file} "
+        f"({len(rubric.body.criteria)} criteria, review flags on "
+        f"{sum(bool(r.flags) for r in rubric.review)})")  # fmt: skip
+    folder = out / "judgments-v2" / rubric.sha256[:16]
+
+    def one(item):  # noqa: ANN001, ANN202
+        tier, study_id, index, evidence = item
+        if isinstance(evidence, str):
+            return v2.AttemptVerdict(rubric_sha256=rubric.sha256, tier=tier, study=study_id,
+                                     branch=index, status="no_evidence", failure=evidence[:2000])  # fmt: skip
+        path = folder / tier / f"{study_id}-b{index}-{evidence.identity[:16]}.json"
+        if path.exists():
+            return v2.AttemptVerdict.model_validate_json(path.read_bytes())
+        try:
+            row = v2.judge_attempt_v2(rubric, task, evidence, tier=tier, study=study_id,
+                                      branch=index, decide=decide, caller=judge)  # fmt: skip
+        except Exception as error:  # noqa: BLE001 - an unscored row, retried on rerun
+            say(f"  {tier} b{index}: unavailable ({type(error).__name__}: {str(error)[:160]})")
+            return v2.AttemptVerdict(rubric_sha256=rubric.sha256, tier=tier, study=study_id,
+                                     branch=index, evidence_sha256=evidence.identity,
+                                     status="unavailable", failure=str(error)[:2000])  # fmt: skip
+        if row.status == "judged":
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(row.model_dump_json(indent=2), encoding="utf-8")
+        say(f"  {tier} b{index}: {row.verdict or row.status}")
+        return row
+
+    rows = run_at_once([lambda item=item: one(item) for item in attempts], max(concurrency, 8))
+    report = v2.aggregate_v2(rubric, rows)
+    report["rubric_file"] = str(rubric_file)
+    report["groups"] = dict(groups)
+    report["attempts"] = [row.model_dump(mode="json") for row in rows]
+    stem = f"report-v2-{args.task}-{rubric.sha256[:16]}"
+    (out / f"{stem}.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    say(f"report: {out / stem}.json")
+    say(json.dumps({k: report[k] for k in ("tiers", "pass_rate", "clef_verdicts",
+                                            "escalated_to_llm_judge", "review_flags",
+                                            "uncovered_requirements")}, indent=1))  # fmt: skip
     return 0
 
 
