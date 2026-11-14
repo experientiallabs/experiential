@@ -11,7 +11,7 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
-from exp.runtime.gateway.surfaces import prompt_parameter
+from exp.runtime.gateway.surfaces import prompt_parameter, reasoning_carrier_parameter
 from exp.runtime.gateway.tool_contracts import GatewayCustomToolChoice
 from exp.runtime.gateway.tool_search.contracts import gateway_tool_search_name
 from exp.runtime.models.providers.allowed_tools import (
@@ -156,6 +156,10 @@ _JSON_OBJECT_OUTPUT_DIALECTS = frozenset(
 _NO_PARALLEL_TOOL_CONTROL_DIALECTS = frozenset(
     {"gemini_generate_content", "bedrock_converse_stream"}
 )
+
+
+_PENALTY_WIRES = frozenset({"openai_compatible", "gemini_generate_content"})
+"""The wires whose builders emit presence and frequency penalties when the rung supports them."""
 
 
 def route_generation_parameter_requests(
@@ -372,7 +376,7 @@ def route_generation_parameter_requests(
         supported = (
             profile.supports_presence_penalty if presence else profile.supports_frequency_penalty
         )
-        return supported and profile.dialect == "openai_compatible"
+        return supported and profile.dialect in _PENALTY_WIRES
 
     if request.frequency_penalty is not None and not all(
         penalty_honored(profile, presence=False) for profile in profiles
@@ -697,11 +701,12 @@ def route_generation_parameter_requests(
         # models. Exposing rungs — when the route has any — still forward the
         # plaintext verbatim; the others omit it at encoding. A carrying lead
         # drops it only if a failover reaches a fallback (the sources rule).
+        carrier = reasoning_carrier_parameter(request.surface)
         ignore(
-            "messages.reasoning_content",
-            "messages.reasoning_content->dropped(unsupported_by_fallback_provider)"
+            carrier,
+            f"{carrier}->dropped(unsupported_by_fallback_provider)"
             if profiles[0].replays_plaintext_reasoning
-            else "messages.reasoning_content->dropped(unsupported_by_provider)",
+            else f"{carrier}->dropped(unsupported_by_provider)",
         )
     history_thinking_present = any(
         block.kind in {"thinking", "redacted_thinking"}

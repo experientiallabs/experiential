@@ -525,6 +525,8 @@ def gemini_generate_content_stream_payload(
     supports_logprobs: bool = False,
     supports_reasoning: bool = False,
     reasoning_effort: str | None = None,
+    supports_frequency_penalty: bool = False,
+    supports_presence_penalty: bool = False,
 ) -> JsonObject:
     """Translate one canonical request to the native streamGenerateContent JSON.
 
@@ -557,6 +559,7 @@ def gemini_generate_content_stream_payload(
             "messages": fold_tool_result_attachments(request.messages, kinds=("image", "document"))
         }
     )
+    google_surface = request.surface is GatewayApiSurface.GENERATE_CONTENT
     try:
         return gemini_generate_request(
             model_id,
@@ -573,6 +576,12 @@ def gemini_generate_content_stream_payload(
             ),
             json_object_output=request.json_object_output,
             default_maximum_output_tokens=None,
+            # Only the Google surface carries Google's own thought selector and
+            # Google-issued call ids; other surfaces keep the shared defaults.
+            include_thoughts=request.include_thoughts if google_surface else None,
+            replay_call_ids=google_surface,
+            frequency_penalty=request.frequency_penalty if supports_frequency_penalty else None,
+            presence_penalty=request.presence_penalty if supports_presence_penalty else None,
         )
     except (ProviderParameterError, ProviderCapabilityError):
         raise

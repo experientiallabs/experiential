@@ -84,6 +84,7 @@ from exp.runtime.gateway.surfaces import (
     JSON_OBJECT_OUTPUT_SURFACES,
     OutputLimitParameter,
     ReasoningEffortParameter,
+    StructuredTextParameter,
 )
 from exp.runtime.gateway.surfaces import GatewayApiSurface as GatewayApiSurface
 from exp.runtime.gateway.tool_contracts import (
@@ -470,6 +471,7 @@ class GatewayRequest(ContractModel):
     tool_choice: GatewayToolChoice = None
     parallel_tool_calls: bool | None = None
     structured_text: StructuredTextFormat | None = None
+    structured_text_parameter: StructuredTextParameter | None = Field(default=None, exclude=True)
     json_object_output: bool = Field(default=False, exclude=True)
     """Native JSON mode or disclosed instruction; enabled mode joins replay identity."""
     maximum_output_tokens: int | None = Field(default=None, gt=0)
@@ -631,12 +633,10 @@ class GatewayRequest(ContractModel):
     tool_search: GatewayToolSearch | None = Field(default=None, exclude=True)
     """The caller's normalized tool-search declaration (any spelling); excluded from
     serialization, joins replay identity when present. See ``tool_search.plan``."""
-    # `provider: {"zdr": true}`: the caller demanded ZDR routing. Tightening
-    # only: the host applies its require_zdr posture filter to this request and
-    # refuses with the same 403 when no rung qualifies. Part of identity.
     zdr_requested: bool = False
-    # Verbatim caller `provider` object: forwarded to OpenRouter rungs (tightened
-    # when the rung is constrained), dropped on every other wire.
+    """`provider: {"zdr": true}`: tightening only (the host's require_zdr filter, same 403
+    when no rung qualifies). Part of identity."""
+    # Verbatim caller `provider`: forwarded to OpenRouter rungs (tightened when constrained).
     provider_preferences: JsonObject | None = Field(default=None, exclude=True)
     gateway: GatewayRequestPolicy | None = Field(default=None, exclude=True)
     stream: bool = False
