@@ -12,8 +12,11 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import MAXIMUM_DOCUMENTS_PER_REQUEST, TextContentPart
+from exp.runtime.anthropic_protocol.per_message_effort import PER_MESSAGE_EFFORT_DISCLOSURE
 from exp.runtime.anthropic_protocol.requests import (
     EMPTY_FINAL_ASSISTANT_DROPPED,
+    EMPTY_SYSTEM_TURN_DROPPED,
+    NON_SYSTEM_OUTPUT_CONFIG_DROPPED,
     decode_messages,
     decode_messages_count_tokens,
 )
@@ -1382,6 +1385,181 @@ def test_thinking_display_is_carried_verbatim() -> None:
     config: JsonObject = {"type": "adaptive", "display": "omitted"}
     decoded = decode_messages(_body(thinking=config))
     assert decoded.request.provider_thinking_config == config
+
+
+_EFFORT_ONLY_TURN: JsonObject = {
+    "role": "system",
+    "content": [],
+    "output_config": {"effort": "low"},
+}
+"""Claude Code's per-message effort change: an empty-content system turn."""
+
+
+def test_an_effort_only_system_turn_after_a_user_turn_governs_the_reply() -> None:
+    """Regression: Claude Code's effort-only system turn was a 400.
+
+    The turn has empty ``content`` and only ``output_config.effort``; the
+    unknown-key pass dropped ``output_config`` and the empty turn then failed
+    with "system message must contain text, thinking, tool_use, or
+    tool_result content." at ``messages.1.content``. It renders nothing, and
+    directly after a user turn with new input its level governs the reply.
+    """
+    decoded = decode_messages(
+        _body(
+            output_config={"effort": "high"},
+            messages=[{"role": "user", "content": "hi"}, _EFFORT_ONLY_TURN],
+        )
+    )
+    request = decoded.request
+    assert [message.role for message in request.messages] == ["user"]
+    assert request.reasoning_effort == "low"
+    assert request.provider_output_config == {"effort": "low"}
+    assert request.ignored_parameters == (
+        EMPTY_SYSTEM_TURN_DROPPED,
+        PER_MESSAGE_EFFORT_DISCLOSURE,
+    )
+
+
+def test_an_effort_only_system_turn_deep_in_a_tool_loop_decodes() -> None:
+    """The same turn later in a conversation (``messages.8`` in the report)."""
+    tool_round: list[JsonValue] = []
+    for round_index in range(3):
+        call_id = f"toolu_{round_index}"
+        tool_round += [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": call_id, "name": "Bash", "input": {"command": "ls"}}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": call_id, "content": "ok"}],
+            },
+        ]
+    messages: list[JsonValue] = [
+        {"role": "user", "content": "start"},
+        *tool_round,
+        {"role": "assistant", "content": "done"},
+        _EFFORT_ONLY_TURN,
+        {"role": "user", "content": "next task"},
+    ]
+    assert messages[8] == _EFFORT_ONLY_TURN
+    decoded = decode_messages(
+        _body(
+            tools=[{"name": "Bash", "input_schema": {"type": "object"}}],
+            messages=messages,
+        )
+    )
+    # Between an assistant turn and the next new user input, the level
+    # starts at that user turn, which this reply answers.
+    assert decoded.request.reasoning_effort == "low"
+    assert "system" not in [message.role for message in decoded.request.messages]
+
+
+def test_an_effort_turn_that_has_not_taken_effect_leaves_the_top_level_effort() -> None:
+    """After tool results only, the level waits for the next user input."""
+    decoded = decode_messages(
+        _body(
+            output_config={"effort": "high"},
+            tools=[{"name": "Bash", "input_schema": {"type": "object"}}],
+            messages=[
+                {"role": "user", "content": "start"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}],
+                },
+                _EFFORT_ONLY_TURN,
+            ],
+        )
+    )
+    assert decoded.request.reasoning_effort == "high"
+    assert decoded.request.provider_output_config == {"effort": "high"}
+    assert decoded.request.ignored_parameters == (EMPTY_SYSTEM_TURN_DROPPED,)
+
+
+def test_count_tokens_accepts_an_effort_only_system_turn() -> None:
+    """Claude Code counts the same history it sends."""
+    decoded = decode_messages_count_tokens(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi"}, _EFFORT_ONLY_TURN],
+        }
+    )
+    assert [message.role for message in decoded.request.messages] == ["user"]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [[], "", [{"type": "text", "text": ""}]],
+    ids=["empty-list", "empty-string", "empty-text-block"],
+)
+def test_an_empty_system_turn_is_dropped_with_disclosure(content: JsonValue) -> None:
+    """A system turn with nothing to render is dropped, not refused."""
+    decoded = decode_messages(
+        _body(messages=[{"role": "user", "content": "hi"}, {"role": "system", "content": content}])
+    )
+    assert [message.role for message in decoded.request.messages] == ["user"]
+    assert decoded.request.ignored_parameters == (EMPTY_SYSTEM_TURN_DROPPED,)
+
+
+def test_a_system_turn_with_text_and_effort_keeps_both() -> None:
+    """Content renders in place; the effort governs the reply."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "be brief", "output_config": {"effort": "medium"}},
+            ]
+        )
+    )
+    assert [message.content for message in decoded.request.messages] == ["hi", "be brief"]
+    assert decoded.request.reasoning_effort == "medium"
+
+
+def test_output_config_on_a_user_turn_is_dropped_with_disclosure() -> None:
+    """Only system turns define it; the turn itself is still served."""
+    decoded = decode_messages(
+        _body(messages=[{"role": "user", "content": "hi", "output_config": {"effort": "low"}}])
+    )
+    assert decoded.request.reasoning_effort is None
+    assert decoded.request.ignored_parameters == (NON_SYSTEM_OUTPUT_CONFIG_DROPPED,)
+
+
+def test_empty_user_and_assistant_turns_keep_their_named_400() -> None:
+    """Only system turns drop when empty: an empty user turn is still refused."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": []},
+                    {"role": "assistant", "content": "x"},
+                    {"role": "user", "content": "y"},
+                ]
+            )
+        )
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.detail.param == "messages.0.content"
+
+
+def test_a_malformed_per_message_output_config_is_a_named_400() -> None:
+    """``output_config`` on a turn must be an object."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    {"role": "system", "content": [], "output_config": "low"},
+                ]
+            )
+        )
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.detail.param is not None
+    assert excinfo.value.detail.param.startswith("messages.1.output_config")
 
 
 def test_mid_conversation_system_turn_decodes_positionally() -> None:

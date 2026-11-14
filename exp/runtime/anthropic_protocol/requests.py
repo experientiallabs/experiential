@@ -30,7 +30,15 @@ from __future__ import annotations
 import json
 from typing import Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    TypeAdapter,
+    ValidationError,
+    model_validator,
+)
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import (
@@ -62,6 +70,11 @@ from exp.runtime.anthropic_protocol.media_blocks import (
     tool_result_text,
 )
 from exp.runtime.anthropic_protocol.openai_tool_shapes import fold_openai_tool_shapes
+from exp.runtime.anthropic_protocol.per_message_effort import (
+    TurnFacts,
+    governing_effort,
+    with_governing_effort,
+)
 from exp.runtime.anthropic_protocol.reasoning_channels import (
     ReasoningConfig,
     resolve_reasoning_channels,
@@ -239,6 +252,10 @@ class _Message(AnthropicWireModel):
     role: Literal["user", "assistant", "system"]
     content: str | tuple[_ContentBlock, ...]
     cache_control: CacheControl | None = None
+    # Per-message effort on a system turn (``per_message_effort``), where it
+    # must be an object. On any other role no provider defines it, and it is
+    # dropped with the unknown-key disclosure whatever its value.
+    output_config: JsonValue | None = None
 
 
 _MESSAGE_KEYS = frozenset(_Message.model_fields)
@@ -251,6 +268,53 @@ Anthropic rejects empty content on every turn "except for the optional final
 assistant message": an empty final assistant turn is an empty prefill, which
 the provider treats as no prefill at all. The decoder drops that turn so the
 request is served exactly as Anthropic serves it."""
+
+
+EMPTY_SYSTEM_TURN_DROPPED = "messages.system->dropped(empty)"
+"""Disclosure for a ``system`` turn in ``messages`` that carries no content.
+
+Anthropic accepts an empty-content system turn that only sets
+``output_config.effort``; it renders nothing at its position, so the decoder
+drops it (its effort is resolved separately). A bare empty system turn
+renders nothing either and drops the same way."""
+
+NON_SYSTEM_OUTPUT_CONFIG_DROPPED = "messages.output_config->dropped(unknown_message_field)"
+"""Disclosure for ``output_config`` on a user or assistant turn, where no
+provider defines it; the turn itself is served. The same entry the unknown-key
+pass writes, so the disclosure is unchanged for those turns."""
+
+
+def _is_empty_system_turn(message: _Message) -> bool:
+    """Whether ``message`` is a system turn with no content to render.
+
+    An empty string, an empty block list, or only unmarked, uncited empty
+    text blocks. A marked empty block keeps its typed refusal, as on
+    :func:`_is_empty_prefill`.
+    """
+    if message.role != "system":
+        return False
+    if isinstance(message.content, str):
+        return not message.content
+    return all(
+        isinstance(block, _TextBlock)
+        and not block.text
+        and not block.citations
+        and block.cache_control is None
+        for block in message.content
+    )
+
+
+def _turn_facts(message: _Message) -> TurnFacts:
+    """Reduce one turn to what per-message effort resolution reads."""
+    effort = (
+        message.output_config.get("effort") if isinstance(message.output_config, dict) else None
+    )
+    return TurnFacts(
+        role=message.role,
+        new_input=isinstance(message.content, str)
+        or any(not isinstance(block, _ToolResultBlock) for block in message.content),
+        effort=effort if message.role == "system" and isinstance(effort, str) else None,
+    )
 
 
 def _is_empty_prefill(message: _Message) -> bool:
@@ -495,8 +559,20 @@ def _decode(
             )
         )
     prefill_disclosures: tuple[str, ...] = ()
+    turn_disclosures: dict[str, None] = {}
     last_index = len(request.messages) - 1
     for index, message in enumerate(request.messages):
+        if message.output_config is not None and message.role != "system":
+            turn_disclosures[NON_SYSTEM_OUTPUT_CONFIG_DROPPED] = None
+        elif message.output_config is not None and not isinstance(message.output_config, dict):
+            raise invalid_field(
+                f"messages.{index}.output_config", "output_config must be an object."
+            )
+        if _is_empty_system_turn(message):
+            # Nothing renders at its position; a per-message effort it sets
+            # is resolved below, over every turn.
+            turn_disclosures[EMPTY_SYSTEM_TURN_DROPPED] = None
+            continue
         if (
             index == last_index
             and _is_empty_prefill(message)
@@ -529,15 +605,15 @@ def _decode(
     parallel_tool_calls: bool | None = None
     if request.tool_choice is not None and request.tool_choice.disable_parallel_tool_use:
         parallel_tool_calls = False
+    output_config, effort_disclosures = with_governing_effort(
+        cast(JsonObject, payload["output_config"]) if request.output_config is not None else None,
+        governing_effort([_turn_facts(message) for message in request.messages]),
+    )
     channels = resolve_reasoning_channels(
         request.reasoning,
         max_tokens=request.max_tokens,
         thinking=cast(JsonObject, payload["thinking"]) if request.thinking is not None else None,
-        output_config=(
-            cast(JsonObject, payload["output_config"])
-            if request.output_config is not None
-            else None
-        ),
+        output_config=output_config,
     )
     _require_thinking_budget_below_max_tokens(channels.thinking_config, request.max_tokens)
     try:
@@ -586,6 +662,8 @@ def _decode(
                 *media_disclosures,
                 *document_disclosures,
                 *prefill_disclosures,
+                *turn_disclosures,
+                *effort_disclosures,
                 *stream_disclosures,
                 *tool_shape_disclosures,
                 *dropped_beta_disclosures,
