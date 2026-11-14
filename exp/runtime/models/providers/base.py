@@ -5,6 +5,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import math
+import os
 import time
 from collections.abc import Coroutine, Mapping
 from copy import deepcopy
@@ -64,7 +65,8 @@ from exp.runtime.models.providers.transport import (
 if TYPE_CHECKING:
     from exp.runtime.gateway.recovery import FrozenRecoveryBinding
 
-DEFAULT_TIMEOUT_SECONDS = 60.0
+DEFAULT_TIMEOUT_SECONDS = float(os.environ.get("EXP_PROVIDER_TIMEOUT_SECONDS", "60") or 60)
+"""Request-wide timeout (queueing, attempts and backoff); an operator may raise it for heavy load."""
 DEFAULT_RETRY_POLICY = RetryPolicy()
 DEFAULT_MAXIMUM_OUTPUT_TOKENS = 4096
 

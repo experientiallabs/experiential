@@ -209,14 +209,19 @@ def run_variant(
     )
     row = FamilyVariant(scenario_id=scenario.scenario_id, variant=variant)
     reference = variant.reference
-    if reference is None:
+    if reference is None and frozen is None:
         return row.model_copy(update={"stopped": "variant: " + "; ".join(variant.problems)})
-    restored = verify_restoration(
-        project, reference, expected_state_sha256=variant.edited_state_sha256
-    )
-    row = row.model_copy(update={"restored": restored})
-    if not restored:
-        return row.model_copy(update={"stopped": "variant does not restore to its edited state"})
+    if reference is not None:
+        restored = verify_restoration(
+            project, reference, expected_state_sha256=variant.edited_state_sha256
+        )
+        row = row.model_copy(update={"restored": restored})
+        if not restored and frozen is None:
+            return row.model_copy(
+                update={"stopped": "variant does not restore to its edited state"}
+            )
+    # A frozen start (the world freeze's own initialization of this variant) supersedes an edited
+    # fork of the source checkpoint: the witness and contrasts start from it either way.
     if frozen is not None:
         row = row.model_copy(update={"frozen": frozen})
         reference = frozen
