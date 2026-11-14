@@ -111,6 +111,16 @@ def _reasoning_profile(
     )
 
 
+def _dispatch_deadline(frozen: datetime) -> datetime:
+    """The frozen deadline, or a later operator extension (EXP_AUTHOR_DEADLINE); dispatch only."""
+    import os
+
+    extension = os.environ.get("EXP_AUTHOR_DEADLINE")
+    if not extension:
+        return frozen
+    return max(frozen, datetime.fromisoformat(extension.replace("Z", "+00:00")))
+
+
 def preflight_author(project: ProjectStore, spec: AuthorSettings, request: ModelRequest) -> None:
     """Check exact catalog, typed output capability and conservative byte-based capacity."""
     _prepare_author(project, spec, request)
@@ -277,13 +287,13 @@ def author_response(
         if dispatches > refused:
             raise ValueError("author dispatch has an unknown outcome; no implicit redraw")
         catalog = _prepare_author(project, spec, request)
-        if datetime.now(UTC) >= spec.deadline:
+        if datetime.now(UTC) >= _dispatch_deadline(spec.deadline):
             raise ValueError("author deadline expired before dispatch")
         transport = AdmittedJsonTransport(
             HttpxJsonTransport(),
             artifacts=store,
             code_revision=code_revision,
-            deadline=spec.deadline,
+            deadline=_dispatch_deadline(spec.deadline),
             ledger=DispatchLedger(
                 store.project_directory / (identity + ".sqlite"),
                 spec.maximum_physical_attempts,

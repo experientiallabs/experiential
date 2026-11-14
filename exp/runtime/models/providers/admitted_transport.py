@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from exp.runtime.models.deadlines import dispatch_deadline
 import json
 import math
 import time
@@ -172,7 +173,7 @@ class AdmittedJsonTransport(JsonHttpTransport):
         self._capacity_rounds, self._sleep = capacity_rounds, sleep
         if deadline.tzinfo is None:
             raise ValueError("transport deadline must be timezone-aware")
-        self._inner, self._ledger, self._deadline = inner, ledger, deadline
+        self._inner, self._ledger, self._deadline = inner, ledger, dispatch_deadline(deadline)
         self._admission = admission or HostProviderAdmission.for_host()
         self._route = route
         self._before_claim = before_claim
