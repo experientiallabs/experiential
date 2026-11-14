@@ -10,6 +10,7 @@ from exp.common.core.artifacts import JsonObject, canonical_json_bytes, sha256_j
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.gateway.decisions_contracts import ChoiceQuestion, DecisionRequest, NoulQuestion
 from exp.runtime.gateway.replay_identity import caller_operation_sha256, canonical_request_sha256
+from exp.runtime.google_protocol.requests import decode_generate_content
 
 
 def test_caller_operation_uses_only_the_standard_opt_in_key() -> None:
@@ -174,9 +175,9 @@ def test_chat_nested_thinking_budget_changes_replay_identity() -> None:
 
 def test_generate_content_include_thoughts_changes_replay_identity() -> None:
     """Asking for thought summaries changes the visible answer, so it changes identity."""
-    from exp.runtime.google_protocol.requests import decode_generate_content
 
     def _decoded(config: JsonObject) -> GatewayRequest:
+        """One minimal generateContent request carrying ``config`` as its generationConfig."""
         return decode_generate_content(
             {"contents": [{"role": "user", "parts": [{"text": "hi"}]}], "generationConfig": config},
             model="coding",
@@ -188,3 +189,35 @@ def test_generate_content_include_thoughts_changes_replay_identity() -> None:
     on = _decoded({"thinkingConfig": {"includeThoughts": True}})
     assert canonical_request_sha256(plain) == canonical_request_sha256(off) == sha256_json(plain)
     assert canonical_request_sha256(on) != canonical_request_sha256(plain)
+
+
+def test_a_minted_call_id_joins_replay_identity() -> None:
+    """A history that omitted a call id digests apart from one that spelled the same id."""
+    body: JsonObject = {
+        "contents": [
+            {"role": "user", "parts": [{"text": "q"}]},
+            {"role": "model", "parts": [{"functionCall": {"name": "f", "args": {}}}]},
+            {"role": "user", "parts": [{"functionResponse": {"name": "f", "response": {}}}]},
+        ]
+    }
+    minted = decode_generate_content(body, model="coding", stream=False).request
+    minted_id = minted.messages[1].tool_calls[0].call_id
+    spelled = minted.model_copy(
+        update={
+            "messages": (
+                minted.messages[0],
+                minted.messages[1].model_copy(
+                    update={
+                        "tool_calls": (
+                            minted.messages[1]
+                            .tool_calls[0]
+                            .model_copy(update={"call_id_minted": False}),
+                        )
+                    }
+                ),
+                minted.messages[2],
+            )
+        }
+    )
+    assert spelled.messages[1].tool_calls[0].call_id == minted_id
+    assert canonical_request_sha256(minted) != canonical_request_sha256(spelled)

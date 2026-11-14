@@ -601,3 +601,27 @@ def test_penalties_reach_gemini_only_where_the_rung_supports_them() -> None:
         ],
     )
     assert (supported["frequencyPenalty"], supported["presencePenalty"]) == (0.5, -0.5)
+
+
+def test_the_placeholder_answer_carries_the_google_id_of_the_unanswered_call() -> None:
+    """An interrupted Google-issued call gets a placeholder whose id matches the call."""
+    calls = (
+        ToolCall(call_id="g-1", name="read", arguments={}),
+        ToolCall(call_id="gemini-call-0-1", name="list", arguments={}, call_id_minted=True),
+    )
+    request = ModelRequest(
+        messages=(
+            ModelMessage(role="user", content="go"),
+            ModelMessage(role="assistant", assistant_action=AssistantAction(tool_calls=calls)),
+            ModelMessage(role="user", content="never mind"),
+        ),
+    )
+    contents = cast(
+        "list[JsonObject]", gemini_generate_request("g", request, replay_call_ids=True)["contents"]
+    )
+    responses = [
+        cast("JsonObject", part["functionResponse"])
+        for part in cast("list[JsonObject]", contents[2]["parts"])
+    ]
+    assert responses[0]["id"] == "g-1"
+    assert "id" not in responses[1]
