@@ -245,7 +245,9 @@ def _renders_nothing(content: JsonValue) -> bool:
         and block.get("type") == "text"
         and block.get("text") == ""
         and block.get("cache_control") is None
-        and not block.get("citations")
+        # Only an absent, null, or empty-list citations value is "uncited";
+        # anything else (false, "") is left for the wire model to refuse.
+        and block.get("citations") in (None, [])
         and set(block) <= {"type", "text", "cache_control", "citations"}
         for block in content
     )

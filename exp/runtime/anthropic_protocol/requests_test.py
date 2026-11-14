@@ -1549,6 +1549,45 @@ def test_empty_user_and_assistant_turns_keep_their_named_400() -> None:
     assert excinfo.value.detail.param == "messages.0.content"
 
 
+@pytest.mark.parametrize(
+    "citations", [False, "", 0, {}], ids=["false", "empty-string", "zero", "object"]
+)
+def test_malformed_citations_on_an_empty_system_block_are_refused(citations: JsonValue) -> None:
+    """A falsy but malformed ``citations`` is validated, never dropped as empty."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "system",
+                        "content": [{"type": "text", "text": "", "citations": citations}],
+                    },
+                ]
+            )
+        )
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.detail.param is not None
+    assert excinfo.value.detail.param.startswith("messages.1.content.0")
+
+
+def test_an_empty_system_block_with_null_or_empty_citations_drops() -> None:
+    """``null`` and ``[]`` are the uncited shapes; the empty turn still drops."""
+    for citations in (None, []):
+        decoded = decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "system",
+                        "content": [{"type": "text", "text": "", "citations": citations}],
+                    },
+                ]
+            )
+        )
+        assert decoded.request.ignored_parameters == (EMPTY_SYSTEM_TURN_DROPPED,)
+
+
 def test_an_effort_only_system_turn_may_omit_content() -> None:
     """Anthropic's system turn makes ``content`` optional; absent reads as empty."""
     decoded = decode_messages(
