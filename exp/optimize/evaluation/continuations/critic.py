@@ -28,6 +28,7 @@ from exp.common.models import (
 from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.common.tasks import ToolSchema
 from exp.runtime.agents.chat import ChatAgentRuntime
+from exp.runtime.models.deadlines import dispatch_deadline
 from exp.runtime.models.providers.admitted_transport import (
     AdmittedJsonTransport,
     require_admitted_transport,
@@ -313,7 +314,7 @@ def predict_success(
                 HttpxJsonTransport(),
                 artifacts=store,
                 code_revision=code_revision,
-                deadline=spec.deadline,
+                deadline=dispatch_deadline(spec.deadline),
                 ledger=DispatchLedger(
                     store.project_directory / (identity + ".sqlite"),
                     spec.maximum_physical_attempts,

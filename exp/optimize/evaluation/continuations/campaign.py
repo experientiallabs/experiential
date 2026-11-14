@@ -38,6 +38,7 @@ from exp.optimize.evaluation.continuations.proposals import (
     SourceBranchPolicy,
     propose_checkpoints,
 )
+from exp.runtime.models.deadlines import dispatch_deadline
 from exp.runtime.models.providers.admitted_transport import require_admitted_transport
 from exp.runtime.models.registry import RuntimeModelCatalog
 
@@ -223,7 +224,7 @@ def _selector(
         reasoning_effort=row.reasoning_effort,
         maximum_input_bytes=spec.selector_input_bytes,
         source_branches=spec.selector_source_branches,
-        deadline=spec.initial.deadline,
+        deadline=dispatch_deadline(spec.initial.deadline),
         seed=spec.seed + index,
         horizon_tolerance=spec.horizon_tolerance,
     )

@@ -33,6 +33,7 @@ from exp.optimize.evaluation.executable.loader import (
     load_runtime_definition,
 )
 from exp.runtime.agents.chat import ChatAgentRuntime
+from exp.runtime.models.deadlines import dispatch_deadline
 from exp.runtime.models.providers.admitted_transport import (
     AdmittedJsonTransport,
     require_admitted_transport,
@@ -176,7 +177,7 @@ def execute_continuation_job(
         ledger=ledger,
         artifacts=project.artifacts,
         code_revision=revision,
-        deadline=job.deadline,
+        deadline=dispatch_deadline(job.deadline),
     )
     catalog = RuntimeModelCatalog(
         load_model_catalog(project.model_catalog_path), transport_factory=lambda: transport

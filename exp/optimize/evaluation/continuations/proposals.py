@@ -47,6 +47,7 @@ from exp.optimize.evaluation.continuations.selection import (
 from exp.optimize.evaluation.continuations.study import ContinuationStudy
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.models.call_evidence import canonical_call
+from exp.runtime.models.deadlines import dispatch_deadline
 from exp.runtime.models.providers.admitted_transport import (
     AdmittedJsonTransport,
     require_admitted_transport,
@@ -536,7 +537,7 @@ def propose_checkpoints(
                 HttpxJsonTransport(),
                 artifacts=store,
                 code_revision=code_revision,
-                deadline=spec.deadline,
+                deadline=dispatch_deadline(spec.deadline),
                 ledger=DispatchLedger(
                     store.project_directory / (identity + ".sqlite"), 1, sha256_json(spec)
                 ),
