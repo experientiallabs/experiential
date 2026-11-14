@@ -66,6 +66,7 @@ from exp.optimize.evaluation.continuations.job import (
     preflight_continuation_job,
 )
 from exp.optimize.evaluation.continuations.study import restore_continuation_world
+from exp.optimize.evaluation.executable.grounded import ExecutableCheckpoint, simulated_image
 from exp.optimize.evaluation.variance.actor_critic import admitted_concurrency
 from exp.optimize.evaluation.variance.bounded import run_keyed
 from exp.optimize.evaluation.variance.contracts import (
@@ -452,7 +453,16 @@ def run_observation_witness(
             load_continuation_runtime(project, bound) as runtime,
             restore_continuation_world(runtime.world, original.world_task, original.world) as world,
         ):
-            state = runtime.probe(world.checkpoint())
+            snapshot = world.checkpoint()
+            state = runtime.probe(snapshot)
+            # The probe is the judge's private projection (probe names, not state paths); the
+            # variant's edits live at state paths, so check them against the full simulated state
+            # when the checkpoint carries one.
+            if isinstance(snapshot, ExecutableCheckpoint):
+                try:
+                    state = simulated_image(snapshot)[0]
+                except (ValueError, KeyError, TypeError):
+                    pass
             for step, call in zip(scenario.witness, calls, strict=True):
                 try:
                     executed.append(
