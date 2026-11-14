@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -26,8 +25,7 @@ from exp.common.project.records import ProjectRecordError, ProjectRecords
 from exp.common.sqlite.schema import ContentSchemaError
 from exp.simulation.retrieval.contracts import RAG_KEY_SCHEMA_VERSION
 
-_LOCK_TIMEOUT_SECONDS = float(os.environ.get("EXP_EMBED_LOCK_WAIT_SECONDS", "") or 10)
-"""Wait for another build's embedding work; an operator may raise it to run builds at once."""
+_LOCK_TIMEOUT_SECONDS = 10
 Vector = tuple[float, ...]
 EmbeddingBatch = Callable[[Sequence[str]], tuple[Vector, ...]]
 
