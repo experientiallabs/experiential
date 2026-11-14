@@ -274,6 +274,9 @@ def variant_job(
         return job
     # The frozen runtime reports its own probe identity; the study must expect that one, or the
     # loader refuses the runtime ("runtime probe differs from the frozen definition").
-    probe = GroundedRuntimeDefinition.model_validate(start[1]).probe_sha256
+    try:
+        probe = GroundedRuntimeDefinition.model_validate(start[1]).probe_sha256
+    except ValueError:  # a non-grounded runtime reports the job's own probe
+        return job.model_copy(update={"configuration": start[1]})
     study = job.study.model_copy(update={"probe_sha256": probe})
     return job.model_copy(update={"study": study, "configuration": start[1]})
