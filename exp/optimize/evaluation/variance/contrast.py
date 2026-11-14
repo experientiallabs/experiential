@@ -265,6 +265,10 @@ def _correct_action(decision: DecisionState, scenario: Scenario) -> str:
     raise ValueError(f"scenario {scenario.scenario_id} names an undeclared option")
 
 
+WITNESS_PROTOCOL = "witness-v2"
+"""Witness semantics version; v2 checks edits against the full simulated state, not the probe."""
+
+
 def witness_identity(
     checkpoint: ArtifactInput, scenario: Scenario, job: ContinuationJob, *, code_revision: str
 ) -> str:
@@ -282,6 +286,7 @@ def witness_identity(
     return stable_id(
         "observation-witness",
         {
+            "protocol": WITNESS_PROTOCOL,
             "checkpoint": checkpoint.model_dump(mode="json"),
             "scenario": sha256_json(scenario),
             "job": job.implementation(code_revision),
