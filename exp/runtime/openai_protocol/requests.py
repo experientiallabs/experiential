@@ -71,8 +71,8 @@ from exp.runtime.openai_protocol.manifest import (
 )
 from exp.runtime.openai_protocol.media_parts import message_content
 from exp.runtime.openai_protocol.nullable_params import (
-    CHAT_NULLABLE_PARAMS,
-    RESPONSES_NULLABLE_PARAMS,
+    CHAT_NULL_AS_ABSENT,
+    RESPONSES_NULL_AS_ABSENT,
     drop_null_defaults,
 )
 from exp.runtime.openai_protocol.official_schema import (
@@ -292,7 +292,7 @@ def decode_chat(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
     payload, alias_disclosures = repair_chat(
-        *fold_prompt_cache_key_alias(drop_null_defaults(payload, CHAT_NULLABLE_PARAMS))
+        *fold_prompt_cache_key_alias(drop_null_defaults(payload, CHAT_NULL_AS_ABSENT))
     )
     payload, media_disclosures = degrade_chat_media(payload)
     breakpoints = extract_prompt_cache_breakpoints(payload, container="messages")
@@ -478,7 +478,7 @@ def decode_responses(
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
     payload, alias_disclosures = repair_responses(
-        *fold_prompt_cache_key_alias(drop_null_defaults(payload, RESPONSES_NULLABLE_PARAMS))
+        *fold_prompt_cache_key_alias(drop_null_defaults(payload, RESPONSES_NULL_AS_ABSENT))
     )
     payload, thinking_disclosures, thinking_default_enable = translate_responses_thinking(payload)
     payload, media_disclosures = degrade_responses_media(payload)

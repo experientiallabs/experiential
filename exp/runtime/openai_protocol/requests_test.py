@@ -47,8 +47,8 @@ from exp.runtime.models.providers.streaming_requests import (
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.model_adapter import model_request
 from exp.runtime.openai_protocol.nullable_params import (
-    CHAT_NULLABLE_PARAMS,
-    RESPONSES_NULLABLE_PARAMS,
+    CHAT_NULL_AS_ABSENT,
+    RESPONSES_NULL_AS_ABSENT,
 )
 from exp.runtime.openai_protocol.requests import (
     DecodedGatewayRequest,
@@ -6587,15 +6587,15 @@ def test_a_numeric_true_stream_streams_with_its_stream_options(value: float) -> 
     assert responses.ignored_parameters == ()
 
 
-@pytest.mark.parametrize("field", sorted(CHAT_NULLABLE_PARAMS))
+@pytest.mark.parametrize("field", sorted(CHAT_NULL_AS_ABSENT))
 def test_every_chat_nullable_null_decodes_as_absent(field: str) -> None:
-    """A null on any OpenAI-nullable Chat field is the default, with no disclosure."""
+    """A null on any optional Chat field OpenAI serves null on is the default, undisclosed."""
     assert decode_chat({**_CHAT_BODY, field: None}) == decode_chat(_CHAT_BODY)
 
 
-@pytest.mark.parametrize("field", sorted(RESPONSES_NULLABLE_PARAMS))
+@pytest.mark.parametrize("field", sorted(RESPONSES_NULL_AS_ABSENT))
 def test_every_responses_nullable_null_decodes_as_absent(field: str) -> None:
-    """A null on any OpenAI-nullable Responses field is the default, with no disclosure."""
+    """A null on any optional Responses field OpenAI serves null on is the default."""
     assert decode_responses({**_RESPONSES_BODY, field: None}) == decode_responses(_RESPONSES_BODY)
 
 
@@ -6604,20 +6604,36 @@ def test_every_responses_nullable_null_decodes_as_absent(field: str) -> None:
     [
         (_CHAT_BODY, "model"),
         (_CHAT_BODY, "messages"),
-        (_CHAT_BODY, "tool_choice"),
-        (_CHAT_BODY, "response_format"),
         (_RESPONSES_BODY, "model"),
         (_RESPONSES_BODY, "input"),
-        (_RESPONSES_BODY, "tool_choice"),
     ],
 )
 def test_a_null_openai_refuses_is_still_refused_by_name(body: JsonObject, field: str) -> None:
-    """Fields OpenAI does not let be null keep a 400 that names them, never ``stream``."""
+    """Required fields keep a 400 that names them on a null, never ``stream``."""
     decode = decode_chat if "messages" in body else decode_responses
     with pytest.raises(OpenAIProtocolError) as raised:
         decode({**body, field: None})
     assert raised.value.status_code == 400
     assert raised.value.detail.param == field
+
+
+def test_the_sdk_null_response_format_and_tools_decode_as_absent() -> None:
+    """AsyncOpenAI's ``response_format=None, tools=None`` is served, not refused pre-admission.
+
+    Before the fix such a body was refused with "Invalid value for 'response_format':
+    expected an object, but got null instead." and "Invalid value for 'tools'.".
+    """
+    body: JsonObject = {
+        **_CHAT_BODY,
+        "response_format": None,
+        "tools": None,
+        "tool_choice": None,
+        "parallel_tool_calls": None,
+        "user": None,
+    }
+    assert decode_chat(body) == decode_chat(_CHAT_BODY)
+    responses: JsonObject = {**_RESPONSES_BODY, "text": None, "tools": None, "tool_choice": None}
+    assert decode_responses(responses) == decode_responses(_RESPONSES_BODY)
 
 
 def test_a_non_string_chat_model_is_named_not_reported_as_a_missing_stream() -> None:

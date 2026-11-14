@@ -14,10 +14,16 @@ request types declare nullable (``Optional[...]``; the SDK is generated from
 OpenAI's OpenAPI specification, so ``Optional`` there is the spec's
 ``nullable``). They are pinned literals, locked to the SDK by an equality
 test, so a pin bump that changes OpenAI's contract fails the test rather than
-silently widening what this gateway accepts. A field OpenAI does not let be
-null (``model``, ``messages``, ``input``, ``tools``, ``tool_choice``,
-``response_format``, ``user``, ...) is left in place and keeps its named
-refusal.
+silently widening what this gateway accepts.
+
+A second, smaller vocabulary names the OPTIONAL fields the generated types do
+not mark ``Optional`` but the official API (and OpenRouter) still serve a null
+on as absent: ``response_format``, ``tools``, ``tool_choice``, ``user`` and a
+few more. The official Python SDK sends a JSON ``null`` for any of them when a
+caller passes ``None`` (``response_format=None`` is the common spelling of "no
+structured output"), so refusing them would fail every such call before
+admission. A REQUIRED field (``model``, ``messages``, ``input``)
+is never in either vocabulary and keeps its named refusal.
 
 Removing such a null changes nothing the caller asked for, so it carries no
 ``ignored_parameters`` disclosure (the same convention the other null-valued
@@ -97,6 +103,42 @@ RESPONSES_NULLABLE_PARAMS = frozenset(
 Source: platform.openai.com/docs/api-reference/responses/create, as generated
 into ``openai.types.responses.response_create_params.ResponseCreateParamsNonStreaming``.
 """
+
+
+CHAT_SERVED_NULL_PARAMS = frozenset(
+    {
+        "parallel_tool_calls",
+        "prompt_cache_options",
+        "response_format",
+        "tool_choice",
+        "tools",
+        "user",
+        "web_search_options",
+    }
+)
+"""Optional Chat fields whose null the official API serves as absent, beyond the SDK's.
+
+Each is an optional (``NotRequired``) key of the SDK's request type that the
+type does not declare ``Optional``; the test pins that, so the set can never
+name a required field.
+"""
+
+RESPONSES_SERVED_NULL_PARAMS = frozenset(
+    {
+        "prompt_cache_options",
+        "text",
+        "tool_choice",
+        "tools",
+        "user",
+    }
+)
+"""Optional Responses fields whose null the official API serves as absent, beyond the SDK's."""
+
+CHAT_NULL_AS_ABSENT = CHAT_NULLABLE_PARAMS | CHAT_SERVED_NULL_PARAMS
+"""Every Chat top-level field an explicit null is read as absent on."""
+
+RESPONSES_NULL_AS_ABSENT = RESPONSES_NULLABLE_PARAMS | RESPONSES_SERVED_NULL_PARAMS
+"""Every Responses top-level field an explicit null is read as absent on."""
 
 
 def drop_null_defaults(payload: JsonObject, nullable: frozenset[str]) -> JsonObject:
