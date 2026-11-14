@@ -220,7 +220,7 @@ class TraceMLSettings(ContractModel):
     enabled: bool = True
     decision_alias: str = Field(default=DEFAULT_DECISION_ALIAS, min_length=1)
     bank_root: Path | None = None
-    concurrency: int = Field(default=4, ge=1, le=64, strict=True)
+    concurrency: int = Field(default=4, ge=1, le=512, strict=True)
     steps_per_call: int = Field(default=4, ge=1, le=64, strict=True)
     deadline_hours: int = Field(default=6, ge=1, le=72, strict=True)
     move_judge: AuthorSettings | None = None

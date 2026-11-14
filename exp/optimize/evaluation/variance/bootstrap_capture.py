@@ -150,6 +150,11 @@ def start_definition(
             "state_memory": None
             if template.state_memory is None
             else template.state_memory.model_dump(mode="json"),
+            **(
+                {}
+                if template.reasoning_effort is None
+                else {"reasoning_effort": template.reasoning_effort}
+            ),
         }
     )
 

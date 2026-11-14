@@ -35,6 +35,7 @@ from exp.common.core.artifacts import (
     JsonValue,
     Sha256,
 )
+from exp.common.models.model import ReasoningEffort
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.executable.grounded import (
@@ -167,6 +168,10 @@ class RuntimeTemplate(ContractModel):
     state_memory: StateMemoryPolicy | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    reasoning_effort: ReasoningEffort | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """Simulator (predictor) reasoning effort; None keeps the catalog default and every identity."""
 
 
 class FamilyInput(ContractModel):
