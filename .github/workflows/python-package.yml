@@ -78,14 +78,19 @@ jobs:
               assert event == 'push' and ref.startswith('refs/tags/v') or (
                   replay and ref == 'refs/heads/main'
               ), 'manual publication requires latest-release on main'
-              subprocess.run(['git', 'merge-base', '--is-ancestor', 'HEAD', 'origin/main'], check=True)
+              prerelease = re.fullmatch(r'v\d+\.\d+\.\d+rc\d+', tag) is not None
+              if not prerelease:
+                  subprocess.run(['git', 'merge-base', '--is-ancestor', 'HEAD', 'origin/main'], check=True)
               assert not Path('.github/deferred-native-release.toml').exists()
               project = tomllib.loads(Path('pyproject.toml').read_text())['project']
               assert project['name'] == 'experiential'
               assert tag == 'v' + project['version'], 'tag must match the flagship version'
               native = tomllib.loads(Path('exp/runtime/gateway/native/pyproject.toml').read_text())['project']
               cargo = tomllib.loads(Path('exp/runtime/gateway/native/Cargo.toml').read_text())['package']
-              assert native['name'] == 'exp-gateway-native' and native['version'] == cargo['version']
+              assert native['name'] == 'exp-gateway-native'
+              assert re.fullmatch(r'\d+\.\d+\.\d+(rc\d+)?', native['version'])
+              assert re.sub(r'rc(\d+)$', r'-rc.\1', native['version']) == cargo['version']
+              assert prerelease or 'rc' not in native['version'], 'stable releases require stable native wheels'
           revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f'revision={revision}\npublish={str(publish).lower()}\n')
