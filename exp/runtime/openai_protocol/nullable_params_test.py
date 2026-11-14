@@ -11,8 +11,12 @@ from openai.types.responses.response_create_params import ResponseCreateParamsNo
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.openai_protocol.nullable_params import (
+    CHAT_NULL_AS_ABSENT,
     CHAT_NULLABLE_PARAMS,
+    CHAT_SERVED_NULL_PARAMS,
+    RESPONSES_NULL_AS_ABSENT,
     RESPONSES_NULLABLE_PARAMS,
+    RESPONSES_SERVED_NULL_PARAMS,
     drop_null_defaults,
 )
 
@@ -47,12 +51,27 @@ def test_nullable_vocabularies_match_the_installed_official_sdk(
     assert pinned == _sdk_nullable(params)
 
 
-def test_required_and_non_nullable_fields_are_never_dropped() -> None:
-    """``model``, ``messages``/``input`` and OpenAI's non-nullable options keep their refusal."""
-    for field in ("model", "messages", "tools", "tool_choice", "response_format", "user"):
-        assert field not in CHAT_NULLABLE_PARAMS
-    for field in ("model", "input", "tools", "tool_choice", "text", "user"):
-        assert field not in RESPONSES_NULLABLE_PARAMS
+@pytest.mark.parametrize(
+    ("served", "params"),
+    [
+        (CHAT_SERVED_NULL_PARAMS, CompletionCreateParamsNonStreaming),
+        (RESPONSES_SERVED_NULL_PARAMS, ResponseCreateParamsNonStreaming),
+    ],
+)
+def test_served_null_vocabularies_are_optional_sdk_fields_beyond_its_nullable_ones(
+    served: frozenset[str], params: type
+) -> None:
+    """Each served-null field is an optional SDK key the SDK does not already mark nullable."""
+    assert served <= frozenset(vars(params)["__optional_keys__"])
+    assert not served & _sdk_nullable(params)
+
+
+def test_required_fields_are_never_dropped() -> None:
+    """``model`` and ``messages``/``input`` keep their named refusal on a null."""
+    for field in ("model", "messages"):
+        assert field not in CHAT_NULL_AS_ABSENT
+    for field in ("model", "input"):
+        assert field not in RESPONSES_NULL_AS_ABSENT
 
 
 def test_drop_null_defaults_removes_only_nullable_nulls() -> None:
