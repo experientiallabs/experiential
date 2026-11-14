@@ -545,28 +545,13 @@ def _system_text(instruction: _Content | None) -> str | None:
         return None
     texts: list[str] = []
     for index, part in enumerate(instruction.parts):
-        if part.text is None or _has_non_text(part):
-            raise invalid_field(
-                f"systemInstruction.parts.{index}", "systemInstruction parts must be text."
-            )
+        param = f"systemInstruction.parts.{index}"
+        _require_one_payload(part, param)
+        if part.text is None:
+            raise invalid_field(param, "systemInstruction parts must be text.")
         texts.append(part.text)
     joined = "\n\n".join(text for text in texts if text)
     return joined or None
-
-
-def _has_non_text(part: _Part) -> bool:
-    """Whether one part carries anything but text."""
-    return any(
-        value is not None
-        for value in (
-            part.inline_data,
-            part.file_data,
-            part.function_call,
-            part.function_response,
-            part.executable_code,
-            part.code_execution_result,
-        )
-    )
 
 
 def _require_one_payload(part: _Part, param: str) -> None:
@@ -632,11 +617,12 @@ def _turn_messages(
             return
         text = "".join(part.text for part in segments if part.kind == "text")
         multimodal = any(part.kind != "text" for part in segments)
+        retained = tuple(part for part in segments if part.kind != "text" or part.text)
         out.append(
             GatewayMessage(
                 role="assistant" if role == "model" else "user",
-                content=text if (text or multimodal or not calls) else None,
-                content_parts=tuple(segments) if multimodal else (),
+                content=text if (segments or not calls) else None,
+                content_parts=retained if multimodal else (),
                 tool_calls=tuple(calls),
                 provider_reasoning=tuple(reasoning),
             )
@@ -680,7 +666,7 @@ def _turn_messages(
             segments.append(_inline_part(part.inline_data, part_param))
         elif part.file_data is not None:
             segments.append(_file_part(part.file_data, part_param))
-        elif part.text:
+        elif part.text is not None:
             segments.append(TextContentPart(text=part.text))
     flush()
     if not out:
@@ -725,10 +711,13 @@ def _tool_message(
                 f"functionResponse '{response.name}' answers no preceding functionCall.",
             )
         call_id = match[0]
-    elif pending_calls.get(call_id) != response.name:
+    elif pending_calls.get(call_id) != response.name or all(
+        entry[0] != call_id for entry in unanswered
+    ):
         raise invalid_field(
             f"{param}.functionResponse.id",
-            "functionResponse.id must name a preceding functionCall of the same name.",
+            "functionResponse.id must name a preceding, still unanswered functionCall of the "
+            "same name.",
         )
     unanswered[:] = [entry for entry in unanswered if entry[0] != call_id]
     return GatewayMessage(
@@ -738,7 +727,7 @@ def _tool_message(
 
 def _response_text(response: JsonObject | None) -> str:
     """The tool result as text: a lone string result verbatim, else compact JSON."""
-    if not response:
+    if response is None:
         return ""
     if len(response) == 1:
         (value,) = response.values()

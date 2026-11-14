@@ -365,20 +365,23 @@ impl GenerateContentEncoder {
                 Ok(Vec::new())
             }
             Event::ToolArgumentsDelta { index, delta } => {
-                self.tool_arguments
-                    .entry(*index)
-                    .or_default()
-                    .push_str(delta);
+                // A completed call leaves the maps, so a late delta fails here too.
+                let accumulated = self.tool_arguments.get_mut(index).ok_or_else(|| {
+                    invalid_provider_stream(
+                        "generateContent tool arguments arrived outside an active tool call.",
+                    )
+                })?;
+                accumulated.push_str(delta);
                 Ok(Vec::new())
             }
             Event::ToolCallCompleted { index, call } => {
-                let identity = self.tool_identities.get(index).ok_or_else(|| {
+                let identity = self.tool_identities.remove(index).ok_or_else(|| {
                     invalid_provider_stream(
                         "generateContent tool completion omitted its started tool call.",
                     )
                 })?;
-                let streamed = self.tool_arguments.get(index).cloned().unwrap_or_default();
-                if identity != &(call.call_id.clone(), call.name.clone())
+                let streamed = self.tool_arguments.remove(index).unwrap_or_default();
+                if identity != (call.call_id.clone(), call.name.clone())
                     || streamed != call.raw_arguments
                 {
                     return Err(invalid_provider_stream(
@@ -749,6 +752,49 @@ mod tests {
             payloads[0]["candidates"][0]["content"]["parts"][0]["functionCall"]["id"],
             "call-1"
         );
+    }
+
+    #[test]
+    fn tool_argument_deltas_outside_an_active_call_fail_the_stream() {
+        let mut encoder = GenerateContentEncoder::new("req-4", "coding", Vec::new(), false);
+        let stray = Event::ToolArgumentsDelta {
+            index: 0,
+            delta: "{".into(),
+        };
+        assert!(encoder.feed(&stray).is_err());
+        let call = CompletedToolCall {
+            call_id: "call-1".into(),
+            name: "search".into(),
+            namespace: None,
+            caller: None,
+            thought_signature: None,
+            provider_item_id: None,
+            provider_status: None,
+            raw_arguments: "{}".into(),
+            custom: false,
+        };
+        let mut encoder = GenerateContentEncoder::new("req-4", "coding", Vec::new(), false);
+        encoder
+            .feed(&Event::ToolCallStarted {
+                custom: false,
+                index: 0,
+                call_id: "call-1".into(),
+                name: "search".into(),
+                namespace: None,
+                caller: None,
+                thought_signature: None,
+            })
+            .unwrap();
+        encoder
+            .feed(&Event::ToolArgumentsDelta {
+                index: 0,
+                delta: "{}".into(),
+            })
+            .unwrap();
+        encoder
+            .feed(&Event::ToolCallCompleted { index: 0, call })
+            .unwrap();
+        assert!(encoder.feed(&stray).is_err());
     }
 
     #[test]

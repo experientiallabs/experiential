@@ -395,6 +395,31 @@ def test_inline_media_becomes_canonical_parts() -> None:
             "invalid_parameter",
             "contents.0.parts.0",
         ),
+        (
+            _body(systemInstruction={"parts": [{"text": "s", "videoMetadata": {"fps": 1}}]}),
+            400,
+            "unsupported_parameter",
+            "systemInstruction.parts.0.videoMetadata",
+        ),
+        # One call answered twice by explicit id is one invocation with two results.
+        (
+            _body(
+                contents=[
+                    {"role": "user", "parts": [{"text": "q"}]},
+                    {"role": "model", "parts": [{"functionCall": {"id": "c", "name": "f"}}]},
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"functionResponse": {"id": "c", "name": "f", "response": {}}},
+                            {"functionResponse": {"id": "c", "name": "f", "response": {}}},
+                        ],
+                    },
+                ]
+            ),
+            400,
+            "invalid_parameter",
+            "contents.2.parts.1.functionResponse.id",
+        ),
     ],
 )
 def test_rejections_name_the_offending_field(
@@ -516,3 +541,23 @@ def test_an_echoed_signature_is_disclosed_as_dropped_off_gemini_wires() -> None:
     assert THOUGHT_SIGNATURE_DROPPED in public.ignored_parameters
     public, _provider = route_generation_parameter_requests((gemini, openai), request)
     assert THOUGHT_SIGNATURE_DROPPED not in public.ignored_parameters
+
+
+def test_empty_objects_and_empty_text_parts_survive_as_sent() -> None:
+    """``response: {}`` is the text ``{}`` and an empty text part is an empty turn, not a 400."""
+    request = decode_generate_content(
+        _body(
+            contents=[
+                {"role": "user", "parts": [{"text": ""}]},
+                {"role": "model", "parts": [{"functionCall": {"id": "c", "name": "f"}}]},
+                {
+                    "role": "user",
+                    "parts": [{"functionResponse": {"id": "c", "name": "f", "response": {}}}],
+                },
+            ]
+        ),
+        model="m",
+        stream=False,
+    ).request
+    assert request.messages[0].content == ""
+    assert request.messages[-1].content == "{}"
