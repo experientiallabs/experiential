@@ -155,8 +155,7 @@ def gemini_generate_request(
     json_object_output = json_object_output or request.json_object_output
     system_parts: list[JsonObject] = []
     contents: list[JsonObject] = []
-    tool_names: dict[str, str] = {}
-    caller_ids: set[str] = set()
+    tool_names: dict[str, tuple[str, bool]] = {}
     # systemInstruction has no position inside contents, so an instruction
     # after conversation start rides as user text where the caller put it
     # (consecutive user contents are accepted on this wire); only the leading
@@ -170,9 +169,7 @@ def gemini_generate_request(
             continue
         if message.role == "assistant":
             turn.close(contents)
-        content = _gemini_content(
-            message, tool_names, replay_call_ids=replay_call_ids, caller_ids=caller_ids
-        )
+        content = _gemini_content(message, tool_names, replay_call_ids=replay_call_ids)
         if message.role == "assistant":
             turn.open(message, contents, content)
         elif turn.collects(message):
@@ -336,18 +333,17 @@ class _CallTurn:
 
 def _gemini_content(
     message: ModelMessage,
-    tool_names: dict[str, str],
+    tool_names: dict[str, tuple[str, bool]],
     *,
     replay_call_ids: bool = False,
-    caller_ids: set[str] | None = None,
 ) -> JsonObject:
     """Map a EXP history item to Gemini user or model content parts.
 
     Args:
         message: One visible non-system history message.
-        tool_names: Accumulated tool-call ID to tool-name linkage, updated in place.
+        tool_names: Accumulated tool-call ID to (tool name, caller-supplied id) linkage,
+            updated in place; the answered call alone decides whether its id is echoed.
         replay_call_ids: Echo caller-supplied (Google-issued) call ids on both parts.
-        caller_ids: The caller-supplied ids seen so far (never minted ones), updated in place.
 
     Returns:
         One native Gemini content object.
@@ -355,13 +351,13 @@ def _gemini_content(
     Raises:
         ValueError: The message cannot preserve its role or tool linkage.
     """
-    caller_ids = set() if caller_ids is None else caller_ids
     if message.role == "tool":
-        tool_name = tool_names.get(message.tool_call_id or "")
-        if tool_name is None:
+        linked = tool_names.get(message.tool_call_id or "")
+        if linked is None:
             raise ValueError("Gemini tool result has no preceding tool-call name")
+        tool_name, caller_id = linked
         response: JsonObject = {"name": tool_name, "response": {"content": message.content or ""}}
-        if replay_call_ids and message.tool_call_id in caller_ids:
+        if replay_call_ids and caller_id:
             response["id"] = message.tool_call_id
         return {"role": "user", "parts": [{"functionResponse": response}]}
     if message.role == "user":
@@ -409,11 +405,10 @@ def _gemini_content(
         # stay unsigned); a turn with none falls back to the placeholder.
         signed_turn = any(call.provider_thought_signature for call in action.tool_calls)
         for call in action.tool_calls:
-            tool_names[call.call_id] = call.name
+            tool_names[call.call_id] = (call.name, not call.call_id_minted)
             function_call: JsonObject = {"name": call.name, "args": call.arguments}
             if replay_call_ids and not call.call_id_minted:
                 function_call["id"] = call.call_id
-                caller_ids.add(call.call_id)
             part: JsonObject = {"functionCall": function_call}
             if call.provider_thought_signature is not None:
                 part["thoughtSignature"] = call.provider_thought_signature

@@ -447,3 +447,28 @@ def test_a_google_callers_include_thoughts_survives_the_numeric_budget() -> None
     generation = payload["generationConfig"]
     assert isinstance(generation, dict)
     assert generation["thinkingConfig"] == {"includeThoughts": True, "thinkingBudget": 1024}
+
+
+def test_the_display_kill_switch_also_governs_the_budget_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``EXP_GATEWAY_REASONING_DISPLAY=0`` strips includeThoughts beside a numeric budget too."""
+    from exp.runtime.google_protocol.requests import decode_generate_content
+
+    monkeypatch.setenv("EXP_GATEWAY_REASONING_DISPLAY", "0")
+    request = decode_generate_content(
+        {
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {
+                "maxOutputTokens": 4000,
+                "thinkingConfig": {"includeThoughts": True, "thinkingBudget": 1024},
+            },
+        },
+        model="coding",
+        stream=True,
+    ).request
+    profile = _gemini_profile("gemini-2.5-flash")
+    _public, provider = route_generation_parameter_requests((profile,), request)
+    generation = dialect_stream_payload(profile, provider)["generationConfig"]
+    assert isinstance(generation, dict)
+    assert generation["thinkingConfig"] == {"thinkingBudget": 1024}
