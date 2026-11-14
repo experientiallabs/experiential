@@ -1,6 +1,7 @@
 """One bounded author draw with durable intent, exact response replay and no implicit redraw."""
 
 import json
+import os
 from copy import deepcopy
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -111,6 +112,17 @@ def _reasoning_profile(
     )
 
 
+def _dispatch_deadline(frozen: datetime) -> datetime:
+    """The frozen deadline, or a later operator extension (EXP_AUTHOR_DEADLINE, ISO time).
+
+    The extension never enters the saved spec or any identity; it only lets new draws dispatch.
+    """
+    extension = os.environ.get("EXP_AUTHOR_DEADLINE")
+    if not extension:
+        return frozen
+    return max(frozen, datetime.fromisoformat(extension.replace("Z", "+00:00")))
+
+
 def preflight_author(project: ProjectStore, spec: AuthorSettings, request: ModelRequest) -> None:
     """Check exact catalog, typed output capability and conservative byte-based capacity."""
     _prepare_author(project, spec, request)
@@ -135,7 +147,9 @@ def _prepare_author(
 ) -> ModelCatalog:
     """Validate the effective request and return its credential-free per-call catalog view."""
     request = _effective_request(spec, request)
-    if len(request.model_dump_json().encode()) > spec.maximum_input_bytes:
+    if len(request.model_dump_json().encode()) > max(
+        spec.maximum_input_bytes, int(os.environ.get("EXP_AUTHOR_INPUT_BYTES_FLOOR", "0") or 0)
+    ):
         raise ValueError("author context exceeds its frozen byte allowance")
     if request.maximum_output_tokens != spec.output_tokens:
         raise ValueError("author request differs from its frozen output allowance")
@@ -277,13 +291,14 @@ def author_response(
         if dispatches > refused:
             raise ValueError("author dispatch has an unknown outcome; no implicit redraw")
         catalog = _prepare_author(project, spec, request)
-        if datetime.now(UTC) >= spec.deadline:
+        deadline = _dispatch_deadline(spec.deadline)
+        if datetime.now(UTC) >= deadline:
             raise ValueError("author deadline expired before dispatch")
         transport = AdmittedJsonTransport(
             HttpxJsonTransport(),
             artifacts=store,
             code_revision=code_revision,
-            deadline=spec.deadline,
+            deadline=deadline,
             ledger=DispatchLedger(
                 store.project_directory / (identity + ".sqlite"),
                 spec.maximum_physical_attempts,

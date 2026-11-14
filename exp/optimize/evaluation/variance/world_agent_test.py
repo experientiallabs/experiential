@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from exp.optimize.evaluation.variance import world_agent as _world_agent_module
+
 from exp.common.core.artifacts import JsonObject
 from exp.common.project import artifact_input
 from exp.optimize.evaluation.variance.authoring_packet_test import ticket_packet, tool_reply, wire
@@ -132,6 +134,7 @@ def test_each_prompt_set_runs_its_own_trajectory_and_the_first_ready_one_is_sele
         tool_reply(WORLD_TOOL, world_answer(packet, close=WRONG_CLOSE)),
         tool_reply(PLAN_TOOL, _plan()),
         tool_reply(WORLD_TOOL, research_answer("question:0")),
+        tool_reply(WORLD_TOOL, research_answer("question:0")),
         tool_reply(PLAN_TOOL, _plan()),
         tool_reply(WORLD_TOOL, world_answer(packet)),
     )
@@ -146,19 +149,19 @@ def test_each_prompt_set_runs_its_own_trajectory_and_the_first_ready_one_is_sele
             maximum_repairs=1,
         )
 
-    assert len(transport.requests) == 7
+    assert len(transport.requests) == 8
     assert [(row.prompt_set, row.draft.status) for row in authoring.trajectories] == [
         ("contract-first", "refused"),
         ("state-machine-first", "needs_research"),
         ("failure-mode-first", "ready"),
     ]
-    assert [len(row.rounds) for row in authoring.trajectories] == [3, 2, 2]
+    assert [len(row.rounds) for row in authoring.trajectories] == [3, 3, 2]
     assert authoring.selected == "failure-mode-first"
     systems = _systems(transport)
     for index, name in (
         (0, "contract-first"),
         (3, "state-machine-first"),
-        (5, "failure-mode-first"),
+        (6, "failure-mode-first"),
     ):
         assert PROMPT_SETS[name].version in systems[index]
     assert len({row.prompt_sha256 for row in authoring.trajectories}) == 3
@@ -173,3 +176,9 @@ def test_each_prompt_set_runs_its_own_trajectory_and_the_first_ready_one_is_sele
             code_revision="test",
             prompt_sets=("contract-first", "contract-first"),
         )
+
+
+@pytest.fixture(autouse=True)
+def _sequential_prompt_sets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ordered fake transport needs the prompt sets drawn one after another."""
+    monkeypatch.setattr(_world_agent_module, "PARALLEL_PROMPT_SETS", False)

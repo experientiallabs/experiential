@@ -104,7 +104,7 @@ from exp.simulation.rules.properties import (
 )
 from exp.simulation.rules.workloads import boundary_workloads
 
-WORLD_FREEZE_PROTOCOL = "world-freeze-v2"
+WORLD_FREEZE_PROTOCOL = "world-freeze-v3"
 """Version of the freeze checks and compatibility review; change it whenever either changes."""
 
 FREEZE_TYPE = "world-freeze"
@@ -199,6 +199,7 @@ class VariantFreeze(ContractModel):
     restored: bool | None = None
     problems: tuple[str, ...] = ()
     diagnostics: tuple[str, ...] = ()
+    caveats: tuple[str, ...] = ()
 
 
 class WorldFreeze(ContractModel):
@@ -792,8 +793,13 @@ def _freeze_variant(
     variant_id = row.variant_id
     problems = [*checks.problems, *checks.variant_problems.get(variant_id, [])]
     diagnostics = [*checks.variant_diagnostics.get(variant_id, [])]
-    diagnostics += [
-        f"rule {rule_id} has an unsupported decision boundary" for rule_id in diagnostic
+    # Rules are guidance the simulator LLM reads, built and checked with decision tags; a rule
+    # the tags have not confirmed is diagnostic context, never the only rule that exists, so it
+    # is recorded as a caveat and does not block freezing. The same holds for behaviors the
+    # world declares it leaves to the grounded model.
+    caveats = [
+        f"rule {rule_id} has an unconfirmed decision boundary (diagnostic context)"
+        for rule_id in diagnostic
     ]
     unexecuted = [
         run.case.workload.workload_id
@@ -803,18 +809,22 @@ def _freeze_variant(
     if unexecuted:
         diagnostics.append(f"boundary workloads {unexecuted} were not executed")
     if unsupported:
-        diagnostics.append(f"the world declares unsupported behaviors {list(unsupported)}")
+        caveats.append(f"the world declares unsupported behaviors {list(unsupported)}")
     if problems:
         return VariantFreeze(
             variant_id=variant_id,
             status="rejected",
             problems=tuple(problems),
             diagnostics=tuple(diagnostics),
+        caveats=tuple(caveats),
         )
     if definition is None:
         diagnostics.append("no runtime definition was supplied, so restoration is unproven")
         return VariantFreeze(
-            variant_id=variant_id, status="diagnostic", diagnostics=tuple(diagnostics)
+            variant_id=variant_id,
+            status="diagnostic",
+            diagnostics=tuple(diagnostics),
+            caveats=tuple(caveats),
         )
     try:
         reference = _start(
@@ -828,6 +838,7 @@ def _freeze_variant(
             definition_sha256=sha256_json(definition),
             problems=tuple(problems),
             diagnostics=tuple(diagnostics),
+        caveats=tuple(caveats),
         )
     restored = restores_exactly(project, definition, reference, row.state)
     if not restored:
@@ -843,6 +854,7 @@ def _freeze_variant(
         restored=restored,
         problems=tuple(problems),
         diagnostics=tuple(diagnostics),
+        caveats=tuple(caveats),
     )
 
 
@@ -876,8 +888,11 @@ def _start(
         if not isinstance(source.world, ExecutableCheckpoint):
             raise ValueError("a resume start needs a simulated checkpoint carrying its history")
         state, history = simulated_image(source.world)
-        if state != row.state and history:
+        if state != row.state and history and trajectory is not None:
             raise ValueError("the resume source's simulated state is not the variant's state")
+        # Without a branch trajectory the actor resumes at the packet checkpoint and the served
+        # world is re-imaged to the variant's packet state below (with_simulated_image), keeping
+        # the retained history: the packet's states use their own keys, never the checkpoint's.
         context, sources = source.actor, (packet_reference, origin)
         if (nudge := packet.variant(row.variant_id).nudge) is not None:
             told = (*context.messages, ModelMessage(role="user", content=nudge))
@@ -923,7 +938,7 @@ def _resume_source(
     world = load_continuation_checkpoint(project.artifacts, packet.checkpoint).world
     if isinstance(world, ExecutableCheckpoint):
         state, history = simulated_image(world)
-        if state == row.state or (trajectory is None and not history):
+        if state == row.state or trajectory is None:
             return packet.checkpoint
     scenario = next(
         (

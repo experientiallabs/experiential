@@ -30,6 +30,8 @@ when its computed eligibility holds.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
@@ -112,7 +114,7 @@ from exp.optimize.evaluation.variance.rubric_author import (
     save_rubric,
 )
 from exp.optimize.evaluation.variance.rubric_revision import RevisionTargets, revise_until_stable
-from exp.optimize.evaluation.variance.world_agent import author_world_agentic
+from exp.optimize.evaluation.variance.world_agent import WORLD_AGENT_PROTOCOL, author_world_agentic
 from exp.optimize.evaluation.variance.world_author import (
     WorldSpec,
     load_world_draft,
@@ -294,31 +296,39 @@ class _Point:
             )
         packet = self.packet(state, scenarios)
         packet_ref = save_packet(project, packet, code_revision=revision)
-        prefix = stable_id("family-authoring", {"draws": self.draws, "packet": packet_ref.sha256})
+        prefix = stable_id(
+            "family-authoring",
+            {"draws": self.draws, "packet": packet_ref.sha256, "world": WORLD_AGENT_PROTOCOL},
+        )
         library = self.library(packet_ref, prefix)
         if library is not None:
             refuse_actor_exposure(library.library, actor_texts(packet, scenarios))
         base = GroundedRuntimeDefinition.model_validate(self.tier.job.configuration)
         with ProgramSandbox() as sandbox:
-            world_run = author_world_agentic(
-                project,
-                authoring.world_author,
-                packet_ref,
-                sandbox=sandbox,
-                identity=prefix + "-world",
-                code_revision=revision,
-                prompt_sets=authoring.world_prompt_sets,
-                maximum_repairs=authoring.world_repairs,
-            )
-            rubric_run = author_rubric_agentic(
-                project,
-                authoring.rubric_author,
-                packet_ref,
-                identity=prefix + "-rubric",
-                code_revision=revision,
-                profile=authoring.rubric_profile,
-                library=library,
-            )
+            # The world and rubric authors never read each other's output: draw them at once.
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                world_future = pool.submit(
+                    author_world_agentic,
+                    project,
+                    authoring.world_author,
+                    packet_ref,
+                    sandbox=sandbox,
+                    identity=prefix + "-world",
+                    code_revision=revision,
+                    prompt_sets=authoring.world_prompt_sets,
+                    maximum_repairs=authoring.world_repairs,
+                )
+                rubric_future = pool.submit(
+                    author_rubric_agentic,
+                    project,
+                    authoring.rubric_author,
+                    packet_ref,
+                    identity=prefix + "-rubric",
+                    code_revision=revision,
+                    profile=authoring.rubric_profile,
+                    library=library,
+                )
+                world_run, rubric_run = world_future.result(), rubric_future.result()
             if world_run.draft is None:
                 raise ValueError("the world author returned no ready draft")
             if rubric_run.draft.status != "ready":

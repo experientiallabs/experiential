@@ -25,7 +25,10 @@ rubric author's output, and its plan never becomes authority over the packet.
 from __future__ import annotations
 
 import json
+import os
+import threading
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Literal
 
 from pydantic import Field
@@ -41,7 +44,6 @@ from exp.optimize.evaluation.variance.authoring_packet import (
     author_request,
     bounded_reason,
     buy_author_draw,
-    check_research,
     forced_tool_arguments,
     load_packet,
     save_author_result,
@@ -59,11 +61,14 @@ from exp.optimize.evaluation.variance.world_author import (
 from exp.simulation.induction.contracts import ValidationReport
 from exp.simulation.induction.sandbox import ProgramSandbox
 
-WORLD_AGENT_PROTOCOL = "world-agent-v1"
+WORLD_AGENT_PROTOCOL = "world-agent-v3"
 """Version of the prompt sets, phases, plan schema, repair feedback and selection."""
 
 PLAN_TOOL = "submit_world_plan"
 """Name of the one tool the plan phase must call."""
+
+PARALLEL_PROMPT_SETS = True
+"""Run the prompt sets' trajectories at once (tests with an ordered fake transport turn it off)."""
 
 WORLD_AUTHORING_TYPE = "world-authoring"
 """Artifact type of a saved agentic authoring record."""
@@ -102,8 +107,9 @@ _PHASES: dict[Phase, str] = {
 Do not write programs yet. Call submit_world_plan exactly once: describe the state machine
 (domains, states and the transitions each tool causes), which tools deserve an exact program and
 which stay with the grounded model, every failure mode you must model, and the replay fixtures
-that will exercise each program path. Cite packet locators. Ask research questions for behavior
-the packet does not support.""",
+that will exercise each program path. Cite packet locators exactly as citable_locators lists
+them. Record open questions as research notes; a question never stops the draft: a tool whose
+reply the packet does not pin stays with the grounded model.""",
     "draft": """PHASE draft
 The user message holds the authoring packet and your own plan. Your plan is a working note, not
 evidence: where it disagrees with the packet, the packet wins. Call submit_world_draft once.""",
@@ -112,8 +118,9 @@ Your previous answer failed the host checks quoted in host_failures, exactly as 
 the program sandbox reported them (failing replay steps carry the expected and actual replies).
 Fix the world so every check passes. Never fix a check by enforcing an unsupported rule,
 dropping a variant, deleting a fixture that exposes a real defect or hard-coding a fixture's
-answer; if the packet cannot support a passing world, return needs_research. Keep what passed.
-Call submit_world_draft once.""",
+answer. Where host_failures says needs_research was declined, return status ready: leave each
+unresolved tool or behavior to the grounded model (no program), list the open question under
+unresolved (never unsupported), and keep every variant. Keep what passed. Call submit_world_draft once.""",
 }
 
 PROMPT_SETS: dict[str, WorldPromptSet] = {
@@ -162,7 +169,7 @@ class WorldPlan(ContractModel):
         research: Questions the packet does not answer.
     """
 
-    state_machine: str = Field(min_length=1, max_length=4000)
+    state_machine: str = Field(min_length=1, max_length=16000)
     programs: tuple[str, ...] = ()
     predicted: tuple[str, ...] = ()
     failure_modes: tuple[str, ...] = ()
@@ -283,6 +290,11 @@ def author_world_agentic(
         )
     if maximum_repairs < 0:
         raise ValueError("maximum_repairs cannot be negative")
+    # A world with programs and fixtures outgrows a small output allowance; an operator floor
+    # (EXP_WORLD_OUTPUT_TOKENS_FLOOR) raises it for new draws without touching the spec.
+    floor = int(os.environ.get("EXP_WORLD_OUTPUT_TOKENS_FLOOR", "0") or 0)
+    if floor > settings.output_tokens:
+        settings = settings.model_copy(update={"output_tokens": floor})
     packet = load_packet(project, packet_reference)
     store = project.artifacts
     with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
@@ -290,10 +302,19 @@ def author_world_agentic(
         if store.exists(result_id):
             return WorldAuthoring.model_validate_json(store.read_bytes(result_id, "draft.json"))
         run = _Run(project, settings, packet, packet_reference, sandbox, code_revision)
-        trajectories = tuple(
-            run.trajectory(PROMPT_SETS[name], f"{identity}-{name}", maximum_repairs)
-            for name in prompt_sets
-        )
+        # The prompt sets are independent draws: run them at once (order is kept); the shared
+        # program sandbox is used under one lock.
+        with ThreadPoolExecutor(
+            max_workers=max(1, len(prompt_sets)) if PARALLEL_PROMPT_SETS else 1
+        ) as pool:
+            trajectories = tuple(
+                pool.map(
+                    lambda name: run.trajectory(
+                        PROMPT_SETS[name], f"{identity}-{name}", maximum_repairs
+                    ),
+                    prompt_sets,
+                )
+            )
         chosen = next((row for row in trajectories if row.draft.status == "ready"), None)
         authoring = WorldAuthoring(
             author_protocol_sha256=world_protocol_sha256(),
@@ -343,6 +364,7 @@ class _Run:
     ) -> None:
         """Bind the project, author settings, packet, executor and producing revision."""
         self.project, self.settings, self.sandbox = project, settings, sandbox
+        self.sandbox_lock = threading.Lock()
         self.packet, self.packet_reference, self.code_revision = (
             packet,
             packet_reference,
@@ -415,10 +437,21 @@ class _Run:
         reference, response = bought
         try:
             plan = WorldPlan.model_validate(forced_tool_arguments(response, PLAN_TOOL))
-            check_research(self.packet, plan.research)
-            invented = self.packet.unsupplied(list(plan.supported_by))
-            if invented:
-                raise ValueError(f"the plan cites locators that were not supplied: {invented}")
+            # The plan is a working note, not evidence: notes citing locators the packet never
+            # supplied are dropped rather than refusing the whole plan.
+            known = {variant.variant_id for variant in self.packet.variants}
+            research = tuple(
+                item
+                for item in plan.research
+                if not self.packet.unsupplied(list(item.cited)) and set(item.blocks) <= known
+            )
+            invented = set(self.packet.unsupplied(list(plan.supported_by)))
+            plan = plan.model_copy(
+                update={
+                    "research": research,
+                    "supported_by": tuple(r for r in plan.supported_by if r not in invented),
+                }
+            )
         except ValueError as error:
             rounds.append(
                 WorldRound(
@@ -470,7 +503,8 @@ class _Run:
         arguments: object = None
         try:
             arguments = forced_tool_arguments(response, WORLD_TOOL)
-            answer, report = review_world_answer(arguments, self.packet, self.sandbox)
+            with self.sandbox_lock:
+                answer, report = review_world_answer(arguments, self.packet, self.sandbox)
         except ValueError as error:
             failure = bounded_reason(error)
             report = error.report if isinstance(error, WorldReviewError) else None
@@ -512,6 +546,20 @@ class _Run:
                 validation=report,
             )
         )
+        if answer.status == "needs_research":
+            declined: JsonObject = {
+                "previous_answer": json.loads(json.dumps(arguments)),
+                "host_failures": [
+                    "needs_research declined: the grounded model simulates every tool without "
+                    "an exact program from the state, the rule book and similar real outputs. "
+                    "Return status ready; leave these questions' tools to the grounded model and "
+                    "list each question under unresolved (not unsupported): "
+                    + json.dumps([item.question for item in answer.research])[:6000]
+                ],
+                "failing_programs": [],
+            }
+        else:
+            declined = None
         draft = WorldDraft(
             identity=identity,
             packet_sha256=self.packet.identity,
@@ -521,7 +569,7 @@ class _Run:
             research=answer.research,
             validation=report,
         )
-        return draft, None
+        return draft, declined
 
     def _request(
         self,

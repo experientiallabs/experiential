@@ -327,8 +327,17 @@ class DecisionFamilySpec(ContractModel):
                     [item.model_dump(mode="json") for item in self.dispositions]
                 ),
                 **({"measure_decisions": True} if self.measure_spec is not None else {}),
+                "world_agent": _world_agent_protocol(),
             },
         )
+
+
+def _world_agent_protocol() -> str:
+    """The world author's protocol: a new one re-keys the family, never its draws."""
+    from exp.optimize.evaluation.variance.world_agent import WORLD_AGENT_PROTOCOL
+    from exp.optimize.evaluation.variance.world_freeze import WORLD_FREEZE_PROTOCOL
+
+    return WORLD_AGENT_PROTOCOL + "/" + WORLD_FREEZE_PROTOCOL
 
 
 class FamilyReport(ContractModel):
