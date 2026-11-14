@@ -115,16 +115,7 @@ async fn one(
         Some(prepared) => input::inspect(prepared, budget).await,
         None => Err(()),
     };
-    let result = result.and_then(|mut verdict| {
-        if started.elapsed() > budget {
-            return Err(());
-        }
-        if check.adapter["kind"] == "http_json" && !verdict["replacement_messages"].is_null() {
-            verdict["replacement_messages"] = json!(input_rewrite::hosted(
-                subject,
-                &verdict["replacement_messages"]
-            )?);
-        }
+    let result = result.and_then(|verdict| {
         if started.elapsed() > budget {
             return Err(());
         }
@@ -163,12 +154,26 @@ async fn one(
     if action != "modify" {
         return Err(inspection::failed(action, id));
     }
-    let replacement = verdict["replacement_messages"]
-        .as_array()
-        .cloned()
-        .and_then(|m| input_rewrite::restore(subject, m).ok());
+    let replacement = if check.adapter["kind"] == "http_json" {
+        input_rewrite::hosted(subject, &verdict["replacement_messages"]).ok()
+    } else {
+        verdict["replacement_messages"].as_array().cloned()
+    }
+    .and_then(|m| input_rewrite::restore(subject, m).ok());
+    if started.elapsed() > budget {
+        *observed = inspection::decision(
+            "error",
+            id,
+            "unavailable",
+            "Content inspection is unavailable. Retry later.",
+        );
+        return inspection::uncertain(check).map_or_else(
+            || Ok(subject.clone()),
+            |failure| unavailable(failure, observed),
+        );
+    }
     let Some(replacement) = replacement else {
-        return unavailable(inspection::failed("error", id), observed);
+        return Err(inspection::failed("error", id));
     };
     let mut result = subject.clone();
     result.set_messages(replacement);
@@ -284,6 +289,36 @@ mod tests {
                 assert_eq!(error["failure"]["failure_class"], "unavailable");
             }
         }
+    }
+
+    #[test]
+    fn flagged_immutable_context_cannot_fail_open_when_redaction_is_impossible() {
+        let mut case: Value = crate::lossless_json::from_str(
+            include_str!("../../tests/generated/input_programs.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        case["checks"][0]["policy"]["input_fail_open"] = json!(true);
+        case["checks"][0]["check"]["action"] = json!("modify");
+        case["checks"][0]["adapter"]["input_limit"] = json!(1_048_576);
+        let check: Check = crate::lossless_json::from_value(case["checks"][0].clone()).unwrap();
+        let subject: Subject = crate::lossless_json::from_value(case["subject"].clone()).unwrap();
+        let result = super::super::inspection_http::runtime()
+            .unwrap()
+            .block_on(one(
+                &check,
+                &subject,
+                Instant::now() + Duration::from_secs(1),
+                &mut Value::Null,
+                &mut Value::Null,
+            ));
+        let failure = result
+            .err()
+            .expect("a matched tool definition must not reach dispatch");
+        assert_eq!(failure["failure"]["failure_class"], "guardrail");
+        assert_eq!(failure["action"], "error");
     }
 
     #[test]

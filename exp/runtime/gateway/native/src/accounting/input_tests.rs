@@ -6,6 +6,46 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 #[test]
+fn an_exact_maximum_inspection_fits_the_idle_byte_budget() {
+    let bytes = std::sync::Arc::new(tokio::sync::Semaphore::new(64 * 1024));
+    let units = super::input::capacity_units(64 * 1024 * 1024);
+    let permit = bytes.clone().try_acquire_many_owned(units).unwrap();
+    assert!(bytes.clone().try_acquire_owned().is_err());
+    drop(permit);
+    assert!(bytes
+        .clone()
+        .try_acquire_many_owned(super::input::capacity_units(64 * 1024 * 1024 + 1))
+        .is_err());
+    assert_eq!(super::input::capacity_units(0), 1);
+    assert_eq!(super::input::capacity_units(1024), 1);
+    assert_eq!(super::input::capacity_units(1025), 2);
+}
+
+#[test]
+fn optional_failure_stays_permissive_when_the_next_check_is_cancelled() {
+    let (url, received, release, server) = server("{\"flagged\":false}", 200);
+    let mut first = check(&url, false);
+    first.adapter = json!({"kind":"unavailable"});
+    let gate = InputGate::start(vec![first, check(&url, false)], 5.0).unwrap();
+    received.recv_timeout(Duration::from_secs(3)).unwrap();
+    gate.cancel(None);
+    let decision = gate.decision();
+    release.send(()).unwrap();
+    server.join().unwrap();
+    assert_eq!(decision["action"], "allow");
+    assert_eq!(decision["moderation"]["status"], "failed_open");
+    assert_eq!(
+        decision["moderation"]["observations"][0]["outcome"],
+        "unavailable"
+    );
+    assert_eq!(decision["moderation"]["observations"][0]["action"], "error");
+    assert_eq!(
+        decision["moderation"]["observations"][1]["outcome"],
+        "cancelled"
+    );
+}
+
+#[test]
 fn cancelling_an_approved_input_preserves_its_metered_terminal() {
     let gate = InputGate::start(vec![], 30.0).unwrap();
     assert_eq!(gate.wait()["action"], "allow");

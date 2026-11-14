@@ -43,6 +43,7 @@ from exp.runtime.gateway.guardrails.store_test import _authorization
 from exp.runtime.gateway.guardrails.subjects_test import _changed_subject
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
+from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_execution import NativeDialectUnavailableError
 from exp.runtime.gateway.tests.guardrail_policy_integrity_test import _body, _provider
@@ -618,20 +619,30 @@ def test_observation_recorder_failure_cannot_reject_a_request(
 
 @pytest.mark.parametrize("surface", ["embeddings", "images", "decisions", "audio", "video"])
 @pytest.mark.parametrize("mode", ["observe", "enforce"])
+@pytest.mark.parametrize("default_sink", [False, True])
 def test_fail_open_policies_record_unsupported_request_coverage(
-    surface: str, mode: str, caplog: pytest.LogCaptureFixture
+    surface: str, mode: str, default_sink: bool, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Unsupported coverage is request-correlated metadata rather than a rejection."""
     classifier = _Classifier(GuardrailOutcome.FLAGGED)
     policy = _policy().model_copy(
         update={"mode": mode, "input_fail_open": True, "revision": "private-revision-marker"}
     )
-    engine = _Engine(classifier, policy)
+    engine = (
+        GuardrailEngine(
+            store=MappingGuardrailStore((policy,)),
+            client=DirectClassifierClient(ClassifierRegistry({})),
+            monotonic=time.monotonic,
+        )
+        if default_sink
+        else _Engine(classifier, policy)
+    )
     authorization = _authorization()
     with caplog.at_level(logging.INFO, logger="exp.runtime.gateway.guardrails.recording"):
         require_unguarded_surface(engine, authorization, surface)
         engine.close(timeout_seconds=2)
-    assert engine.observed == [("platform-observer", None, GuardrailOutcome.UNSUPPORTED)]
+    if isinstance(engine, _Engine):
+        assert engine.observed == [("platform-observer", None, GuardrailOutcome.UNSUPPORTED)]
     assert classifier.input_calls == 0
     assert f"request_id={authorization.request_id}" in caplog.text
     assert f"surface={surface}" in caplog.text
@@ -639,6 +650,31 @@ def test_fail_open_policies_record_unsupported_request_coverage(
     assert "outcome=unsupported" in caplog.text
     assert "private-revision-marker" not in caplog.text
     engine.close(timeout_seconds=0)
+
+
+@pytest.mark.parametrize("same_policy", [False, True])
+def test_refused_unsupported_surface_never_claims_failed_open_delivery(
+    same_policy: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Output enforcement or another strict policy keeps coverage logs honest."""
+    permissive = _policy().model_copy(update={"mode": "enforce", "input_fail_open": True})
+    output_check = permissive.checks[0].model_copy(update={"stage": GuardrailCheckStage.OUTPUT})
+    strict = permissive.model_copy(update={"policy_id": "strict-output", "checks": (output_check,)})
+    policies = (
+        (permissive.model_copy(update={"checks": (*permissive.checks, output_check)}),)
+        if same_policy
+        else (permissive, strict)
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore(policies),
+        client=DirectClassifierClient(ClassifierRegistry({})),
+        monotonic=time.monotonic,
+    )
+    with caplog.at_level(logging.INFO, logger="exp.runtime.gateway.guardrails.recording"):
+        with pytest.raises(NativeBridgeError):
+            require_unguarded_surface(engine, _authorization(), "embeddings")
+        engine.close(timeout_seconds=2)
+    assert "status=failed_open" not in caplog.text
 
 
 @pytest.mark.parametrize("surface", ["chat", "responses", "messages"])

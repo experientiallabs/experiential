@@ -860,7 +860,10 @@ def test_input_modify_can_redact_only_history_after_authenticated_reasoning() ->
     assert result.messages == replacement
 
 
-def test_input_modify_rejects_removing_provider_reasoning_with_bound_history() -> None:
+@pytest.mark.parametrize("fail_open", [False, True])
+def test_input_modify_rejects_removing_provider_reasoning_with_bound_history(
+    fail_open: bool,
+) -> None:
     """A modifier cannot truncate authenticated provider history to a new user turn."""
     request = _reasoning_request()
     replacement = (GatewayMessage(role="user", content="fully redacted"),)
@@ -872,6 +875,7 @@ def test_input_modify_rejects_removing_provider_reasoning_with_bound_history() -
     )
     policy = engine.policies_for(_authorization())[0]
     assert policy is not None
+    policy = policy.model_copy(update={"input_fail_open": fail_open})
 
     with pytest.raises(GuardrailRejected):
         _awaited(engine.enforce_input(policy=policy, request=request, deadline_monotonic=200.0))
