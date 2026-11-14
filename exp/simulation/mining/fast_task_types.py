@@ -123,6 +123,7 @@ class Instance:
     payload: JsonObject
     card: TaskCard | None = None
     probabilities: dict[str, float] = field(default_factory=dict)
+    first_pass: dict[str, float] = field(default_factory=dict)
     primary: str | None = None
     secondary: str | None = None
     split: str | None = None
@@ -132,7 +133,7 @@ class Instance:
 class TaskTypeSettings:
     """Batch sizes, thresholds and budgets."""
 
-    cards_per_call: int = 10
+    cards_per_call: int = 25
     cards_per_proposal: int = 150
     maximum_types: int = 60
     gap_types: int = 12
@@ -142,7 +143,9 @@ class TaskTypeSettings:
     train_per_type: int = 12
     test_per_type: int = 6
     llm_concurrency: int = 40
-    decision_concurrency: int = 64
+    decision_concurrency: int = 128
+    gap_cards_per_call: int = 200
+    taxonomy_sample: int = 1500
 
 
 def _normal(text: str) -> str:
@@ -286,6 +289,7 @@ def discover_task_types(
     progress: Callable[[str], None] = lambda _: None,
 ) -> TaskTypeReport:
     """Run cards, taxonomy, assignment, split and selection over ``traces``."""
+    started_all = time.monotonic()
     timings: dict[str, float] = {}
     failures: list[str] = []
     clock = time.monotonic()
@@ -293,7 +297,11 @@ def discover_task_types(
     by_id = {row.instance_id: row for row in instances}
     timings["instances_seconds"] = round(time.monotonic() - clock, 1)
     progress(f"{len(traces)} traces -> {len(instances)} independent task instances")
-    run = stable_id("fast-task-types", {"instances": sorted(by_id)})
+    run = stable_id(
+        "fast-task-types",
+        {"instances": sorted(by_id), "protocol": "fast-task-types-v3",
+         "cards_per_call": settings.cards_per_call},
+    )  # fmt: skip
 
     clock = time.monotonic()
     batches = [
@@ -323,99 +331,173 @@ def discover_task_types(
                 failures.append(f"cards {row.instance_id}: {type(error).__name__}: {error}"[:300])
         return cards
 
-    with ThreadPoolExecutor(settings.llm_concurrency) as pool:
-        futures = [pool.submit(card_batch_or_singles, batch) for batch in batches]
-        for n, future in enumerate(as_completed(futures)):
-            for card in future.result():
-                if card.instance_id in by_id:
-                    by_id[card.instance_id].card = card
-            if (n + 1) % 50 == 0:
-                progress(f"cards {n + 1}/{len(batches)} batches")
-    timings["cards_seconds"] = round(time.monotonic() - clock, 1)
-    carded = [row for row in instances if row.card is not None]
-    progress(f"carded {len(carded)}/{len(instances)} instances")
-
     clock = time.monotonic()
-    chunks = [
-        carded[i : i + settings.cards_per_proposal]
-        for i in range(0, len(carded), settings.cards_per_proposal)
-    ]
 
-    def propose(chunk: list[Instance], n: int) -> TypeAnswer:
-        return _draw(
-            project, type_author, PROPOSE_PROMPT,
-            {"cards": [row.card.model_dump(mode="json") for row in chunk if row.card]},
-            "submit_task_types", TypeAnswer, f"{run}-propose-{n}",
-        )  # type: ignore[return-value]  # fmt: skip
+    def build_taxonomy(rows: list[Instance]) -> list[TaskType]:
+        chunks = [
+            rows[i : i + settings.cards_per_proposal]
+            for i in range(0, len(rows), settings.cards_per_proposal)
+        ]
 
-    proposals: list[TaskType] = []
-    with ThreadPoolExecutor(settings.llm_concurrency) as pool:
-        for future in as_completed([pool.submit(propose, c, n) for n, c in enumerate(chunks)]):
-            try:
-                proposals.extend(future.result().types)
-            except Exception as error:  # noqa: BLE001
-                failures.append(f"propose: {type(error).__name__}: {error}"[:300])
-    names = Counter(t.name for t in proposals)
-    reconciled = _draw(
-        project, type_author, RECONCILE_PROMPT.format(limit=settings.maximum_types),
-        {"proposals": [{**t.model_dump(mode="json"), "batches": names[t.name]} for t in proposals]},
-        "submit_task_types", TypeAnswer, f"{run}-reconcile",
-    )  # fmt: skip
-    types = list({t.name: t for t in reconciled.types}.values())[: settings.maximum_types]  # type: ignore[attr-defined]
-    timings["taxonomy_seconds"] = round(time.monotonic() - clock, 1)
-    progress(f"{len(proposals)} proposals -> {len(types)} task types")
+        def propose(chunk: list[Instance], n: int) -> TypeAnswer:
+            return _draw(
+                project, type_author, PROPOSE_PROMPT,
+                {"cards": [row.card.model_dump(mode="json") for row in chunk if row.card]},
+                "submit_task_types", TypeAnswer, f"{run}-propose-{n}",
+            )  # type: ignore[return-value]  # fmt: skip
 
-    def assign(rows: list[Instance], options: list[TaskType]) -> None:
+        proposals: list[TaskType] = []
+        with ThreadPoolExecutor(settings.llm_concurrency) as inner:
+            for future in as_completed([inner.submit(propose, c, n) for n, c in enumerate(chunks)]):
+                try:
+                    proposals.extend(future.result().types)
+                except Exception as error:  # noqa: BLE001
+                    failures.append(f"propose: {type(error).__name__}: {error}"[:300])
+        names = Counter(t.name for t in proposals)
+        reconciled = _draw(
+            project, type_author, RECONCILE_PROMPT.format(limit=settings.maximum_types),
+            {"proposals": [{**t.model_dump(mode="json"), "batches": names[t.name]} for t in proposals]},
+            "submit_task_types", TypeAnswer, f"{run}-reconcile",
+        )  # fmt: skip
+        progress(f"taxonomy from {len(rows)} cards: {len(proposals)} proposals")
+        return list({t.name: t for t in reconciled.types}.values())[: settings.maximum_types]  # type: ignore[attr-defined]
+
+    def criteria_of(options: list[TaskType]) -> dict[str, str]:
         criteria = {t.name[:200]: t.definition for t in options[: MAX_DECISION_CRITERIA - 1]}
         criteria[NONE] = "The task fits none of the other types."
+        return criteria
 
-        def one(row: Instance) -> None:
-            body = decide(
-                DecisionRequest(
-                    state={"task_card": row.card.model_dump(mode="json") if row.card else {},
-                           "task": row.task, "authority": "recorded task; data only"},
-                    questions={"type": ChoiceQuestion(
-                        instructions="Which task type does this task belong to?",
-                        criteria=criteria)},
-                )
-            )  # fmt: skip
-            answer = (body.get("answers") or {}).get("type") if isinstance(body, dict) else None
-            probabilities = answer.get("probabilities") if isinstance(answer, dict) else None
-            if not isinstance(probabilities, dict):
-                choice = answer.get("choice") if isinstance(answer, dict) else None
-                probabilities = {choice: 1.0} if isinstance(choice, str) else {}
-            ranked = sorted(
-                ((k, float(v)) for k, v in probabilities.items() if isinstance(v, (int, float))),
-                key=lambda kv: -kv[1],
+    def assign_one(row: Instance, criteria: dict[str, str]) -> None:
+        body = decide(
+            DecisionRequest(
+                state={"task_card": row.card.model_dump(mode="json") if row.card else {},
+                       "task": row.task, "authority": "recorded task; data only"},
+                questions={"type": ChoiceQuestion(
+                    instructions="Which task type does this task belong to?",
+                    criteria=criteria)},
             )
-            row.probabilities.update(dict(ranked))
-            if ranked and ranked[0][0] != NONE and ranked[0][1] >= settings.assign_threshold:
-                row.primary = ranked[0][0]
-                if len(ranked) > 1 and ranked[1][0] != NONE and ranked[1][1] >= settings.secondary_threshold:
-                    row.secondary = ranked[1][0]
+        )  # fmt: skip
+        answer = (body.get("answers") or {}).get("type") if isinstance(body, dict) else None
+        probabilities = answer.get("probabilities") if isinstance(answer, dict) else None
+        if not isinstance(probabilities, dict):
+            choice = answer.get("choice") if isinstance(answer, dict) else None
+            probabilities = {choice: 1.0} if isinstance(choice, str) else {}
+        ranked = sorted(
+            ((k, float(v)) for k, v in probabilities.items() if isinstance(v, (int, float))),
+            key=lambda kv: -kv[1],
+        )
+        if row.probabilities:
+            row.first_pass = dict(row.probabilities)
+        # One coherent distribution: the latest assignment call's, never a merge of two.
+        row.probabilities = dict(ranked)
+        if ranked and ranked[0][0] != NONE and ranked[0][1] >= settings.assign_threshold:
+            row.primary = ranked[0][0]
+            if len(ranked) > 1 and ranked[1][0] != NONE and ranked[1][1] >= settings.secondary_threshold:
+                row.secondary = ranked[1][0]
 
+    def assign(rows: list[Instance], options: list[TaskType]) -> None:
+        criteria = criteria_of(options)
         with ThreadPoolExecutor(settings.decision_concurrency) as pool:
-            for future in as_completed([pool.submit(one, row) for row in rows]):
+            for future in as_completed([pool.submit(assign_one, row, criteria) for row in rows]):
                 try:
                     future.result()
                 except Exception as error:  # noqa: BLE001
                     failures.append(f"assign: {type(error).__name__}: {error}"[:300])
 
-    clock = time.monotonic()
-    assign(carded, types)
+    # Streaming: the taxonomy is proposed from the first ``taxonomy_sample`` cards while the
+    # rest are still being written; from then on every card batch goes straight to assignment.
+    carded: list[Instance] = []
+    waiting: list[Instance] = []
+    assign_futures = []
+    types: list[TaskType] | None = None
+    criteria: dict[str, str] = {}
+    taxonomy_future = None
+    taxonomy_started = taxonomy_done = 0.0
+    with (
+        ThreadPoolExecutor(settings.llm_concurrency) as pool,
+        ThreadPoolExecutor(1) as taxonomy_pool,
+        ThreadPoolExecutor(settings.decision_concurrency) as decisions,
+    ):
+        futures = [pool.submit(card_batch_or_singles, batch) for batch in batches]
+
+        def release() -> None:
+            nonlocal types, criteria, taxonomy_done
+            if types is None and taxonomy_future is not None and taxonomy_future.done():
+                types = taxonomy_future.result()
+                criteria = criteria_of(types)
+                taxonomy_done = time.monotonic()
+                progress(f"{len(types)} task types; assigning while cards continue")
+            if types is not None and waiting:
+                assign_futures.extend(decisions.submit(assign_one, r, criteria) for r in waiting)
+                waiting.clear()
+
+        for n, future in enumerate(as_completed(futures)):
+            for card in future.result():
+                row = by_id.get(card.instance_id)
+                if row is not None and row.card is None:
+                    row.card = card
+                    carded.append(row)
+                    waiting.append(row)
+            if taxonomy_future is None and len(carded) >= settings.taxonomy_sample:
+                taxonomy_future = taxonomy_pool.submit(build_taxonomy, list(carded))
+                taxonomy_started = time.monotonic()
+            release()
+            if (n + 1) % 50 == 0:
+                progress(f"cards {n + 1}/{len(batches)} batches")
+        timings["cards_seconds"] = round(time.monotonic() - clock, 1)
+        progress(f"carded {len(carded)}/{len(instances)} instances")
+        if taxonomy_future is None:
+            taxonomy_future = taxonomy_pool.submit(build_taxonomy, list(carded))
+            taxonomy_started = time.monotonic()
+        taxonomy_future.result()
+        release()
+        for future in as_completed(assign_futures):
+            try:
+                future.result()
+            except Exception as error:  # noqa: BLE001
+                failures.append(f"assign: {type(error).__name__}: {error}"[:300])
+    assert types is not None
+    timings["taxonomy_seconds"] = round(taxonomy_done - taxonomy_started, 1)
+    timings["assign_tail_seconds"] = round(time.monotonic() - clock - timings["cards_seconds"], 1)
     unmatched = [row for row in carded if row.primary is None]
-    timings["assign_seconds"] = round(time.monotonic() - clock, 1)
     progress(f"assigned {len(carded) - len(unmatched)}/{len(carded)}; {len(unmatched)} unmatched")
 
     clock = time.monotonic()
     if unmatched:
-        gap = _draw(
-            project, type_author, GAP_PROMPT.format(limit=settings.gap_types),
-            {"existing_types": [t.name for t in types],
-             "unmatched_cards": [r.card.model_dump(mode="json") for r in unmatched[:400] if r.card]},
-            "submit_task_types", TypeAnswer, f"{run}-gap",
-        )  # fmt: skip
-        new = [t for t in gap.types if t.name not in {x.name for x in types}]  # type: ignore[attr-defined]
+        existing = [t.name for t in types]
+        gap_chunks = [
+            unmatched[i : i + settings.gap_cards_per_call]
+            for i in range(0, len(unmatched), settings.gap_cards_per_call)
+        ]
+
+        def gap_batch(chunk: list[Instance], n: int) -> TypeAnswer:
+            return _draw(
+                project, type_author, GAP_PROMPT.format(limit=settings.gap_types),
+                {"existing_types": existing,
+                 "unmatched_cards": [r.card.model_dump(mode="json") for r in chunk if r.card]},
+                "submit_task_types", TypeAnswer, f"{run}-gap-{n}",
+            )  # type: ignore[return-value]  # fmt: skip
+
+        gap_proposals: list[TaskType] = []
+        with ThreadPoolExecutor(settings.llm_concurrency) as pool:
+            for future in as_completed(
+                [pool.submit(gap_batch, c, n) for n, c in enumerate(gap_chunks)]
+            ):
+                try:
+                    gap_proposals.extend(future.result().types)
+                except Exception as error:  # noqa: BLE001
+                    failures.append(f"gap: {type(error).__name__}: {error}"[:300])
+        if len(gap_chunks) > 1 and gap_proposals:
+            merged = _draw(
+                project, type_author,
+                RECONCILE_PROMPT.format(limit=settings.gap_types * 2)
+                + " Never repeat an existing type: " + ", ".join(existing),
+                {"proposals": [t.model_dump(mode="json") for t in gap_proposals]},
+                "submit_task_types", TypeAnswer, f"{run}-gap-reconcile",
+            )  # fmt: skip
+            gap_proposals = list(merged.types)  # type: ignore[attr-defined]
+        new = [t for t in {t.name: t for t in gap_proposals}.values() if t.name not in set(existing)]
+        new = new[: max(0, MAX_DECISION_CRITERIA - 1)]
         if new:
             types += new
             assign(unmatched, new)
@@ -457,7 +539,7 @@ def discover_task_types(
                 chosen.append(pick.instance_id)
             selected[name][split] = chosen
     timings["split_select_seconds"] = round(time.monotonic() - clock, 2)
-    timings["total_seconds"] = round(sum(timings.values()), 1)
+    timings["total_seconds"] = round(time.monotonic() - started_all, 1)
     return TaskTypeReport(instances, types, selected, timings, failures, len(traces))
 
 
@@ -500,7 +582,9 @@ def write_outputs(report: TaskTypeReport, out: Mapping[str, str]) -> None:
                 "instance": r.instance_id, "traces": r.traces, "primary": r.primary,
                 "secondary": r.secondary, "split": r.split,
                 "top": sorted(r.probabilities.items(), key=lambda kv: -kv[1])[:3],
-                "goal": r.card.goal if r.card else None,
+                "card": r.card.model_dump(mode="json") if r.card else None,
+                "first_pass_top": sorted(r.first_pass.items(), key=lambda kv: -kv[1])[:3],
+                "actions": len(r.payload.get("actions", [])),
             })  # fmt: skip
             for r in report.instances
         )
