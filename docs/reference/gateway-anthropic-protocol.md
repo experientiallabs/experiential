@@ -137,7 +137,9 @@ that reply; one anywhere else takes effect at the next user turn with new input;
 user turns are not new input; the latest level in effect wins) and serves the request with it as
 the top-level `output_config.effort`, disclosed as
 `messages.output_config.effort->output_config.effort`. A level that has not taken effect by the
-reply leaves the top-level value unchanged. `output_config` on a user or assistant turn is dropped
+reply leaves the top-level value unchanged. A system turn's `output_config` is closed: only an optional `effort` of `low`,
+`medium`, `high`, `xhigh` or `max`; any other key or value is a named 400 at
+`messages.<n>.output_config.<key>`. `output_config` on a user or assistant turn is dropped
 with `messages.output_config->dropped(unknown_message_field)`.
 
 An OpenAI function tool in `tools`, Chat's nested `{"type": "function", "function": {name,

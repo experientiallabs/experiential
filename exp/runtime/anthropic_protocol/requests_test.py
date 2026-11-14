@@ -1549,6 +1549,32 @@ def test_empty_user_and_assistant_turns_keep_their_named_400() -> None:
     assert excinfo.value.detail.param == "messages.0.content"
 
 
+@pytest.mark.parametrize(
+    ("output_config", "param"),
+    [
+        ({"effort": 1}, "messages.1.output_config.effort"),
+        ({"effort": "turbo"}, "messages.1.output_config.effort"),
+        ({"effort": "low", "format": {}}, "messages.1.output_config.format"),
+    ],
+    ids=["non-string-effort", "unknown-effort", "unknown-key"],
+)
+def test_a_system_turn_output_config_is_validated_closed(
+    output_config: JsonValue, param: str
+) -> None:
+    """Only an optional documented effort is accepted; anything else is a named 400."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    {"role": "system", "content": [], "output_config": output_config},
+                ]
+            )
+        )
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.detail.param == param
+
+
 def test_a_malformed_per_message_output_config_is_a_named_400() -> None:
     """``output_config`` on a turn must be an object."""
     with pytest.raises(OpenAIProtocolError) as excinfo:

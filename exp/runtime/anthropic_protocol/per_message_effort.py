@@ -31,10 +31,13 @@ from dataclasses import dataclass
 from typing import Final, Literal
 
 from exp.common.core.artifacts import JsonObject, JsonValue
-from exp.runtime.openai_protocol.errors import invalid_field
+from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 
 PER_MESSAGE_EFFORT_DISCLOSURE: Final = "messages.output_config.effort->output_config.effort"
 """Disclosed when a system turn's effort governs the reply in place of the top-level one."""
+
+TURN_EFFORTS: Final = frozenset({"low", "medium", "high", "xhigh", "max"})
+"""The effort levels Anthropic documents for a system turn's ``output_config``."""
 
 EMPTY_SYSTEM_TURN_DROPPED: Final = "messages.system->dropped(empty)"
 """Disclosed when a ``system`` turn in ``messages`` with no content is dropped.
@@ -71,29 +74,24 @@ def governing_effort(turns: Sequence[TurnFacts]) -> str | None:
         The effort value of the latest system turn in effect at the reply, or
         ``None`` when no system turn's effort has taken effect.
     """
-    governing: tuple[int, int, str] | None = None
-    for index, turn in enumerate(turns):
-        if turn.role != "system" or turn.effort is None:
-            continue
-        # A turn takes effect at a user turn with new input: the one it
-        # directly follows, else the next one after it.
-        previous = next((i for i in range(index - 1, -1, -1) if turns[i].role != "system"), -1)
-        if previous >= 0 and turns[previous].role == "user" and turns[previous].new_input:
-            start = previous
-        else:
-            start = next(
-                (
-                    i
-                    for i in range(index + 1, len(turns))
-                    if turns[i].role == "user" and turns[i].new_input
-                ),
-                -1,
-            )
-            if start < 0:
-                continue
-        if governing is None or (start, index) >= governing[:2]:
-            governing = (start, index, turn.effort)
-    return governing[2] if governing is not None else None
+    # One forward pass. A level set directly after a user turn with new input
+    # takes effect at once; any other one waits (``pending``) for the next
+    # such turn, where it takes effect before any level set directly after
+    # that turn, which then replaces it.
+    in_effect: str | None = None
+    pending: str | None = None
+    after_new_input = False
+    for turn in turns:
+        if turn.role != "system":
+            after_new_input = turn.role == "user" and turn.new_input
+            if after_new_input and pending is not None:
+                in_effect, pending = pending, None
+        elif turn.effort is not None:
+            if after_new_input:
+                in_effect = turn.effort
+            else:
+                pending = turn.effort
+    return in_effect
 
 
 def with_governing_effort(
@@ -167,13 +165,7 @@ def take_system_turn_effort(payload: JsonObject) -> tuple[JsonObject, SystemTurn
             if _renders_nothing(content):
                 empty.add(index)
             if "output_config" in message:
-                config = message["output_config"]
-                if not isinstance(config, dict):
-                    raise invalid_field(
-                        f"messages.{index}.output_config", "output_config must be an object."
-                    )
-                value = config.get("effort")
-                effort = value if isinstance(value, str) else None
+                effort = _turn_effort(message["output_config"], f"messages.{index}.output_config")
                 message = {key: item for key, item in message.items() if key != "output_config"}
         messages.append(message)
         facts.append(
@@ -194,6 +186,40 @@ def take_system_turn_effort(payload: JsonObject) -> tuple[JsonObject, SystemTurn
     if messages == raw_messages:
         return payload, turns
     return {**payload, "messages": messages}, turns
+
+
+def _turn_effort(config: JsonValue, param: str) -> str | None:
+    """Validate a system turn's ``output_config`` closed and return its effort.
+
+    Anthropic defines one optional key here, ``effort``, from a fixed set.
+
+    Args:
+        config: The turn's raw ``output_config``.
+        param: Its dotted public path, for error messages.
+
+    Returns:
+        The effort level, or ``None`` when the object sets none.
+
+    Raises:
+        OpenAIProtocolError: ``config`` is not an object, carries another key,
+            or names an effort outside :data:`TURN_EFFORTS`.
+    """
+    if not isinstance(config, dict):
+        raise invalid_field(param, "output_config must be an object.")
+    for key in config:
+        if key != "effort":
+            raise unsupported_field(f"{param}.{key}")
+    effort = config.get("effort")
+    if effort is None:
+        return None
+    if not isinstance(effort, str) or effort not in TURN_EFFORTS:
+        raise invalid_field(
+            f"{param}.effort",
+            "output_config.effort on a system turn must be one of: "
+            + ", ".join(sorted(TURN_EFFORTS))
+            + ".",
+        )
+    return effort
 
 
 def _renders_nothing(content: JsonValue) -> bool:
