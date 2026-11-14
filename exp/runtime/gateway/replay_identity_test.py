@@ -170,3 +170,21 @@ def test_chat_nested_thinking_budget_changes_replay_identity() -> None:
         for budget in (1024, 2048)
     ]
     assert canonical_request_sha256(requests[0]) != canonical_request_sha256(requests[1])
+
+
+def test_generate_content_include_thoughts_changes_replay_identity() -> None:
+    """Asking for thought summaries changes the visible answer, so it changes identity."""
+    from exp.runtime.google_protocol.requests import decode_generate_content
+
+    def _decoded(config: JsonObject) -> GatewayRequest:
+        return decode_generate_content(
+            {"contents": [{"role": "user", "parts": [{"text": "hi"}]}], "generationConfig": config},
+            model="coding",
+            stream=False,
+        ).request
+
+    plain = _decoded({})
+    off = _decoded({"thinkingConfig": {"includeThoughts": False}})
+    on = _decoded({"thinkingConfig": {"includeThoughts": True}})
+    assert canonical_request_sha256(plain) == canonical_request_sha256(off) == sha256_json(plain)
+    assert canonical_request_sha256(on) != canonical_request_sha256(plain)

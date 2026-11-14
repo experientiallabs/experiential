@@ -155,6 +155,7 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
         and not request.include_output_text_logprobs
         and not request.include_web_search_sources
         and not request.json_object_output
+        and not request.include_thoughts
         and not request.provider_beta_tokens
         and not request.provider_server_tools
         and not request.provider_native_tools
@@ -174,6 +175,10 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
     # every request decoded before they existed keeps its exact digest.
     if request.thinking_budget is not None:
         envelope["thinking_budget"] = request.thinking_budget
+    if request.include_thoughts:
+        # Thought summaries change the caller-visible parts, so the enabled
+        # selector joins identity; the false default keeps every digest.
+        envelope["include_thoughts"] = True
     if request.diagnostics is not None:
         envelope["diagnostics"] = request.diagnostics
     if request.safeguards is not None:

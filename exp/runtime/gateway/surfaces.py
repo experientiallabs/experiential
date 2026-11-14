@@ -56,6 +56,43 @@ def prompt_parameter(surface: GatewayApiSurface) -> str:
     return _PROMPT_PARAMETERS.get(surface, "messages")
 
 
+StructuredTextParameter = Literal[
+    "response_format",
+    "text.format",
+    "generationConfig.responseSchema",
+    "generationConfig.responseJsonSchema",
+]
+"""Every public field a caller can carry a structured-output schema in."""
+
+_STRUCTURED_TEXT_PARAMETERS: dict[GatewayApiSurface, StructuredTextParameter] = {
+    GatewayApiSurface.RESPONSES: "text.format",
+    GatewayApiSurface.GENERATE_CONTENT: "generationConfig.responseJsonSchema",
+}
+
+
+def default_structured_text_parameter(surface: GatewayApiSurface) -> StructuredTextParameter:
+    """The surface's schema field, for a request whose decoder recorded none."""
+    return _STRUCTURED_TEXT_PARAMETERS.get(surface, "response_format")
+
+
+_STOP_PARAMETERS: dict[GatewayApiSurface, str] = {
+    GatewayApiSurface.MESSAGES: "stop_sequences",
+    GatewayApiSurface.GENERATE_CONTENT: "generationConfig.stopSequences",
+}
+
+
+def stop_parameter(surface: GatewayApiSurface) -> str:
+    """The public field a surface's stop sequences arrive in."""
+    return _STOP_PARAMETERS.get(surface, "stop")
+
+
+def reasoning_carrier_parameter(surface: GatewayApiSurface) -> str:
+    """The public field a replayed reasoning carrier arrives in."""
+    if surface is GatewayApiSurface.GENERATE_CONTENT:
+        return "contents.parts.thought"
+    return "messages.reasoning_content"
+
+
 def default_output_limit_parameter(surface: GatewayApiSurface) -> OutputLimitParameter:
     """The surface's output-ceiling field, for a request that did not carry one."""
     return _OUTPUT_LIMIT_PARAMETERS.get(surface, "max_tokens")

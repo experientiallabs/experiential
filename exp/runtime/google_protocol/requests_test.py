@@ -17,7 +17,7 @@ from exp.runtime.google_protocol.requests import (
     decode_generate_content_count_tokens,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
-from exp.runtime.models.providers.gemini_requests import THOUGHT_SIGNATURE_DROPPED
+from exp.runtime.models.providers.gemini_requests import GEMINI_THOUGHT_SIGNATURE_DROPPED
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
@@ -110,6 +110,7 @@ def test_decode_full_sdk_request_is_lossless() -> None:
     assert request.tool_choice == GatewayNamedToolChoice(name="search")
     assert request.structured_text is not None
     assert request.structured_text.json_schema == {"type": "object"}
+    assert request.structured_text_parameter == "generationConfig.responseJsonSchema"
     assert request.maximum_output_tokens == 64
     assert request.maximum_output_tokens_parameter == "generationConfig.maxOutputTokens"
     assert request.stop == ("END",)
@@ -146,10 +147,12 @@ def test_snake_case_spellings_and_schema_enums_decode() -> None:
     assert request.maximum_output_tokens == 8
     assert request.tool_choice == "none"
     assert request.structured_text is not None
+    # Google's OpenAPI ``nullable`` becomes the JSON Schema null union.
     assert request.structured_text.json_schema == {
         "type": "object",
-        "properties": {"n": {"type": "integer", "nullable": True}},
+        "properties": {"n": {"type": ["integer", "null"]}},
     }
+    assert request.structured_text_parameter == "generationConfig.responseSchema"
 
 
 def test_json_mode_without_a_schema_rides_json_object_output() -> None:
@@ -401,6 +404,21 @@ def test_inline_media_becomes_canonical_parts() -> None:
             "unsupported_parameter",
             "systemInstruction.parts.0.videoMetadata",
         ),
+        (
+            _body(
+                contents=[
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"fileData": {"mimeType": "application/zip", "fileUri": "https://x/a"}}
+                        ],
+                    }
+                ]
+            ),
+            400,
+            "unsupported_parameter",
+            "contents.0.parts.0.fileData.mimeType",
+        ),
         # One call answered twice by explicit id is one invocation with two results.
         (
             _body(
@@ -538,9 +556,9 @@ def test_an_echoed_signature_is_disclosed_as_dropped_off_gemini_wires() -> None:
         dialect="gemini_generate_content", url="https://gemini.test", model_id="gemini-3"
     )
     public, _provider = route_generation_parameter_requests((openai,), request)
-    assert THOUGHT_SIGNATURE_DROPPED in public.ignored_parameters
+    assert GEMINI_THOUGHT_SIGNATURE_DROPPED in public.ignored_parameters
     public, _provider = route_generation_parameter_requests((gemini, openai), request)
-    assert THOUGHT_SIGNATURE_DROPPED not in public.ignored_parameters
+    assert GEMINI_THOUGHT_SIGNATURE_DROPPED not in public.ignored_parameters
 
 
 def test_empty_objects_and_empty_text_parts_survive_as_sent() -> None:
@@ -561,3 +579,20 @@ def test_empty_objects_and_empty_text_parts_survive_as_sent() -> None:
     ).request
     assert request.messages[0].content == ""
     assert request.messages[-1].content == "{}"
+
+
+def test_a_thought_only_model_turn_drops_and_the_history_continues() -> None:
+    """A MAX_TOKENS stop while thinking leaves a thought-only model turn; replay must not 400."""
+    request = decode_generate_content(
+        _body(
+            contents=[
+                {"role": "user", "parts": [{"text": "q"}]},
+                {"role": "model", "parts": [{"text": "pondering", "thought": True}]},
+                {"role": "user", "parts": [{"text": "continue"}]},
+            ]
+        ),
+        model="m",
+        stream=False,
+    ).request
+    assert [message.role for message in request.messages] == ["user", "user"]
+    assert THOUGHT_DROPPED in request.ignored_parameters

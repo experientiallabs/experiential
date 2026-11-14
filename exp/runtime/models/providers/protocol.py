@@ -8,7 +8,8 @@ from typing import Protocol, runtime_checkable
 
 from exp.common.models import ModelCapabilities, ModelClient, ModelRequest, ModelResponse
 from exp.common.models.catalog import GatewayDeploymentCapabilities
-from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
+from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.surfaces import stop_parameter
 from exp.runtime.models.providers.async_transport import (
     RequestDeadline,
     run_then_close_pooled_client,
@@ -413,7 +414,7 @@ def preflight_gateway_request(
                 f"This model route accepts at most {stop_limit} stop "
                 f"sequences; the request supplied {len(request.stop)}."
             ),
-            param=("stop_sequences" if request.surface == GatewayApiSurface.MESSAGES else "stop"),
+            param=stop_parameter(request.surface),
             code="invalid_parameter",
         )
 

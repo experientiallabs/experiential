@@ -763,6 +763,8 @@ def dialect_stream_payload(
             supports_logprobs=profile.supports_logprobs,
             supports_reasoning=profile.supports_reasoning,
             reasoning_effort=required_reasoning_effort,
+            supports_frequency_penalty=profile.supports_frequency_penalty,
+            supports_presence_penalty=profile.supports_presence_penalty,
         )
         if budget is not None:
             generation = payload["generationConfig"]
