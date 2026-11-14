@@ -81,6 +81,65 @@ def one_line(summary: Mapping[str, object], limit: int = 110) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _trace_on() -> bool:
+    """--trace-code (EXP_STEP_TRACE_CODE=1): print the code that owns each stage."""
+    import os
+
+    return os.environ.get("EXP_STEP_TRACE_CODE") == "1"
+
+
+def _where(obj: object) -> str:
+    """file:line of a function, method or class, relative to the repository."""
+    import inspect
+
+    try:
+        target = inspect.unwrap(obj)  # type: ignore[arg-type]
+        path = inspect.getsourcefile(target) or "?"
+        line = inspect.getsourcelines(target)[1]
+    except (TypeError, OSError):
+        return getattr(obj, "__qualname__", str(obj))
+    marker = "/exp/"
+    rel = "exp/" + path.split(marker, 1)[1] if marker in path else path
+    return f"{getattr(target, '__module__', '')}.{getattr(target, '__qualname__', '')}  ({rel}:{line})"
+
+
+def phase_code(name: str) -> list[str]:
+    """The functions a front-door phase runs, in order."""
+    from exp.optimize.evaluation.variance import bootstrap_plan, frontdoor_source, pipeline
+    from exp.optimize.evaluation.variance.frontdoor_executors import review_families
+    from exp.optimize.evaluation.variance.frontdoor_slots import slot_executor
+
+    if name == "project-build":
+        return [_where(frontdoor_source.ensure_build)]
+    if name == "variance-build":
+        return [_where(review_families)]
+    if name == "bootstrap-preparation":
+        return [_where(bootstrap_plan.run_bootstrap_preparation), _where(bootstrap_plan._run)]
+    if name.startswith("slot "):
+        try:
+            executor = slot_executor(name.removeprefix("slot "))  # type: ignore[arg-type]
+            return [_where(type(executor).run)]
+        except Exception:  # noqa: BLE001 - an unknown slot has no owner to show
+            return []
+    if name.startswith("pipeline "):
+        return [_where(pipeline.run_decision_variance), _where(pipeline._execute)]
+    return []
+
+
+def stage_code(stage: str) -> list[str]:
+    """The executor that owns one pipeline stage."""
+    from exp.optimize.evaluation.variance.pipeline import DEFAULT_EXECUTORS
+
+    executor = DEFAULT_EXECUTORS.get(stage)  # type: ignore[call-overload]
+    if executor is None:
+        return []
+    rows = [_where(type(executor).run)]
+    inner = getattr(executor, "inner", None)
+    if inner is not None:
+        rows.append(_where(type(inner).run))
+    return rows
+
+
 @dataclass
 class Stepper:
     """Shows the cards and waits; receives the front door's events and stage results.
@@ -211,6 +270,9 @@ class Stepper:
             self.console.print(Text.assemble(("  does       ", "dim"), does))
         reads = READS.get(name, "the start registered by the preparation")
         self.console.print(Text.assemble(("  reads      ", "dim"), reads))
+        if _trace_on():
+            for row_code in phase_code(name):
+                self.console.print(Text.assemble(("  code       ", "dim"), (row_code, "cyan")))
         if row is not None and row.costs:
             requests = sum(line.attempts for line in row.costs)
             self.console.print(f"  [dim]bound[/dim]      at most {requests:,} physical requests")
@@ -249,6 +311,9 @@ class Stepper:
         self.console.print(f"\n  [bold]▸ {stage}[/bold] [dim]{task}[/dim]")
         self.console.print(Text.assemble(("    does     ", "dim"), STAGE_COVERS[stage]))
         self.console.print(Text.assemble(("    reads    ", "dim"), STAGE_READS[stage]))
+        if _trace_on():
+            for row_code in stage_code(stage):
+                self.console.print(Text.assemble(("    code     ", "dim"), (row_code, "cyan")))
         self._started[f"{task}/{stage}"] = time.time()
         self.wait("run")
 
@@ -299,12 +364,28 @@ class Stepper:
             self.console.print(f"\n  [bold]▸ {stage}[/bold] [dim]{task}[/dim]")
             self.console.print(Text.assemble(("    does     ", "dim"), STAGE_COVERS[stage]))
             self.console.print(Text.assemble(("    reads    ", "dim"), STAGE_READS[stage]))
+            if _trace_on():
+                for row_code in stage_code(stage):
+                    self.console.print(Text.assemble(("    code     ", "dim"), (row_code, "cyan")))
             if stage not in start.saved:
                 self.console.print("    [dim]·[/dim] not saved")
             else:
                 record = json.loads(
                     self.store.artifacts.read_bytes(start.saved[stage], "record.json")
                 )
+                if _trace_on():
+                    manifest = self.store.artifacts.read(start.saved[stage]).manifest
+                    self.console.print(
+                        Text.assemble(("    record   ", "dim"), start.saved[stage],
+                                      ("  code revision ", "dim"), str(manifest.code_revision)[:12])
+                    )  # fmt: skip
+                    for ref in list(manifest.inputs)[:6]:
+                        self.console.print(Text.assemble(("    read     ", "dim"), ref.artifact_id))
+                    outputs = record.get("outputs") or {}
+                    if outputs:
+                        self.console.print(
+                            Text.assemble(("    wrote    ", "dim"), ", ".join(sorted(outputs))[:160])
+                        )
                 moment = start.saved_at[stage].astimezone(UTC)
                 self.console.print(
                     f"  [green]✓[/green] {stage}  replayed (saved {moment:%Y-%m-%d %H:%M} UTC)"
