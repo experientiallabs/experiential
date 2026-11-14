@@ -388,16 +388,9 @@ def decode_generate_content(
 ) -> DecodedGatewayRequest:
     """Decode one ``generateContent`` / ``streamGenerateContent`` body.
 
-    The model travels in the URL path (the body has no model field), and Google
-    defines no idempotency header, so this surface never joins keyed replay.
-
-    Args:
-        payload: Parsed JSON request body.
-        model: The catalog alias named in the request path.
-        stream: Whether the action is ``streamGenerateContent``.
-
-    Returns:
-        Public alias and lossless canonical gateway request.
+    ``model`` is the catalog alias from the URL path (the body has no model field);
+    Google defines no idempotency header, so this surface never joins keyed replay.
+    Returns the public alias and the lossless canonical gateway request.
 
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
@@ -418,14 +411,7 @@ def decode_generate_content_count_tokens(
     """Decode one ``countTokens`` body for prompt counting.
 
     Google's count carries ``contents`` or a whole ``generateContentRequest``; the
-    canonical request is only counted, never dispatched.
-
-    Args:
-        payload: Parsed JSON request body.
-        model: The catalog alias named in the request path.
-
-    Returns:
-        Public alias and the canonical request to count.
+    returned canonical request (under the path alias ``model``) is only counted.
 
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
@@ -866,8 +852,12 @@ def _json_schema(schema: JsonObject, param: str) -> JsonObject:
                 else entry
                 for name, entry in value.items()
             }
-        elif key in {"items"} and isinstance(value, dict):
-            converted[key] = _json_schema(cast("JsonObject", value), param)
+        elif key in {"items", "additionalProperties", "additional_properties"} and isinstance(
+            value, dict
+        ):
+            converted["additionalProperties" if key != "items" else key] = _json_schema(
+                cast("JsonObject", value), param
+            )
         elif key in {"anyOf", "any_of"} and isinstance(value, list):
             converted["anyOf"] = [
                 _json_schema(cast("JsonObject", entry), param) if isinstance(entry, dict) else entry
@@ -879,9 +869,8 @@ def _json_schema(schema: JsonObject, param: str) -> JsonObject:
         else:
             converted[key] = value
     if schema.get("nullable") is True and converted:
-        # Google's OpenAPI flag has no JSON Schema meaning: null becomes an
-        # alternative to the WHOLE node, so sibling constraints (enum, format,
-        # minimum) keep applying to the non-null branch only.
+        # Null is an alternative to the WHOLE node, so sibling constraints
+        # (enum, format, minimum) keep applying to the non-null branch only.
         return {"anyOf": [converted, {"type": "null"}]}
     return converted
 

@@ -136,6 +136,7 @@ def test_snake_case_spellings_and_schema_enums_decode() -> None:
                 "response_schema": {
                     "type": "OBJECT",
                     "properties": {"n": {"type": "INTEGER", "nullable": True, "enum": [1]}},
+                    "additional_properties": {"type": "STRING", "nullable": True},
                 },
             },
             "tool_config": {"function_calling_config": {"mode": "NONE"}},
@@ -152,6 +153,7 @@ def test_snake_case_spellings_and_schema_enums_decode() -> None:
     assert request.structured_text.json_schema == {
         "type": "object",
         "properties": {"n": {"anyOf": [{"type": "integer", "enum": [1]}, {"type": "null"}]}},
+        "additionalProperties": {"anyOf": [{"type": "string"}, {"type": "null"}]},
     }
     assert request.structured_text_parameter == "generationConfig.responseSchema"
 

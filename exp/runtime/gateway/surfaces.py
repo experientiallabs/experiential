@@ -89,7 +89,8 @@ def stop_parameter(surface: GatewayApiSurface) -> str:
 def reasoning_carrier_parameter(surface: GatewayApiSurface) -> str:
     """The public field a replayed reasoning carrier arrives in."""
     if surface is GatewayApiSurface.GENERATE_CONTENT:
-        return "contents.parts.thought"
+        # The carrier is the thought part's text; `thought` is only the marker.
+        return "contents.parts.text"
     return "messages.reasoning_content"
 
 
