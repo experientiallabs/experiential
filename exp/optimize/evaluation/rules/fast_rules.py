@@ -62,7 +62,7 @@ from exp.runtime.gateway.decisions_contracts import (
 )
 from exp.simulation.rules.contracts import parse_tool_contracts
 
-FAST_RULES_PROTOCOL = "fast-rules-v2"
+FAST_RULES_PROTOCOL = "fast-rules-v3"
 FAST_RULES_TYPE = "fast-rules"
 PROPOSE_TOOL = "submit_trajectory_rules"
 COLLATE_TOOL = "submit_collated_rules"
@@ -104,6 +104,9 @@ TASK
 Rewrite the candidates into one deduplicated, precise list: merge rules that say the same
 thing, sharpen statements with the located original steps (exact reply shapes, exit codes,
 messages), state when each applies, and keep the research questions that still matter with why.
+Each candidate's research_evidence holds the steps a decision model located as answering its
+research question across the corpus: where they settle it, write the answer (citing what the
+steps show) and fold it into the rule; where they do not, leave the answer empty.
 Drop nothing that is supported; never invent behavior the located steps and statistics do
 not support. You always have enough to answer. Call submit_collated_rules exactly once."""
 
@@ -153,6 +156,7 @@ class ResearchNote(ContractModel):
 
     question: str = Field(min_length=1, max_length=800)
     why_it_matters: str = Field(default="", max_length=800)
+    answer: str = Field(default="", max_length=1500)
 
 
 class CollatedRule(ContractModel):
@@ -284,6 +288,7 @@ class FastRulesSettings:
     excerpt_bytes: int = 1_000_000
     excerpts_per_rule: int = 3
     candidates_per_collation: int = 20
+    research_threshold: float = 0.5
 
 
 _V1_SETTINGS = (
@@ -381,7 +386,11 @@ def build_fast_rules(
         )  # fmt: skip
         if isinstance(bought, str):
             raise ValueError(bought)
-        return ProposeAnswer.model_validate(forced_tool_arguments(bought[1], PROPOSE_TOOL)).rules
+        arguments = forced_tool_arguments(bought[1], PROPOSE_TOOL)
+        if isinstance(arguments, dict) and isinstance(arguments.get("rules"), str):
+            # Some providers return the array as a JSON string; read it rather than drop it.
+            arguments = {**arguments, "rules": json.loads(arguments["rules"])}
+        return ProposeAnswer.model_validate(arguments).rules
 
     def tag(source: str, rules: tuple[ProposedRule, ...], offset: int, target: str) -> None:
         questions = {
@@ -457,13 +466,22 @@ def build_fast_rules(
     localize_started = time.monotonic()
     located: dict[tuple[str, str], list[JsonObject]] = {}
 
-    def localize(row: TaggedRule, target: str) -> None:
+    def localize(
+        row: TaggedRule,
+        target: str,
+        *,
+        text: str | None = None,
+        instruction: str = "Which step of this trajectory most directly shows the rule holding "
+        "(its call and reply)? Steps are named s<index>.",
+        into: dict[tuple[str, str], list[JsonObject]] | None = None,
+    ) -> None:
+        into = located if into is None else into
         steps = views[target].get("steps")
         if not isinstance(steps, list) or not steps:
             return
         window = steps[:MAX_DECISION_CRITERIA]
         if len(window) < 2:
-            located[(row.rule_key, target)] = [_clip_strings(window[0], settings.excerpt_bytes)]
+            into[(row.rule_key, target)] = [_clip_strings(window[0], settings.excerpt_bytes)]
             return
         criteria = {
             f"s{n}": str((step.get("action") or {}).get("name", "step"))[:200]
@@ -474,14 +492,14 @@ def build_fast_rules(
         request = DecisionRequest(
             state={
                 "rule": row.rule.statement,
+                **({} if text is None else {"research_question": text}),
                 "tool": row.rule.tool,
                 "trajectory": views[target],
                 "authority": TAG_AUTHORITY,
             },
             questions={
                 "where": ChoiceQuestion(
-                    instructions="Which step of this trajectory most directly shows the rule "
-                    "holding (its call and reply)? Steps are named s<index>.",
+                    instructions=instruction,
                     criteria=criteria,
                 )
             },
@@ -512,7 +530,34 @@ def build_fast_rules(
             if 0 <= index < len(window):
                 picked.append(_clip_strings(window[index], settings.excerpt_bytes))
         if picked:
-            located[(row.rule_key, target)] = picked
+            into[(row.rule_key, target)] = picked
+
+    # Research as evidence requests (JevGPT System One): every confirmed rule's research
+    # question is asked of every trajectory; where one addresses it (p >= research_threshold)
+    # the answering step is located and handed to the collator, which writes the answer.
+    asked = [row for row in tagged if row.confirmed and row.rule.research_question]
+    addressed: dict[str, dict[str, float]] = {}
+    research_located: dict[tuple[str, str], list[JsonObject]] = {}
+
+    def ask(chunk: list[TaggedRule], target: str) -> None:
+        questions = {
+            f"r{n}": NoulQuestion(
+                instructions="Does this trajectory contain evidence that answers this question "
+                "about the environment? " + row.rule.research_question
+            )
+            for n, row in enumerate(chunk)
+        }
+        request = DecisionRequest(
+            state={"trajectory": views[target], "authority": TAG_AUTHORITY},
+            questions=questions,
+        )
+        body, paid = boundary.buy(request)
+        matrix.bought += paid
+        matrix.replayed += not paid
+        for n, row in enumerate(chunk):
+            value = _probability(body, f"r{n}")
+            if value is not None:
+                addressed.setdefault(row.rule_key, {})[target] = value
 
     with ThreadPoolExecutor(settings.tag_concurrency) as pool:
         jobs = [
@@ -521,13 +566,43 @@ def build_fast_rules(
             if row.confirmed
             for target in row.matched[: settings.excerpts_per_rule]
         ]
+        jobs += [
+            pool.submit(ask, asked[start : start + MAX_DECISION_QUESTIONS], target)
+            for start in range(0, len(asked), MAX_DECISION_QUESTIONS)
+            for target in ids
+        ]
         for future in as_completed(jobs):
             try:
                 future.result()
             except Exception as error:  # noqa: BLE001 - an unlocated pair falls back to no excerpt
                 failures.append(f"localize: {type(error).__name__}: {error}"[:400])
+        research_jobs = []
+        for row in asked:
+            ranked = sorted(addressed.get(row.rule_key, {}).items(), key=lambda kv: -kv[1])
+            for target, value in ranked[: settings.excerpts_per_rule]:
+                if value >= settings.research_threshold:
+                    research_jobs.append(
+                        pool.submit(
+                            localize,
+                            row,
+                            target,
+                            text=row.rule.research_question,
+                            instruction="Which step of this trajectory most directly answers "
+                            "the research question (its call and reply)? Steps are named "
+                            "s<index>.",
+                            into=research_located,
+                        )
+                    )
+        for future in as_completed(research_jobs):
+            try:
+                future.result()
+            except Exception as error:  # noqa: BLE001 - an unanswered question stays open
+                failures.append(f"research: {type(error).__name__}: {error}"[:400])
     timings["localize_seconds"] = round(time.monotonic() - localize_started, 1)
-    progress(f"localized {len(located)} rule/trajectory pairs")
+    progress(
+        f"localized {len(located)} rule/trajectory pairs; research addressed for "
+        f"{len({k for k, _ in research_located})}/{len(asked)} questions"
+    )
 
     collate_started = time.monotonic()
     by_tool: dict[str, list[TaggedRule]] = {}
@@ -551,6 +626,18 @@ def build_fast_rules(
                         for t in row.matched[: settings.excerpts_per_rule]
                         if (row.rule_key, t) in located
                     ],
+                    "research_evidence": {
+                        "question": row.rule.research_question,
+                        "addressed_in_trajectories": sum(
+                            v >= settings.research_threshold
+                            for v in addressed.get(row.rule_key, {}).values()
+                        ),
+                        "located_original_steps": [
+                            {"trajectory": t, "steps": steps}
+                            for (key, t), steps in research_located.items()
+                            if key == row.rule_key
+                        ],
+                    },
                 }
                 for row in rows
             ],
@@ -655,7 +742,10 @@ def render_document(
             if rule.reasoning:
                 lines.append(f"  - why: {rule.reasoning}")
             for note in rule.research:
-                lines.append(f"  - research: {note.question} — {note.why_it_matters}")
+                if note.answer:
+                    lines.append(f"  - research (answered): {note.question} — {note.answer}")
+                else:
+                    lines.append(f"  - research (open): {note.question} — {note.why_it_matters}")
     uncollated = [row for row in confirmed if row.rule.tool not in collated]
     for row in uncollated:
         lines.append(
