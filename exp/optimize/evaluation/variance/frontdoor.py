@@ -38,6 +38,9 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
+from types import SimpleNamespace
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -129,6 +132,23 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+_BOOKKEEPING = threading.RLock()
+"""Serializes tracker and ledger updates when pipelines run at once (streaming mode)."""
+
+
+def streaming_settings() -> tuple[bool, int, int]:
+    """Streaming mode (EXP_STREAMING_FRONT_DOOR=1): pipelines at once and families at once.
+
+    It changes no identity: every stage keeps its content-addressed record, so saved runs replay
+    the same; only when work starts and how much runs at once differ. Concurrent phases settle
+    against overlapping usage readings, so the ledger over-counts (conservative: it may stop
+    early, never overspend).
+    """
+    on = os.environ.get("EXP_STREAMING_FRONT_DOOR") == "1"
+    pipelines = int(os.environ.get("EXP_STREAMING_PIPELINES", "8") or 8)
+    families = int(os.environ.get("EXP_STREAMING_FAMILIES", "4") or 4)
+    return on, max(1, pipelines), max(1, families)
 
 
 @dataclass(frozen=True)
@@ -474,6 +494,30 @@ class _Runner:
             done = project.artifacts.exists(result_id)
             self.tracker.stage(stage, "replayed" if done else "priced")
 
+        streaming, pipeline_workers, family_workers = streaming_settings()
+        streamed: dict[str, Future[PipelineOutcome]] = {}
+        pool = ThreadPoolExecutor(pipeline_workers) if streaming else None
+
+        def launch(build_report: ArtifactInput, bindings: tuple[BootstrapBinding, ...]) -> None:
+            """Streaming: start each newly registered start's pipeline now."""
+            assert pool is not None
+            prepared_so_far = SimpleNamespace(build_report=build_report)
+            with _BOOKKEEPING:
+                for binding in bindings:
+                    if binding.task_id not in streamed:
+                        streamed[binding.task_id] = pool.submit(
+                            self.guarded_pipeline, prepared_so_far, binding
+                        )
+            logger.info("streaming: launched %d pipelines (%d total)", len(bindings), len(streamed))
+
+        bootstrap_deps = deps.bootstrap
+        if streaming:
+            bootstrap_deps = replace(
+                bootstrap_deps or BootstrapDependencies(),
+                on_family_ready=launch,
+                family_concurrency=family_workers,
+            )
+
         def prepare() -> BootstrapPreparationReport:
             """Run or replay the preparation under its own share of the ceiling."""
             return run_bootstrap_preparation(
@@ -485,7 +529,7 @@ class _Runner:
                     ceiling_usd=preparation.known_usd,
                     unpriced_attempts=preparation.unpriced_attempts,
                 ),
-                dependencies=deps.bootstrap,
+                dependencies=bootstrap_deps,
             )
 
         prepared, reason = self.phase(
@@ -495,9 +539,13 @@ class _Runner:
             stopped=lambda _: None if project.artifacts.exists(result_id) else "tasks failed",
         )
         if prepared is None:
+            if pool is not None:
+                pool.shutdown(wait=True)  # streamed pipelines finish and save their own work
             return report.model_copy(update={"stopped": reason})
         partial = not project.artifacts.exists(result_id)
         if partial and not (spec.save_partial and prepared.bindings):
+            if pool is not None:
+                pool.shutdown(wait=True)
             failed = ", ".join(f"{t}" for t in (*prepared.failed_tasks, *prepared.refused_tasks))
             return report.model_copy(
                 update={
@@ -535,22 +583,24 @@ class _Runner:
         # resumes the stopped one.
         outcomes: list[PipelineOutcome] = []
         starts = len(prepared.bindings)
-        for index, binding in enumerate(prepared.bindings):
-            report_progress(
-                deps.progress, "pipelines", completed=index, total=starts, detail=binding.task_id
-            )
-            try:
-                outcome = self.pipeline(prepared, binding)
-            except (Exception, RequestAdmissionRefused) as error:  # noqa: BLE001 - per start
-                logger.exception(
-                    "pipeline %s raised; continuing with the next start", binding.task_id
-                )
-                outcome = PipelineOutcome(
-                    task_id=binding.task_id,
-                    binding=binding,
-                    stopped=f"raised {type(error).__name__}: {str(error)[:1000]}",
-                )
-            outcomes.append(outcome)
+        if pool is not None:
+            # Streaming: starts registered during the preparation already run; any it replayed
+            # (no callback fired) join now. Outcomes keep the bindings' order.
+            launch(prepared.build_report, prepared.bindings)
+            for index, binding in enumerate(prepared.bindings):
+                outcomes.append(streamed[binding.task_id].result())
+                report_progress(
+                    deps.progress, "pipelines", completed=index + 1, total=starts,
+                    detail=binding.task_id,
+                )  # fmt: skip
+            pool.shutdown(wait=True)
+        else:
+            for index, binding in enumerate(prepared.bindings):
+                report_progress(
+                    deps.progress, "pipelines", completed=index, total=starts,
+                    detail=binding.task_id,
+                )  # fmt: skip
+                outcomes.append(self.guarded_pipeline(prepared, binding))
         report_progress(deps.progress, "pipelines", completed=starts, total=starts)
         stops = [f"{row.task_id}: {row.stopped}" for row in outcomes if row.stopped is not None]
         if stops:
@@ -595,38 +645,42 @@ class _Runner:
         Returns:
             The result (None when refused) and why it stopped, if it did.
         """
-        state = self.tracker.stages.get(name)
-        if state is None:
-            state = self.tracker.stage(name, StageState.PLANNED.value)
         progress = self.dependencies.progress
+        with _BOOKKEEPING:
+            state = self.tracker.stages.get(name)
+            if state is None:
+                state = self.tracker.stage(name, StageState.PLANNED.value)
         if state == StageState.DONE:
             report_progress(progress, name, detail="replayed")
             return work(), None
         usd = sum(row.usd for row in costs if row.usd is not None)
         attempts = sum(row.attempts for row in costs if row.usd is None)
-        announce = self.dependencies.announce
-        if announce is not None:
-            announce(self.preview(name, costs))
-        reason = self.ledger.admit(name, usd, attempts)
-        if reason is not None:
-            self.tracker.stage(name, "refused")
-            report_progress(progress, name, detail="refused")
-            return None, reason
-        self.tracker.stage(name, "approved")
-        self.tracker.stage(name, "started")
-        report_progress(progress, name, detail="running")
-        before = measure(self.project)
+        with _BOOKKEEPING:
+            announce = self.dependencies.announce
+            if announce is not None:
+                announce(self.preview(name, costs))
+            reason = self.ledger.admit(name, usd, attempts)
+            if reason is not None:
+                self.tracker.stage(name, "refused")
+                report_progress(progress, name, detail="refused")
+                return None, reason
+            self.tracker.stage(name, "approved")
+            self.tracker.stage(name, "started")
+            report_progress(progress, name, detail="running")
+            before = measure(self.project)
         try:
             result = work()
         except BaseException:
             # A budget or admission stop is a BaseException; the phase is settled either way.
-            self.ledger.settle(name, before, measure(self.project))
-            self.tracker.stage(name, "raised")
+            with _BOOKKEEPING:
+                self.ledger.settle(name, before, measure(self.project))
+                self.tracker.stage(name, "raised")
             report_progress(progress, name, detail="raised")
             raise
-        self.ledger.settle(name, before, measure(self.project))
         reason = stopped(result)
-        self.tracker.stage(name, "stopped" if reason is not None else "finished")
+        with _BOOKKEEPING:
+            self.ledger.settle(name, before, measure(self.project))
+            self.tracker.stage(name, "stopped" if reason is not None else "finished")
         report_progress(progress, name, detail="stopped" if reason is not None else "finished")
         return result, reason
 
@@ -682,6 +736,18 @@ class _Runner:
                     return report.model_copy(update={"slots": results, "stopped": halted})
         return report.model_copy(update={"slots": results})
 
+    def guarded_pipeline(self, prepared: object, binding: BootstrapBinding) -> PipelineOutcome:
+        """Run one start's pipeline; a raise or refusal becomes its recorded stop."""
+        try:
+            return self.pipeline(prepared, binding)  # type: ignore[arg-type]
+        except (Exception, RequestAdmissionRefused) as error:  # noqa: BLE001 - per start
+            logger.exception("pipeline %s raised; continuing with the next start", binding.task_id)
+            return PipelineOutcome(
+                task_id=binding.task_id,
+                binding=binding,
+                stopped=f"raised {type(error).__name__}: {str(error)[:1000]}",
+            )
+
     def pipeline(
         self, prepared: BootstrapPreparationReport, binding: BootstrapBinding
     ) -> PipelineOutcome:
@@ -693,8 +759,9 @@ class _Runner:
             self.project, pipeline_spec, code_revision=self.code_revision, executors=deps.executors
         )
         name = f"pipeline {binding.task_id}"
-        if name not in self.tracker.stages and plan.complete:
-            self.tracker.stage(name, StageState.DONE.value)
+        with _BOOKKEEPING:
+            if name not in self.tracker.stages and plan.complete:
+                self.tracker.stage(name, StageState.DONE.value)
         approval = None if plan.complete else PipelineApproval.for_plan(plan)
         costs = tuple(
             line.model_copy(update={"name": f"{row.stage}: {line.name}"})

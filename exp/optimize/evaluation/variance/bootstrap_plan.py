@@ -8,6 +8,7 @@ approval or calls. The resulting bindings are the six-stage pipeline's ordinary 
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -235,6 +236,10 @@ class BootstrapDependencies:
     reviewer: CompatibilityReviewer | None = None
     namer: ClusterNamer | None = None
     decisions: DecisionsTraceTagger | DecisionBoundary | None = None
+    on_family_ready: Callable[[ArtifactInput, tuple[BootstrapBinding, ...]], None] | None = None
+    """Streaming: called with the build report and a family's bindings once its batch is frozen."""
+    family_concurrency: int = 1
+    """Families prepared at once (1 keeps the original sequential order)."""
 
 
 def _identity(spec: BootstrapPreparationSpec, build_identity: str, revision: str) -> str:
@@ -597,35 +602,38 @@ def _run(
             project.artifacts, report.build.trace_dataset.artifact_id
         ).traces
     }
-    batches: list[ArtifactInput] = []
-    bindings: list[BootstrapBinding] = []
-    simulators: list[ArtifactInput] = []
-    failed: list[str] = []
-    refused: list[str] = []
-    for family in selected:
+    build_report = artifact_input(project.artifacts.read(report.identity + "-result").manifest)
+
+    def prepare_family(
+        family: object,
+    ) -> tuple[ArtifactInput, list[BootstrapBinding], ArtifactInput | None, list[str], list[str]]:
+        """Author one family's starts, freeze its batch and save its learned simulator."""
         manifest = run_bootstrap(
             project,
-            family.spec,
+            family.spec,  # type: ignore[attr-defined]
             exposure=exposure,
             traces=traces,
             code_revision=revision,
             decisions=dependencies.decisions,
         )
         batch = freeze_batch(project, manifest)
-        batches.append(batch)
+        family_bindings: list[BootstrapBinding] = []
+        family_failed: list[str] = []
+        family_refused: list[str] = []
         learned = None
         for entry in manifest.entries:
             if entry.status == "failed":
-                failed.append(entry.task_id)
+                family_failed.append(entry.task_id)
             elif entry.status == "refused":
-                refused.append(entry.task_id)
+                family_refused.append(entry.task_id)
             else:
-                bindings.append(BootstrapBinding(batch=batch, task_id=entry.task_id))
+                family_bindings.append(BootstrapBinding(batch=batch, task_id=entry.task_id))
                 outcome = load_outcome(project, entry.identity)
                 assert isinstance(outcome, BootstrapRegistration)
                 learned = outcome
+        simulator = None
         if learned is not None:
-            simulator = family.simulator.model_copy(
+            updated = family.simulator.model_copy(  # type: ignore[attr-defined]
                 update={
                     "rule_book": learned.rulebook,
                     "rule_memory": learned.rule_memory,
@@ -633,13 +641,37 @@ def _run(
                     "runtime": GroundedRuntimeDefinition.model_validate(learned.job.configuration),
                 }
             )
-            simulators.append(
-                save_family_simulator(project.artifacts, simulator, code_revision=revision)
-            )
+            simulator = save_family_simulator(project.artifacts, updated, code_revision=revision)
+        if dependencies.on_family_ready is not None and family_bindings:
+            # Streaming: this family's starts are bindable now; their pipelines need not wait
+            # for the other families.
+            dependencies.on_family_ready(build_report, tuple(family_bindings))
+        return batch, family_bindings, simulator, family_failed, family_refused
+
+    workers = max(1, dependencies.family_concurrency)
+    if workers == 1:
+        prepared = [prepare_family(family) for family in selected]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(workers) as pool:
+            prepared = list(pool.map(prepare_family, selected))
+    batches: list[ArtifactInput] = []
+    bindings: list[BootstrapBinding] = []
+    simulators: list[ArtifactInput] = []
+    failed: list[str] = []
+    refused: list[str] = []
+    for batch, family_bindings, simulator, family_failed, family_refused in prepared:
+        batches.append(batch)
+        bindings.extend(family_bindings)
+        failed.extend(family_failed)
+        refused.extend(family_refused)
+        if simulator is not None:
+            simulators.append(simulator)
     return BootstrapPreparationReport(
         identity=plan.identity,
         plan=plan,
-        build_report=artifact_input(project.artifacts.read(report.identity + "-result").manifest),
+        build_report=build_report,
         batches=tuple(batches),
         bindings=tuple(bindings),
         simulators=tuple(simulators),
