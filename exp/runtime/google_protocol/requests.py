@@ -54,7 +54,6 @@ from exp.runtime.gateway.tool_contracts import (
     GatewayToolDefinition,
 )
 from exp.runtime.google_protocol.manifest import GENERATE_CONTENT_MANIFEST
-from exp.runtime.models.providers.gemini_requests import GEMINI_SYNTHETIC_CALL_ID_PREFIX
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.errors import (
     OpenAIProtocolError,
@@ -675,7 +674,7 @@ def _tool_call(
     """One replayed function call, keeping its exact arguments and signature."""
     call = part.function_call
     assert call is not None
-    call_id = call.id or f"{GEMINI_SYNTHETIC_CALL_ID_PREFIX}{len(pending_calls)}-{ordinal}"
+    call_id = call.id or f"gemini-call-{len(pending_calls)}-{ordinal}"
     raw = json.dumps(call.args or {}, separators=(",", ":"), ensure_ascii=False)
     arguments, treatment = replayed_tool_arguments(raw)
     pending_calls[call_id] = call.name
@@ -686,6 +685,7 @@ def _tool_call(
         arguments=arguments,
         raw_arguments=raw,
         arguments_treatment=treatment,
+        call_id_minted=call.id is None,
         provider_thought_signature=part.thought_signature,
     )
 
@@ -872,16 +872,11 @@ def _json_schema(schema: JsonObject) -> JsonObject:
             continue
         else:
             converted[key] = value
-    if schema.get("nullable") is True:
-        # Google's OpenAPI flag has no JSON Schema meaning; widen the type.
-        declared = converted.get("type")
-        if isinstance(declared, str):
-            converted["type"] = [declared, "null"]
-        elif isinstance(declared, list) and "null" not in declared:
-            converted["type"] = [*declared, "null"]
-        elif isinstance(converted.get("anyOf"), list):
-            converted["anyOf"] = [*cast("list[JsonValue]", converted["anyOf"]), {"type": "null"}]
-        # A typeless node already admits null; nothing to widen.
+    if schema.get("nullable") is True and converted:
+        # Google's OpenAPI flag has no JSON Schema meaning: null becomes an
+        # alternative to the WHOLE node, so sibling constraints (enum, format,
+        # minimum) keep applying to the non-null branch only.
+        return {"anyOf": [converted, {"type": "null"}]}
     return converted
 
 

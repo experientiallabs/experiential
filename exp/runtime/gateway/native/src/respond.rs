@@ -363,6 +363,45 @@ pub(crate) async fn send_bounded(
     )
 }
 
+/// How one streamed terminal settles in the ledger.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StreamOutcome {
+    /// Refusal output appeared somewhere on the stream and the provider
+    /// closed with a non-failing terminal: the typed refusal, never a
+    /// completion and never `empty_completion` (a content-free refusal
+    /// satisfies that predicate too, so this is decided first).
+    Refusal,
+    /// A billed or unreported `stop` that rendered nothing.
+    EmptyCompletion,
+    /// The terminal settles as itself (completed, incomplete, failed).
+    Terminal,
+}
+
+/// Decide the ledger outcome of one streamed terminal. `refusal_seen` covers
+/// the raw events and the encoder; `released` is the guardrail's batch for
+/// this terminal, which may carry a refusal it buffered until the flush.
+pub(crate) fn stream_outcome(
+    terminal: &Event,
+    refusal_seen: bool,
+    released: &[Event],
+    empty_completion: bool,
+) -> StreamOutcome {
+    let refusal_output = refusal_seen
+        || released.iter().any(|event| {
+            matches!(
+                event,
+                Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
+            )
+        });
+    if refusal_output && !matches!(terminal, Event::Failed(_)) {
+        StreamOutcome::Refusal
+    } else if empty_completion {
+        StreamOutcome::EmptyCompletion
+    } else {
+        StreamOutcome::Terminal
+    }
+}
+
 /// Replace a typed refusal terminal with a public completion when refusal
 /// output already reached (or is reaching) the caller, mirroring the python
 /// executor's committed-refusal rule. Returns the recorded refusal failure.

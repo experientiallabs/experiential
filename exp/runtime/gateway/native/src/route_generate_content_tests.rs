@@ -38,3 +38,36 @@ fn model_actions_split_on_the_last_colon() {
     );
     assert_eq!(percent_decode("xpl_%5Fa%2Fb"), "xpl__a/b");
 }
+
+#[test]
+fn a_streamed_refusal_settles_as_the_typed_refusal_ahead_of_empty_completion() {
+    // A content-free refusal closed with a plain stop also satisfies the
+    // empty-completion predicate; the refusal wins (Cursor, #1362).
+    assert_eq!(
+        stream_outcome(&Event::Completed, true, &[], true),
+        StreamOutcome::Refusal
+    );
+    // A refusal the guardrail released only with the terminal flush, unseen
+    // by the encoder at settle time, is still the refusal.
+    let released = vec![Event::RefusalDelta("no".into()), Event::Completed];
+    assert_eq!(
+        stream_outcome(&Event::Completed, false, &released, true),
+        StreamOutcome::Refusal
+    );
+    // A provider-typed failing terminal keeps its own class.
+    let failed = Event::Failed(Failure::new(FailureClass::ProviderInternal, "x"));
+    assert_eq!(
+        stream_outcome(&failed, true, &[], false),
+        StreamOutcome::Terminal
+    );
+    // Without refusal output the empty-completion rule still applies, then
+    // the plain terminal.
+    assert_eq!(
+        stream_outcome(&Event::Completed, false, &[], true),
+        StreamOutcome::EmptyCompletion
+    );
+    assert_eq!(
+        stream_outcome(&Event::Completed, false, &[], false),
+        StreamOutcome::Terminal
+    );
+}

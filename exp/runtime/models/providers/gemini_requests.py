@@ -141,7 +141,7 @@ def gemini_generate_request(
         include_thoughts: The caller's own ``includeThoughts`` (the generateContent
             surface); ``None`` asks for summaries whenever display is enabled.
         replay_call_ids: Echo the caller's Google-issued ``functionCall.id`` and
-            ``functionResponse.id`` (never a gateway-minted id).
+            ``functionResponse.id`` (never an id the decoder minted, per ``call_id_minted``).
         frequency_penalty: The caller's frequencyPenalty, passed only when the rung accepts it.
         presence_penalty: The caller's presencePenalty, passed only when the rung accepts it.
 
@@ -156,6 +156,7 @@ def gemini_generate_request(
     system_parts: list[JsonObject] = []
     contents: list[JsonObject] = []
     tool_names: dict[str, str] = {}
+    caller_ids: set[str] = set()
     # systemInstruction has no position inside contents, so an instruction
     # after conversation start rides as user text where the caller put it
     # (consecutive user contents are accepted on this wire); only the leading
@@ -169,7 +170,9 @@ def gemini_generate_request(
             continue
         if message.role == "assistant":
             turn.close(contents)
-        content = _gemini_content(message, tool_names, replay_call_ids=replay_call_ids)
+        content = _gemini_content(
+            message, tool_names, replay_call_ids=replay_call_ids, caller_ids=caller_ids
+        )
         if message.role == "assistant":
             turn.open(message, contents, content)
         elif turn.collects(message):
@@ -248,9 +251,6 @@ def gemini_generate_request(
     payload["generationConfig"] = generation
     return payload
 
-
-GEMINI_SYNTHETIC_CALL_ID_PREFIX = "gemini-call-"
-"""Prefix of the ids the generateContent decoder mints for calls Google sent without one."""
 
 GEMINI_MISSING_TOOL_RESULT = (
     "[no result: the caller's history carries no tool result for this call]"
@@ -335,7 +335,11 @@ class _CallTurn:
 
 
 def _gemini_content(
-    message: ModelMessage, tool_names: dict[str, str], *, replay_call_ids: bool = False
+    message: ModelMessage,
+    tool_names: dict[str, str],
+    *,
+    replay_call_ids: bool = False,
+    caller_ids: set[str] | None = None,
 ) -> JsonObject:
     """Map a EXP history item to Gemini user or model content parts.
 
@@ -343,6 +347,7 @@ def _gemini_content(
         message: One visible non-system history message.
         tool_names: Accumulated tool-call ID to tool-name linkage, updated in place.
         replay_call_ids: Echo caller-supplied (Google-issued) call ids on both parts.
+        caller_ids: The caller-supplied ids seen so far (never minted ones), updated in place.
 
     Returns:
         One native Gemini content object.
@@ -350,12 +355,13 @@ def _gemini_content(
     Raises:
         ValueError: The message cannot preserve its role or tool linkage.
     """
+    caller_ids = set() if caller_ids is None else caller_ids
     if message.role == "tool":
         tool_name = tool_names.get(message.tool_call_id or "")
         if tool_name is None:
             raise ValueError("Gemini tool result has no preceding tool-call name")
         response: JsonObject = {"name": tool_name, "response": {"content": message.content or ""}}
-        if _replays_id(replay_call_ids, message.tool_call_id):
+        if replay_call_ids and message.tool_call_id in caller_ids:
             response["id"] = message.tool_call_id
         return {"role": "user", "parts": [{"functionResponse": response}]}
     if message.role == "user":
@@ -405,8 +411,9 @@ def _gemini_content(
         for call in action.tool_calls:
             tool_names[call.call_id] = call.name
             function_call: JsonObject = {"name": call.name, "args": call.arguments}
-            if _replays_id(replay_call_ids, call.call_id):
+            if replay_call_ids and not call.call_id_minted:
                 function_call["id"] = call.call_id
+                caller_ids.add(call.call_id)
             part: JsonObject = {"functionCall": function_call}
             if call.provider_thought_signature is not None:
                 part["thoughtSignature"] = call.provider_thought_signature
@@ -416,15 +423,6 @@ def _gemini_content(
     if not parts:
         raise ValueError("assistant messages need text or tool calls")
     return {"role": "model", "parts": parts}
-
-
-def _replays_id(replay_call_ids: bool, call_id: str | None) -> bool:
-    """Whether one call id is a caller-supplied Google id worth echoing."""
-    return (
-        replay_call_ids
-        and bool(call_id)
-        and not (call_id or "").startswith(GEMINI_SYNTHETIC_CALL_ID_PREFIX)
-    )
 
 
 def _gemini_tool_choice(

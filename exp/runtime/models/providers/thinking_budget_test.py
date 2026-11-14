@@ -424,3 +424,26 @@ def test_native_vertex_gemini_preserves_numeric_budget(nested: bool) -> None:
     payload = dialect_stream_payload(profile, provider)
     assert payload["generationConfig"] == {"thinkingConfig": {"thinkingBudget": 2048}}
     assert public.provider_thinking_config == request.provider_thinking_config
+
+
+def test_a_google_callers_include_thoughts_survives_the_numeric_budget() -> None:
+    """``includeThoughts: true`` beside ``thinkingBudget`` reaches Gemini with both fields."""
+    from exp.runtime.google_protocol.requests import decode_generate_content
+
+    request = decode_generate_content(
+        {
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {
+                "maxOutputTokens": 4000,
+                "thinkingConfig": {"includeThoughts": True, "thinkingBudget": 1024},
+            },
+        },
+        model="coding",
+        stream=True,
+    ).request
+    profile = _gemini_profile("gemini-2.5-flash")
+    _public, provider = route_generation_parameter_requests((profile,), request)
+    payload = dialect_stream_payload(profile, provider)
+    generation = payload["generationConfig"]
+    assert isinstance(generation, dict)
+    assert generation["thinkingConfig"] == {"includeThoughts": True, "thinkingBudget": 1024}
