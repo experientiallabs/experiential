@@ -718,7 +718,7 @@ def test_explicit_router_selection_builds_and_composes_provisional_router(
         """
         del run_root, project_repository
         assert only_aliases == frozenset({"support"})
-        return SimpleNamespace(unavailable_aliases=())
+        return SimpleNamespace(unavailable_aliases=(), crash_follow_up=None)
 
     def _control_plane(components: object, **_kwargs: object) -> SimpleNamespace:
         """Return startup-receipt facts without loading real authority.

@@ -560,8 +560,7 @@ process restart never rewrite that source. Schema-v1/v2 attempt rows migrate exp
 network work. The public usage report conserves physical attempt, token, cost, unknown-cost, and
 terminal totals across those source buckets without partitioning logical request counts. The parent
 request terminalizes once after success, final failure, cancellation, disconnect, or crash
-reconciliation. Unknown prices remain unknown instead of being treated as zero or copied across
-deployments.
+reconciliation. Crash reconciliation runs at startup: an open request with no attempt expires at its deadline, and once its deadline plus a 5-second cleanup grace has passed, a dispatched attempt or a request whose attempts all settled for failover without a final answer becomes `unknown_after_crash`, which releases its idempotency key for a retry. Rows still inside that bound at startup get one follow-up pass when the latest of their bounds passes; it touches only rows open at startup and is cancelled at shutdown. Unknown prices remain unknown instead of being treated as zero or copied across deployments.
 
 ## OpenAI-compatible protocol
 

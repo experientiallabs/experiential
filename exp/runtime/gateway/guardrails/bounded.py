@@ -401,6 +401,12 @@ class _IsolationPool:
             return await waiter
         except asyncio.CancelledError:
             self._drop_waiter(waiter)
+            # A release can deliver a worker after the caller is cancelled but before it
+            # resumes; hand that worker back or the pool loses it permanently.
+            if waiter.done() and not waiter.cancelled() and waiter.exception() is None:
+                delivered = waiter.result()
+                if delivered is not None:
+                    self.release(delivered)
             raise
         finally:
             handle.cancel()

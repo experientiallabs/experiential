@@ -1653,6 +1653,116 @@ def test_crash_reconciliation_waits_for_deadline_and_cleanup_bound(tmp_path: Pat
         connection.close()
 
 
+def test_crash_after_failover_settlement_reconciles_the_open_request(tmp_path: Path) -> None:
+    """A request whose attempts all settled for failover is closed once its deadline passes."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    request = _request("failover-crash", idempotency_key="failover-crash-operation")
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=clock.monotonic() + 10,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=None,
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.TRANSPORT,
+            safe_message="retry on sibling route",
+        ),
+        finalize_request=False,
+    )
+
+    clock.advance(11)
+    assert ledger.reconcile_crashed_requests(cleanup_grace=timedelta(0)) == (1, 0)
+    connection = sqlite3.connect(tmp_path / "gateway.db")
+    try:
+        state = connection.execute(
+            "SELECT terminal_state FROM gateway_requests WHERE request_id = ?",
+            (authorization.request_id,),
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert state == "unknown_after_crash"
+    retry = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=clock.monotonic() + 10,
+    )
+    ledger.accept_request(authorization=retry)
+
+
+def test_follow_up_reconciles_dispatched_work_still_inside_its_bound_at_startup(
+    tmp_path: Path,
+) -> None:
+    """Work a startup reconcile skipped is settled once its deadline plus grace passes."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("in-flight-at-crash"),
+        deadline_monotonic=clock.monotonic() + 60,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    grace = timedelta(seconds=5)
+    assert ledger.reconcile_crashed_requests(cleanup_grace=grace) == (0, 0)
+    follow_up = ledger.start_crash_follow_up(cleanup_grace=grace, poll_seconds=0.01)
+    assert follow_up is not None
+    try:
+        clock.advance(30)
+        time.sleep(0.05)
+        assert not follow_up.finished
+        assert _attempt_row(tmp_path, attempt_id)["state"] == "dispatched"
+        clock.advance(36)
+        deadline = time.monotonic() + 10
+        while not follow_up.finished and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert follow_up.finished
+        assert _attempt_row(tmp_path, attempt_id)["state"] == "unknown_after_crash"
+    finally:
+        assert follow_up.close(timeout_seconds=5)
+
+
+def test_follow_up_is_cancelled_at_shutdown_without_touching_rows(tmp_path: Path) -> None:
+    """Closing a pending follow-up stops it before its bound and leaves rows as they were."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("cancelled-follow-up"),
+        deadline_monotonic=clock.monotonic() + 60,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=_deployment(),
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    follow_up = ledger.start_crash_follow_up(cleanup_grace=timedelta(seconds=5))
+    assert follow_up is not None
+    assert follow_up.close(timeout_seconds=5)
+    clock.advance(120)
+    assert _attempt_row(tmp_path, attempt_id)["state"] == "dispatched"
+
+
 def test_concurrent_multi_identity_wal_preserves_receipts_grants_and_attempts(
     tmp_path: Path,
 ) -> None:

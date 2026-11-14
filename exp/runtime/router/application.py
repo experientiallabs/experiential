@@ -151,6 +151,10 @@ class _OwnedGateway:
                 self.guardrails.close(timeout_seconds=max(0.0, deadline - time.monotonic()))
         finally:
             try:
+                if self.components.crash_follow_up is not None:
+                    self.components.crash_follow_up.close(
+                        timeout_seconds=max(0.0, deadline - time.monotonic())
+                    )
                 self.components.selection_workers.shutdown()
                 self.components.write_ledger.close()
             finally:

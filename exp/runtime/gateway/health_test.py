@@ -689,3 +689,30 @@ def test_a_throttle_redial_reservation_is_not_bound_as_a_probe() -> None:
     registry.bind_throttle_probe(_KEY, "redial", probe=False)
     registry.succeeded(_KEY, "redial")
     assert not registry.claim(_KEY)
+
+
+def test_healthy_traffic_across_catalog_publishes_retains_no_state() -> None:
+    """Keys that only ever succeed leave nothing behind, however many catalogs publish."""
+    registry = DeploymentHealthRegistry(clock=lambda: 100.0)
+    for index in range(1_000):
+        key: DeploymentHealthKey = (f"catalog-{index}", "deployment", "connection")
+        assert registry.claim(key)
+        registry.dispatch_opened(key, f"attempt-{index}")
+        registry.succeeded(key, f"attempt-{index}")
+    assert len(registry._states) == 0  # noqa: SLF001 - assert the registry stays bounded.
+
+
+def test_recovered_key_is_pruned_and_a_throttled_key_is_kept() -> None:
+    """A success drops a key with no remaining suppression; a live throttle window stays."""
+    registry = DeploymentHealthRegistry(failure_threshold=2, clock=lambda: 100.0)
+    recovered: DeploymentHealthKey = ("catalog", "recovered", "connection")
+    throttled: DeploymentHealthKey = ("catalog", "throttled", "connection")
+    registry.failed(recovered, _failure(GatewayFailureClass.TRANSPORT))
+    assert recovered in registry._states  # noqa: SLF001 - negative state is recorded.
+    registry.succeeded(recovered)
+    assert recovered not in registry._states  # noqa: SLF001 - recovered state is pruned.
+    assert registry.claim(recovered)
+    registry.failed(throttled, _failure(GatewayFailureClass.THROTTLED))
+    registry.succeeded(throttled)
+    assert throttled in registry._states  # noqa: SLF001 - the live window is kept.
+    assert registry.suppressed(throttled)

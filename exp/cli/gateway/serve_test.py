@@ -171,6 +171,7 @@ def test_project_option_launches_the_native_gateway_on_loopback(
         )
 
     components = SimpleNamespace(
+        crash_follow_up=None,
         reconciled_expired_requests=0,
         reconciled_unknown_attempts=0,
         unavailable_aliases=(),
@@ -329,6 +330,7 @@ def test_unbindable_port_fails_before_any_ready_receipt(
         )
 
     components = SimpleNamespace(
+        crash_follow_up=None,
         reconciled_expired_requests=0,
         reconciled_unknown_attempts=0,
         unavailable_aliases=(),
