@@ -40,6 +40,7 @@ import logging
 import os
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextvars import copy_context
 from types import SimpleNamespace
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -505,8 +506,10 @@ class _Runner:
             with _BOOKKEEPING:
                 for binding in bindings:
                     if binding.task_id not in streamed:
+                        # A copy of the launching context per pipeline: spend scopes and
+                        # ceilings are context variables a bare worker thread would not see.
                         streamed[binding.task_id] = pool.submit(
-                            self.guarded_pipeline, prepared_so_far, binding
+                            copy_context().run, self.guarded_pipeline, prepared_so_far, binding
                         )
             logger.info("streaming: launched %d pipelines (%d total)", len(bindings), len(streamed))
 

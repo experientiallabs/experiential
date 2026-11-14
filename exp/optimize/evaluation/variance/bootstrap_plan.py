@@ -653,9 +653,13 @@ def _run(
         prepared = [prepare_family(family) for family in selected]
     else:
         from concurrent.futures import ThreadPoolExecutor
+        from contextvars import copy_context
 
+        # Each family runs in a copy of this context: the installed spend ceiling and
+        # unpriced-attempt allowance are context variables a bare worker thread would not see.
         with ThreadPoolExecutor(workers) as pool:
-            prepared = list(pool.map(prepare_family, selected))
+            futures = [pool.submit(copy_context().run, prepare_family, f) for f in selected]
+            prepared = [future.result() for future in futures]
     batches: list[ArtifactInput] = []
     bindings: list[BootstrapBinding] = []
     simulators: list[ArtifactInput] = []
