@@ -168,7 +168,7 @@ def gemini_generate_request(
             system_parts.append({"text": message.content})
             continue
         if message.role == "assistant":
-            turn.close(contents)
+            turn.close(contents, replay_call_ids=replay_call_ids)
         content = _gemini_content(message, tool_names, replay_call_ids=replay_call_ids)
         if message.role == "assistant":
             turn.open(message, contents, content)
@@ -176,7 +176,7 @@ def gemini_generate_request(
             turn.add(message, content)
         else:
             contents.append(content)
-    turn.close(contents)
+    turn.close(contents, replay_call_ids=replay_call_ids)
     if json_object_output:
         system_parts.append({"text": JSON_OBJECT_SYSTEM_INSTRUCTION})
     payload: JsonObject = {"contents": contents}
@@ -276,7 +276,7 @@ class _CallTurn:
     """
 
     def __init__(self) -> None:
-        self._calls: tuple[tuple[str, str], ...] = ()
+        self._calls: tuple[tuple[str, str, bool], ...] = ()
         self._responses: dict[str, JsonObject] = {}
         self._others: list[JsonObject] = []
 
@@ -285,7 +285,7 @@ class _CallTurn:
         contents.append(content)
         action = message.assistant_action
         calls = () if action is None else action.tool_calls
-        self._calls = tuple((call.call_id, call.name) for call in calls)
+        self._calls = tuple((call.call_id, call.name, not call.call_id_minted) for call in calls)
 
     def collects(self, message: ModelMessage) -> bool:
         """Whether a user or tool message belongs to the open call turn."""
@@ -297,29 +297,28 @@ class _CallTurn:
         if (
             message.role == "tool"
             and call_id not in self._responses
-            and any(call_id == known for known, _name in self._calls)
+            and any(call_id == known for known, _name, _caller in self._calls)
         ):
             self._responses[call_id] = content
             return
         self._others.append(content)
 
-    def close(self, contents: list[JsonObject]) -> None:
+    def close(self, contents: list[JsonObject], *, replay_call_ids: bool = False) -> None:
         """Emit the open turn's answers as one user content, then the rest in order."""
         if not self._calls:
             return
         if self._responses or self._others:
             parts: list[JsonObject] = []
-            for call_id, name in self._calls:
+            for call_id, name, caller_id in self._calls:
                 response = self._responses.get(call_id)
                 if response is None:
-                    parts.append(
-                        {
-                            "functionResponse": {
-                                "name": name,
-                                "response": {"content": GEMINI_MISSING_TOOL_RESULT},
-                            }
-                        }
-                    )
+                    placeholder: JsonObject = {
+                        "name": name,
+                        "response": {"content": GEMINI_MISSING_TOOL_RESULT},
+                    }
+                    if replay_call_ids and caller_id:
+                        placeholder["id"] = call_id
+                    parts.append({"functionResponse": placeholder})
                     continue
                 response_parts = response["parts"]
                 assert isinstance(response_parts, list)

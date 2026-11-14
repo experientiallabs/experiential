@@ -87,6 +87,7 @@ BEHAVIOR_DROPPED = "tools.functionDeclarations.behavior->dropped(unsupported)"
 RESPONSE_SCHEMA_DROPPED = "tools.functionDeclarations.response->dropped(unsupported)"
 """Disclosure for a declared function output schema; no gateway wire carries one."""
 _THOUGHT_SIGNATURE_MAX = 65_536
+_VIDEO_URL_SUFFIXES = (".mp4", ".m4v", ".mpeg", ".mpg", ".mov", ".webm", ".flv", ".3gp")
 # Gemini's MP3/WAV spellings mapped onto the IANA names the audio contract knows.
 _AUDIO_MIME_ALIASES = {
     "audio/mp3": "audio/mpeg",
@@ -775,11 +776,11 @@ def _file_part(file: _FileData, param: str) -> MessageContentPart:
                 "Audio is served inline only (inlineData); a fileData audio URL is not fetched."
             ),
         )
-    pdf_url = uri.lower().split("?")[0].endswith(".pdf")
+    path = uri.lower().split("?")[0]
     try:
-        if media.startswith("video/"):
+        if media.startswith("video/") or (not media and path.endswith(_VIDEO_URL_SUFFIXES)):
             return video_part_from_url(uri)
-        if media in DOCUMENT_MEDIA_TYPES or (not media and pdf_url):
+        if media in DOCUMENT_MEDIA_TYPES or (not media and path.endswith(".pdf")):
             return DocumentContentPart(url=uri)
         if media in IMAGE_MEDIA_TYPES or not media:
             return image_part_from_url(uri)  # An absent type is inferred from the URL.
@@ -817,7 +818,7 @@ def _tools(
             schema = declaration.parameters_json_schema
             if schema is None:
                 schema = (
-                    _json_schema(declaration.parameters)
+                    _json_schema(declaration.parameters, f"tools.{index}.functionDeclarations")
                     if declaration.parameters
                     else {"type": "object"}
                 )
@@ -850,29 +851,31 @@ def _tools(
     return tuple(definitions), choice
 
 
-def _json_schema(schema: JsonObject) -> JsonObject:
-    """Google's ``Schema`` (upper-case ``type`` enums) as plain JSON Schema."""
+def _json_schema(schema: JsonObject, param: str) -> JsonObject:
+    """Google's ``Schema`` (upper-case ``type`` enums) as plain JSON Schema.
+
+    ``param`` is the caller's field holding this schema, named by rejections."""
     converted: JsonObject = {}
     for key, value in schema.items():
         if key == "type" and isinstance(value, str):
             converted[key] = value.lower()
         elif key in {"properties", "defs"} and isinstance(value, dict):
             converted[key] = {
-                name: _json_schema(cast("JsonObject", entry)) if isinstance(entry, dict) else entry
+                name: _json_schema(cast("JsonObject", entry), param)
+                if isinstance(entry, dict)
+                else entry
                 for name, entry in value.items()
             }
         elif key in {"items"} and isinstance(value, dict):
-            converted[key] = _json_schema(cast("JsonObject", value))
+            converted[key] = _json_schema(cast("JsonObject", value), param)
         elif key in {"anyOf", "any_of"} and isinstance(value, list):
             converted["anyOf"] = [
-                _json_schema(cast("JsonObject", entry)) if isinstance(entry, dict) else entry
+                _json_schema(cast("JsonObject", entry), param) if isinstance(entry, dict) else entry
                 for entry in value
             ]
         elif key == "nullable":
             if not isinstance(value, bool):
-                raise invalid_field(
-                    "generationConfig.responseSchema", "Schema.nullable must be a boolean."
-                )
+                raise invalid_field(param, "Schema.nullable must be a boolean.")
         else:
             converted[key] = value
     if schema.get("nullable") is True and converted:
@@ -911,7 +914,7 @@ def _output_format(
         None if schema is None else "generationConfig.responseJsonSchema"
     )
     if schema is None and config.response_schema is not None:
-        schema = _json_schema(config.response_schema)
+        schema = _json_schema(config.response_schema, "generationConfig.responseSchema")
         field = "generationConfig.responseSchema"
     if schema is not None:
         if mime and mime != _JSON_MIME:

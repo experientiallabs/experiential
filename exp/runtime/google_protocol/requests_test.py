@@ -254,6 +254,7 @@ def test_gemini_audio_spellings_and_file_urls_land_on_their_own_part_kinds() -> 
                             }
                         },
                         {"fileData": {"fileUri": "https://example.com/photo.png"}},
+                        {"fileData": {"fileUri": "https://example.com/clip.mp4"}},
                     ],
                 }
             ]
@@ -262,7 +263,7 @@ def test_gemini_audio_spellings_and_file_urls_land_on_their_own_part_kinds() -> 
         stream=False,
     ).request
     parts = request.messages[0].content_parts
-    assert [part.kind for part in parts] == ["audio", "document", "image"]
+    assert [part.kind for part in parts] == ["audio", "document", "image", "video"]
     audio, document = parts[0], parts[1]
     assert isinstance(audio, AudioContentPart)
     assert audio.media_type == "audio/mpeg"
@@ -609,3 +610,19 @@ def test_a_thought_only_model_turn_drops_and_the_history_continues() -> None:
     ).request
     assert [message.role for message in request.messages] == ["user", "user"]
     assert THOUGHT_DROPPED in request.ignored_parameters
+
+
+def test_a_malformed_nullable_in_a_declaration_names_the_tools_field() -> None:
+    """A schema rejection names the field the caller sent it in, never responseSchema."""
+    error = _error(
+        _body(
+            tools=[
+                {
+                    "functionDeclarations": [
+                        {"name": "f", "parameters": {"type": "OBJECT", "nullable": "yes"}}
+                    ]
+                }
+            ]
+        )
+    )
+    assert error.detail.param == "tools.0.functionDeclarations"

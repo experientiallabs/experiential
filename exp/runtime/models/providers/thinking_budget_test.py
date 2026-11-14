@@ -8,6 +8,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.replay_identity import canonical_request_sha256
+from exp.runtime.google_protocol.requests import decode_generate_content
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
 from exp.runtime.models.providers.errors import ProviderParameterError
@@ -428,8 +429,6 @@ def test_native_vertex_gemini_preserves_numeric_budget(nested: bool) -> None:
 
 def test_a_google_callers_include_thoughts_survives_the_numeric_budget() -> None:
     """``includeThoughts: true`` beside ``thinkingBudget`` reaches Gemini with both fields."""
-    from exp.runtime.google_protocol.requests import decode_generate_content
-
     request = decode_generate_content(
         {
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
@@ -453,8 +452,6 @@ def test_the_display_kill_switch_also_governs_the_budget_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``EXP_GATEWAY_REASONING_DISPLAY=0`` strips includeThoughts beside a numeric budget too."""
-    from exp.runtime.google_protocol.requests import decode_generate_content
-
     monkeypatch.setenv("EXP_GATEWAY_REASONING_DISPLAY", "0")
     request = decode_generate_content(
         {
