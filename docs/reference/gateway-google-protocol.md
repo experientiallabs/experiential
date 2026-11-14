@@ -56,7 +56,8 @@ apply), `labels`, `seed`, `responseLogprobs`/`logprobs`, `mediaResolution`, `aud
 `inlineData`), Google File API handles, `candidateCount` other than 1, non-text
 `responseModalities`, `speechConfig` and `imageConfig`, and an unknown field anywhere. Parts keep
 their order on the canonical message (an image, its caption, the next image). Pre-dispatch
-rejections name Gemini's own fields (`contents`, `generationConfig.maxOutputTokens`), and a
+rejections name Gemini's own fields (`contents`, `generationConfig.maxOutputTokens`, a rejected
+sealed carrier as `contents.parts.text`), and a
 request routed to an Anthropic Messages or Bedrock Converse rung receives the gateway's automatic
 prompt-cache checkpoint exactly as a Chat Completions request does.
 
