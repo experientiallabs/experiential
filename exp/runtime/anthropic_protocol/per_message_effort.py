@@ -162,6 +162,11 @@ def take_system_turn_effort(payload: JsonObject) -> tuple[JsonObject, SystemTurn
         content = message.get("content")
         effort: str | None = None
         if role == "system":
+            if "content" not in message:
+                # Anthropic's system turn makes content optional (an
+                # effort-only turn may omit it); absent reads as empty.
+                content = []
+                message = {**message, "content": content}
             if _renders_nothing(content):
                 empty.add(index)
             if "output_config" in message:
@@ -194,16 +199,18 @@ def _turn_effort(config: JsonValue, param: str) -> str | None:
     Anthropic defines one optional key here, ``effort``, from a fixed set.
 
     Args:
-        config: The turn's raw ``output_config``.
+        config: The turn's raw ``output_config``; ``null`` reads as absent.
         param: Its dotted public path, for error messages.
 
     Returns:
         The effort level, or ``None`` when the object sets none.
 
     Raises:
-        OpenAIProtocolError: ``config`` is not an object, carries another key,
+        OpenAIProtocolError: ``config`` is neither null nor an object, carries another key,
             or names an effort outside :data:`TURN_EFFORTS`.
     """
+    if config is None:
+        return None  # Optional and nullable on Anthropic's system turn: absent.
     if not isinstance(config, dict):
         raise invalid_field(param, "output_config must be an object.")
     for key in config:

@@ -1549,6 +1549,49 @@ def test_empty_user_and_assistant_turns_keep_their_named_400() -> None:
     assert excinfo.value.detail.param == "messages.0.content"
 
 
+def test_an_effort_only_system_turn_may_omit_content() -> None:
+    """Anthropic's system turn makes ``content`` optional; absent reads as empty."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "output_config": {"effort": "low"}},
+            ]
+        )
+    )
+    assert [message.role for message in decoded.request.messages] == ["user"]
+    assert decoded.request.reasoning_effort == "low"
+    assert decoded.request.ignored_parameters == (
+        EMPTY_SYSTEM_TURN_DROPPED,
+        PER_MESSAGE_EFFORT_DISCLOSURE,
+    )
+
+
+def test_a_user_turn_without_content_is_still_a_named_400() -> None:
+    """Only the system turn's ``content`` is optional."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(_body(messages=[{"role": "user"}]))
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.detail.param is not None
+    assert excinfo.value.detail.param.startswith("messages.0")
+
+
+def test_a_null_system_turn_output_config_reads_as_absent() -> None:
+    """``"output_config": null`` is the optional field unset: the turn is served."""
+    decoded = decode_messages(
+        _body(
+            output_config={"effort": "high"},
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "be brief", "output_config": None},
+            ],
+        )
+    )
+    assert [message.content for message in decoded.request.messages] == ["hi", "be brief"]
+    assert decoded.request.reasoning_effort == "high"
+    assert decoded.request.ignored_parameters == ()
+
+
 @pytest.mark.parametrize(
     ("output_config", "param"),
     [
