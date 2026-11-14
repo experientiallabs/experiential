@@ -41,6 +41,7 @@ from exp.runtime.models.providers.openai_payloads import (
     openai_compatible_stream_payload,
     openai_responses_stream_payload,
 )
+from exp.runtime.models.providers.reasoning_compat import reasoning_display_enabled
 from exp.runtime.models.providers.thinking_budget import (
     budgeted_provider_request,
     qwen_budget_payload,
@@ -770,10 +771,11 @@ def dialect_stream_payload(
             generation = payload["generationConfig"]
             assert isinstance(generation, dict)
             # The numeric budget replaces any level; a Google caller's explicit
-            # includeThoughts stays (never beside budget 0, which Vertex refuses).
+            # includeThoughts stays, within the operator display switch and never
+            # beside budget 0 (which Vertex refuses).
             selector = (
                 {"includeThoughts": True}
-                if provider_request.include_thoughts and budget != 0
+                if provider_request.include_thoughts and budget != 0 and reasoning_display_enabled()
                 else {}
             )
             generation["thinkingConfig"] = {**selector, "thinkingBudget": budget}

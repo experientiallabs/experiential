@@ -285,6 +285,9 @@ class ToolCall(ContractModel):
             ``provider_caller`` because the vocabularies differ: this one re-emits verbatim only
             on the Anthropic Messages wire and drops with disclosure elsewhere. Excluded from
             serialization like the other replay fields; joins gateway replay identity explicitly.
+        call_id_minted: Whether the gateway minted ``call_id`` because the caller's wire carried
+            none (a Google generateContent ``functionCall`` may omit its ``id``). Default false;
+            excluded from serialization; a minted id is never echoed to a provider as the caller's.
     """
 
     call_id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
@@ -359,12 +362,6 @@ class ToolCall(ContractModel):
     """
     provider_anthropic_caller: JsonObject | None = Field(default=None, exclude=True)
     call_id_minted: bool = Field(default=False, exclude=True)
-    """Whether the gateway minted ``call_id`` because the caller's wire carried none.
-
-    A Google generateContent history may omit ``functionCall.id``; the decoder then
-    mints one so tool messages pair canonically. A minted id is never echoed back
-    to a provider as if the caller had sent it. Excluded from serialization.
-    """
     provider_thought_signature: str | None = Field(
         default=None,
         min_length=1,

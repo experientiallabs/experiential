@@ -869,7 +869,10 @@ def _json_schema(schema: JsonObject) -> JsonObject:
                 for entry in value
             ]
         elif key == "nullable":
-            continue
+            if not isinstance(value, bool):
+                raise invalid_field(
+                    "generationConfig.responseSchema", "Schema.nullable must be a boolean."
+                )
         else:
             converted[key] = value
     if schema.get("nullable") is True and converted:

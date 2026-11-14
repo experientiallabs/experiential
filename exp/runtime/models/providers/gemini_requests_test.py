@@ -561,7 +561,7 @@ def test_the_callers_include_thoughts_decides_within_the_display_switch(
 
 def test_google_issued_call_ids_replay_only_when_asked_and_never_when_minted() -> None:
     """Gemini-surface histories echo Google's ids; gateway-minted ids and other surfaces do not."""
-    # The second id looks exactly like a minted one; only the flag decides.
+    # Both ids are spelled like minted ones; only the answered call's own flag decides.
     calls = (
         ToolCall(call_id="gemini-call-9-9", name="lookup", arguments={}),
         ToolCall(call_id="gemini-call-0-1", name="lookup", arguments={}, call_id_minted=True),

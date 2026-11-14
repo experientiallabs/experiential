@@ -421,6 +421,17 @@ def test_inline_media_becomes_canonical_parts() -> None:
             "unsupported_parameter",
             "contents.0.parts.0.fileData.mimeType",
         ),
+        (
+            _body(
+                generationConfig={
+                    "responseMimeType": "application/json",
+                    "responseSchema": {"type": "STRING", "nullable": "true"},
+                }
+            ),
+            400,
+            "invalid_parameter",
+            "generationConfig.responseSchema",
+        ),
         # One call answered twice by explicit id is one invocation with two results.
         (
             _body(
