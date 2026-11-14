@@ -53,10 +53,14 @@ spelling, learns at admission that no rung on the route will receive it.
 """
 
 
-_SIGNATURE_ECHOING_SURFACES = frozenset(
-    {GatewayApiSurface.CHAT_COMPLETIONS, GatewayApiSurface.GENERATE_CONTENT}
-)
-"""The public surfaces whose callers can echo a Gemini thought signature on a call."""
+GEMINI_THOUGHT_SIGNATURE_DROPPED = "contents.parts.thoughtSignature->dropped(no_gemini_rung)"
+"""The same disclosure spelled in the generateContent caller's own field."""
+
+_SIGNATURE_DROPPED_BY_SURFACE: dict[GatewayApiSurface, str] = {
+    GatewayApiSurface.CHAT_COMPLETIONS: THOUGHT_SIGNATURE_DROPPED,
+    GatewayApiSurface.GENERATE_CONTENT: GEMINI_THOUGHT_SIGNATURE_DROPPED,
+}
+"""The surfaces whose callers can echo a signature, each with its own-field disclosure."""
 
 
 def disclose_dropped_thought_signatures(
@@ -70,17 +74,18 @@ def disclose_dropped_thought_signatures(
     it (the Gemini rung replays it, the others omit it) and disclosed only
     when none does. Nothing is recorded for a Chat request without one.
     """
+    disclosure = _SIGNATURE_DROPPED_BY_SURFACE.get(request.surface)
     if (
-        request.surface in _SIGNATURE_ECHOING_SURFACES
+        disclosure is not None
         and any(
             call.provider_thought_signature is not None
             for message in request.messages
             for call in message.tool_calls
         )
         and not any(profile.dialect == "gemini_generate_content" for profile in profiles)
-        and THOUGHT_SIGNATURE_DROPPED not in ignored
+        and disclosure not in ignored
     ):
-        ignored.append(THOUGHT_SIGNATURE_DROPPED)
+        ignored.append(disclosure)
 
 
 def gemini_model_path(model_id: str) -> str:
@@ -109,6 +114,10 @@ def gemini_generate_request(
     response_json_schema: JsonObject | None = None,
     json_object_output: bool = False,
     default_maximum_output_tokens: int | None = DEFAULT_MAXIMUM_OUTPUT_TOKENS,
+    include_thoughts: bool | None = None,
+    replay_call_ids: bool = False,
+    frequency_penalty: float | None = None,
+    presence_penalty: float | None = None,
 ) -> JsonObject:
     """Convert a EXP request into Gemini's native generateContent payload.
 
@@ -129,6 +138,12 @@ def gemini_generate_request(
             (``responseMimeType`` only, no ``responseJsonSchema``).
         default_maximum_output_tokens: Model-client default when the request
             omits a ceiling. Gateway callers pass ``None`` to preserve omission.
+        include_thoughts: The caller's own ``includeThoughts`` (the generateContent
+            surface); ``None`` asks for summaries whenever display is enabled.
+        replay_call_ids: Echo the caller's Google-issued ``functionCall.id`` and
+            ``functionResponse.id`` (never an id the decoder minted, per ``call_id_minted``).
+        frequency_penalty: The caller's frequencyPenalty, passed only when the rung accepts it.
+        presence_penalty: The caller's presencePenalty, passed only when the rung accepts it.
 
     Returns:
         A native payload for the generateContent and streamGenerateContent
@@ -140,7 +155,7 @@ def gemini_generate_request(
     json_object_output = json_object_output or request.json_object_output
     system_parts: list[JsonObject] = []
     contents: list[JsonObject] = []
-    tool_names: dict[str, str] = {}
+    tool_names: dict[str, tuple[str, bool]] = {}
     # systemInstruction has no position inside contents, so an instruction
     # after conversation start rides as user text where the caller put it
     # (consecutive user contents are accepted on this wire); only the leading
@@ -153,15 +168,15 @@ def gemini_generate_request(
             system_parts.append({"text": message.content})
             continue
         if message.role == "assistant":
-            turn.close(contents)
-        content = _gemini_content(message, tool_names)
+            turn.close(contents, replay_call_ids=replay_call_ids)
+        content = _gemini_content(message, tool_names, replay_call_ids=replay_call_ids)
         if message.role == "assistant":
             turn.open(message, contents, content)
         elif turn.collects(message):
             turn.add(message, content)
         else:
             contents.append(content)
-    turn.close(contents)
+    turn.close(contents, replay_call_ids=replay_call_ids)
     if json_object_output:
         system_parts.append({"text": JSON_OBJECT_SYSTEM_INSTRUCTION})
     payload: JsonObject = {"contents": contents}
@@ -189,6 +204,10 @@ def gemini_generate_request(
         generation["topP"] = request.top_p
     if request.top_k is not None and supports_top_k:
         generation["topK"] = request.top_k
+    if frequency_penalty is not None:
+        generation["frequencyPenalty"] = frequency_penalty
+    if presence_penalty is not None:
+        generation["presencePenalty"] = presence_penalty
     if stop_sequences:
         generation["stopSequences"] = list(stop_sequences)
     if response_json_schema is not None:
@@ -212,7 +231,9 @@ def gemini_generate_request(
         # Thought summaries are the readable reasoning Google returns; without
         # includeThoughts a thinking model streams only opaque signatures.
         # Vertex refuses includeThoughts on a request whose thinking is off.
-        if thinking and reasoning_display_enabled():
+        # The operator display switch always wins; a Google-surface caller's
+        # own includeThoughts decides within it.
+        if thinking and reasoning_display_enabled() and include_thoughts is not False:
             thinking_config["includeThoughts"] = True
         if thinking_config:
             generation["thinkingConfig"] = thinking_config
@@ -255,7 +276,7 @@ class _CallTurn:
     """
 
     def __init__(self) -> None:
-        self._calls: tuple[tuple[str, str], ...] = ()
+        self._calls: tuple[tuple[str, str, bool], ...] = ()
         self._responses: dict[str, JsonObject] = {}
         self._others: list[JsonObject] = []
 
@@ -264,7 +285,7 @@ class _CallTurn:
         contents.append(content)
         action = message.assistant_action
         calls = () if action is None else action.tool_calls
-        self._calls = tuple((call.call_id, call.name) for call in calls)
+        self._calls = tuple((call.call_id, call.name, not call.call_id_minted) for call in calls)
 
     def collects(self, message: ModelMessage) -> bool:
         """Whether a user or tool message belongs to the open call turn."""
@@ -276,29 +297,28 @@ class _CallTurn:
         if (
             message.role == "tool"
             and call_id not in self._responses
-            and any(call_id == known for known, _name in self._calls)
+            and any(call_id == known for known, _name, _caller in self._calls)
         ):
             self._responses[call_id] = content
             return
         self._others.append(content)
 
-    def close(self, contents: list[JsonObject]) -> None:
+    def close(self, contents: list[JsonObject], *, replay_call_ids: bool = False) -> None:
         """Emit the open turn's answers as one user content, then the rest in order."""
         if not self._calls:
             return
         if self._responses or self._others:
             parts: list[JsonObject] = []
-            for call_id, name in self._calls:
+            for call_id, name, caller_id in self._calls:
                 response = self._responses.get(call_id)
                 if response is None:
-                    parts.append(
-                        {
-                            "functionResponse": {
-                                "name": name,
-                                "response": {"content": GEMINI_MISSING_TOOL_RESULT},
-                            }
-                        }
-                    )
+                    placeholder: JsonObject = {
+                        "name": name,
+                        "response": {"content": GEMINI_MISSING_TOOL_RESULT},
+                    }
+                    if replay_call_ids and caller_id:
+                        placeholder["id"] = call_id
+                    parts.append({"functionResponse": placeholder})
                     continue
                 response_parts = response["parts"]
                 assert isinstance(response_parts, list)
@@ -310,12 +330,19 @@ class _CallTurn:
         self._others = []
 
 
-def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonObject:
+def _gemini_content(
+    message: ModelMessage,
+    tool_names: dict[str, tuple[str, bool]],
+    *,
+    replay_call_ids: bool = False,
+) -> JsonObject:
     """Map a EXP history item to Gemini user or model content parts.
 
     Args:
         message: One visible non-system history message.
-        tool_names: Accumulated tool-call ID to tool-name linkage, updated in place.
+        tool_names: Accumulated tool-call ID to (tool name, caller-supplied id) linkage,
+            updated in place; the answered call alone decides whether its id is echoed.
+        replay_call_ids: Echo caller-supplied (Google-issued) call ids on both parts.
 
     Returns:
         One native Gemini content object.
@@ -324,20 +351,14 @@ def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonOb
         ValueError: The message cannot preserve its role or tool linkage.
     """
     if message.role == "tool":
-        tool_name = tool_names.get(message.tool_call_id or "")
-        if tool_name is None:
+        linked = tool_names.get(message.tool_call_id or "")
+        if linked is None:
             raise ValueError("Gemini tool result has no preceding tool-call name")
-        return {
-            "role": "user",
-            "parts": [
-                {
-                    "functionResponse": {
-                        "name": tool_name,
-                        "response": {"content": message.content or ""},
-                    }
-                }
-            ],
-        }
+        tool_name, caller_id = linked
+        response: JsonObject = {"name": tool_name, "response": {"content": message.content or ""}}
+        if replay_call_ids and caller_id:
+            response["id"] = message.tool_call_id
+        return {"role": "user", "parts": [{"functionResponse": response}]}
     if message.role == "user":
         if message.content_parts:
             return {
@@ -383,8 +404,11 @@ def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonOb
         # stay unsigned); a turn with none falls back to the placeholder.
         signed_turn = any(call.provider_thought_signature for call in action.tool_calls)
         for call in action.tool_calls:
-            tool_names[call.call_id] = call.name
-            part: JsonObject = {"functionCall": {"name": call.name, "args": call.arguments}}
+            tool_names[call.call_id] = (call.name, not call.call_id_minted)
+            function_call: JsonObject = {"name": call.name, "args": call.arguments}
+            if replay_call_ids and not call.call_id_minted:
+                function_call["id"] = call.call_id
+            part: JsonObject = {"functionCall": function_call}
             if call.provider_thought_signature is not None:
                 part["thoughtSignature"] = call.provider_thought_signature
             elif not signed_turn:

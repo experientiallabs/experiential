@@ -1,18 +1,14 @@
 """Decode Gemini ``generateContent`` bodies into canonical serving requests.
 
-The decoder is strict and lossless for supported content: text, ``inlineData``
-(images, video, audio, PDF), ``functionCall`` and ``functionResponse`` parts,
-``systemInstruction``, function declarations, ``toolConfig`` and the
-``generationConfig`` sampling, output, structured-output and thinking controls
-translate faithfully. Google's REST surface accepts the protobuf JSON mapping in
-both spellings, so every field is read as ``camelCase`` or ``snake_case``
-(the official SDK sends ``thinking_level`` and ``parameters_json_schema`` in
-snake case inside otherwise camel-cased objects). A caller's ``thought`` parts
-are display copy and drop with disclosure, except a gateway-issued sealed
-reasoning carrier echoed on a model turn, which replays authenticated. Unknown
-or unsupported fields are rejected with a field-specific error, never silently
-dropped. Errors raise :class:`OpenAIProtocolError` so the shared boundary stays
-single-authority; the data plane renders them in Google's error envelope.
+Strict and lossless for supported content: text, ``inlineData`` (images, video,
+audio, PDF), ``functionCall``/``functionResponse`` parts, ``systemInstruction``,
+function declarations, ``toolConfig`` and the ``generationConfig`` sampling,
+output, structured-output and thinking controls. Every field is read in both
+protobuf JSON spellings (the SDK mixes ``thinking_level`` into camel-cased
+objects). ``thought`` parts are display copy dropped with disclosure, except a
+gateway-issued sealed carrier on a model turn, which replays authenticated.
+Unknown or unsupported fields are rejected by field, never silently dropped.
+Errors raise :class:`OpenAIProtocolError`; the data plane renders Google's envelope.
 """
 
 from __future__ import annotations
@@ -50,6 +46,7 @@ from exp.runtime.gateway.reasoning_carrier import (
     scheme_for_carrier,
 )
 from exp.runtime.gateway.request_policy import GatewayRequestPolicy
+from exp.runtime.gateway.surfaces import StructuredTextParameter
 from exp.runtime.gateway.tool_contracts import (
     GatewayAllowedToolsChoice,
     GatewayNamedToolChoice,
@@ -90,8 +87,8 @@ BEHAVIOR_DROPPED = "tools.functionDeclarations.behavior->dropped(unsupported)"
 RESPONSE_SCHEMA_DROPPED = "tools.functionDeclarations.response->dropped(unsupported)"
 """Disclosure for a declared function output schema; no gateway wire carries one."""
 _THOUGHT_SIGNATURE_MAX = 65_536
-# Gemini spells MP3 audio `audio/mp3` (and WAV sometimes `audio/x-wav`); the
-# canonical audio contract knows the IANA names.
+_VIDEO_URL_SUFFIXES = (".mp4", ".m4v", ".mpeg", ".mpg", ".mov", ".webm", ".flv", ".3gp")
+# Gemini's MP3/WAV spellings mapped onto the IANA names the audio contract knows.
 _AUDIO_MIME_ALIASES = {
     "audio/mp3": "audio/mpeg",
     "audio/x-wav": "audio/wav",
@@ -391,17 +388,9 @@ def decode_generate_content(
 ) -> DecodedGatewayRequest:
     """Decode one ``generateContent`` / ``streamGenerateContent`` body.
 
-    The model travels in the URL path on this protocol, so the caller passes it
-    separately; the body carries no model field. Google defines no idempotency
-    header, so this surface never participates in keyed replay.
-
-    Args:
-        payload: Parsed JSON request body.
-        model: The catalog alias named in the request path.
-        stream: Whether the action is ``streamGenerateContent``.
-
-    Returns:
-        Public alias and lossless canonical gateway request.
+    ``model`` is the catalog alias from the URL path (the body has no model field);
+    Google defines no idempotency header, so this surface never joins keyed replay.
+    Returns the public alias and the lossless canonical gateway request.
 
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
@@ -421,16 +410,8 @@ def decode_generate_content_count_tokens(
 ) -> DecodedGatewayRequest:
     """Decode one ``countTokens`` body for prompt counting.
 
-    Google's count request carries ``contents`` (or a whole
-    ``generateContentRequest``), so the canonical request has no output budget
-    unless the wrapped request named one and is never dispatched, only counted.
-
-    Args:
-        payload: Parsed JSON request body.
-        model: The catalog alias named in the request path.
-
-    Returns:
-        Public alias and the canonical request to count.
+    Google's count carries ``contents`` or a whole ``generateContentRequest``; the
+    returned canonical request (under the path alias ``model``) is only counted.
 
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
@@ -507,6 +488,7 @@ def _canonical(request: _GenerateContentRequest, *, stream: bool) -> GatewayRequ
             tools=tools,
             tool_choice=tool_choice,
             structured_text=output[0],
+            structured_text_parameter=output[2],
             json_object_output=output[1],
             maximum_output_tokens=config.max_output_tokens,
             maximum_output_tokens_parameter=(
@@ -557,10 +539,8 @@ def _system_text(instruction: _Content | None) -> str | None:
 def _require_one_payload(part: _Part, param: str) -> None:
     """Refuse code-execution parts and any part not carrying exactly one payload.
 
-    ``Part`` is a protobuf ``oneof``: JSON that sets two members (``text`` and
-    ``inlineData``, a ``functionCall`` beside a ``functionResponse``) is
-    malformed, and picking one would silently change the caller's content.
-    """
+    ``Part`` is a protobuf ``oneof``: JSON setting two members is malformed, and
+    picking one would silently change the caller's content."""
     if part.executable_code is not None:
         raise unsupported_field(f"{param}.executableCode")
     if part.code_execution_result is not None:
@@ -594,14 +574,14 @@ def _turn_messages(
 ) -> list[GatewayMessage]:
     """Translate one Gemini content into canonical messages, in part order.
 
-    A ``functionResponse`` part becomes a standalone tool message (the canonical
-    contract keeps ``tool_call_id`` on tool messages only), so a user turn
-    mixing answers and text splits into several messages. A response without
-    an ``id`` answers the oldest unanswered call of the same name, which is how
-    Gemini itself pairs them.
+    A ``functionResponse`` part becomes a standalone tool message (``tool_call_id``
+    lives on tool messages only), so a user turn mixing answers and text splits.
+    A response without an ``id`` answers the oldest unanswered call of its name,
+    as Gemini pairs them.
     """
     role = content.role or "user"
     out: list[GatewayMessage] = []
+    thoughts_only = True
     segments: list[MessageContentPart] = []
     calls: list[ToolCall] = []
     reasoning: list[ProviderReasoningBlock] = []
@@ -609,10 +589,8 @@ def _turn_messages(
     def flush() -> None:
         """Emit the pending segments, calls and reasoning as one message.
 
-        Segments keep the caller's part order (an image, its caption, the next
-        image); the canonical ``content`` is their text flattened in that order
-        and ``content_parts`` is retained only when media is present.
-        """
+        Segments keep the caller's part order; ``content`` is their text flattened
+        in that order and ``content_parts`` is retained only with media."""
         if not segments and not calls and not reasoning:
             return
         text = "".join(part.text for part in segments if part.kind == "text")
@@ -634,6 +612,7 @@ def _turn_messages(
     for index, part in enumerate(content.parts):
         part_param = f"{param}.parts.{index}"
         _require_one_payload(part, part_param)
+        thoughts_only = thoughts_only and bool(part.thought)
         if part.function_response is not None:
             if role == "model":
                 raise invalid_field(part_param, "functionResponse parts belong to user turns.")
@@ -648,9 +627,8 @@ def _turn_messages(
         if part.thought:
             scheme = scheme_for_carrier(part.text) if part.text else None
             if scheme is not None and role == "model" and part.text is not None:
-                # A gateway-issued sealed carrier echoed on a model turn
-                # replays authenticated; any other thought text is display
-                # copy the provider never sees again.
+                # A gateway-issued sealed carrier replays authenticated; any
+                # other thought text is display copy the provider never sees.
                 try:
                     reasoning.append(parse_reasoning_content_carrier(part.text, scheme=scheme))
                 except ValueError as exc:
@@ -669,6 +647,9 @@ def _turn_messages(
         elif part.text is not None:
             segments.append(TextContentPart(text=part.text))
     flush()
+    if not out and role == "model" and thoughts_only:
+        # A thought-only model turn (MAX_TOKENS while thinking) is disclosed display copy.
+        return []
     if not out:
         raise invalid_field(f"{param}.parts", "A content needs at least one gateway-visible part.")
     return out
@@ -691,6 +672,7 @@ def _tool_call(
         arguments=arguments,
         raw_arguments=raw,
         arguments_treatment=treatment,
+        call_id_minted=call.id is None,
         provider_thought_signature=part.thought_signature,
     )
 
@@ -780,14 +762,23 @@ def _file_part(file: _FileData, param: str) -> MessageContentPart:
                 "Audio is served inline only (inlineData); a fileData audio URL is not fetched."
             ),
         )
+    path = uri.lower().split("?")[0]
     try:
-        if media.startswith("video/"):
+        if media.startswith("video/") or (not media and path.endswith(_VIDEO_URL_SUFFIXES)):
             return video_part_from_url(uri)
-        if media in DOCUMENT_MEDIA_TYPES or uri.lower().split("?")[0].endswith(".pdf"):
+        if media in DOCUMENT_MEDIA_TYPES or (not media and path.endswith(".pdf")):
             return DocumentContentPart(url=uri)
-        return image_part_from_url(uri)
+        if media in IMAGE_MEDIA_TYPES or not media:
+            return image_part_from_url(uri)  # An absent type is inferred from the URL.
     except (ValueError, ValidationError) as exc:
         raise invalid_field(f"{param}.fileData.fileUri", str(exc)) from exc
+    raise unsupported_field(
+        f"{param}.fileData.mimeType",
+        message=(
+            f"Unsupported fileData media type '{file.mime_type}'. Send a PNG, JPEG, GIF, WebP, "
+            "MP4-family video or PDF URL; audio is served inline only."
+        ),
+    )
 
 
 def _tools(
@@ -813,7 +804,7 @@ def _tools(
             schema = declaration.parameters_json_schema
             if schema is None:
                 schema = (
-                    _json_schema(declaration.parameters)
+                    _json_schema(declaration.parameters, f"tools.{index}.functionDeclarations")
                     if declaration.parameters
                     else {"type": "object"}
                 )
@@ -846,33 +837,48 @@ def _tools(
     return tuple(definitions), choice
 
 
-def _json_schema(schema: JsonObject) -> JsonObject:
-    """Google's ``Schema`` (upper-case ``type`` enums) as plain JSON Schema."""
+def _json_schema(schema: JsonObject, param: str) -> JsonObject:
+    """Google's ``Schema`` (upper-case ``type`` enums) as plain JSON Schema.
+
+    ``param`` is the caller's field holding this schema, named by rejections."""
     converted: JsonObject = {}
     for key, value in schema.items():
         if key == "type" and isinstance(value, str):
             converted[key] = value.lower()
         elif key in {"properties", "defs"} and isinstance(value, dict):
             converted[key] = {
-                name: _json_schema(cast("JsonObject", entry)) if isinstance(entry, dict) else entry
+                name: _json_schema(cast("JsonObject", entry), param)
+                if isinstance(entry, dict)
+                else entry
                 for name, entry in value.items()
             }
-        elif key in {"items"} and isinstance(value, dict):
-            converted[key] = _json_schema(cast("JsonObject", value))
+        elif key in {"items", "additionalProperties", "additional_properties"} and isinstance(
+            value, dict
+        ):
+            converted["additionalProperties" if key != "items" else key] = _json_schema(
+                cast("JsonObject", value), param
+            )
         elif key in {"anyOf", "any_of"} and isinstance(value, list):
             converted["anyOf"] = [
-                _json_schema(cast("JsonObject", entry)) if isinstance(entry, dict) else entry
+                _json_schema(cast("JsonObject", entry), param) if isinstance(entry, dict) else entry
                 for entry in value
             ]
-        elif key == "nullable" and value is True:
-            converted["nullable"] = True
+        elif key == "nullable":
+            if not isinstance(value, bool):
+                raise invalid_field(param, "Schema.nullable must be a boolean.")
         else:
             converted[key] = value
+    if schema.get("nullable") is True and converted:
+        # Null is an alternative to the WHOLE node, so sibling constraints
+        # (enum, format, minimum) keep applying to the non-null branch only.
+        return {"anyOf": [converted, {"type": "null"}]}
     return converted
 
 
-def _output_format(config: _GenerationConfig) -> tuple[StructuredTextFormat | None, bool]:
-    """The structured-output selection: a schema, schema-free JSON, or neither."""
+def _output_format(
+    config: _GenerationConfig,
+) -> tuple[StructuredTextFormat | None, bool, StructuredTextParameter | None]:
+    """The structured-output selection (schema, schema-free JSON, neither) and its field."""
     if config.candidate_count is not None and config.candidate_count != 1:
         raise unsupported_field(
             "generationConfig.candidateCount",
@@ -893,8 +899,12 @@ def _output_format(config: _GenerationConfig) -> tuple[StructuredTextFormat | No
         raise unsupported_field("generationConfig.audioTranscriptionConfig")
     mime = (config.response_mime_type or "").lower()
     schema = config.response_json_schema
+    field: StructuredTextParameter | None = (
+        None if schema is None else "generationConfig.responseJsonSchema"
+    )
     if schema is None and config.response_schema is not None:
-        schema = _json_schema(config.response_schema)
+        schema = _json_schema(config.response_schema, "generationConfig.responseSchema")
+        field = "generationConfig.responseSchema"
     if schema is not None:
         if mime and mime != _JSON_MIME:
             raise invalid_field(
@@ -902,11 +912,15 @@ def _output_format(config: _GenerationConfig) -> tuple[StructuredTextFormat | No
                 "A response schema needs responseMimeType application/json.",
             )
         try:
-            return StructuredTextFormat(name="response", json_schema=schema, strict=True), False
+            return (
+                StructuredTextFormat(name="response", json_schema=schema, strict=True),
+                False,
+                field,
+            )
         except ValidationError as exc:
             raise validation_protocol_error(exc) from exc
     if mime == _JSON_MIME:
-        return None, True
+        return None, True, None
     if mime and mime not in _TEXT_MIMES:
         raise unsupported_field(
             "generationConfig.responseMimeType",
@@ -915,7 +929,7 @@ def _output_format(config: _GenerationConfig) -> tuple[StructuredTextFormat | No
                 "use application/json or text/plain."
             ),
         )
-    return None, False
+    return None, False, None
 
 
 def _thinking(config: _ThinkingConfig | None) -> tuple[ReasoningEffort | None, int | None, bool]:

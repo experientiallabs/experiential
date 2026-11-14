@@ -27,13 +27,16 @@ Messages request. The `{model}` is the catalog alias (an OpenRouter-style spelli
 Both JSON spellings of every protobuf field are accepted (the SDK mixes `camelCase` objects with
 `snake_case` keys such as `thinking_level` and `parameters_json_schema`). Supported and translated
 losslessly: text, `inlineData` (PNG, JPEG, GIF, WebP, MP4-family video, WAV/MP3 audio, PDF) and
-public http(s) `fileData` parts, `functionCall` parts (with their `thoughtSignature` carried onto
-the canonical call so Gemini lanes replay it), `functionResponse` parts (paired by `id`, else by
+public http(s) `fileData` parts (image, video or PDF by declared type, inferred from the URL
+when absent; any other declared type is refused), `functionCall` parts (with their `thoughtSignature` and Google-issued `id` carried onto the
+canonical call so Gemini lanes replay both), `functionResponse` parts (paired by `id`, else by
 name order as Gemini pairs them; a lone `result`/`content`/`output` string is the tool text,
 anything else compact JSON), `systemInstruction`, `functionDeclarations` (`parametersJsonSchema`
-or the upper-case `Schema` form, converted), `toolConfig.functionCallingConfig` (`AUTO`, `ANY`,
+or the upper-case `Schema` form, converted; Google's `nullable` becomes a JSON Schema `anyOf` with
+`{"type": "null"}` beside the whole node, so sibling constraints keep applying to the non-null branch), `toolConfig.functionCallingConfig` (`AUTO`, `ANY`,
 `NONE`, `allowedFunctionNames`; `VALIDATED` reads as `AUTO` with disclosure), and
-`generationConfig` sampling (`temperature`, `topP`, `topK`, `presencePenalty`, `frequencyPenalty`),
+`generationConfig` sampling (`temperature`, `topP`, `topK`; `presencePenalty` and `frequencyPenalty`
+reach a lane only where its catalog says the model accepts them, else they drop with disclosure),
 `maxOutputTokens`, `stopSequences`, structured output (`responseJsonSchema` or `responseSchema`
 with `responseMimeType: application/json`; the MIME type alone selects schema-free JSON mode),
 and `thinkingConfig` (`thinkingLevel` is the canonical reasoning effort reported under
@@ -41,7 +44,8 @@ and `thinkingConfig` (`thinkingLevel` is the canonical reasoning effort reported
 `includeThoughts` governs whether thought summaries are rendered).
 
 Dropped with `x-experiential-ignored-parameters` disclosure: replayed `thought: true` parts (display
-copy; a gateway-issued sealed carrier echoed on a model turn replays authenticated instead), a
+copy; a model turn of only thoughts drops whole and the history continues; a gateway-issued sealed
+carrier echoed on a model turn replays authenticated instead), a
 `thoughtSignature` on a text part, `safetySettings` (the gateway's own per-identity guardrails
 apply), `labels`, `seed`, `responseLogprobs`/`logprobs`, `mediaResolution`, `audioTimestamp`,
 `enableEnhancedCivicAnswers`, declaration `behavior` and a declaration's `response`/`responseJsonSchema`
@@ -52,7 +56,8 @@ apply), `labels`, `seed`, `responseLogprobs`/`logprobs`, `mediaResolution`, `aud
 `inlineData`), Google File API handles, `candidateCount` other than 1, non-text
 `responseModalities`, `speechConfig` and `imageConfig`, and an unknown field anywhere. Parts keep
 their order on the canonical message (an image, its caption, the next image). Pre-dispatch
-rejections name Gemini's own fields (`contents`, `generationConfig.maxOutputTokens`), and a
+rejections name Gemini's own fields (`contents`, `generationConfig.maxOutputTokens`, a rejected
+sealed carrier as `contents.parts.text`), and a
 request routed to an Anthropic Messages or Bedrock Converse rung receives the gateway's automatic
 prompt-cache checkpoint exactly as a Chat Completions request does.
 

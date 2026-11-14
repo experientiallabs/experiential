@@ -84,6 +84,7 @@ from exp.runtime.gateway.surfaces import (
     JSON_OBJECT_OUTPUT_SURFACES,
     OutputLimitParameter,
     ReasoningEffortParameter,
+    StructuredTextParameter,
 )
 from exp.runtime.gateway.surfaces import GatewayApiSurface as GatewayApiSurface
 from exp.runtime.gateway.tool_contracts import (
@@ -386,9 +387,8 @@ class GatewayMessage(ContractModel):
         if self.provider_text_blocks:
             if self.role == "tool":
                 raise ValueError("text blocks are not valid for tool messages")
-            # The carrier never changes semantics: its text must flatten to
-            # this message's canonical content (message runs join adjacent
-            # parts directly; system blocks join with one blank line).
+            # The carrier never changes semantics: its text must flatten to this
+            # content (runs join adjacent parts; system blocks join with a blank line).
             texts = [str(block.get("text", "")) for block in self.provider_text_blocks]
             if (self.content or "") not in ("".join(texts), "\n\n".join(texts)):
                 raise ValueError("provider text blocks must flatten to the message content")
@@ -461,6 +461,9 @@ class GatewayRequest(ContractModel):
             defines zero and -1 semantics. Excluded from serialization, retained in replay identity.
         reasoning_effort_parameter: Optional exact caller spelling of the effort control;
             omission uses the surface default when reporting unsupported parameters.
+        structured_text_parameter: Optional exact caller spelling of the structured-output
+            schema field (default None, excluded from serialization); errors and routing
+            disclosures name it, else the surface default.
         gateway: Optional request routing/retry policy; excluded from provider serialization.
     """
 
@@ -470,6 +473,7 @@ class GatewayRequest(ContractModel):
     tool_choice: GatewayToolChoice = None
     parallel_tool_calls: bool | None = None
     structured_text: StructuredTextFormat | None = None
+    structured_text_parameter: StructuredTextParameter | None = Field(default=None, exclude=True)
     json_object_output: bool = Field(default=False, exclude=True)
     """Native JSON mode or disclosed instruction; enabled mode joins replay identity."""
     maximum_output_tokens: int | None = Field(default=None, gt=0)
@@ -631,23 +635,19 @@ class GatewayRequest(ContractModel):
     tool_search: GatewayToolSearch | None = Field(default=None, exclude=True)
     """The caller's normalized tool-search declaration (any spelling); excluded from
     serialization, joins replay identity when present. See ``tool_search.plan``."""
-    # `provider: {"zdr": true}`: the caller demanded ZDR routing. Tightening
-    # only: the host applies its require_zdr posture filter to this request and
-    # refuses with the same 403 when no rung qualifies. Part of identity.
     zdr_requested: bool = False
-    # Verbatim caller `provider` object: forwarded to OpenRouter rungs (tightened
-    # when the rung is constrained), dropped on every other wire.
+    """`provider: {"zdr": true}`: tightening only (the host's require_zdr filter, same 403
+    when no rung qualifies). Part of identity."""
+    # Verbatim caller `provider`: forwarded to OpenRouter rungs (tightened when constrained).
     provider_preferences: JsonObject | None = Field(default=None, exclude=True)
     gateway: GatewayRequestPolicy | None = Field(default=None, exclude=True)
     stream: bool = False
     include_usage: bool = False
     previous_response_id: str | None = Field(default=None, min_length=1, max_length=256)
     metadata: JsonObject = Field(default_factory=dict)
-    # End-user attribution / cache hints from the OpenAI request. Captured for
-    # gateway-side attribution and never forwarded verbatim. `safety_identifier`
-    # is the current stable end-user identifier; `user` its deprecated predecessor;
-    # `prompt_cache_key` a same-prefix cache-routing hint (never an identity) that
-    # reaches the provider only as the namespaced `provider_prompt_cache_key`.
+    # OpenAI end-user attribution / cache hints, captured and never forwarded verbatim:
+    # `safety_identifier` (current), `user` (deprecated), `prompt_cache_key` (a routing
+    # hint, never an identity; reaches the provider only as `provider_prompt_cache_key`).
     safety_identifier: str | None = Field(default=None, max_length=1024)
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
