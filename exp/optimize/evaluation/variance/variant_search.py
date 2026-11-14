@@ -591,8 +591,9 @@ def ladder_measurer(
                 raise KeyError(f"no binding for scenarios {missing}")
         except (ValueError, KeyError) as error:
             return f"binding: {failure_reason(error)}"
-        variants = [
-            run_variant(
+        # Every variant's witness and contrasts start from its own frozen start: run them at once.
+        def one(scenario: Scenario) -> object:
+            return run_variant(
                 project,
                 job=bound[scenario.scenario_id].job,
                 base=base,
@@ -607,8 +608,13 @@ def ladder_measurer(
                 required_state=required_state,
                 frozen=bound[scenario.scenario_id].frozen,
             )
-            for scenario in scenarios.scenarios
-        ]
+
+        from concurrent.futures import ThreadPoolExecutor
+        from contextvars import copy_context
+
+        with ThreadPoolExecutor(max(1, len(scenarios.scenarios))) as pool:
+            futures = [pool.submit(copy_context().run, one, s) for s in scenarios.scenarios]
+            variants = [future.result() for future in futures]
         reference, result, why = measure_family(
             project,
             spec,

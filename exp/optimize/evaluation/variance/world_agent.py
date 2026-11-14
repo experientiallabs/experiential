@@ -28,7 +28,8 @@ import json
 import os
 import threading
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from typing import Literal
 
 from pydantic import Field
@@ -61,7 +62,7 @@ from exp.optimize.evaluation.variance.world_author import (
 from exp.simulation.induction.contracts import ValidationReport
 from exp.simulation.induction.sandbox import ProgramSandbox
 
-WORLD_AGENT_PROTOCOL = "world-agent-v3"
+WORLD_AGENT_PROTOCOL = "world-agent-v4"
 """Version of the prompt sets, phases, plan schema, repair feedback and selection."""
 
 PLAN_TOOL = "submit_world_plan"
@@ -304,16 +305,47 @@ def author_world_agentic(
         run = _Run(project, settings, packet, packet_reference, sandbox, code_revision)
         # The prompt sets are independent draws: run them at once (order is kept); the shared
         # program sandbox is used under one lock.
-        with ThreadPoolExecutor(
-            max_workers=max(1, len(prompt_sets)) if PARALLEL_PROMPT_SETS else 1
-        ) as pool:
+        if not PARALLEL_PROMPT_SETS:
             trajectories = tuple(
-                pool.map(
-                    lambda name: run.trajectory(
-                        PROMPT_SETS[name], f"{identity}-{name}", maximum_repairs
+                run.trajectory(PROMPT_SETS[name], f"{identity}-{name}", maximum_repairs)
+                for name in prompt_sets
+            )
+        else:
+            # The first ready world wins: stop waiting for the other prompt sets' repair rounds
+            # (they finish in the background and their draws stay saved); each unfinished set is
+            # recorded as superseded.
+            pool = ThreadPoolExecutor(max_workers=max(1, len(prompt_sets)))
+            futures = {
+                pool.submit(
+                    copy_context().run,
+                    run.trajectory,
+                    PROMPT_SETS[name],
+                    f"{identity}-{name}",
+                    maximum_repairs,
+                ): name
+                for name in prompt_sets
+            }
+            finished: dict[str, WorldTrajectory] = {}
+            for future in as_completed(futures):
+                row = future.result()
+                finished[futures[future]] = row
+                if row.draft.status == "ready":
+                    break
+            pool.shutdown(wait=False, cancel_futures=True)
+            trajectories = tuple(
+                finished.get(name)
+                or WorldTrajectory(
+                    prompt_set=name,
+                    prompt_sha256=PROMPT_SETS[name].sha256,
+                    rounds=(),
+                    draft=WorldDraft(
+                        identity=f"{identity}-{name}",
+                        packet_sha256=packet.identity,
+                        status="unavailable",
+                        failure="superseded: another prompt set's world was ready first",
                     ),
-                    prompt_sets,
                 )
+                for name in prompt_sets
             )
         chosen = next((row for row in trajectories if row.draft.status == "ready"), None)
         authoring = WorldAuthoring(
