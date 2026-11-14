@@ -45,6 +45,10 @@ from exp.simulation.mining.questions import QuestionBank, resolve_question_bank
 from exp.simulation.mining.tagging import DecisionCache
 
 
+BEHAVIOR_CONCURRENCY_LIMIT = 64
+"""Behavior mining's own bound; traceml.concurrency above it still drives the rollouts."""
+
+
 def behavior_bank(spec: DecisionVarianceSpec) -> QuestionBank | None:
     """Resolve the exact local behavior bank before pricing or provider dispatch.
 
@@ -210,7 +214,7 @@ def behavior_differences(
         tagger=tagger,
         code_revision=context.code_revision,
         maximum_steps=job.maximum_model_calls * (spec.traceml.steps_per_call + 1),
-        concurrency=spec.traceml.concurrency,
+        concurrency=min(spec.traceml.concurrency, BEHAVIOR_CONCURRENCY_LIMIT),
     )
     return ref
 
@@ -283,7 +287,7 @@ def _rubric_tag_differences(
         tagger=tagger,
         code_revision=context.code_revision,
         maximum_steps=steps,
-        concurrency=spec.traceml.concurrency,
+        concurrency=min(spec.traceml.concurrency, BEHAVIOR_CONCURRENCY_LIMIT),
         tag_set=(tag_ref, tag_set),
     )
     return ref
