@@ -1169,6 +1169,71 @@ def test_bound_rule_memory_recalls_only_relevant_files_and_replays(
         )
 
 
+def test_rules_document_reaches_every_prediction_without_any_rule_recall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Document mode skips recall (no decision call) and puts the whole document on the wire."""
+    from exp.optimize.evaluation.executable.grounded import RuleMemoryBinding
+    from exp.optimize.evaluation.rules.rules_document import save_rules_document
+    from exp.optimize.evaluation.tests.fidelity_memory_test import memory_project
+    from exp.simulation.engines.text.prompt import ENVIRONMENT_RULES_GUIDANCE
+    from exp.simulation.rules.recall import RecallPolicy
+
+    project, fidelity = memory_project(tmp_path)
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
+    document = save_rules_document(
+        project, save_rules(project, pending_rules()), None, code_revision="test"
+    )
+    base = _record_spec(project, fidelity).model_copy(update={"maximum_physical_attempts": 10})
+    recalled = base.model_copy(
+        update={
+            "rule_memory": RuleMemoryBinding(
+                memory_set=_rule_memory(project, "Inspecting a record shows its pending status."),
+                recall=RecallPolicy(jev_alias="jev"),
+            )
+        }
+    )
+    spec = recalled.model_copy(update={"rules_document": document})
+    assert "rules_document" not in recalled.model_dump(mode="json")
+    assert spec.model_dump(mode="json") == {
+        **recalled.model_dump(mode="json"),
+        "rules_document": document.model_dump(mode="json"),
+    }
+    wire = _RecallWire()
+    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", lambda: wire)
+
+    def first_step(definition: GroundedRuntimeDefinition) -> WorldCheckpoint:
+        with (
+            continuation_runtime(project, definition.model_dump(mode="json")) as runtime,
+            runtime.world.open(definition.task) as world,
+        ):
+            assert world.execute(ToolCall(name="inspect", call_id="read", arguments={})).content
+            return world.checkpoint()
+
+    saved = first_step(spec)
+    assert wire.decisions == [], "a rules document replaces every per-step recall call"
+    (prediction,) = wire.predictions
+    system, user = wire_messages(prediction)
+    assert ENVIRONMENT_RULES_GUIDANCE in system
+    rules = json.loads(user)["environment_rules"]
+    assert "Inspecting the record shows pending." in rules and "# Environment rules" in rules
+    assert "Inspecting a record shows its pending status." not in json.dumps(prediction)
+    intents = [
+        json.loads(project.artifacts.read_bytes(key, "event.json"))
+        for key in project.artifacts.list_ids(artifact_type="grounded-world-prediction")
+    ]
+    (intent,) = [event for event in intents if event["stage"] == "intent"]
+    assert "rule_recall" not in intent["payload"]
+
+    plain = first_step(base)
+    assert isinstance(saved, ExecutableCheckpoint) and isinstance(plain, ExecutableCheckpoint)
+    assert saved.backend_sha256 != plain.backend_sha256
+    assert "environment_rules" not in wire_messages(wire.predictions[-1])[1]
+    stale = document.model_copy(update={"sha256": "0" * 64})
+    with pytest.raises(ValueError, match="manifest digest changed"):
+        preflight_grounded_runtime(project, spec.model_copy(update={"rules_document": stale}))
+
+
 class _DescribingWire:
     """One shared physical wire: state descriptions and scripted predictions."""
 

@@ -43,6 +43,7 @@ from exp.optimize.evaluation.executable.grounded import RuleMemoryBinding
 from exp.optimize.evaluation.executable.model_costs import CostComponent
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.rules.memory_stage import MemorySetSettings
+from exp.optimize.evaluation.rules.rules_document import RuntimeRules
 from exp.optimize.evaluation.rules.stage import RulesStageSpec
 from exp.optimize.evaluation.variance.admission import FamilyAdmissionPolicy, VariantJudging
 from exp.optimize.evaluation.variance.adversarial_rubric import AdversarialRubricSpec
@@ -171,6 +172,11 @@ class RulesSettings(ContractModel):
             recalled step by step in every served world.
         jev_alias: Catalog alias of the native decision model System One reads with and recall
             uses, the same alias the decision tagging uses.
+        runtime_rules: How served worlds read the learned rules. ``recall`` (the default)
+            recalls rule files step by step through ``jev_alias``. ``document`` collates the rule
+            book and its tag admission into one saved ``rules-document`` that every prediction
+            and the world authors read whole; no rule is recalled per step. Left at the default,
+            the setting is omitted and every identity is unchanged.
     """
 
     spec: RulesStageSpec
@@ -179,6 +185,9 @@ class RulesSettings(ContractModel):
     bind_rule_book: bool = True
     jev_memory: bool = True
     jev_alias: str = Field(default=DEFAULT_DECISION_ALIAS, min_length=1)
+    runtime_rules: RuntimeRules = Field(
+        default="recall", exclude_if=lambda value: value == "recall"
+    )
 
     def stage_spec(self) -> RulesStageSpec:
         """Return the registration the stage runs: ``jev_memory`` by default."""
@@ -841,6 +850,8 @@ class RulesOutputs(ContractModel):
         rubric_packet: The whole-task packet the rubric was authored from, when it was authored.
         rubric_library: The behavior library version (with its reviewed adversarial linters)
             the authored rubric was assembled from, when one was saved.
+        rules_document: The saved ``rules-document`` the mining runtime reads whole, under
+            ``runtime_rules="document"``; the world authors read it too.
     """
 
     report: ArtifactInput
@@ -851,6 +862,9 @@ class RulesOutputs(ContractModel):
     rubric: ArtifactInput
     rubric_packet: ArtifactInput | None = None
     rubric_library: ArtifactInput | None = None
+    rules_document: ArtifactInput | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class TraceMLOutputs(ContractModel):

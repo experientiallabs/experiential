@@ -31,6 +31,7 @@ from exp.optimize.evaluation.executable.model_costs import CostComponent
 from exp.optimize.evaluation.fidelity.retrieval_binding import rag_index_embedder_alias
 from exp.optimize.evaluation.induction.episodes import trace_episode
 from exp.optimize.evaluation.rules.memory_stage import memory_stage_costs
+from exp.optimize.evaluation.rules.rules_document import load_rules_document
 from exp.optimize.evaluation.rules.stage import RulesStageSpec, load_rulebook
 from exp.optimize.evaluation.variance.authoring_packet import (
     SourceRef,
@@ -255,6 +256,7 @@ def mining_rubric(
     job: ContinuationJob,
     rulebook: ArtifactInput,
     library: LibraryBinding | None = None,
+    rules_document: ArtifactInput | None = None,
 ) -> tuple[ArtifactInput, ArtifactInput]:
     """Author, or replay, the mining-probe task's general rubric over a whole-task packet.
 
@@ -269,6 +271,8 @@ def mining_rubric(
         job: The rule-bound mining job, starting at the task's initial context.
         rulebook: The frozen rule book bound into ``job``.
         library: The behavior library version the rubric is assembled from, if any.
+        rules_document: The saved rules document the packet carries, under
+            ``runtime_rules="document"``.
 
     Returns:
         The saved rubric and the packet it was authored from.
@@ -308,6 +312,9 @@ def mining_rubric(
         decision=None,
         scenarios=(),
         observed_episodes=episodes,
+        rules_document=None
+        if rules_document is None
+        else load_rules_document(project.artifacts, rules_document),
     )
     if library is not None:
         refuse_actor_exposure(library.library, (start.task.instruction,))
@@ -364,7 +371,10 @@ class GeneralRubric:
 
 
 def general_rubric(
-    context: StageContext, job: ContinuationJob, rulebook: ArtifactInput
+    context: StageContext,
+    job: ContinuationJob,
+    rulebook: ArtifactInput,
+    rules_document: ArtifactInput | None = None,
 ) -> GeneralRubric:
     """Return the general rubric: registered, or authored over the frozen rule book.
 
@@ -378,7 +388,7 @@ def general_rubric(
         return GeneralRubric(rubric=spec.mining.rubric)
     build = BuildOutputs.model_validate(context.upstream["variance-build"].outputs)
     library = epoch_library(context.project, spec)
-    rubric, packet = mining_rubric(context, build, job, rulebook, library)
+    rubric, packet = mining_rubric(context, build, job, rulebook, library, rules_document)
     return GeneralRubric(
         rubric=rubric, packet=packet, library=None if library is None else library.reference
     )

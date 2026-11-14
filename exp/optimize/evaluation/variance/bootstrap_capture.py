@@ -150,6 +150,9 @@ def start_definition(
             "state_memory": None
             if template.state_memory is None
             else template.state_memory.model_dump(mode="json"),
+            "rules_document": None
+            if not bind or template.runtime_rules != "document" or knowledge.rules_document is None
+            else knowledge.rules_document.model_dump(mode="json"),
         }
     )
 

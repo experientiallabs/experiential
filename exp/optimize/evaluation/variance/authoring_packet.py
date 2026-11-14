@@ -286,6 +286,11 @@ class AuthoringPacket(ContractModel):
         brief: The decision brief, a proposal.
         coalition: Every attempt, tier, pattern, selector, critic and contrast behind the family.
         evidence: The judge's evidence contract.
+        rules_document: The family's rules document, when served worlds read rules as one
+            document: every rule with its tag-admission verdict (confirmed rules are strong
+            guidance, the rest diagnostic context) and the research questions. Authors answer
+            from it and the research given and never refuse for missing context. Absent, the
+            packet and its identity are unchanged.
     """
 
     protocol: str = AUTHORING_PACKET_PROTOCOL
@@ -308,6 +313,9 @@ class AuthoringPacket(ContractModel):
     brief: DecisionBrief
     coalition: CoalitionEvidence = Field(default_factory=CoalitionEvidence)
     evidence: EvidenceContract = Field(default_factory=EvidenceContract)
+    rules_document: str | None = Field(
+        default=None, min_length=1, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def _distinct(self) -> Self:
@@ -448,6 +456,7 @@ def build_authoring_packet(
     extra_claims: tuple[PacketClaim, ...] = (),
     unresolved: tuple[str, ...] = (),
     coalition: CoalitionEvidence | None = None,
+    rules_document: str | None = None,
 ) -> AuthoringPacket:
     """Assemble the packet from original sources, the coalition, the rule book and the brief.
 
@@ -470,6 +479,7 @@ def build_authoring_packet(
         extra_claims: Further source claims, with their own evidence status.
         unresolved: Interpretations the brief left open.
         coalition: The behavioral coalition from error mining and contrasts.
+        rules_document: The family's rules document, when served worlds read rules whole.
 
     Returns:
         The packet. A baseline variant is added when no scenario keeps the checkpoint state and
@@ -545,6 +555,7 @@ def build_authoring_packet(
         variants=tuple(variants),
         brief=_brief(decision, scenarios, unresolved),
         coalition=coalition,
+        rules_document=rules_document,
     )
 
 

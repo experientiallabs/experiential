@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from exp.common.core.artifacts import ArtifactInput, JsonObject, Sha256, sha256_json
+from exp.common.core.artifacts import ArtifactInput, JsonObject, Sha256, sha256_bytes, sha256_json
 from exp.common.core.json_schema import expand_local_references
 from exp.common.models import (
     AssistantAction,
@@ -26,6 +26,7 @@ from exp.runtime.environments.world_responses import ReplyStateBinding
 from exp.runtime.sessions.store import SessionBinding, SessionStore
 from exp.simulation.engines.state_policy import StateEditPolicy
 from exp.simulation.engines.text.prompt import (
+    ENVIRONMENT_RULES_GUIDANCE,
     NATIVE_ARTIFACT_PLAN_GUIDANCE,
     MemoryContext,
     parse_world_model_transition,
@@ -140,6 +141,9 @@ class GroundedTransitionEngine:
         research_history: False removes current research delivery, not prior learning effects.
         facts_version: State version of the session's first action: the recorded actions
             applied before it, such as a disclosed public prefix.
+        environment_rules: Optional rules document of the environment, delivered whole to
+            every prediction in its own ``environment_rules`` channel. Absent, the identity and
+            every request are unchanged.
     """
 
     def __init__(
@@ -155,6 +159,7 @@ class GroundedTransitionEngine:
         facts_version: int = 0,
         research_history: bool = True,
         prediction_reader: PredictionPreparation | None = None,
+        environment_rules: str | None = None,
     ) -> None:
         """Bind an existing predictor to a single public fixed-action task."""
         if maximum_output_tokens <= 0 or task.reference_answer is not None:
@@ -180,6 +185,9 @@ class GroundedTransitionEngine:
             raise ValueError("the facts state version of the first action cannot be negative")
         self.facts = None if facts is None else facts.require_validated("this session")
         self.facts_version = facts_version
+        if environment_rules is not None and not environment_rules.strip():
+            raise ValueError("an environment rules document must not be empty")
+        self.environment_rules = environment_rules
 
     @property
     def identity(self) -> Sha256:
@@ -226,6 +234,17 @@ class GroundedTransitionEngine:
                     {}
                     if self.runtime.tag_retrieval is None
                     else {"tag_retrieval": self.runtime.tag_retrieval_identity(self.task)}
+                ),
+                # Recorded only with a rules document, so identities without one stay unchanged.
+                **(
+                    {}
+                    if self.environment_rules is None
+                    else {
+                        "environment_rules_sha256": sha256_bytes(self.environment_rules.encode()),
+                        "environment_rules_guidance_sha256": sha256_json(
+                            ENVIRONMENT_RULES_GUIDANCE
+                        ),
+                    }
                 ),
             }
         )
@@ -445,6 +464,7 @@ class GroundedTransitionEngine:
             memory=memory,
             output_protocol=self.output_protocol,
             facts=conditioning,
+            environment_rules=self.environment_rules,
         )
         if not self.research_history:
             prepared = replace(prepared, request=project_research_request(prepared.request))

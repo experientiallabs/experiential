@@ -11,6 +11,7 @@ from exp.common.tasks.facts import ConditioningFacts, parse_instance_facts
 from exp.common.tasks.facts_test import fact
 from exp.runtime.environments.artifact_edits import NativeArtifactBinding
 from exp.simulation.engines.text.prompt import (
+    ENVIRONMENT_RULES_GUIDANCE,
     INSTANCE_FACTS_GUIDANCE,
     NATIVE_ARTIFACT_PLAN_GUIDANCE,
     WORLD_MODEL_TEXT_PROMPT_VERSION,
@@ -222,6 +223,36 @@ def test_instance_facts_have_their_own_channel_separate_from_memory() -> None:
     assert without.messages[0] == with_facts.messages[0].model_copy(
         update={"content": (with_facts.messages[0].content or "")[: -len(INSTANCE_FACTS_GUIDANCE)]}
     )
+
+
+def test_rules_document_has_its_own_channel_and_absent_leaves_the_request_unchanged() -> None:
+    """A rules document renders as ``environment_rules`` with guidance; absent, nothing changes."""
+
+    def request(rules: str | None) -> ModelRequest:
+        """The same prediction request, with or without a rules document."""
+        return build_world_model_request(
+            _task(),
+            visible_messages=(ModelMessage(role="user", content="Read the workbook."),),
+            candidate_response=AssistantAction(content="Reading."),
+            grounded_examples=(),
+            maximum_output_tokens=1_000,
+            environment_rules=rules,
+        )
+
+    document = "# Environment rules\n\n- Confirmed: replies end with an exit code.\n"
+    with_rules, without = request(document), request(None)
+    assert json.loads(with_rules.messages[1].content or "")["environment_rules"] == document
+    system = with_rules.messages[0].content or ""
+    assert system.endswith(ENVIRONMENT_RULES_GUIDANCE) and "never a reason to" in system
+    assert without == build_world_model_request(
+        _task(),
+        visible_messages=(ModelMessage(role="user", content="Read the workbook."),),
+        candidate_response=AssistantAction(content="Reading."),
+        grounded_examples=(),
+        maximum_output_tokens=1_000,
+    )
+    assert "environment_rules" not in json.loads(without.messages[1].content or "")
+    assert without.messages[0].content == system[: -len(ENVIRONMENT_RULES_GUIDANCE)]
 
 
 def test_native_contract_augments_output_without_restricting_simulated_tools() -> None:

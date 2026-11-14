@@ -247,3 +247,29 @@ def test_mining_draws_on_its_own_finite_simulator_ledger(
     assert sha256_json(before.model_dump(mode="json", exclude={"maximum_physical_attempts"})) == (
         sha256_json(after.model_dump(mode="json", exclude={"maximum_physical_attempts"}))
     )
+
+
+def test_document_runtime_rules_are_omitted_at_default_and_rekey_from_the_rules_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``runtime_rules`` serializes only when set, so default identities stay byte-identical."""
+    run = wired(tmp_path, monkeypatch)
+    base = make_spec(run.fixture, run.rubric, run.bank)
+    assert "runtime_rules" not in base.model_dump(mode="json")["rules"]
+    data = base.model_dump(mode="json")
+    data["rules"]["runtime_rules"] = "document"
+    document = DecisionVarianceSpec.model_validate(data)
+    assert document.rules.runtime_rules == "document"
+    assert DecisionVarianceSpec.model_validate(base.model_dump(mode="json")) == base
+
+    def chain(spec: DecisionVarianceSpec) -> list[str]:
+        """Every stage identity of a spec, chained in order."""
+        identities: list[str] = []
+        for stage in STAGES:
+            identities.append(stage_identity(stage, spec, tuple(identities), "test"))
+        return identities
+
+    original, changed = chain(base), chain(document)
+    rules = STAGES.index("rules")
+    assert changed[:rules] == original[:rules]
+    assert all(a != b for a, b in zip(changed[rules:], original[rules:], strict=True))

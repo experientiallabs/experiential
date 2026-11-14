@@ -44,6 +44,7 @@ from exp.optimize.evaluation.executable.grounded import (
 from exp.optimize.evaluation.executable.state_recall import StateRecallBinding
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.rules.agent_loop import AgentProfile
+from exp.optimize.evaluation.rules.rules_document import RuntimeRules
 from exp.optimize.evaluation.rules.stage import RulesStageSpec
 from exp.optimize.evaluation.variance.bootstrap_prompts import (
     AUTHOR_VARIANTS,
@@ -147,6 +148,10 @@ class RuntimeTemplate(ContractModel):
         state_recall: Each family's pinned state-tag index and policy, by family; a start of a
             listed family retrieves recorded transitions by pre-turn state agreement.
         state_memory: Per-task state description policy every start's simulator uses.
+        runtime_rules: How each start's simulator reads the family's rules: ``recall`` (the
+            default) recalls rule files per step through ``jev_alias``; ``document`` binds the
+            family's saved ``rules-document`` whole into every prediction, with no per-step
+            recall. Left at the default, the setting is omitted and every identity is unchanged.
     """
 
     runtime_file: Path
@@ -166,6 +171,9 @@ class RuntimeTemplate(ContractModel):
     )
     state_memory: StateMemoryPolicy | None = Field(
         default=None, exclude_if=lambda value: value is None
+    )
+    runtime_rules: RuntimeRules = Field(
+        default="recall", exclude_if=lambda value: value == "recall"
     )
 
 

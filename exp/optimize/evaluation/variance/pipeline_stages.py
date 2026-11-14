@@ -43,6 +43,7 @@ from exp.optimize.evaluation.executable.grounded import (
 from exp.optimize.evaluation.executable.model_costs import CostComponent, decision_cost
 from exp.optimize.evaluation.factory.authoring import author_response
 from exp.optimize.evaluation.rules.challenges import RuntimeChallenges
+from exp.optimize.evaluation.rules.rules_document import save_rules_document
 from exp.optimize.evaluation.rules.stage import RulesStageReport, RulesStageSpec, run_rules_stage
 from exp.optimize.evaluation.variance.actor_critic import (
     ActorCriticReport,
@@ -444,12 +445,21 @@ class _RulesStage:
                 guards=None if report.memory_stage is None else report.memory_stage.guards_artifact,
             )
         )
+        document = None
+        if spec.rules.runtime_rules == "document":
+            staged = report.memory_stage
+            document = save_rules_document(
+                project,
+                report.rulebook,
+                None if staged is None else staged.admission_artifact,
+                code_revision=revision,
+            )
         job = spec.mining.registered
         if spec.rules.bind_rule_book:
-            definition = _world(job, build, report.rulebook, memory)
+            definition = _world(job, build, report.rulebook, memory, document)
             job = bound_job(project, job, definition, revision)
         executed = 0 if report.challenges is None else len(report.challenges.runs)
-        rubric = general_rubric(context, job, report.rulebook)
+        rubric = general_rubric(context, job, report.rulebook, document)
         outputs = RulesOutputs(
             report=saved,
             rulebook=report.rulebook,
@@ -459,9 +469,16 @@ class _RulesStage:
             rubric=rubric.rubric,
             rubric_packet=rubric.packet,
             rubric_library=rubric.library,
+            rules_document=document,
         )
         summary = _rules_summary(report) | {"challenges_executed": executed, **rubric.summary()}
-        references = (saved, report.rulebook, job.study.checkpoint, *rubric.references())
+        references = (
+            saved,
+            report.rulebook,
+            job.study.checkpoint,
+            *rubric.references(),
+            *(() if document is None else (document,)),
+        )
         return StageRun(outputs, references, summary)
 
 
@@ -1169,11 +1186,13 @@ def _world(
     build: BuildOutputs,
     rulebook: ArtifactInput | None,
     memory: RuleMemoryBinding | None = None,
+    document: ArtifactInput | None = None,
 ) -> GroundedRuntimeDefinition:
     """Return the job's grounded runtime over the build's world, binding, rules and memory.
 
     Every later served world (the tiers' groups, the frozen variant worlds and the Harbor
-    exports) derives from this definition, so they all recall the same rule memory.
+    exports) derives from this definition, so they all recall the same rule memory, or all
+    read the same rules document when one is given.
     """
     definition = GroundedRuntimeDefinition.model_validate(job.configuration)
     return definition.model_copy(
@@ -1182,6 +1201,7 @@ def _world(
             "tag_retrieval": build.tag_retrieval,
             "rule_book": rulebook,
             "rule_memory": memory,
+            "rules_document": document,
         }
     )
 
