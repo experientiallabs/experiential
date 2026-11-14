@@ -50,6 +50,10 @@ pub(super) fn unavailable() -> Value {
     )
 }
 
+pub(super) fn capacity_units(bytes: usize) -> u32 {
+    bytes.div_ceil(1024).clamp(1, u32::MAX as usize) as u32
+}
+
 impl InputGate {
     pub fn start(mut checks: Vec<Check>, remaining: f64) -> Result<Arc<Self>, ()> {
         if !remaining.is_finite()
@@ -132,7 +136,7 @@ impl InputGate {
                 "mode": if c.policy["mode"] == "observe" {"observe"} else {"enforce"}}),
                         c.policy["mode"] == "observe"
                             || c.policy["input_fail_open"] == true
-                            || c.policy["protected"] == false,
+                            || inspection::uncertain(c).is_none(),
                     )
                 })
                 .collect(),
@@ -145,7 +149,7 @@ impl InputGate {
         let weight = checks.iter().fold(0usize, |size, c| {
             size.saturating_add(c.adapter.to_string().len())
         });
-        let units = (weight / 1024 + 1).min(u32::MAX as usize) as u32;
+        let units = capacity_units(weight);
         let job = JOBS
             .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(256)))
             .clone()
@@ -348,7 +352,16 @@ impl InputGate {
                 record
             })
             .collect();
-        interrupted(observations, reason)
+        let fail_open = observations
+            .iter()
+            .zip(&self.checks)
+            .all(|(record, (_, skip))| {
+                record["mode"] == "observe"
+                    || record["action"] == "allow"
+                    || (*skip
+                        && matches!(record["outcome"].as_str(), Some("timeout" | "unavailable")))
+            });
+        interrupted(observations, reason, fail_open)
     }
 
     pub fn observe(&self) -> bool {
@@ -476,10 +489,7 @@ impl Drop for InputGate {
     }
 }
 
-fn interrupted(observations: Vec<Value>, reason: &str) -> Value {
-    let fail_open = observations
-        .iter()
-        .all(|record| record["mode"] == "observe" || record["action"] == "allow");
+fn interrupted(observations: Vec<Value>, reason: &str, fail_open: bool) -> Value {
     let completed_denial = observations.iter().find(|record| {
         record["mode"] != "observe" && record["outcome"] == "flagged" && record["action"] != "allow"
     });
@@ -810,7 +820,7 @@ mod interruption_tests {
                     json!({"mode":"enforce", "outcome":"flagged", "action":action, "check_id":"denied-check"}),
                     json!({"mode":"enforce", "outcome":reason, "action":"error"}),
                 ];
-                let decision = interrupted(records.clone(), reason);
+                let decision = interrupted(records.clone(), reason, true);
                 assert_eq!(decision["failure"]["failure_class"], "guardrail");
                 assert_eq!(decision["failure"]["safe_details"]["action"], action);
                 assert_eq!(

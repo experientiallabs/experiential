@@ -119,14 +119,17 @@ def require_unguarded_surface(
 ) -> None:
     """Record missed coverage and reject only strict unsupported policies."""
     policies = () if engine is None else engine.policies_for(authorization)
-    if engine is not None:
-        engine.record_unsupported_observations(
-            policies, request_id=authorization.request_id, surface=surface
-        )
-    if any(
+    refused = any(
         policy.mode == "enforce" and (policy.output_checks or not policy.input_fail_open)
         for policy in policies
-    ):
+    )
+    if engine is not None:
+        engine.record_unsupported_observations(
+            tuple(policy for policy in policies if not refused or policy.mode == "observe"),
+            request_id=authorization.request_id,
+            surface=surface,
+        )
+    if refused:
         raise NativeBridgeError(
             OpenAIProtocolError(
                 status_code=400,
