@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.job import ContinuationJob
+from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
 from exp.optimize.evaluation.executable.package import export_executable_harbor
 from exp.optimize.evaluation.executable.task import (
     ExecutableTask,
@@ -271,4 +272,8 @@ def variant_job(
     """
     if start is None:
         return job
-    return job.model_copy(update={"configuration": start[1]})
+    # The frozen runtime reports its own probe identity; the study must expect that one, or the
+    # loader refuses the runtime ("runtime probe differs from the frozen definition").
+    probe = GroundedRuntimeDefinition.model_validate(start[1]).probe_sha256
+    study = job.study.model_copy(update={"probe_sha256": probe})
+    return job.model_copy(update={"study": study, "configuration": start[1]})
