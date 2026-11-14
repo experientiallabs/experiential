@@ -71,6 +71,7 @@ from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts, require
 from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias
 from exp.optimize.evaluation.learning.profile import EvaluationMemory, bind_evaluation_memory
 from exp.optimize.evaluation.rules.memory_admission import load_guard_table
+from exp.optimize.evaluation.rules.rules_document import load_rules_document
 from exp.optimize.evaluation.variance.build_records import load_tag_retrieval_binding
 from exp.runtime.environments.world_contracts import (
     ExecutableCheckpoint,
@@ -183,6 +184,12 @@ class GroundedRuntimeDefinition(ContractModel):
             recorded transitions whose pre-turn state agrees best with the live one, tagged by
             the native decision alias through the decision cache. Absent, the definition and
             every derived identity are unchanged.
+        rules_document: Optional saved ``rules-document`` artifact: the family's rules collated
+            with their tag-admission verdicts and research. Every prediction receives the whole
+            document in its own channel, and no rule is recalled per step, so prediction makes
+            no decision-model call for rules even when ``rule_memory`` is bound (its guard
+            table, if any, still checks proposals). Absent, the definition and every derived
+            identity are unchanged.
     """
 
     task: TaskCase
@@ -217,6 +224,9 @@ class GroundedRuntimeDefinition(ContractModel):
         default=None, exclude_if=lambda value: value is None
     )
     state_recall: StateRecallBinding | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    rules_document: ArtifactInput | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
 
@@ -429,8 +439,9 @@ def _checked(
     RuleBook | None,
     TagRetrievalBinding | None,
     MemorySet | None,
+    str | None,
 ]:
-    """Run every credential-free check; return catalog, simulator, embedder, rules, tags, memory."""
+    """Run every credential-free check; return simulator inputs and the rules document text."""
     require_development_task(project.artifacts, spec.task)
     if spec.task.reference_answer is not None:
         raise ValueError("grounded executable tasks must not contain private expected answers")
@@ -475,7 +486,8 @@ def _checked(
         if artifact.original_evidence == "none":
             raise ValueError("a memory-first simulator retrieves nothing to rank by tags")
     rule_memory = None
-    if spec.rule_memory is not None:
+    # A rules document replaces per-step recall, so its recall alias and set are not needed.
+    if spec.rule_memory is not None and spec.rules_document is None:
         alias = catalog.models.get(spec.rule_memory.recall.jev_alias)
         if alias is None or catalog.connections[alias.connection].provider != "typesafe":
             raise ValueError("rule memory recall requires the admitted native decision wire")
@@ -492,7 +504,12 @@ def _checked(
         )
     if spec.state_recall is not None:
         check_state_recall(catalog, spec.state_recall)
-    return catalog, artifact, embedder_alias, rule_book, tag_retrieval, rule_memory
+    document = (
+        None
+        if spec.rules_document is None
+        else load_rules_document(project.artifacts, spec.rules_document)
+    )
+    return catalog, artifact, embedder_alias, rule_book, tag_retrieval, rule_memory, document
 
 
 def guarded_rule_book(rule_book: RuleBook | None, table: GuardTable) -> RuleBook:
@@ -551,7 +568,7 @@ def _runtime(
     provider_grant: ProviderGrant | None = None,
 ) -> ContinuationRuntime:
     """Compose identical state/predictor definitions under one explicitly selected call ledger."""
-    catalog, artifact, embedder_alias, rule_book, tag_retrieval, memory_set = _checked(
+    catalog, artifact, embedder_alias, rule_book, tag_retrieval, memory_set, document = _checked(
         project, spec
     )
     revision = installed_execution_revision()
@@ -697,7 +714,8 @@ def _runtime(
                             if spec.rule_memory is None or spec.rule_memory.guards is None
                             else (spec.rule_memory.guards,)
                         )
-                        + (() if spec.state_recall is None else (spec.state_recall.index,)),
+                        + (() if spec.state_recall is None else (spec.state_recall.index,))
+                        + (() if spec.rules_document is None else (spec.rules_document,)),
                         key=lambda reference: reference.artifact_id,
                     )
                 ),
@@ -761,6 +779,7 @@ def _runtime(
             facts_version=0 if spec.facts is None else spec.facts.first_version,
             research_history=spec.research_history,
             prediction_reader=reader,
+            environment_rules=document,
         ),
         spec.manifest,
         spec.initial_state,

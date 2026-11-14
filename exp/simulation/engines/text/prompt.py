@@ -198,6 +198,14 @@ memory, research history, and grounded examples never override them for the valu
 A key absent from instance_facts is unknown, not empty; a null value is an observed empty value.
 """
 
+ENVIRONMENT_RULES_GUIDANCE = """
+environment_rules, when present, is one Markdown document of this environment's learned rules
+and open research questions. Confirmed rules are strong guidance. Unconfirmed and contradicted
+rules are diagnostic context: they are not the only rules that exist and never a reason to
+refuse. Rules describe behavior, never this instance's state. When no rule covers the call,
+still predict the most plausible result from the evidence you have.
+"""
+
 
 class MemoryContext(ContractModel):
     """Cross-trajectory memory for one prediction, already selected and split by authority.
@@ -228,6 +236,7 @@ def build_world_model_request(
     memory: MemoryContext | None = None,
     output_protocol: Literal["text", "json-tool"] = "text",
     facts: ConditioningFacts | None = None,
+    environment_rules: str | None = None,
 ) -> ModelRequest:
     """Frame a simulated environment transition without enabling provider tools.
 
@@ -243,6 +252,8 @@ def build_world_model_request(
         output_protocol: Text transition or typed-proposal system instructions.
         facts: Validated instance facts admissible for this prediction, rendered as the
             separate ``instance_facts`` channel; never mixed into memory or research history.
+        environment_rules: One rules document of the environment, rendered as the separate
+            ``environment_rules`` channel with its own guidance. Absent, the request is unchanged.
 
     Returns:
         A text-only provider request with the pinned prompt and no candidate hidden state.
@@ -306,6 +317,9 @@ def build_world_model_request(
     if facts is not None:
         system_prompt += INSTANCE_FACTS_GUIDANCE
         evidence["instance_facts"] = facts.rendered()
+    if environment_rules is not None:
+        system_prompt += ENVIRONMENT_RULES_GUIDANCE
+        evidence["environment_rules"] = environment_rules
     return ModelRequest(
         messages=(
             ModelMessage(role="system", content=system_prompt),

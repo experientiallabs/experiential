@@ -115,6 +115,8 @@ class FamilyKnowledge:
         traces: The family's world-learning traces by identity.
         contracts: Reconciled tool contracts: the family's own over the rule book's.
         state_domains: Names of the family's shared state domains; empty when it declares none.
+        rules_document: The family's saved ``rules-document`` every start's runtime reads whole,
+            when the runtime template reads rules as a document.
     """
 
     family_id: str
@@ -125,6 +127,7 @@ class FamilyKnowledge:
     traces: Mapping[str, Trace]
     contracts: Mapping[str, ToolContract]
     state_domains: tuple[str, ...] = ()
+    rules_document: ArtifactInput | None = None
 
 
 @dataclass(frozen=True)

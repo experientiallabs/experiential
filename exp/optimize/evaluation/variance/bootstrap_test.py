@@ -938,3 +938,34 @@ def test_a_frozen_family_runtime_is_kept_and_only_the_start_is_replaced(
     ) == frozen.model_dump(exclude={"task", "manifest", "initial_state", "probe_paths", "facts"})
     assert (definition.task.task_id, definition.initial_state) == ("recon", HIGH)
     assert definition.facts is None and definition.maximum_reasks == 2
+
+
+def test_a_document_template_binds_the_family_rules_document_into_each_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only ``runtime_rules="document"`` puts the family's document in a start's runtime."""
+    setup = _setup(tmp_path, monkeypatch)
+    family = FamilyInput(family_id="tickets", member_traces=("w1",))
+    draft = StartDraft.model_validate(_draft("recon", {"findings": []}))
+    document = ArtifactInput(artifact_id="rules-document-fixture", sha256="1" * 64)
+    knowledge = FamilyKnowledge(
+        family_id="tickets",
+        report=None,
+        rulebook=ArtifactInput(artifact_id="unused", sha256="0" * 64),
+        book=RuleBook(contracts={}),
+        rule_memory=None,
+        traces={},
+        contracts={},
+        rules_document=document,
+    )
+    task = BootstrapTask(task=_task("recon"))
+    template = setup.spec.runtime
+    assert "runtime_rules" not in template.model_dump(mode="json")
+    recalled = start_definition(template, family, knowledge, task, draft)
+    assert recalled.rules_document is None
+    assert "rules_document" not in recalled.model_dump(mode="json")
+    reading = template.model_copy(update={"runtime_rules": "document"})
+    assert reading.model_dump(mode="json")["runtime_rules"] == "document"
+    bound = start_definition(reading, family, knowledge, task, draft)
+    assert bound.rules_document == document
+    assert bound.model_copy(update={"rules_document": None}) == recalled

@@ -61,6 +61,7 @@ from exp.common.traces import Trace
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.executable.grounded import RuleMemoryBinding
 from exp.optimize.evaluation.rules.agent_loop import run_bounded
+from exp.optimize.evaluation.rules.rules_document import save_rules_document
 from exp.optimize.evaluation.rules.stage import (
     REPORT_TYPE,
     RulesStageReport,
@@ -219,6 +220,7 @@ def family_knowledge(
         if report is not None and frozen_report(project, report).rulebook != adapter.rule_book:
             raise ValueError(f"family {adapter.family_id} rules report names another rule book")
         rulebook, memory = adapter.rule_book, adapter.rule_memory
+        staged = None if report is None else frozen_report(project, report).memory_stage
     else:
         assert spec.rules is not None
         learned = run_rules_stage(
@@ -233,14 +235,22 @@ def family_knowledge(
         )
         report = artifact_input(project.artifacts.read(learned.identity + "-result").manifest)
         rulebook, memory = learned.rulebook, None
+        staged = learned.memory_stage
         if learned.memory_set is not None:
             recall = RecallPolicy(jev_alias=spec.runtime.jev_alias)
-            staged = learned.memory_stage
             memory = RuleMemoryBinding(
                 memory_set=learned.memory_set,
                 recall=recall,
                 guards=None if staged is None else staged.guards_artifact,
             )
+    document = None
+    if spec.runtime.runtime_rules == "document":
+        document = save_rules_document(
+            project,
+            rulebook,
+            None if staged is None else staged.admission_artifact,
+            code_revision=code_revision,
+        )
     book = load_rulebook(project, rulebook)
     return FamilyKnowledge(
         family_id=adapter.family_id,
@@ -251,6 +261,7 @@ def family_knowledge(
         traces=members,
         contracts={**book.contracts, **adapter.tool_contracts},
         state_domains=tuple(sorted(adapter.state_domains)),
+        rules_document=document,
     )
 
 
@@ -653,6 +664,8 @@ def _bootstrap_task(
         }
         if knowledge.rule_memory is not None:
             refs.add(knowledge.rule_memory.memory_set)
+        if knowledge.rules_document is not None:
+            refs.add(knowledge.rules_document)
         if task.recorded_state is not None:
             refs.add(task.recorded_state)
         sources = tuple(sorted(refs, key=lambda ref: ref.artifact_id))

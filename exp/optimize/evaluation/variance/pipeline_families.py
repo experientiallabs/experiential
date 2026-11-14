@@ -30,9 +30,8 @@ when its computed eligibility holds.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json, stable_id
@@ -41,6 +40,7 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.executable.costs import evaluation_costs, job_costs
 from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
 from exp.optimize.evaluation.executable.model_costs import CostComponent
+from exp.optimize.evaluation.rules.rules_document import load_rules_document
 from exp.optimize.evaluation.rules.stage import load_rulebook
 from exp.optimize.evaluation.variance.actor_critic import ActorCriticReport
 from exp.optimize.evaluation.variance.admission import VariantJudging, frozen_run_digests
@@ -509,6 +509,9 @@ class _Point:
             scenarios=scenarios,
             observed_episodes=episodes,
             coalition=coalition,
+            rules_document=None
+            if rules.rules_document is None
+            else load_rules_document(project.artifacts, rules.rules_document),
         )
 
 

@@ -155,6 +155,9 @@ def start_definition(
                 if template.reasoning_effort is None
                 else {"reasoning_effort": template.reasoning_effort}
             ),
+            "rules_document": None
+            if not bind or template.runtime_rules != "document" or knowledge.rules_document is None
+            else knowledge.rules_document.model_dump(mode="json"),
         }
     )
 

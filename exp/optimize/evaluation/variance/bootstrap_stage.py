@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.project import ProjectStore
+from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
 from exp.optimize.evaluation.variance.bootstrap import (
     frozen_report,
     load_outcome,
@@ -71,7 +72,10 @@ def run_bootstrapped_rules(context: StageContext) -> StageRun:
         )
     if frozen_report(project, report).rulebook != registration.rulebook:
         raise ValueError("the bootstrapped family's rules report names another rule book")
-    rubric = general_rubric(context, spec.mining.registered, registration.rulebook)
+    document = GroundedRuntimeDefinition.model_validate(
+        spec.mining.registered.configuration
+    ).rules_document
+    rubric = general_rubric(context, spec.mining.registered, registration.rulebook, document)
     outputs = RulesOutputs(
         report=report,
         rulebook=registration.rulebook,
@@ -81,6 +85,7 @@ def run_bootstrapped_rules(context: StageContext) -> StageRun:
         rubric=rubric.rubric,
         rubric_packet=rubric.packet,
         rubric_library=rubric.library,
+        rules_document=document,
     )
     summary: JsonObject = {
         "bootstrapped_family": registration.family_id,

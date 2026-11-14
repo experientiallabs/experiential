@@ -547,6 +547,44 @@ def test_a_whole_task_packet_has_only_its_baseline_and_refuses_scenarios(
         build((tier_scenario("urgent", "high"),))
 
 
+def test_a_rules_document_rides_in_the_packet_only_when_supplied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Authors read the rules document from the packet; without one the packet is unchanged."""
+    fixture = grounded_fixture(tmp_path, monkeypatch)
+    reference, book = save_book(fixture.project)
+
+    def build(rules_document: str | None) -> AuthoringPacket:
+        """Build the whole-task packet, with or without a rules document."""
+        return build_authoring_packet(
+            family_id="ticket-mining",
+            task=fixture.definition.task,
+            checkpoint=fixture.job.study.checkpoint,
+            before_state=INITIAL,
+            public_history=(),
+            remaining_calls=6,
+            sources=(
+                SourceRef(
+                    source_id="trace-1", kind="trace", trace_id="trace-1", summary="Escalated."
+                ),
+            ),
+            exposure=plan(),
+            rule_book=reference,
+            book=book,
+            decision=None,
+            scenarios=(),
+            rules_document=rules_document,
+        )
+
+    document = "# Environment rules\n\n## Confirmed rules (strong guidance)\n"
+    packet, plain = build(document), build(None)
+    assert packet.rules_document == document
+    assert packet.model_dump(mode="json")["rules_document"] == document
+    assert "rules_document" not in plain.model_dump(mode="json")
+    assert packet.model_copy(update={"rules_document": None}) == plain
+    assert AuthoringPacket.model_validate_json(packet.model_dump_json()) == packet
+
+
 def test_a_response_the_secret_boundary_refuses_is_an_unusable_draw(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

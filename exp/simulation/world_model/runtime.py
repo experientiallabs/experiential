@@ -201,6 +201,7 @@ class GroundedWorldModel:
         memory: MemoryContext | None = None,
         output_protocol: Literal["text", "json-tool"] = "text",
         facts: ConditioningFacts | None = None,
+        environment_rules: str | None = None,
     ) -> PreparedGroundedWorldModelCall:
         """Retrieve and frame one fit- or serving-bound grounded text transition.
 
@@ -215,6 +216,7 @@ class GroundedWorldModel:
             memory: Typed cross-trajectory memory rendered into its authority channels.
             output_protocol: Text transition or typed-proposal system instructions.
             facts: Instance facts admissible for this prediction, in their own channel.
+            environment_rules: The environment's rules document, in its own channel.
 
         Returns:
             Exact request and retrieved evidence before provider dispatch.
@@ -229,6 +231,7 @@ class GroundedWorldModel:
             memory=memory,
             output_protocol=output_protocol,
             facts=facts,
+            environment_rules=environment_rules,
         )
         if self.artifact.original_evidence == "none":
             # Memory-first profile: no recorded transition is retrieved for any prediction.
@@ -243,6 +246,7 @@ class GroundedWorldModel:
                 memory=memory,
                 output_protocol=output_protocol,
                 facts=facts,
+                environment_rules=environment_rules,
             )
             request = request.model_copy(update={"json_object_output": json_object_output})
             return PreparedGroundedWorldModelCall(
@@ -301,6 +305,7 @@ class GroundedWorldModel:
             memory=memory,
             output_protocol=output_protocol,
             facts=facts,
+            environment_rules=environment_rules,
         )
         request = request.model_copy(update={"json_object_output": json_object_output})
         return PreparedGroundedWorldModelCall(
@@ -337,6 +342,7 @@ class GroundedWorldModel:
         memory: MemoryContext | None = None,
         output_protocol: Literal["text", "json-tool"] = "text",
         facts: ConditioningFacts | None = None,
+        environment_rules: str | None = None,
     ) -> None:
         """Admit required framing before retrieval or its paid-work accounting window.
 
@@ -351,6 +357,7 @@ class GroundedWorldModel:
             memory: Typed cross-trajectory memory counted as required content.
             output_protocol: Text transition or typed-proposal system instructions.
             facts: Instance facts counted as required content.
+            environment_rules: The environment's rules document, counted as required content.
 
         Raises:
             ValueError: The output allowance is not positive.
@@ -367,6 +374,7 @@ class GroundedWorldModel:
             memory=memory,
             output_protocol=output_protocol,
             facts=facts,
+            environment_rules=environment_rules,
         ).model_copy(update={"json_object_output": json_object_output})
         # Admission may bind unpublished output around required content. Retrieval still uses
         # the original allowance so optional examples yield before actual output is bound.
