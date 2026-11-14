@@ -370,6 +370,8 @@ def _run_gateway(
                         timeout_seconds=min(300.0, max(0.1, graceful_timeout))
                     ):
                         _logger.warning("Waiting for retained gateway accounting before shutdown")
+                    if components.crash_follow_up is not None:
+                        components.crash_follow_up.close(timeout_seconds=graceful_timeout)
                     if capture_controller is not None:
                         capture_controller.native.close(0)
     except typer.BadParameter:

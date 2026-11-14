@@ -30,6 +30,12 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.interfaces import GatewayClock
+from exp.runtime.gateway.ledger_crash_recovery import (
+    FOLLOW_UP_POLL_SECONDS,
+    CrashReconcileFollowUp,
+    pending_crash_follow_up,
+    reconcile_crashed,
+)
 from exp.runtime.gateway.ledger_errors import (
     AttemptRejectedError as AttemptRejectedError,
 )
@@ -822,73 +828,53 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
             web_search_requests=web_search_requests,
         )
 
-    def reconcile_crashed_requests(self, *, cleanup_grace: timedelta) -> tuple[int, int]:
-        """Settle expired pre-dispatch and dispatched work after a crash.
+    def reconcile_crashed_requests(
+        self, *, cleanup_grace: timedelta, request_ids: frozenset[str] | None = None
+    ) -> tuple[int, int]:
+        """Settle expired pre-dispatch, failover-orphaned, and dispatched work after a crash.
 
         Args:
             cleanup_grace: Additional bound allowed for upstream cleanup after deadline.
+            request_ids: When given, only these requests and their attempts are settled.
 
         Returns:
-            Counts of expired pre-dispatch requests and unknown dispatched attempts.
+            Counts of reconciled open requests and unknown dispatched attempts.
         """
         if cleanup_grace < timedelta(0):
             raise ValueError("cleanup grace cannot be negative")
         now = self._clock.now()
-        expired_requests = 0
-        unknown_attempts = 0
         with self._transaction() as connection:
-            request_rows = connection.execute(
-                """
-                SELECT r.request_id, r.deadline_at,
-                       EXISTS(
-                           SELECT 1 FROM gateway_attempts AS a WHERE a.request_id = r.request_id
-                       ) AS has_attempt
-                FROM gateway_requests AS r WHERE r.terminal_state IS NULL
-                """
-            ).fetchall()
-            for request in request_rows:
-                deadline = datetime.fromisoformat(str(request["deadline_at"]))
-                if int(request["has_attempt"]) == 0 and deadline <= now:
-                    connection.execute(
-                        """
-                        UPDATE gateway_requests
-                        SET terminal_state = 'expired_before_dispatch', terminal_at = ?
-                        WHERE request_id = ? AND terminal_state IS NULL
-                        """,
-                        (utc_text(now), str(request["request_id"])),
-                    )
-                    expired_requests += 1
-            attempt_rows = connection.execute(
-                """
-                SELECT a.attempt_id, a.request_id, r.deadline_at
-                FROM gateway_attempts AS a
-                JOIN gateway_requests AS r ON r.request_id = a.request_id
-                WHERE a.state = 'dispatched'
-                """
-            ).fetchall()
-            for attempt in attempt_rows:
-                deadline = datetime.fromisoformat(str(attempt["deadline_at"]))
-                if deadline + cleanup_grace > now:
-                    continue
-                connection.execute(
-                    """
-                    UPDATE gateway_attempts
-                    SET state = 'unknown_after_crash', terminal_at = ?,
-                        usage_source = 'unknown'
-                    WHERE attempt_id = ? AND state = 'dispatched'
-                    """,
-                    (utc_text(now), str(attempt["attempt_id"])),
-                )
-                connection.execute(
-                    """
-                    UPDATE gateway_requests
-                    SET terminal_state = 'unknown_after_crash', terminal_at = ?
-                    WHERE request_id = ? AND terminal_state IS NULL
-                    """,
-                    (utc_text(now), str(attempt["request_id"])),
-                )
-                unknown_attempts += 1
-        return expired_requests, unknown_attempts
+            return reconcile_crashed(
+                connection, now=now, cleanup_grace=cleanup_grace, request_ids=request_ids
+            )
+
+    def start_crash_follow_up(
+        self, *, cleanup_grace: timedelta, poll_seconds: float = FOLLOW_UP_POLL_SECONDS
+    ) -> CrashReconcileFollowUp | None:
+        """Schedule one reconcile of the rows a startup reconcile left open.
+
+        Call it right after the startup reconcile and before serving, so every
+        open row belongs to a stopped process.
+
+        Args:
+            cleanup_grace: The bound the startup reconcile applied.
+            poll_seconds: Longest real wait between two clock reads.
+
+        Returns:
+            The running follow-up the owner must close at shutdown, or ``None``.
+        """
+        with self._connect() as connection:
+            pending = pending_crash_follow_up(connection, cleanup_grace=cleanup_grace)
+        if pending is None:
+            return None
+        return CrashReconcileFollowUp(
+            due_at=pending.due_at,
+            reconcile=lambda: self.reconcile_crashed_requests(
+                cleanup_grace=cleanup_grace, request_ids=pending.request_ids
+            ),
+            clock=self._clock,
+            poll_seconds=poll_seconds,
+        )
 
     def usage(
         self, *, organization_id: str, identity_id: str | None = None
