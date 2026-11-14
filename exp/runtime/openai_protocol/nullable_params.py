@@ -21,9 +21,8 @@ not mark ``Optional`` but the official API (and OpenRouter) still serve a null
 on as absent: ``response_format``, ``tools``, ``tool_choice``, ``user`` and a
 few more. The official Python SDK sends a JSON ``null`` for any of them when a
 caller passes ``None`` (``response_format=None`` is the common spelling of "no
-structured output"), so refusing them failed every such call before admission
-(2026-11-14: one AsyncOpenAI caller, 78 ``response_format`` and 3 ``tools``
-refusals in 35 minutes). A REQUIRED field (``model``, ``messages``, ``input``)
+structured output"), so refusing them would fail every such call before
+admission. A REQUIRED field (``model``, ``messages``, ``input``)
 is never in either vocabulary and keeps its named refusal.
 
 Removing such a null changes nothing the caller asked for, so it carries no

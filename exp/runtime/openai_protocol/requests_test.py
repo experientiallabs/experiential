@@ -6620,9 +6620,8 @@ def test_a_null_openai_refuses_is_still_refused_by_name(body: JsonObject, field:
 def test_the_sdk_null_response_format_and_tools_decode_as_absent() -> None:
     """AsyncOpenAI's ``response_format=None, tools=None`` is served, not refused pre-admission.
 
-    The production report (2026-11-14) was "Invalid value for 'response_format':
-    expected an object, but got null instead." and "Invalid value for 'tools'."
-    on a Chat body the official Python SDK serialized from ``None`` arguments.
+    Before the fix such a body was refused with "Invalid value for 'response_format':
+    expected an object, but got null instead." and "Invalid value for 'tools'.".
     """
     body: JsonObject = {
         **_CHAT_BODY,
