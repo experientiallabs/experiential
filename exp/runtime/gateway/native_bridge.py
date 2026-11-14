@@ -8,7 +8,6 @@ import time
 from collections.abc import Callable
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import BillingSource
 from exp.runtime.gateway.attempt_tokens import counted_input_tokens
 from exp.runtime.gateway.class_throttles import admission_priority_class, tier_authorization
 from exp.runtime.gateway.client_apps import with_client_identity
@@ -533,7 +532,7 @@ class NativeControlPlane(
             tool_search_admission = planned.admission
             if request != inspection_request and guardrails is not None:
                 try:
-                    request = guardrails.inspect_input(request)
+                    request = guardrails.inspect_input(request, defer=parallel_guardrail)
                 except GuardrailRejected as exc:
                     discard_capture(self._capture, authorization.request_id)
                     self._accounting.finish_request_quietly(
@@ -805,12 +804,7 @@ class NativeControlPlane(
                 try:
                     guardrails.prepare_dispatch(
                         (original_guardrail_request, captured_request, request, public_request),
-                        overlap=parallel_guardrail
-                        and cache_state is None
-                        and all(
-                            d.billing_source is BillingSource.HOST_MANAGED
-                            for d in route.deployments
-                        ),
+                        overlap=parallel_guardrail,
                     )
                 except GuardrailRejected as exc:
                     discard_capture(self._capture, authorization.request_id)

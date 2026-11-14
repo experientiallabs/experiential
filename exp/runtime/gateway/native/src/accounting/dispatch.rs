@@ -60,7 +60,7 @@ pub(super) struct Dispatch {
     admitted_attempts: Mutex<HashMap<String, terminal::Terms>>,
     pub(super) inspection: Option<super::inspection::Inspection>,
     pub(super) deadline: std::time::Instant,
-    pub(super) resources: super::resources::Resources,
+    pub(super) resources: Arc<super::resources::Resources>,
     cache: Option<super::cache::Cache>,
 }
 
@@ -141,7 +141,7 @@ impl Dispatch {
             host,
             inspection,
             deadline,
-            resources,
+            resources: Arc::new(resources),
             cache,
             admitted_attempts: Mutex::new(HashMap::new()),
             state: Mutex::new(State {
@@ -187,6 +187,9 @@ impl Dispatch {
         };
         let tool_round =
             start.tool_search_round && start.current_depth.is_some() && start.failure.is_none();
+        if tool_round {
+            self.resources.activate_reinspection()?;
+        }
         let repair = start.reasoning_repair && start.current_depth.is_some();
         let mut failover = FailoverPass::begin(
             &c.rules,
@@ -814,8 +817,15 @@ impl Driver for Dispatch {
             };
         }
         if method == "tool_search_round" {
-            if let Some(input) = &self.resources.input {
-                input.wait();
+            let runtime = super::inspection_http::runtime().map_err(|_| PublicError::internal())?;
+            // Cancellation and terminal writes must retain access to dispatch while
+            // a strict classifier is pending. Revalidate the attempt under the lock below.
+            let approved = runtime.block_on(self.resources.wait_for_tools());
+            if approved["action"] != "allow" && approved["action"] != "pending" {
+                if approved["failure"].is_object() {
+                    return Ok(json!({"inspection_failure": approved["failure"], "rounds": []}));
+                }
+                return Err(PublicError::internal());
             }
         }
         let mut state = self.state.lock().map_err(|_| PublicError::internal())?;

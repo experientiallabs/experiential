@@ -33,6 +33,7 @@ fn registry() -> Arc<Registry> {
 fn register(registry: &Arc<Registry>, id: &str, org: &str, ledger: Arc<Ledger>) {
     registry
         .register(Arc::new(Entry {
+            resources: Arc::new(super::super::resources::Resources::default()),
             owner: Owner::new(
                 id.into(),
                 org.into(),

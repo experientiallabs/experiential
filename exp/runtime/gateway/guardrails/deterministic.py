@@ -121,7 +121,11 @@ def native_input_request(
     if any(check.adapter_id not in detectors for check in policy.input_checks):
         return None
     if request_exceeds_inspection_limit(request, policy.max_request_bytes):
-        _record(policy, None, GuardrailAction.ERROR)
+        _record(
+            policy, None, GuardrailAction.ALLOW if policy.input_fail_open else GuardrailAction.ERROR
+        )
+        if policy.input_fail_open:
+            return request
         raise GuardrailRejected(coverage_failure())
     current = request
     for check in policy.input_checks:
@@ -137,6 +141,9 @@ def native_input_request(
         try:
             messages, flagged, immutable_match = _redacted_messages(detector, current)
         except ClassifierCoverageError:
+            if policy.input_fail_open:
+                _uncertain(policy, check)
+                continue
             _record(policy, check, GuardrailAction.ERROR)
             raise GuardrailRejected(coverage_failure(check_id=check.check_id)) from None
         except ValueError:
@@ -224,13 +231,15 @@ def _applied(
 
 
 def _uncertain(policy: GuardrailPolicy, check: GuardrailCheck) -> None:
-    """Fail closed for a protected policy, or skip the uncertain check.
+    """Apply the input policy when a deterministic check cannot produce a verdict.
 
     Raises:
-        GuardrailRejected: The policy is protected.
+        GuardrailRejected: The policy is protected and input fail-open is disabled.
     """
-    _record(policy, check, GuardrailAction.ERROR)
-    if policy.protected:
+    _record(
+        policy, check, GuardrailAction.ALLOW if policy.input_fail_open else GuardrailAction.ERROR
+    )
+    if policy.protected and not policy.input_fail_open:
         raise GuardrailRejected(
             GatewayFailure(
                 failure_class=GatewayFailureClass.UNAVAILABLE,

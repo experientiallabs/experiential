@@ -62,6 +62,12 @@ struct WorkerPool {
 }
 
 impl Bridge {
+    pub(crate) fn input_resources(
+        &self,
+        request_id: &str,
+    ) -> Option<Arc<crate::accounting::InputResources>> {
+        self.native.as_ref()?.input_resources(request_id)
+    }
     /// Start `maximum_concurrent_calls` named worker threads over one queue.
     ///
     /// The permit count equals the worker count, so an accepted call always

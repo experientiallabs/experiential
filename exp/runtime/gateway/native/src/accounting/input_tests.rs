@@ -6,6 +6,46 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 #[test]
+fn an_exact_maximum_inspection_fits_the_idle_byte_budget() {
+    let bytes = std::sync::Arc::new(tokio::sync::Semaphore::new(64 * 1024));
+    let units = super::input::capacity_units(64 * 1024 * 1024);
+    let permit = bytes.clone().try_acquire_many_owned(units).unwrap();
+    assert!(bytes.clone().try_acquire_owned().is_err());
+    drop(permit);
+    assert!(bytes
+        .clone()
+        .try_acquire_many_owned(super::input::capacity_units(64 * 1024 * 1024 + 1))
+        .is_err());
+    assert_eq!(super::input::capacity_units(0), 1);
+    assert_eq!(super::input::capacity_units(1024), 1);
+    assert_eq!(super::input::capacity_units(1025), 2);
+}
+
+#[test]
+fn optional_failure_stays_permissive_when_the_next_check_is_cancelled() {
+    let (url, received, release, server) = server("{\"flagged\":false}", 200);
+    let mut first = check(&url, false);
+    first.adapter = json!({"kind":"unavailable"});
+    let gate = InputGate::start(vec![first, check(&url, false)], 5.0).unwrap();
+    received.recv_timeout(Duration::from_secs(3)).unwrap();
+    gate.cancel(None);
+    let decision = gate.decision();
+    release.send(()).unwrap();
+    server.join().unwrap();
+    assert_eq!(decision["action"], "allow");
+    assert_eq!(decision["moderation"]["status"], "failed_open");
+    assert_eq!(
+        decision["moderation"]["observations"][0]["outcome"],
+        "unavailable"
+    );
+    assert_eq!(decision["moderation"]["observations"][0]["action"], "error");
+    assert_eq!(
+        decision["moderation"]["observations"][1]["outcome"],
+        "cancelled"
+    );
+}
+
+#[test]
 fn cancelling_an_approved_input_preserves_its_metered_terminal() {
     let gate = InputGate::start(vec![], 30.0).unwrap();
     assert_eq!(gate.wait()["action"], "allow");
@@ -21,12 +61,12 @@ fn cancelling_an_approved_input_preserves_its_metered_terminal() {
 }
 
 #[test]
-fn explicit_capture_failure_still_overrides_an_approved_input() {
+fn explicit_inspection_failure_remains_immutable_after_cancellation() {
     let gate = InputGate::start(vec![], 30.0).unwrap();
     assert_eq!(gate.wait()["action"], "allow");
     gate.cancel(Some(
-        json!({"failure_class": "unavailable", "safe_message": "capture failed",
-        "safe_details": {"code": "capture_unavailable"}}),
+        json!({"failure_class": "unavailable", "safe_message": "inspection failed",
+        "safe_details": {"code": "inspection_unavailable"}}),
     ));
     let decision = gate.decision();
     gate.cancel(None);
@@ -37,7 +77,7 @@ fn explicit_capture_failure_still_overrides_an_approved_input() {
     );
     assert_eq!(
         decision["failure"]["safe_details"]["code"],
-        "capture_unavailable"
+        "inspection_unavailable"
     );
 }
 
@@ -166,6 +206,129 @@ pub(super) fn check(url: &str, protected: bool) -> Check {
             "transport": {"public_only": false, "headers": {}},
             "payload": {"stage": "input", "request": {"messages": [{"content": "fixture"}]}}}}))
     .unwrap()
+}
+
+#[tokio::test]
+async fn asynchronous_verdict_wakes_every_waiter_and_denial_survives_release() {
+    let (url, received, release, server) = server("{\"flagged\":true}", 200);
+    let mut check = check(&url, true);
+    check.policy["input_fail_open"] = json!(true);
+    let gate = InputGate::start(vec![check], 5.0).unwrap();
+    received.recv_timeout(Duration::from_secs(3)).unwrap();
+    let first = gate.clone();
+    let second = gate.clone();
+    let first = tokio::spawn(async move { first.wait_async().await });
+    let second = tokio::spawn(async move { second.wait_async().await });
+    release.send(()).unwrap();
+    for waiter in [first, second] {
+        let decision = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decision["action"], "error");
+        assert_eq!(decision["moderation"]["status"], "denied");
+    }
+    gate.release_incomplete("response_ready_timeout");
+    assert_eq!(gate.decision()["action"], "error");
+    server.join().unwrap();
+}
+
+#[test]
+fn expired_strict_inspection_records_its_unavailable_decision() {
+    let mut check = check("http://127.0.0.1:1/inspect", true);
+    check.policy["input_fail_open"] = json!(false);
+    let gate = InputGate::start(vec![check], 0.0).unwrap();
+    let decision = gate.wait();
+    assert_eq!(decision["action"], "error");
+    assert_eq!(decision["moderation"]["status"], "unavailable");
+    assert_eq!(decision["moderation"]["observations"][0]["action"], "error");
+}
+
+#[tokio::test]
+async fn unprotected_checks_require_explicit_opt_in_to_response_grace() {
+    let (url, received, release, server) = server("{\"flagged\":true}", 200);
+    let mut check = check(&url, false);
+    check.policy["input_fail_open"] = json!(false);
+    check.policy["input_max_wait_ms"] = json!(0);
+    let gate = InputGate::start(vec![check], 5.0).unwrap();
+    received.recv_timeout(Duration::from_secs(3)).unwrap();
+    gate.begin_response(Instant::now());
+    assert_eq!(gate.grace(), None);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), gate.wait_strict())
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), gate.wait_async())
+            .await
+            .is_err()
+    );
+    release.send(()).unwrap();
+    let decision = tokio::time::timeout(Duration::from_secs(2), gate.wait_strict())
+        .await
+        .unwrap();
+    assert_eq!(decision["action"], "error");
+    assert_eq!(gate.wait_async().await["moderation"]["status"], "denied");
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn response_timeout_releases_and_cancels_moderation_without_waiving_provider_usage() {
+    let (url, received, release, server) = server("{\"flagged\":true}", 200);
+    let mut check = check(&url, true);
+    check.policy["input_fail_open"] = json!(true);
+    check.policy["input_max_wait_ms"] = json!(0);
+    let gate = InputGate::start(vec![check], 5.0).unwrap();
+    received.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(gate.grace(), Some(Duration::ZERO));
+    let resources = Resources::new(Some(gate.clone()), None, None, "request").unwrap();
+    resources.release_incomplete();
+    let decision = tokio::time::timeout(Duration::from_millis(100), resources.wait())
+        .await
+        .unwrap();
+    assert_eq!(decision["action"], "allow");
+    assert_eq!(decision["moderation"]["status"], "failed_open");
+    release.send(()).unwrap();
+    server.join().unwrap();
+    assert_eq!(gate.decision(), decision);
+    let mut terminal = json!({"state": "completed", "usage": {"input_tokens": 11}});
+    resources.terminal(&mut terminal);
+    assert_eq!(terminal["state"], "completed");
+    assert_eq!(terminal["usage"]["input_tokens"], 11);
+    assert!(terminal["input_guardrail_denied"].is_null());
+    assert_eq!(terminal["input_moderation"]["status"], "failed_open");
+}
+
+#[tokio::test]
+async fn unavailable_classifier_and_observed_denial_cannot_refuse_delivery() {
+    for observe in [false, true] {
+        let (url, received, release, server) =
+            server("{\"flagged\":true}", if observe { 200 } else { 503 });
+        let mut check = check(&url, true);
+        check.policy["input_fail_open"] = json!(true);
+        check.policy["mode"] = json!(if observe { "observe" } else { "enforce" });
+        let input = InputGate::start(vec![check], 5.0).unwrap();
+        received.recv_timeout(Duration::from_secs(3)).unwrap();
+        let resources = Resources::new(Some(input.clone()), None, None, "request").unwrap();
+        if observe {
+            assert_eq!(resources.wait().await["action"], "allow");
+            resources.close("request");
+            assert_eq!(input.decision()["action"], "pending");
+        }
+        release.send(()).unwrap();
+        let decision = input.wait_async().await;
+        assert_eq!(decision["action"], "allow");
+        assert_eq!(
+            decision["moderation"]["status"],
+            if observe { "observed" } else { "failed_open" }
+        );
+        assert_eq!(
+            decision["moderation"]["observations"][0]["outcome"],
+            if observe { "flagged" } else { "unavailable" }
+        );
+        server.join().unwrap();
+    }
 }
 
 #[test]
@@ -307,6 +470,14 @@ fn capture_is_registered_once_after_approval_and_never_after_close_or_capacity_f
             "request",
         )
         .unwrap();
+        assert_eq!(
+            super::inspection_http::runtime()
+                .unwrap()
+                .block_on(resources.wait_for_tools())["action"],
+            "allow"
+        );
+        assert!(resources.pending_capture.lock().unwrap().is_some());
+        assert!(collector.attach("request").is_none());
         if mode == "full" {
             assert!(admission::begin(&collector, &captured("occupied")));
         }
@@ -316,16 +487,15 @@ fn capture_is_registered_once_after_approval_and_never_after_close_or_capacity_f
         let result = resources.status();
         assert_eq!(
             result["action"],
-            if mode == "allow" {
-                "allow"
-            } else if mode == "closed" {
-                "closed"
-            } else {
-                "error"
+            match mode {
+                "closed" => "closed",
+                "full" => "error",
+                _ => "allow",
             }
         );
         assert_eq!(resources.status(), result);
         if mode == "full" {
+            assert_eq!(result["failure"]["failure_class"], "unavailable");
             assert_eq!(
                 result["failure"]["safe_details"]["code"],
                 "capture_unavailable"
@@ -333,8 +503,15 @@ fn capture_is_registered_once_after_approval_and_never_after_close_or_capacity_f
             let mut terminal = json!({});
             resources.terminal(&mut terminal);
             assert_eq!(terminal["input_guardrail_denied"], true);
+            assert_eq!(terminal["state"], "failed");
+            assert_eq!(terminal["failure"], result["failure"]);
         }
         collector.settle("occupied", false, false);
+        assert_eq!(
+            resources.status(),
+            result,
+            "capacity recovery cannot erase a failure"
+        );
         resources.settled(
             "request",
             &json!({"capture": {"keep_prompt": true, "keep_response": false}}),
@@ -347,4 +524,267 @@ fn capture_is_registered_once_after_approval_and_never_after_close_or_capacity_f
             assert_eq!(record["request"]["request_id"], "request");
         }
     }
+}
+
+#[test]
+fn capture_activation_racing_request_close_never_registers_twice() {
+    use crate::capture::collector::Collector;
+    use std::sync::{Arc, Barrier};
+    for _ in 0..32 {
+        let (sent, received) = mpsc::channel();
+        let config = crate::lossless_json::from_value(json!({"delivery": {"maximum_records": 8, "maximum_bytes": 65536, "maximum_record_bytes": 8192},
+            "maximum_pending_records": 1, "maximum_pending_bytes": 65536, "maximum_request_bytes": 4096,
+            "maximum_response_bytes": 4096, "ttl_seconds": 30, "settlement_required": true, "asynchronous_delivery": true})).unwrap();
+        let collector = Arc::new(Collector::new(config, CaptureSink(sent)).unwrap());
+        let input = InputGate::start(vec![], 5.0).unwrap();
+        assert_eq!(input.wait()["action"], "allow");
+        let resources = Resources::new(
+            Some(input),
+            Some(collector.clone()),
+            Some(captured("request")),
+            "request",
+        )
+        .unwrap();
+        let start = Barrier::new(3);
+        std::thread::scope(|scope| {
+            let activate = scope.spawn(|| {
+                start.wait();
+                resources.status()
+            });
+            let close = scope.spawn(|| {
+                start.wait();
+                resources.close("request");
+            });
+            start.wait();
+            let _ = activate.join().unwrap();
+            close.join().unwrap();
+        });
+        assert_eq!(resources.status()["action"], "closed");
+        assert!(resources.pending_capture.lock().unwrap().is_none());
+        resources.settled(
+            "request",
+            &json!({"capture": {"keep_prompt": true, "keep_response": false}}),
+        );
+        assert!(collector.close_until(Instant::now() + Duration::from_secs(3)));
+        assert!(received.try_iter().count() <= 1);
+    }
+}
+
+#[tokio::test]
+async fn successor_input_keeps_all_predecessors_live_and_races_their_denials() {
+    for denied in [0, 1] {
+        let mut gates = Vec::new();
+        let mut releases = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..2 {
+            let (url, received, release, server) = server("{\"flagged\":true}", 200);
+            let mut check = check(&url, true);
+            check.policy["input_fail_open"] = json!(true);
+            check.policy["input_max_wait_ms"] = json!(0);
+            let gate = InputGate::start(vec![check], 5.0).unwrap();
+            received.recv_timeout(Duration::from_secs(2)).unwrap();
+            gates.push(gate);
+            releases.push(release);
+            servers.push(server);
+        }
+        let resources = Resources::new(Some(gates[0].clone()), None, None, "request").unwrap();
+        resources.stage_reinspection(gates[1].clone()).unwrap();
+        let mut terminal = json!({"state":"completed", "finalize":false});
+        resources.terminal(&mut terminal);
+        resources.activate_reinspection().unwrap();
+        assert_eq!(resources.status()["action"], "pending");
+        assert_eq!(gates[0].decision()["action"], "pending");
+        releases[denied].send(()).unwrap();
+        let decision = tokio::time::timeout(Duration::from_secs(1), resources.wait())
+            .await
+            .unwrap();
+        assert_eq!(decision["action"], "error");
+        assert_eq!(gates[1 - denied].decision()["action"], "pending");
+        releases[1 - denied].send(()).unwrap();
+        for server in servers {
+            server.join().unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn one_response_release_expires_every_pending_physical_input() {
+    let mut gates = Vec::new();
+    let mut servers = Vec::new();
+    for _ in 0..2 {
+        let (url, received, release, server) = server("{\"flagged\":true}", 200);
+        let mut check = check(&url, true);
+        check.policy["input_fail_open"] = json!(true);
+        let gate = InputGate::start(vec![check], 5.0).unwrap();
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        gates.push(gate);
+        servers.push((release, server));
+    }
+    let resources = Resources::new(Some(gates[0].clone()), None, None, "request").unwrap();
+    resources.stage_reinspection(gates[1].clone()).unwrap();
+    resources.activate_reinspection().unwrap();
+    assert_eq!(resources.grace(), Some(Duration::ZERO));
+    resources.release_incomplete();
+    let decision = tokio::time::timeout(Duration::from_millis(100), resources.wait())
+        .await
+        .unwrap();
+    assert_eq!(decision["action"], "allow");
+    assert_eq!(decision["moderation"]["status"], "failed_open");
+    assert_eq!(
+        decision["moderation"]["observations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    for gate in gates {
+        assert_eq!(
+            gate.decision()["moderation"]["reason"],
+            "response_ready_timeout"
+        );
+    }
+    for (release, server) in servers {
+        release.send(()).unwrap();
+        server.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn one_policy_cannot_extend_another_policys_response_grace() {
+    let (url, received, release, server) = server("{\"flagged\":false}", 200);
+    let mut slow = check(&url, true);
+    slow.policy["input_fail_open"] = json!(true);
+    slow.policy["input_max_wait_ms"] = json!(1000);
+    slow.policy["policy_id"] = json!("long-grace");
+    let mut zero = slow.clone();
+    zero.policy["policy_id"] = json!("zero-grace");
+    zero.policy["input_max_wait_ms"] = json!(0);
+    zero.adapter = json!({"kind":"keyword","subjects":["denied"],"needles":["denied"]});
+    let gate = InputGate::start(vec![slow, zero], 5.0).unwrap();
+    received.recv_timeout(Duration::from_secs(2)).unwrap();
+    gate.begin_response(Instant::now());
+    release.send(()).unwrap();
+    let decision = gate.wait_async().await;
+    assert_eq!(decision["action"], "allow");
+    assert_eq!(
+        decision["moderation"]["observations"][0]["outcome"],
+        "allow"
+    );
+    assert_eq!(
+        decision["moderation"]["observations"][1]["outcome"],
+        "response_ready_timeout"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn cancellation_keeps_completed_scores_and_each_remaining_policys_failure_mode() {
+    let (first_url, first_received, first_release, first_server) =
+        server("{\"answers\":{\"q\":{\"noul\":0.25}}}", 200);
+    let (second_url, second_received, second_release, second_server) =
+        server("{\"flagged\":true}", 200);
+    let mut first = check(&first_url, true);
+    first.policy["input_fail_open"] = json!(true);
+    first.adapter["kind"] = json!("decision_model");
+    first.adapter["timeout_ms"] = json!(3000);
+    first.adapter["cache"] = json!({"max_entries":2,"ttl_seconds":60});
+    first.adapter["cache_scope"] = json!(first_url);
+    first.adapter["cache_key"] = json!("fixture-progress");
+    first.adapter["categories"] =
+        json!({"category":{"questions":{"q":{}},"aggregate":"mean","threshold":0.8}});
+    let mut second = check(&second_url, true);
+    second.policy["input_fail_open"] = json!(true);
+    let mut strict = check("http://127.0.0.1:1/strict", true);
+    strict.adapter = json!({"kind":"allow"});
+    strict.policy["input_fail_open"] = json!(false);
+    let gate = InputGate::start(vec![first, second, strict], 5.0).unwrap();
+    first_received.recv_timeout(Duration::from_secs(2)).unwrap();
+    first_release.send(()).unwrap();
+    second_received
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    gate.cancel(None);
+    let resources = Resources::new(Some(gate), None, None, "request").unwrap();
+    let decision = resources.status();
+    assert_eq!(decision["moderation"]["status"], "failed_open");
+    assert_eq!(decision["moderation"]["reason"], "cancelled");
+    let records = &decision["moderation"]["observations"];
+    assert_eq!(records[1]["outcome"], "allow");
+    assert_eq!(records[1]["scores"], json!([["category", 0.25]]));
+    assert_eq!(records[1]["cached"], false);
+    assert_eq!(records[2]["outcome"], "cancelled");
+    assert_eq!(records[2]["action"], "allow");
+    assert_eq!(records[0]["action"], "allow");
+    second_release.send(()).unwrap();
+    first_server.join().unwrap();
+    second_server.join().unwrap();
+}
+
+#[tokio::test]
+async fn mixed_observation_never_delays_enforcement_or_response_release() {
+    let (url, received, release, server) = server("{\"flagged\":true}", 200);
+    let mut observed = check(&url, true);
+    observed.policy["mode"] = json!("observe");
+    let mut enforced = observed.clone();
+    enforced.policy["mode"] = json!("enforce");
+    enforced.policy["input_fail_open"] = json!(true);
+    enforced.adapter = json!({"kind":"allow"});
+    let gate = InputGate::start(vec![observed, enforced], 5.0).unwrap();
+    received.recv_timeout(Duration::from_secs(2)).unwrap();
+    let decision = tokio::time::timeout(Duration::from_millis(100), gate.wait_async())
+        .await
+        .unwrap();
+    assert_eq!(decision["action"], "allow");
+    gate.begin_response(Instant::now());
+    gate.cancel(None);
+    release.send(()).unwrap();
+    server.join().unwrap();
+    assert_eq!(gate.wait_async().await["action"], "allow");
+}
+
+#[tokio::test]
+async fn slow_fail_open_policy_does_not_gate_strict_search_approval() {
+    for strict_first in [false, true] {
+        let (url, received, release, server) = server("{\"flagged\":true}", 200);
+        let mut permissive = check(&url, true);
+        permissive.policy["input_fail_open"] = json!(true);
+        let mut strict = check("http://127.0.0.1:1/unused", true);
+        strict.adapter = json!({"kind":"allow"});
+        let checks = if strict_first {
+            vec![strict, permissive]
+        } else {
+            vec![permissive, strict]
+        };
+        let gate = InputGate::start(checks, 5.0).unwrap();
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        let resources = Resources::new(Some(gate.clone()), None, None, "request").unwrap();
+        let allowed = tokio::time::timeout(Duration::from_millis(100), resources.wait_for_tools())
+            .await
+            .unwrap();
+        assert_eq!(allowed["action"], "pending");
+        assert_eq!(gate.decision()["action"], "pending");
+        release.send(()).unwrap();
+        assert_eq!(resources.wait().await["action"], "error");
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn request_deadline_labels_unstarted_sibling_checks_as_timed_out() {
+    let (url, received, release, server) = server("{\"flagged\":false}", 200);
+    let first = check(&url, true);
+    let mut second = first.clone();
+    second.check["check_id"] = json!("unstarted");
+    second.adapter = json!({"kind":"allow"});
+    let gate = InputGate::start(vec![first, second], 0.2).unwrap();
+    received.recv_timeout(Duration::from_secs(2)).unwrap();
+    // Let the inspection task reach its deadline without a caller racing its recovery.
+    std::thread::sleep(Duration::from_millis(300));
+    let decision = gate.wait();
+    release.send(()).unwrap();
+    server.join().unwrap();
+    assert_eq!(decision["moderation"]["status"], "unavailable");
+    let records = decision["moderation"]["observations"].as_array().unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(records.iter().all(|record| record["outcome"] == "timeout"));
 }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import time
 from concurrent.futures import Future
@@ -14,7 +15,7 @@ import httpx
 import pytest
 from websockets.sync.client import connect
 
-from exp.common.models import BillingSource
+from exp.common.models import BillingSource, GatewayTokenPrices
 from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.contracts import GatewayFailureClass, GatewayRequest
 from exp.runtime.gateway.guardrails.bounded import _NATIVE_RUNNER, BoundedInspect
@@ -42,6 +43,7 @@ from exp.runtime.gateway.guardrails.store_test import _authorization
 from exp.runtime.gateway.guardrails.subjects_test import _changed_subject
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
+from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_execution import NativeDialectUnavailableError
 from exp.runtime.gateway.tests.guardrail_policy_integrity_test import _body, _provider
@@ -615,6 +617,139 @@ def test_observation_recorder_failure_cannot_reject_a_request(
         engine.close(timeout_seconds=2)
 
 
+@pytest.mark.parametrize("surface", ["embeddings", "images", "decisions", "audio", "video"])
+@pytest.mark.parametrize("mode", ["observe", "enforce"])
+@pytest.mark.parametrize("default_sink", [False, True])
+def test_fail_open_policies_record_unsupported_request_coverage(
+    surface: str, mode: str, default_sink: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Unsupported coverage is request-correlated metadata rather than a rejection."""
+    classifier = _Classifier(GuardrailOutcome.FLAGGED)
+    policy = _policy().model_copy(
+        update={"mode": mode, "input_fail_open": True, "revision": "private-revision-marker"}
+    )
+    engine = (
+        GuardrailEngine(
+            store=MappingGuardrailStore((policy,)),
+            client=DirectClassifierClient(ClassifierRegistry({})),
+            monotonic=time.monotonic,
+        )
+        if default_sink
+        else _Engine(classifier, policy)
+    )
+    authorization = _authorization()
+    with caplog.at_level(logging.INFO, logger="exp.runtime.gateway.guardrails.recording"):
+        require_unguarded_surface(engine, authorization, surface)
+        engine.close(timeout_seconds=2)
+    if isinstance(engine, _Engine):
+        assert engine.observed == [("platform-observer", None, GuardrailOutcome.UNSUPPORTED)]
+    assert classifier.input_calls == 0
+    assert f"request_id={authorization.request_id}" in caplog.text
+    assert f"surface={surface}" in caplog.text
+    assert f"status={'observed' if mode == 'observe' else 'failed_open'}" in caplog.text
+    assert "outcome=unsupported" in caplog.text
+    assert "private-revision-marker" not in caplog.text
+    engine.close(timeout_seconds=0)
+
+
+@pytest.mark.parametrize("same_policy", [False, True])
+def test_refused_unsupported_surface_never_claims_failed_open_delivery(
+    same_policy: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Output enforcement or another strict policy keeps coverage logs honest."""
+    permissive = _policy().model_copy(update={"mode": "enforce", "input_fail_open": True})
+    output_check = permissive.checks[0].model_copy(update={"stage": GuardrailCheckStage.OUTPUT})
+    strict = permissive.model_copy(update={"policy_id": "strict-output", "checks": (output_check,)})
+    policies = (
+        (permissive.model_copy(update={"checks": (*permissive.checks, output_check)}),)
+        if same_policy
+        else (permissive, strict)
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore(policies),
+        client=DirectClassifierClient(ClassifierRegistry({})),
+        monotonic=time.monotonic,
+    )
+    with caplog.at_level(logging.INFO, logger="exp.runtime.gateway.guardrails.recording"):
+        with pytest.raises(NativeBridgeError):
+            require_unguarded_surface(engine, _authorization(), "embeddings")
+        engine.close(timeout_seconds=2)
+    assert "status=failed_open" not in caplog.text
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("outcome", [GuardrailOutcome.FLAGGED, GuardrailOutcome.UNAVAILABLE])
+def test_native_provider_finishes_and_is_charged_before_observation_completes(
+    tmp_path: Path, surface: str, stream: bool, outcome: GuardrailOutcome
+) -> None:
+    """Actual native HTTP delivery and ledger settlement never wait for an observer."""
+    classifier = _Classifier(outcome)
+    engine = _Engine(classifier, _policy(timeout_ms=5000))
+    marker = "provider response before observation"
+    with _provider(_content_chunk(marker) + _terminal_frames()) as (url, received):
+        _, key = _configured_gateway(
+            tmp_path,
+            base_url=url,
+            billing_source=BillingSource.HOST_MANAGED,
+            prices=GatewayTokenPrices(
+                input_nano_usd_per_million_tokens=1_000_000_000,
+                output_nano_usd_per_million_tokens=2_000_000_000,
+            ),
+        )
+        components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"})
+        control = NativeControlPlane(components, guardrails=engine)
+        try:
+            with _serving(control) as gateway:
+                path, body = _body(surface, stream)
+                response = httpx.post(
+                    gateway + path,
+                    headers={"authorization": f"Bearer {key}"},
+                    json=body,
+                    timeout=3,
+                )
+                assert response.status_code == 200, response.text
+                assert marker in response.text
+                assert classifier.started.wait(2)
+                assert not classifier.release.is_set() and not classifier.cancelled.is_set()
+                assert engine.observed == []
+                with connect_sqlite(components.ledger.database_path) as db:
+                    # Delivery can reach the client before the post-flush write finishes.
+                    # Keep the observer blocked while waiting for that durable write.
+                    deadline = time.monotonic() + 2
+                    while True:
+                        rows = db.execute(
+                            "select state, failure_class, budget_settled_nano_usd "
+                            "from gateway_attempts"
+                        ).fetchall()
+                        if rows and rows[0][0] == "completed":
+                            break
+                        assert time.monotonic() < deadline, rows
+                        time.sleep(0.005)
+                assert len(rows) == 1
+                assert rows[0][:2] == ("completed", None)
+                assert rows[0][2] > 0
+                assert not classifier.release.is_set() and not classifier.cancelled.is_set()
+                assert engine.observed == []
+                assert len(received) == 1
+                classifier.release.set()
+                assert control.close(2)
+                with connect_sqlite(components.ledger.database_path) as db:
+                    rows = db.execute("select result from gateway_input_moderation").fetchall()
+                assert len(rows) == 1
+                evidence = json.loads(rows[0][0])
+                assert evidence["status"] == (
+                    "observed" if outcome is GuardrailOutcome.FLAGGED else "failed_open"
+                )
+                assert evidence["observations"][0]["outcome"] in (
+                    {"flagged"} if outcome is GuardrailOutcome.FLAGGED else {"unavailable", "error"}
+                )
+                assert engine.enforced == []
+        finally:
+            classifier.release.set()
+            engine.close(timeout_seconds=2)
+
+
 @pytest.mark.parametrize("observing", [True, False])
 def test_websocket_turn_uses_the_same_observation_or_coverage_authority(
     tmp_path: Path, observing: bool
@@ -709,10 +844,10 @@ def test_native_tool_search_observes_expanded_context_without_output_enforcement
 
 
 @pytest.mark.parametrize("execution", ["before_dispatch", "parallel"])
-def test_native_serial_rejection_retains_one_observation_without_dispatch(
+def test_native_denial_retains_one_observation_and_one_terminal_owner(
     tmp_path: Path, execution: str
 ) -> None:
-    """A serial refusal cannot erase a concurrent observer or dispatch the provider."""
+    """Serial and parallel refusals retain observation and finalize through one owner."""
     classifier = _Classifier(GuardrailOutcome.FLAGGED)
     observer = _policy(timeout_ms=5000)
     blocker = observer.model_copy(
@@ -748,9 +883,13 @@ def test_native_serial_rejection_retains_one_observation_without_dispatch(
                 )
                 assert response.status_code == 400, response.text
                 assert response.json()["error"]["code"] == "content_filter"
-                assert finish.call_count == 1
-                assert finish.call_args.args[1].failure_class is GatewayFailureClass.GUARDRAIL
-                assert not received
+                if execution == "before_dispatch":
+                    assert finish.call_count == 1
+                    assert finish.call_args.args[1].failure_class is GatewayFailureClass.GUARDRAIL
+                    assert not received
+                else:
+                    assert finish.call_count == 0
+                    assert len(received) <= 1
                 assert classifier.started.wait(2)
                 classifier.release.set()
                 assert control.close(timeout_seconds=2)

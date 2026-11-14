@@ -93,6 +93,8 @@ def open_admission_guardrails(
     )
     if session is not None:
         session.native_execution = True
+    if session is not None:
+        session.native_execution = True
     if request.idempotency_key is not None:
         revision = None if session is None else session.engine.policy_revision(session.policies)
         if (
@@ -115,11 +117,19 @@ def require_unguarded_surface(
     authorization: AuthorizationSnapshot,
     surface: str,
 ) -> None:
-    """Reject applicable policies before accepting a surface this engine cannot inspect."""
+    """Record missed coverage and reject only strict unsupported policies."""
     policies = () if engine is None else engine.policies_for(authorization)
+    refused = any(
+        policy.mode == "enforce" and (policy.output_checks or not policy.input_fail_open)
+        for policy in policies
+    )
     if engine is not None:
-        engine.record_unsupported_observations(policies)
-    if any(policy.mode == "enforce" for policy in policies):
+        engine.record_unsupported_observations(
+            tuple(policy for policy in policies if not refused or policy.mode == "observe"),
+            request_id=authorization.request_id,
+            surface=surface,
+        )
+    if refused:
         raise NativeBridgeError(
             OpenAIProtocolError(
                 status_code=400,

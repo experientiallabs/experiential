@@ -35,11 +35,11 @@ from exp.runtime.gateway.web_search.contracts import GatewayWebSearchResult
 
 @pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
 @pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("outcome", ["allow", "block", "full"])
+@pytest.mark.parametrize("outcome", ["allow", "block", "error", "timeout", "grace", "full"])
 def test_native_capture_follows_the_final_moderation_release(
     tmp_path: Path, surface: str, stream: bool, outcome: str
 ) -> None:
-    """The native owner preserves required capture and financial cleanup at input release."""
+    """Moderation fail-open retains capture; required capture capacity still gates release."""
     records: list[str] = []
     collector = exp_gateway_native.CaptureCollector(
         CaptureConfiguration(settlement_required=True, maximum_pending_records=1).model_dump_json(),
@@ -54,6 +54,7 @@ def test_native_capture_follows_the_final_moderation_release(
                 tmp_path,
                 blocked=outcome == "block",
                 detector_status=500 if outcome == "error" else 200,
+                wait_ms=0 if outcome == "grace" else 3000,
                 timeout_ms=500 if outcome == "timeout" else 3000,
                 capture=capture,
             ) as scenario,
@@ -77,12 +78,17 @@ def test_native_capture_follows_the_final_moderation_release(
             finally:
                 scenario.moderator.release.set()
                 scenario.provider.release.set()
-            allowed = outcome == "allow"
-            assert response.status_code == (
-                200 if allowed else 503 if outcome == "full" else 400
-            ), response.text
+            allowed = outcome not in {"block", "full"}
+            expected_status = 503 if outcome == "full" else 200 if allowed else 400
+            assert response.status_code == expected_status, response.text
             assert ("provider-marker" in response.text) is allowed
-            assert scenario.control.close(timeout_seconds=2)
+            evidence = scenario.records()
+            assert len(evidence) == 1
+            if outcome == "full":
+                assert (
+                    "overloaded_error" if surface == "messages" else "capture_unavailable"
+                ) in response.text
+                assert evidence[0]["status"] == "allowed"
             with connect_sqlite(scenario.database) as db:
                 request_id, state = db.execute(
                     "SELECT request_id,terminal_state FROM gateway_requests"
@@ -103,7 +109,7 @@ def test_native_capture_follows_the_final_moderation_release(
             collector.settle("request", False, False)
             assert collector.close(2)
             parsed = [CaptureRecord.model_validate_json(record) for record in records]
-            captured_content = allowed and outcome != "full"
+            captured_content = allowed
             assert bool(parsed) is captured_content
             assert len({record.request.request_id for record in parsed}) == int(captured_content)
             assert sum(record.response is not None for record in parsed) == int(captured_content)
@@ -142,7 +148,7 @@ def test_native_admission_failure_releases_capture_and_financial_ownership(
             response = scenario.request(stream=False)
             assert response.status_code == (500 if broken else 200), response.text
             assert "private-capture-policy-error" not in response.text
-            assert scenario.control.close(timeout_seconds=2)
+            scenario.records()
             with connect_sqlite(scenario.database) as db:
                 request_id, terminal = db.execute(
                     "SELECT request_id,terminal_state FROM gateway_requests"

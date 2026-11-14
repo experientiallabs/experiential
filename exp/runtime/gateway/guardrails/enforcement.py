@@ -22,6 +22,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     ClassifierVerdict,
     GuardrailAction,
     GuardrailCheck,
+    GuardrailCheckStage,
     GuardrailCompletion,
     GuardrailOutcome,
     GuardrailPolicy,
@@ -318,8 +319,9 @@ class GuardrailEngine:
         self.input_invocations += 1
         limit = self._input_limit(policy)
         if limit is not None and request_exceeds_inspection_limit(request, limit):
-            self._decision(policy, None, GuardrailAction.ERROR, GuardrailOutcome.UNSUPPORTED, 0.0)
-            if policy.mode == "observe":
+            action = GuardrailAction.ALLOW if policy.input_fail_open else GuardrailAction.ERROR
+            self._decision(policy, None, action, GuardrailOutcome.UNSUPPORTED, 0.0)
+            if policy.mode == "observe" or policy.input_fail_open:
                 return request
             raise GuardrailRejected(coverage_failure())
         current = request
@@ -550,11 +552,21 @@ class GuardrailEngine:
             )
             self._emit_observation(policy, None, outcome, 0.0)
 
-    def record_unsupported_observations(self, policies: tuple[GuardrailPolicy, ...]) -> None:
-        """Record incomplete observation coverage on a surface with no inspection boundary."""
+    def record_unsupported_observations(
+        self,
+        policies: tuple[GuardrailPolicy, ...],
+        *,
+        request_id: str | None = None,
+        surface: str | None = None,
+    ) -> None:
+        """Record missed coverage without delaying an unsupported fail-open request."""
         for policy in policies:
-            if policy.mode == "observe":
-                self._emit_observation(policy, None, GuardrailOutcome.UNSUPPORTED, 0.0)
+            if policy.mode == "observe" or policy.input_fail_open:
+                self._observation_records.submit(
+                    ObservationRecord(
+                        policy, None, GuardrailOutcome.UNSUPPORTED, 0.0, request_id, surface
+                    )
+                )
 
     def close(self, *, timeout_seconds: float = 1.0) -> None:
         """Stop observations and drain within a bounded host shutdown budget."""
@@ -768,18 +780,13 @@ class GuardrailEngine:
         retention: ObservationLease | None = None,
         request_id: str | None = None,
     ) -> ClassifierVerdict | None:
-        """Invoke one adapter under the tighter of check timeout and request deadline.
-
-        The inspect itself runs on an isolation worker. This caller only waits
-        until the remaining budget elapses. A decision-model answer also queues
-        its category scores for the host's score sink when the request is known.
+        """Inspect on an isolation worker under the remaining check and request budget.
 
         Returns:
-            The verdict, or ``None`` when a non-protected check is skipped.
+            The flagged verdict, or ``None`` for an allow or skipped inspection.
 
         Raises:
-            GuardrailRejected: Protected identities fail closed. Error actions
-                and expired deadlines are always terminal.
+            GuardrailRejected: The enforcing policy requires refusal on unavailable inspection.
         """
         remaining = deadline_monotonic - self._monotonic()
         timeout = min(check.timeout_ms / 1000.0, remaining)
@@ -796,14 +803,15 @@ class GuardrailEngine:
                 retention=retention,
             )
         except ClassifierCoverageError:
+            fail_open = check.stage is GuardrailCheckStage.INPUT and policy.input_fail_open
             self._decision(
                 policy,
                 check,
-                GuardrailAction.ERROR,
+                GuardrailAction.ALLOW if fail_open else GuardrailAction.ERROR,
                 GuardrailOutcome.UNSUPPORTED,
                 self._monotonic() - started,
             )
-            if policy.mode == "enforce":
+            if policy.mode == "enforce" and not fail_open:
                 raise GuardrailRejected(coverage_failure(check_id=check.check_id)) from None
             return None
         except ClassifierUncertainError:
@@ -862,8 +870,10 @@ class GuardrailEngine:
         latency_seconds: float = 0.0,
     ) -> ClassifierVerdict | None:
         """Apply fail-closed or skip-and-continue for an uncertain check."""
-        self._decision(policy, check, GuardrailAction.ERROR, outcome, latency_seconds)
-        if policy.protected and policy.mode == "enforce":
+        fail_open = check.stage is GuardrailCheckStage.INPUT and policy.input_fail_open
+        action = GuardrailAction.ALLOW if fail_open else GuardrailAction.ERROR
+        self._decision(policy, check, action, outcome, latency_seconds)
+        if policy.protected and policy.mode == "enforce" and not fail_open:
             raise GuardrailRejected(
                 GatewayFailure(
                     failure_class=GatewayFailureClass.UNAVAILABLE,
@@ -899,6 +909,7 @@ class GuardrailEngine:
 
     def _deliver_observation(self, record: ObservationRecord) -> None:
         """Invoke the host sink only on the separately bounded metadata worker."""
+        record.log_coverage()
         self._record_observation(
             record.policy, record.check, record.outcome, record.latency_seconds
         )
@@ -911,19 +922,7 @@ class GuardrailEngine:
         latency_seconds: float,
     ) -> None:
         """Emit content-free observation metadata separately from enforced decisions."""
-        _logger.info(
-            "guardrail observation policy_id=%s revision=%s organization_id=%s identity_id=%s "
-            "check_id=%s capability=%s would_action=%s outcome=%s latency_ms=%.1f",
-            policy.policy_id,
-            policy.revision,
-            policy.organization_id,
-            policy.identity_id,
-            None if check is None else check.check_id,
-            None if check is None else check.capability.value,
-            None if check is None else check.action.value,
-            outcome.value,
-            latency_seconds * 1000,
-        )
+        ObservationRecord(policy, check, outcome, latency_seconds).log_outcome()
 
     def _apply_input(
         self,

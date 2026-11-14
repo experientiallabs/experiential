@@ -38,6 +38,7 @@ from exp.runtime.gateway.guardrails.classifiers import (
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient, InspectingClassifier
 from exp.runtime.gateway.guardrails.contracts import (
     CategoryScore,
+    ClassifierCoverageError,
     ClassifierVerdict,
     GuardrailAction,
     GuardrailCapabilityKind,
@@ -87,6 +88,11 @@ class _Clock:
 class _RaisingClassifier(ScriptedClassifier):
     """Adapter that fails every inspection."""
 
+    def __init__(self, error_type: type[Exception] = RuntimeError) -> None:
+        """Choose whether inspection is unavailable or lacks subject coverage."""
+        super().__init__()
+        self._error_type = error_type
+
     async def inspect_input(
         self,
         *,
@@ -96,7 +102,7 @@ class _RaisingClassifier(ScriptedClassifier):
         """Raise instead of returning a verdict."""
         del request, check
         self.input_calls += 1
-        raise RuntimeError("classifier unavailable")
+        raise self._error_type()
 
     async def inspect_output(
         self,
@@ -107,7 +113,7 @@ class _RaisingClassifier(ScriptedClassifier):
         """Raise instead of returning a verdict."""
         del completion, check
         self.output_calls += 1
-        raise RuntimeError("classifier unavailable")
+        raise self._error_type()
 
 
 class _HungAsyncClassifier:
@@ -854,7 +860,10 @@ def test_input_modify_can_redact_only_history_after_authenticated_reasoning() ->
     assert result.messages == replacement
 
 
-def test_input_modify_rejects_removing_provider_reasoning_with_bound_history() -> None:
+@pytest.mark.parametrize("fail_open", [False, True])
+def test_input_modify_rejects_removing_provider_reasoning_with_bound_history(
+    fail_open: bool,
+) -> None:
     """A modifier cannot truncate authenticated provider history to a new user turn."""
     request = _reasoning_request()
     replacement = (GatewayMessage(role="user", content="fully redacted"),)
@@ -866,6 +875,7 @@ def test_input_modify_rejects_removing_provider_reasoning_with_bound_history() -
     )
     policy = engine.policies_for(_authorization())[0]
     assert policy is not None
+    policy = policy.model_copy(update={"input_fail_open": fail_open})
 
     with pytest.raises(GuardrailRejected):
         _awaited(engine.enforce_input(policy=policy, request=request, deadline_monotonic=200.0))
@@ -1070,6 +1080,48 @@ def test_unprotected_identity_skips_a_failed_check() -> None:
     )
 
     assert result.messages[0].content == "hello"
+
+
+@pytest.mark.parametrize("expired", [False, True])
+@pytest.mark.parametrize("error_type", [RuntimeError, ClassifierCoverageError])
+def test_serial_modify_fail_open_preserves_input_without_waiving_output(
+    expired: bool, error_type: type[Exception]
+) -> None:
+    """Missing or timed-out modification returns the original input under an explicit opt-in."""
+    engine, _classifier = _engine(
+        classifier=_RaisingClassifier(error_type),
+        checks=(
+            _check("input", action=GuardrailAction.MODIFY),
+            _check("output", stage=GuardrailCheckStage.OUTPUT, action=GuardrailAction.MODIFY),
+        ),
+        protected=True,
+    )
+    policy = engine.policies_for(_authorization())[0].model_copy(
+        update={"input_fail_open": True, "input_execution": "before_dispatch"}
+    )
+    original = _request("unchanged")
+    deadline = 0.0 if expired else 200.0
+    try:
+        assert (
+            _awaited(
+                engine.enforce_input(
+                    policy=policy,
+                    request=original,
+                    deadline_monotonic=deadline,
+                )
+            )
+            == original
+        )
+        with pytest.raises(GuardrailRejected):
+            _awaited(
+                engine.enforce_output(
+                    policy=policy,
+                    completion=GuardrailCompletion(text="output"),
+                    deadline_monotonic=deadline,
+                )
+            )
+    finally:
+        engine.close(timeout_seconds=2)
 
 
 def test_expired_deadline_fail_closes_for_protected_identities() -> None:
