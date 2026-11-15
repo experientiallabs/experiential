@@ -851,8 +851,10 @@ def test_native_expiry_counts_only_unfinished_checks_once() -> None:
 
 
 @pytest.mark.parametrize("late_outcome", ["block", "timeout"])
+@pytest.mark.parametrize("boundary_started", [False, True])
 def test_native_late_result_records_one_expiry_without_an_enforced_block(
     late_outcome: str,
+    boundary_started: bool,
 ) -> None:
     """A long stream cannot turn a late result into duplicate or applied telemetry."""
     classifier = _Classifier("block")
@@ -871,7 +873,7 @@ def test_native_late_result_records_one_expiry_without_an_enforced_block(
     )
     native = Mock()
     native.expired.return_value = False
-    native.elapsed_seconds.return_value = None
+    native.elapsed_seconds.return_value = 0.0 if boundary_started else None
     native.decision_json.return_value = '{"action":"allow"}'
     session = _session(engine)
     session.native_input = native

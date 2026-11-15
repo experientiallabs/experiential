@@ -284,7 +284,9 @@ class GuardrailSession:
         if result is None:
             self._finish_input_check(policy, expired=True)
             return request
-        self._finish_input_check(policy)
+        self._finish_input_check(
+            policy, expired=self.native_input is not None and self.native_input.expired()
+        )
         return result
 
     async def _inspect_input(self, request: GatewayRequest) -> GatewayRequest:
