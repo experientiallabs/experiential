@@ -29,6 +29,12 @@ from exp.runtime.gateway.routing import GatewayRoute
 FallbackRules = tuple[frozenset[str] | None, ...]
 """One entry per route depth: the rung's token set, or ``None`` for an unrestricted rung."""
 
+RungFamily = tuple[str, str, str, frozenset[str] | None]
+"""One upstream offering: ``(provider, provider_model, billing_source, failover_only_on)``."""
+
+RungFamilies = tuple[RungFamily, ...]
+"""One entry per route depth: the rung family that depth dials (``route_rung_families``)."""
+
 FALLBACK_REASON_PREFIX = "failover_only_on:"
 """Prefix of the ledger ``fallback_reason`` an attempt on a rule-matched rung records."""
 
@@ -135,6 +141,77 @@ def untried_depths(
         for depth in eligible_depths(rules, 0, failure, unrestricted=unrestricted)
         if depth != current_depth and (depth >= len(dispatched) or dispatched[depth] == 0)
     )
+
+
+def route_rung_families(route: GatewayRoute) -> RungFamilies:
+    """Return each depth's rung family.
+
+    A family is one upstream offering on one kind of credential: the
+    deployments of one lane differ only by connection and share a family,
+    while a different provider or model, a customer's own credential, or a
+    rung carrying its own ``failover_only_on`` set is a family of its own.
+    """
+    return tuple(
+        (
+            deployment.provider,
+            deployment.provider_model,
+            deployment.billing_source.value,
+            rung_rules(deployment),
+        )
+        for deployment in route.deployments
+    )
+
+
+def fresh_family_count(
+    depths: Sequence[int], families: RungFamilies, dispatched: Sequence[int]
+) -> int:
+    """Count the families with a depth in ``depths`` that this request has not dialed.
+
+    Args:
+        depths: The untried eligible depths.
+        families: One family per route depth.
+        dispatched: Physical dispatches per route depth in this request.
+
+    Returns:
+        How many undialed families the remaining attempts must still reach.
+    """
+    dialed = {families[depth] for depth, count in enumerate(dispatched) if count > 0}
+    return len({families[depth] for depth in depths} - dialed)
+
+
+def reserve_fresh_families(
+    depths: tuple[int, ...],
+    families: RungFamilies,
+    dispatched: Sequence[int],
+    remaining_attempts: int,
+) -> tuple[int, ...]:
+    """Order ``depths`` so the attempt budget reaches every untried rung family.
+
+    A route often lists one rung as several deployments of one family (one
+    per connection of the same lane) ahead of the next rung. Walked in route
+    order, a throttle burst answered by every connection would spend the
+    whole attempt budget on that family and end the request with the next
+    rung never dialed. So when the attempts left (this one included) are no
+    more than the families this request has not dialed yet
+    (``fresh_family_count``), those fresh families' depths come first, in
+    route order. The other depths follow, so a fresh rung that sheds or is
+    refused still spills onto a sibling. With budget to spare the order is
+    unchanged.
+
+    Args:
+        depths: The untried eligible depths, in route order.
+        families: One family per route depth.
+        dispatched: Physical dispatches per route depth in this request.
+        remaining_attempts: Attempts the request may still make, this one included.
+
+    Returns:
+        The same depths, fresh families first when the budget is tight.
+    """
+    if fresh_family_count(depths, families, dispatched) < remaining_attempts:
+        return depths
+    dialed = {families[depth] for depth, count in enumerate(dispatched) if count > 0}
+    fresh = tuple(depth for depth in depths if families[depth] not in dialed)
+    return fresh + tuple(depth for depth in depths if depth not in fresh)
 
 
 def eligible_ladder(route: GatewayRoute, failure: GatewayFailure | None) -> tuple[int, ...]:

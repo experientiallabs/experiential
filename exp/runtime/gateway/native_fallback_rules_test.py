@@ -7,6 +7,7 @@ import pytest
 from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
 from exp.common.models.failover_tokens import FailoverToken
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.models.model import BillingSource
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -31,7 +32,9 @@ from exp.runtime.gateway.native_fallback_rules import (
     failure_token,
     matched_token,
     require_unrestricted_rung,
+    reserve_fresh_families,
     route_fallback_rules,
+    route_rung_families,
     rule_fallback_reason,
     untried_depths,
 )
@@ -269,3 +272,65 @@ def test_coercible_rejections_are_due_only_without_a_first_dial() -> None:
     # No unrestricted rung at all: every rejection, left to the guard's error.
     restricted = _route(_deployment("x", ("refusal",)), _deployment("y", ("throttled",)))
     assert coercible_rejections(restricted, (), ("x-lacks", "y-lacks")) == ("x-lacks", "y-lacks")
+
+
+_ANTHROPIC = ("anthropic", "claude-fable", "host_managed", None)
+_OPENROUTER = ("openrouter", "~anthropic/claude-fable-latest", "host_managed", None)
+_EIGHT_THEN_ONE = (_ANTHROPIC,) * 8 + (_OPENROUTER,)
+
+
+@pytest.mark.parametrize(
+    ("dispatched", "remaining", "expected"),
+    [
+        # Budget to spare: route order is kept.
+        ((1, 0, 0, 0, 0, 0, 0, 0, 0), 7, (1, 2, 3, 4, 5, 6, 7, 8)),
+        ((1, 1, 1, 1, 1, 1, 0, 0, 0), 2, (6, 7, 8)),
+        # The last attempt: the undialed family comes first, siblings after it.
+        ((1, 1, 1, 1, 1, 1, 1, 0, 0), 1, (8, 7)),
+        # Nothing fresh left: route order.
+        ((1, 1, 1, 1, 1, 1, 1, 0, 1), 1, (7,)),
+    ],
+)
+def test_reserve_fresh_families_reaches_the_next_rung_before_the_budget_ends(
+    dispatched: tuple[int, ...], remaining: int, expected: tuple[int, ...]
+) -> None:
+    """The order changes only when the attempts left could not reach every untried family."""
+    untried = tuple(depth for depth, count in enumerate(dispatched) if count == 0)
+    assert reserve_fresh_families(untried, _EIGHT_THEN_ONE, dispatched, remaining) == expected
+
+
+def test_reserve_fresh_families_never_adds_a_depth_the_rules_excluded() -> None:
+    """A rung the rules left out (a failover-only key, say) is not brought back."""
+    dispatched = (1, 1, 1, 1, 1, 1, 1, 0, 0)
+    assert reserve_fresh_families((7,), _EIGHT_THEN_ONE, dispatched, 1) == (7,)
+
+
+def test_route_rung_families_split_rule_and_customer_credentials_from_house_connections() -> None:
+    """Connections of one lane share a family; a rule-only or customer credential does not."""
+    house = _deployment("house-1"), _deployment("house-2")
+    rule_key = _deployment("trusted-key", ("refusal:cyber_policy",))
+    customer = _deployment("customer").model_copy(
+        update={"billing_source": BillingSource.CUSTOMER_MANAGED}
+    )
+    house_managed = tuple(
+        item.model_copy(update={"billing_source": BillingSource.HOST_MANAGED}) for item in house
+    )
+    families = route_rung_families(_route(*house_managed, rule_key, customer))
+    assert families[0] == families[1]
+    assert len({families[1], families[2], families[3]}) == 3
+
+
+def test_a_tight_budget_keeps_a_matched_rule_key_ahead_of_a_later_fresh_rung() -> None:
+    """A rule-only key after dialed house connections is fresh, so route order keeps it first."""
+    house = tuple(
+        _deployment(f"house-{index}").model_copy(
+            update={"billing_source": BillingSource.HOST_MANAGED}
+        )
+        for index in range(7)
+    )
+    rule_key = _deployment("trusted-key", ("refusal:cyber_policy",))
+    later = _deployment("later").model_copy(update={"provider": "anthropic"})
+    route = _route(*house, rule_key, later)
+    families = route_rung_families(route)
+    dispatched = (1,) * 7 + (0, 0)
+    assert reserve_fresh_families((7, 8), families, dispatched, 1) == (7, 8)

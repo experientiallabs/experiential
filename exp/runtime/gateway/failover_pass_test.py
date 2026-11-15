@@ -6,6 +6,7 @@ each with a refusing ``concurrency_bound``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from typing import cast
@@ -15,7 +16,9 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelCapabilities
 from exp.common.models.catalog import GatewayRungDispatchPolicy
+from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.runtime.gateway.budgets import BudgetScopeKind
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_accounting_test import (
@@ -414,3 +417,197 @@ def test_a_transport_failure_returns_to_its_rung_when_the_sibling_cannot_take_it
     # forcing the sibling past its bound or ending the request.
     reserved = _start(registry, ordinal=1, current_depth=0, failure=_REFUSED, request_id="redial")
     assert reserved["route_depth"] == 0
+
+
+# A provider 429 exactly as the data plane classifies it (never redialed on its own).
+_RATE_LIMITED: JsonObject = {
+    "failure_class": "throttled",
+    "safe_message": "provider throttled the request: http 429: rate_limit_error",
+    "retryable_same_deployment": False,
+    "failover_eligible": True,
+}
+
+
+def _lane_connections(
+    provider: str, provider_model: str, count: int
+) -> tuple[ExactModelDeployment, ...]:
+    """Build one waterfall rung served through ``count`` connections.
+
+    Args:
+        provider: The provider every connection dials.
+        provider_model: The model every connection dials.
+        count: How many connections (one deployment each) the rung lists.
+
+    Returns:
+        The rung's deployments in route order, one per connection.
+    """
+    return tuple(
+        _deployment(
+            f"{provider}-c-{index}",
+            connection_sha256=hashlib.sha256(f"{provider}-{index}".encode()).hexdigest(),
+        ).model_copy(update={"provider": provider, "provider_model": provider_model})
+        for index in range(count)
+    )
+
+
+def _throttle_every_attempt(
+    registry: NativeAttemptAccounting,
+    ledger: _RecordingLedger,
+    request_id: str,
+    *,
+    throttle_backoff: bool = False,
+) -> JsonObject:
+    """Answer every attempt of ``request_id`` with a 429 until it lands on openrouter or ends.
+
+    Args:
+        registry: The accounting bridge serving the request.
+        ledger: The recording ledger whose started rows name each dialed deployment.
+        request_id: The admitted request to drive.
+        throttle_backoff: Whether each reservation reports that the data plane
+            waited the pool's backoff (asking to redial the throttled rung).
+
+    Returns:
+        The last reservation answer: the openrouter attempt, or the exhausted reply.
+    """
+    answer = _start(registry, ordinal=0, request_id=request_id)
+    while answer.get("exhausted") is not True:
+        depth = int(cast("int", answer["route_depth"]))
+        if str(ledger.started[-1]["deployment_id"]).startswith("openrouter"):
+            return answer
+        _settle(
+            registry,
+            attempt_id=str(answer["attempt_id"]),
+            outcome="failed",
+            finalize=False,
+            failure=_RATE_LIMITED,
+            request_id=request_id,
+        )
+        answer = _start(
+            registry,
+            ordinal=len(ledger.started),
+            current_depth=depth,
+            failure=_RATE_LIMITED,
+            request_id=request_id,
+            throttle_backoff=throttle_backoff,
+        )
+    return answer
+
+
+def test_scheduled_throttle_redials_leave_the_last_attempt_for_the_next_rung() -> None:
+    """Post-backoff redials of a lane's connections stop where the next rung needs the budget."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    route = (
+        *_lane_connections("anthropic", "claude-fable", 8),
+        *_lane_connections("openrouter", "~anthropic/claude-fable-latest", 1),
+    )
+    redial = GatewayThrottleRedialPolicy(max_attempts=3, base_delay_ms=500, max_delay_ms=8_000)
+    _admit(registry, route, request_id="redials", throttle_redial=redial)
+    landed = _throttle_every_attempt(registry, ledger, "redials", throttle_backoff=True)
+    assert landed.get("exhausted") is not True, landed
+    assert [row["route_depth"] for row in ledger.started] == [0, 0, 0, 0, 1, 1, 1, 8]
+    assert ledger.started[-1]["dispatch_reason"] == "throttle_failover_cold"
+
+
+@pytest.mark.parametrize("redial_authored", [False, True])
+def test_a_rung_whose_every_connection_throttles_continues_to_the_next_rung(
+    redial_authored: bool,
+) -> None:
+    """Production, 2026-11-15: eight throttled connections must not spend the whole budget.
+
+    Rung 0 is one lane behind eight connections and rung 1 a second provider.
+    Every connection answered a 429; the eight-attempt cap was spent on rung 0
+    and the caller got the 429. The last attempt now goes to rung 1.
+    """
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    route = (
+        *_lane_connections("anthropic", "claude-fable", 8),
+        *_lane_connections("openrouter", "~anthropic/claude-fable-latest", 1),
+    )
+    redial = (
+        GatewayThrottleRedialPolicy(max_attempts=3, base_delay_ms=500, max_delay_ms=8_000)
+        if redial_authored
+        else None
+    )
+    entry = _admit(registry, route, request_id="fable", throttle_redial=redial)
+    assert entry.attempt_policy.maximum_total_attempts == 8
+    landed = _throttle_every_attempt(registry, ledger, "fable")
+    assert landed.get("exhausted") is not True, landed
+    assert landed["route_depth"] == 8
+    assert [row["route_depth"] for row in ledger.started] == [0, 1, 2, 3, 4, 5, 6, 8]
+    assert ledger.started[-1]["deployment_id"] == "openrouter-c-0"
+    assert ledger.started[-1]["attempt_ordinal"] == 7
+    if redial_authored:
+        assert ledger.started[-1]["dispatch_reason"] == "throttle_failover_cold"
+        assert ledger.started[-1]["preferred_deployment_id"] == "anthropic-c-6"
+    # Every throttled connection keeps its own window: none is claimable for others.
+    keys = [deployment_health_key(entry.authorization, item) for item in route[:7]]
+    assert all(not registry.health.claim(key) for key in keys)
+
+
+def test_budget_to_spare_keeps_route_order_across_connections() -> None:
+    """With attempts left for every family, the walk stays in route order."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    route = (
+        *_lane_connections("anthropic", "claude-fable", 3),
+        *_lane_connections("openrouter", "~anthropic/claude-fable-latest", 1),
+    )
+    _admit(registry, route, request_id="short")
+    landed = _throttle_every_attempt(registry, ledger, "short")
+    assert landed["route_depth"] == 3
+    assert [row["route_depth"] for row in ledger.started] == [0, 1, 2, 3]
+
+
+def test_a_free_route_never_overflows_to_a_paid_rung_when_its_connections_throttle() -> None:
+    """``:free`` stays free: the host refuses the paid rung, so the budget stays on free lanes.
+
+    The reserve moves the paid rung up to the last attempt; the host ledger
+    refuses to reserve it for a free-only request, so the walk spills back to
+    the last free connection rather than ending, and no paid attempt exists.
+    """
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    free = _lane_connections("anthropic", "claude-fable", 8)
+    paid = _lane_connections("openrouter", "~anthropic/claude-fable-latest", 1)
+    ledger.budget_rejections[paid[0].deployment_id] = BudgetScopeKind.DEPLOYMENT
+    _admit(registry, (*free, *paid), request_id="free")
+    answer = _throttle_every_attempt(registry, ledger, "free")
+    assert answer["exhausted"] is True
+    assert cast("JsonObject", answer["failure"])["failure_class"] == "throttled"
+    assert [row["route_depth"] for row in ledger.started] == list(range(8))
+    assert all(str(row["deployment_id"]).startswith("anthropic") for row in ledger.started)
+
+
+def test_a_route_with_no_further_rung_ends_with_the_throttle() -> None:
+    """A host-compiled ``:free`` route with only free connections still ends in the 429."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    _admit(registry, _lane_connections("anthropic", "claude-fable", 8), request_id="alone-429")
+    answer = _throttle_every_attempt(registry, ledger, "alone-429")
+    assert answer["exhausted"] is True
+    assert cast("JsonObject", answer["failure"])["failure_class"] == "throttled"
+    assert [row["route_depth"] for row in ledger.started] == list(range(8))
+
+
+def test_a_last_attempt_ordered_past_an_ejected_next_rung_discloses_the_ejection() -> None:
+    """Fresh-first order puts the ejected next rung ahead; the sibling that serves names it."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    route = (
+        *_lane_connections("anthropic", "claude-fable", 8),
+        *_lane_connections("openrouter", "~anthropic/claude-fable-latest", 1),
+    )
+    entry = _admit(registry, route, request_id="ejected-next")
+    dead_key = deployment_health_key(entry.authorization, route[8])
+    for _ in range(3):
+        registry.health.failed(
+            dead_key,
+            GatewayFailure(failure_class=GatewayFailureClass.TRANSPORT, safe_message="refused"),
+        )
+    answer = _throttle_every_attempt(registry, ledger, "ejected-next")
+    assert answer["exhausted"] is True
+    assert [row["route_depth"] for row in ledger.started] == list(range(8))
+    assert ledger.started[-1]["dispatch_reason"] == "lane_ejected"
+    assert ledger.started[-1]["preferred_deployment_id"] == "openrouter-c-0"

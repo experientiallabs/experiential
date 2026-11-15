@@ -53,7 +53,12 @@ from exp.runtime.gateway.lane_ejection import DEAD_LANE_FAILURES
 from exp.runtime.gateway.lane_saturation import lane_saturated_failure
 from exp.runtime.gateway.native_context_window import route_context_windows, wider_windows
 from exp.runtime.gateway.native_execution import InflightRequest
-from exp.runtime.gateway.native_fallback_rules import route_fallback_rules, untried_depths
+from exp.runtime.gateway.native_fallback_rules import (
+    reserve_fresh_families,
+    route_fallback_rules,
+    route_rung_families,
+    untried_depths,
+)
 from exp.runtime.gateway.rung_admission import RungShed
 
 
@@ -112,13 +117,18 @@ class FailoverPass:
         )
         if not (failure.failover_eligible or refusal):
             return None
-        untried = wider_windows(
-            untried_depths(
-                route_fallback_rules(entry.route), failure, entry.attempt_counts, current_depth
+        untried = reserve_fresh_families(
+            wider_windows(
+                untried_depths(
+                    route_fallback_rules(entry.route), failure, entry.attempt_counts, current_depth
+                ),
+                failure,
+                current_depth,
+                route_context_windows(entry.route),
             ),
-            failure,
-            current_depth,
-            route_context_windows(entry.route),
+            route_rung_families(entry.route),
+            entry.attempt_counts,
+            entry.attempt_policy.maximum_total_attempts - entry.total_attempts,
         )
         policy = entry.attempt_policy
         cap = policy.physical_route_cap

@@ -6,8 +6,30 @@ from __future__ import annotations
 from datetime import datetime
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway.native_execution import deployment_priced_for_service_tier
 from exp.runtime.gateway.service_tiers import GatewayServiceTierAdmission, tier_admission
+
+
+def deployment_priced_for_service_tier(
+    deployment: ExactModelDeployment,
+    service_tier: str | None,
+    *,
+    forwards_tier: bool,
+) -> ExactModelDeployment:
+    """Reprice one deployment for a requested flex/priority processing tier.
+
+    The admitted card is frozen beside the standard card; settlement selects
+    between them from upstream evidence rather than assuming the requested tier.
+    No tier, no forwarding, or no card returns the deployment unchanged. The
+    copy stays Python-side and never crosses the native boundary.
+    """
+    if not forwards_tier:
+        return deployment
+    effective = deployment.gateway.prices.for_service_tier(service_tier)
+    if effective is deployment.gateway.prices:
+        return deployment
+    return deployment.model_copy(
+        update={"gateway": deployment.gateway.model_copy(update={"prices": effective})}
+    )
 
 
 def deployment_priced_at[DeploymentT: ExactModelDeployment | None](
