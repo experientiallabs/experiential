@@ -207,6 +207,22 @@ impl Owner {
         Ok(reply)
     }
 
+    /// The caller owns execution. A racing completion still retains a failed late meter.
+    fn write_late(&self, method: &str, input: Value) -> Result<Value, PublicError> {
+        let result = self.write(method, &input);
+        let mut state = self.state()?;
+        if result.is_err() {
+            state.late.get_or_insert(input);
+        } else if state
+            .late
+            .as_ref()
+            .is_some_and(|late| late["attempt_id"] == input["attempt_id"])
+        {
+            state.late = None;
+        }
+        result
+    }
+
     fn terminal(&self, method: &str, input: Value) -> Result<Value, PublicError> {
         let Some(pending) = self.observe(input.clone())? else {
             // A meter that arrives after recovery finished the request is still
@@ -214,25 +230,14 @@ impl Owner {
             // cancelled one records the late meter, so served usage stays billed.
             // A failed delivery stays owned until recovery writes it.
             let _execution = self.execution.lock().map_err(|_| PublicError::internal())?;
-            let result = self.write(method, &input);
-            let mut state = self.state()?;
-            if result.is_err() {
-                state.late.get_or_insert(input);
-            } else if state
-                .late
-                .as_ref()
-                .is_some_and(|late| late["attempt_id"] == input["attempt_id"])
-            {
-                state.late = None;
-            }
-            return result;
+            return self.write_late(method, input);
         };
         let _execution = self.execution.lock().map_err(|_| PublicError::internal())?;
         {
             let state = self.state()?;
             if state.finished {
                 drop(state);
-                return self.write(method, &input);
+                return self.write_late(method, input);
             }
             if !state
                 .pending
@@ -491,6 +496,44 @@ mod acknowledgement_contract {
             assert_eq!(method, "settle");
             Ok(json!({"terminalized": self.0.load(Ordering::SeqCst)}))
         }
+    }
+
+    #[test]
+    fn a_writer_waiting_on_execution_retains_evidence_after_another_completion() {
+        let driver = Arc::new(PendingWrite::default());
+        let owner = Owner::new(
+            "request".into(),
+            "org".into(),
+            Instant::now() + Duration::from_secs(60),
+            driver.clone(),
+        );
+        let meter = json!({"request_id":"request", "attempt_id":"attempt", "outcome":"completed", "finalize":true, "usage":{"input_tokens":37,"output_tokens":5}});
+        let execution = owner.execution.lock().unwrap();
+        let waiting_owner = owner.clone();
+        let waiting_meter = meter.clone();
+        let waiting = std::thread::spawn(move || waiting_owner.call("settle", waiting_meter));
+        let end = Instant::now() + Duration::from_secs(5);
+        let pending = loop {
+            if let Some(pending) = owner.state().unwrap().pending.clone() {
+                break pending;
+            }
+            assert!(
+                Instant::now() < end,
+                "waiting writer did not observe the meter"
+            );
+            std::thread::yield_now();
+        };
+        // Commit through the same owner transition while the second writer waits.
+        owner.committed(&pending, &Ok(json!({}))).unwrap();
+        drop(execution);
+        assert!(waiting.join().unwrap().is_err());
+        assert!(owner.fenced());
+        assert!(!owner.retired());
+        assert_eq!(owner.state().unwrap().late.as_ref(), Some(&meter));
+        driver.0.store(true, Ordering::SeqCst);
+        owner.recover(Instant::now()).unwrap();
+        assert!(owner.retired());
+        assert!(!owner.fenced());
     }
 
     #[test]
