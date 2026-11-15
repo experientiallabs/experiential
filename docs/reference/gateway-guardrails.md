@@ -74,15 +74,28 @@ retention also wait. Approval releases the pending prefix and resumes normal
 streaming, without waiting for full completion. Function declarations supplied by
 clients do not execute remote tools.
 
-A block, classifier error, or timeout cancels the provider request and discards its
-response. The trusted `input_guardrail_denied` settlement detail requires zero
-customer charge while retaining available provider usage. Missing final usage uses
-the existing estimated or unknown-cost accounting contract. The platform bears
-provider work that already occurred; cancellation cannot undo it.
+A confirmed block cancels the provider request and discards its response. Strict
+policies also stop on classifier uncertainty. With `input_fail_open=true`, classifier
+errors, overload and timeouts allow the request and record the uncertainty.
+`input_max_wait_ms` bounds additional waiting once the first streaming content or
+complete buffered response is ready. A final provider error is also a response
+boundary. For a parallel fail-open policy that must wait before dispatch, the
+same budget starts at that blocking boundary. One request retains the earliest
+boundary through admission, retries, tool successors and input revalidation;
+each round does not receive a fresh wait. Strict policies and explicitly serial
+policies keep their configured classifier deadlines. A verdict arriving after
+fail-open delivery cannot revoke that response.
+The trusted `input_guardrail_denied` settlement detail requires zero customer charge
+while retaining available provider usage. Missing final usage uses the existing
+estimated or unknown-cost accounting contract. The host bears provider work that
+already occurred; cancellation cannot undo it.
 
 Provider-native or provider-server tools, gateway web or tool search, explicit cache
-operations, service tiers, and routes with customer-managed credentials require
-approval before dispatch. These are execution constraints of the same session.
+operations, service tiers, premium fast mode, and customer-managed credentials require
+approval before dispatch. Read-only checks on direct routes wait in Rust after host
+admission has returned, so the classifier does not occupy an admission worker.
+Requests requiring admission-time web search and input rewrites complete inspection
+before that work. These are execution constraints of the same session.
 Customers cannot choose the operator policy's mode or forge its settlement detail.
 
 Project aliases complete input inspection before learned routing. Selection may
@@ -136,7 +149,7 @@ window of the request (a `WindowedClassifier`) declares a configuration digest. 
 joins the replay revision, and a policy whose input checks are all windowed is not refused
 for its total request size.
 
-Startup requires `GUARDRAIL_CONTRACT_VERSION=3`. Publish coordinated engine and
+Startup requires `GUARDRAIL_CONTRACT_VERSION=5`. Publish coordinated engine and
 native packages before a downstream host updates its exact release pins. There
 are no synchronous adapter wrappers, alternate mandatory-policy entry points, or
 package-version fallbacks.
@@ -270,7 +283,20 @@ failed check and continue the remaining chain.
 ## Latency
 
 With `input_execution="before_dispatch"`, input inspection follows continuation
-expansion and delays dispatch. Parallel input inspection uses the overlap rules above. Output enforcement for a protected identity delays the
+expansion and delays dispatch. On direct aliases, read-only serial checks wait in
+Rust after host admission releases its capacity, before acquiring dispatch capacity
+or reserving a provider attempt. A denied request has a failed request record with
+no attempt or customer charge. Checks that rewrite input still finish before
+acceptance and routing. Gateway-run web search also requires inspection before its
+admission-time search call; it does not use deferred admission.
+
+Parallel input inspection uses the overlap rules above. Its response-ready grace
+starts at the first deliverable event for an incremental stream, or after the full
+provider response for non-streaming and buffered output. Input denial still cancels
+generation during that collection. Required capture, continuation retention and
+replay publication remain behind input approval.
+
+Output enforcement for a protected identity delays the
 first visible byte until the winning completion is buffered and the output
 chain returns.
 

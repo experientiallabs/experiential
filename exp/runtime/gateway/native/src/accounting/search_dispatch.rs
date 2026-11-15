@@ -1,5 +1,7 @@
 //! Request-owned tool execution and the next physical dispatch on the same rung.
 
+use std::sync::Arc;
+
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -57,6 +59,7 @@ impl Dispatch {
         &self,
         input: &Value,
         state: &mut State,
+        serial_gate: &mut Option<Arc<super::input::InputGate>>,
     ) -> Result<Value, PublicError> {
         let depth = input["route_depth"]
             .as_u64()
@@ -72,8 +75,11 @@ impl Dispatch {
         }
         let session = state.search.as_mut().ok_or_else(PublicError::internal)?;
         let plan = session.plans.get(depth).ok_or_else(PublicError::internal)?;
+        let runtime = super::inspection_http::runtime().map_err(|_| PublicError::internal())?;
+        // The strict wait ran without holding dispatch. Recheck after acquiring it
+        // so cancellation or a new denial cannot start a paid search.
         let approved = self.resources.status();
-        if approved["action"] != "allow" {
+        if approved["action"] != "allow" && approved["action"] != "pending" {
             if approved["failure"].is_object() {
                 return Ok(json!({"inspection_failure": approved["failure"], "rounds": []}));
             }
@@ -108,19 +114,42 @@ impl Dispatch {
                 gate.bind_reporter(self.resources.reporting.as_ref().and_then(|r| r.reporter()));
             }
         }
-        let inspected = super::inspection_http::runtime()
-            .map_err(|_| PublicError::internal())?
-            .block_on(input_program::enforce(
+        let inspected = if session.checks.is_empty() {
+            Ok(subject)
+        } else if session
+            .checks
+            .iter()
+            .all(|check| check.check["action"] != "modify")
+        {
+            let checks = input_program::read_only(&session.checks, &subject);
+            let gate = super::input::InputGate::start(
+                checks,
+                self.deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_secs_f64(),
+            )
+            .map_err(|_| PublicError::internal())?;
+            gate.bind_reporter(self.resources.reporting.as_ref().and_then(|r| r.reporter()));
+            if !session
+                .checks
+                .iter()
+                .all(|check| check.policy["input_execution"] == "parallel")
+            {
+                // The caller releases dispatch before waiting on this decision.
+                *serial_gate = Some(gate.clone());
+            }
+            // The prior search turn settles under its original decision. Activate
+            // this inspection only when its successor attempt is reserved.
+            self.resources.stage_reinspection(gate)?;
+            Ok(subject)
+        } else {
+            runtime.block_on(input_program::enforce(
                 &session.checks,
                 &subject,
                 self.deadline,
+                self.resources.blocking_boundary()?,
                 self.resources.reporting.as_ref(),
-            ));
-        let inspected = if !session.checks.is_empty() && std::time::Instant::now() >= self.deadline
-        {
-            Err(super::input::unavailable())
-        } else {
-            inspected
+            ))
         };
         let inspected = match inspected {
             Ok(subject) => subject,

@@ -44,6 +44,7 @@ from exp.runtime.gateway.guardrails.subjects import observation_subject_bytes
 from exp.runtime.gateway.native_capture import capture_unavailable_failure
 from exp.runtime.gateway.tests.guardrail_fixture_test import _Classifier, _engine
 from exp.runtime.gateway.tool_contracts import GatewayProviderNativeTool
+from exp.runtime.gateway.tool_search.contracts import GatewayToolSearch
 
 
 def _request(text: str = "fixture") -> GatewayRequest:
@@ -251,9 +252,11 @@ def test_every_scope_uses_the_same_parallel_approval_and_settlement(
         session.cancel()
 
 
-@pytest.mark.parametrize("kind", ["provider_native", "provider_server", "tier"])
-def test_effectful_requests_use_the_same_session_before_dispatch(kind: str) -> None:
-    """Provider-executed actions and tier pricing do not overlap unapproved input."""
+@pytest.mark.parametrize(
+    "kind", ["provider_native", "provider_server", "tool_search", "tier", "speed"]
+)
+def test_external_execution_waits_for_input_approval_in_rust(kind: str) -> None:
+    """External tools and paid tiers cannot execute before the input decision."""
     session = _session(_engine(_Classifier("allow")))
     request = _request()
     assert session.can_overlap_input(request)
@@ -269,8 +272,24 @@ def test_effectful_requests_use_the_same_session_before_dispatch(kind: str) -> N
         request = request.model_copy(
             update={"provider_server_tools": ({"type": "web_search", "name": "web_search"},)}
         )
+    elif kind == "tool_search":
+        request = request.model_copy(
+            update={
+                "tool_search": GatewayToolSearch(
+                    declared_as="openrouter_tool", tool_type="openrouter:tool_search"
+                )
+            }
+        )
+    elif kind == "speed":
+        request = request.model_copy(update={"speed": "fast"})
     else:
         request = request.model_copy(update={"service_tier": "priority"})
+    assert session.can_defer_input(request)
+    assert not session.can_overlap_input(request)
+    session.policies = tuple(
+        policy.model_copy(update={"input_execution": "before_dispatch"})
+        for policy in session.policies
+    )
     assert not session.can_overlap_input(request)
 
 
@@ -343,14 +362,14 @@ def test_scope_configuration_is_strict() -> None:
         GuardrailPolicy(policy_id="unprotected-platform")
 
 
-@pytest.mark.parametrize("marker", [None, True, "3", 0, 1, 2, 4])
+@pytest.mark.parametrize("marker", [None, True, "5", 0, 1, 2, 3, 4])
 def test_mismatched_native_contract_fails_at_startup(marker: object) -> None:
     """There is no package-version compatibility path that can omit an approval gate."""
     with patch(
         "exp.runtime.gateway.guardrails.native.importlib.import_module",
         return_value=SimpleNamespace(GUARDRAIL_CONTRACT_VERSION=marker),
     ):
-        with pytest.raises(ValueError, match="GUARDRAIL_CONTRACT_VERSION=3"):
+        with pytest.raises(ValueError, match="GUARDRAIL_CONTRACT_VERSION=5"):
             validate_guardrail_engine(_engine(_Classifier("allow")))
 
 
@@ -669,3 +688,51 @@ def test_later_modifier_cannot_undo_an_earlier_redaction(
         assert session.output_plan() is None
         with pytest.raises(GuardrailRejected):
             session.inspect_output(GuardrailCompletion(text=original))
+
+
+def test_observers_do_not_renew_the_blocking_budget_for_later_subjects() -> None:
+    """Several observed contexts cannot give each enforcing subject another grace."""
+    from exp.runtime.gateway.tests.parallel_input_guardrails_test import (
+        _Classifier as NativeClassifier,
+    )
+    from exp.runtime.gateway.tests.parallel_input_guardrails_test import _Endpoint
+
+    endpoint = _Endpoint(b'{"flagged":true}', content_type="application/json")
+    policy = GuardrailPolicy(
+        policy_id="blocking-budget",
+        protected=True,
+        input_execution="parallel",
+        input_fail_open=True,
+        input_max_wait_ms=250,
+        checks=(
+            GuardrailCheck(
+                check_id="input",
+                adapter_id="detector",
+                capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+                stage=GuardrailCheckStage.INPUT,
+                action=GuardrailAction.BLOCK,
+                timeout_ms=5000,
+            ),
+        ),
+    )
+    observer = policy.model_copy(update={"policy_id": "observer", "mode": "observe"})
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((observer, policy)),
+        client=DirectClassifierClient(ClassifierRegistry({"detector": NativeClassifier(endpoint)})),
+        monotonic=time.monotonic,
+    )
+    try:
+        session = _session(engine)
+        session.native_execution = True
+        session.inspect_input(_request("observed first"), defer=True)
+        session.inspect_input(_request("observed second"), defer=True)
+        started = time.monotonic()
+        session.inspect_input(_request("blocking first"))
+        assert time.monotonic() - started >= 0.2
+        started = time.monotonic()
+        session.inspect_input(_request("blocking second"))
+        assert time.monotonic() - started < 0.1
+        assert not endpoint.release.is_set()
+    finally:
+        endpoint.close()
+        engine.close(timeout_seconds=2)

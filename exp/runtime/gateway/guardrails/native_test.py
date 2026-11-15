@@ -169,6 +169,32 @@ def test_pool_scoped_platform_policy_fences_only_its_target_pool() -> None:
     require_unguarded_surface(engine, unguarded, "images")
 
 
+@pytest.mark.parametrize("surface", ["embeddings", "images", "audio", "video"])
+@pytest.mark.parametrize("include_output", [False, True])
+def test_input_fail_open_does_not_waive_unsupported_output_enforcement(
+    surface: str, include_output: bool
+) -> None:
+    """Input-only missed coverage may proceed while configured output checks stay strict."""
+    engine = _engine()
+    authorization = _authorization()
+    policy = engine.policies_for(authorization)[0]
+    policy = policy.model_copy(
+        update={
+            "input_fail_open": True,
+            "checks": policy.checks if include_output else policy.input_checks,
+        }
+    )
+    engine._store = MappingGuardrailStore((policy,))
+    try:
+        if include_output:
+            with pytest.raises(NativeBridgeError, match="do not support native"):
+                require_unguarded_surface(engine, authorization, surface)
+        else:
+            require_unguarded_surface(engine, authorization, surface)
+    finally:
+        engine.close(timeout_seconds=2)
+
+
 def test_mandatory_policy_checks_customer_rewrites_before_dispatch() -> None:
     """A customer-controlled replacement cannot introduce uninspected instructions."""
     request = GatewayRequest(

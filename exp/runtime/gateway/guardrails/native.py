@@ -9,6 +9,8 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol, cast
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models import BillingSource
+from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayFailure, GatewayRequest
 from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
@@ -31,6 +33,24 @@ from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 if TYPE_CHECKING:
     from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+
+def input_may_overlap(
+    session: GuardrailSession | None,
+    subjects: Sequence[GatewayRequest],
+    deployments: Sequence[ExactModelDeployment],
+    *,
+    deferred: bool,
+    cache_bound: bool,
+) -> bool:
+    """Require approval before external tools, cache writes or customer-funded dispatch."""
+    return (
+        deferred
+        and session is not None
+        and not cache_bound
+        and all(session.can_overlap_input(subject) for subject in subjects)
+        and all(d.billing_source is BillingSource.HOST_MANAGED for d in deployments)
+    )
 
 
 def require_capture(
@@ -70,9 +90,9 @@ def validate_guardrail_engine(engine: GuardrailEngine | None) -> None:
     if engine is None:
         return
     native = importlib.import_module("exp_gateway_native")
-    if getattr(native, "GUARDRAIL_CONTRACT_VERSION", None) != 3:
+    if getattr(native, "GUARDRAIL_CONTRACT_VERSION", None) != 5:
         raise ValueError(
-            "guardrails require native GUARDRAIL_CONTRACT_VERSION=3; "
+            "guardrails require native GUARDRAIL_CONTRACT_VERSION=5; "
             "install the coordinated native package"
         )
 
@@ -115,11 +135,19 @@ def require_unguarded_surface(
     authorization: AuthorizationSnapshot,
     surface: str,
 ) -> None:
-    """Reject applicable policies before accepting a surface this engine cannot inspect."""
+    """Record missed coverage and reject only strict unsupported policies."""
     policies = () if engine is None else engine.policies_for(authorization)
+    refused = any(
+        policy.mode == "enforce" and (policy.output_checks or not policy.input_fail_open)
+        for policy in policies
+    )
     if engine is not None:
-        engine.record_unsupported_observations(policies)
-    if any(policy.mode == "enforce" for policy in policies):
+        engine.record_unsupported_observations(
+            tuple(policy for policy in policies if not refused or policy.mode == "observe"),
+            request_id=authorization.request_id,
+            surface=surface,
+        )
+    if refused:
         raise NativeBridgeError(
             OpenAIProtocolError(
                 status_code=400,

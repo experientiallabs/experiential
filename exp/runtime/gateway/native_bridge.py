@@ -8,7 +8,6 @@ import time
 from collections.abc import Callable
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import BillingSource
 from exp.runtime.gateway.attempt_tokens import counted_input_tokens
 from exp.runtime.gateway.class_throttles import admission_priority_class, tier_authorization
 from exp.runtime.gateway.client_apps import with_client_identity
@@ -30,6 +29,7 @@ from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import (
     NativeGuardrailsMixin,
     discard_unaccepted_input,
+    input_may_overlap,
     native_output_mode,
     open_admission_guardrails,
     require_capture,
@@ -383,12 +383,12 @@ class NativeControlPlane(
         )
         if guardrails is not None:
             guardrails.detectors = self._guardrail_detectors
-        parallel_guardrail = isinstance(authorization.target, DirectTarget) and (
-            guardrails is not None and guardrails.can_overlap_input(request)
+        deferred_guardrail = isinstance(authorization.target, DirectTarget) and (
+            guardrails is not None and guardrails.can_defer_input(request)
         )
         try:
             if guardrails is not None:
-                request = guardrails.inspect_input(request, defer=parallel_guardrail)
+                request = guardrails.inspect_input(request, defer=deferred_guardrail)
         except GuardrailRejected as exc:
             assert guardrails is not None
             self.record_rejected_input(authorization, guardrails, exc.failure)
@@ -432,7 +432,7 @@ class NativeControlPlane(
         request = strip_stale_reasoning_history(request)
         if request != captured_request and guardrails is not None:
             try:
-                request = guardrails.inspect_input(request, defer=parallel_guardrail)
+                request = guardrails.inspect_input(request, defer=deferred_guardrail)
             except GuardrailRejected as exc:
                 self.record_rejected_input(authorization, guardrails, exc.failure)
                 raise NativeBridgeError(public_failure_error(exc.failure)) from None
@@ -455,7 +455,7 @@ class NativeControlPlane(
             if self._capture is not None
             else None
         )
-        if not parallel_guardrail:
+        if not deferred_guardrail:
             try:
                 require_capture(self._capture, authorization, pending_capture)
             except NativeBridgeError as exc:
@@ -533,7 +533,7 @@ class NativeControlPlane(
             tool_search_admission = planned.admission
             if request != inspection_request and guardrails is not None:
                 try:
-                    request = guardrails.inspect_input(request)
+                    request = guardrails.inspect_input(request, defer=deferred_guardrail)
                 except GuardrailRejected as exc:
                     discard_capture(self._capture, authorization.request_id)
                     self._accounting.finish_request_quietly(
@@ -799,19 +799,20 @@ class NativeControlPlane(
             explicit_cache_state=cache_state,
         )
 
+        guardrail_subjects = (original_guardrail_request, captured_request, request, public_request)
+        input_overlap = input_may_overlap(
+            guardrails,
+            guardrail_subjects,
+            route.deployments,
+            deferred=deferred_guardrail,
+            cache_bound=cache_state is not None,
+        )
+
         def prepare_request() -> None:
             """Prepare inspection and capture after selecting this request's owner."""
             if guardrails is not None:
                 try:
-                    guardrails.prepare_dispatch(
-                        (original_guardrail_request, captured_request, request, public_request),
-                        overlap=parallel_guardrail
-                        and cache_state is None
-                        and all(
-                            d.billing_source is BillingSource.HOST_MANAGED
-                            for d in route.deployments
-                        ),
-                    )
+                    guardrails.prepare_dispatch(guardrail_subjects, overlap=input_overlap)
                 except GuardrailRejected as exc:
                     discard_capture(self._capture, authorization.request_id)
                     raise NativeBridgeError(
@@ -844,6 +845,9 @@ class NativeControlPlane(
             **attempt_policy(request.gateway).model_dump(mode="json"),
             "refusal_failover": authorization.refusal_failover,
             "guardrail_input_pending": guardrails is not None and guardrails.input_pending,
+            "guardrail_input_before_dispatch": (
+                guardrails is not None and guardrails.input_pending and not input_overlap
+            ),
             "output_guardrail": native_output_mode(
                 guardrails,
                 public_request,
@@ -901,9 +905,7 @@ class NativeControlPlane(
             client_request_id=optional_text(data.get("client_request_id")),
         )
         request = decoded.request
-        # Only the standard Idempotency-Key names a retriable operation;
-        # client_request_id is a session correlation id real callers reuse
-        # across distinct requests, so it never keys replay.
+        # Only Idempotency-Key keys replay; client_request_id correlates distinct requests.
         caller_operation = request.idempotency_key
         if caller_operation is None:
             raise NativeBridgeError(

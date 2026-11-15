@@ -70,6 +70,7 @@ class GuardrailSession:
         deadline_monotonic: Original absolute deadline, never renewed by polls or retries.
         request_id: Authenticated request identity for score records, or None for none.
         detectors: Pure native detector implementations, empty until configured.
+        _native_blocking_input: First synchronous inspection owning the shared wait budget.
         _input: Pending parallel input inspection, or None before it starts.
         _input_failure: Retained input or required capture rejection, or None before failure.
         _input_approved_at: Approval time, or None before the current subject is approved.
@@ -88,6 +89,9 @@ class GuardrailSession:
     native_observation: NativeInputInspection | None = field(default=None, init=False, repr=False)
     native_completed: list[NativeInputInspection] = field(
         default_factory=list, init=False, repr=False
+    )
+    _native_blocking_input: NativeInputInspection | None = field(
+        default=None, init=False, repr=False
     )
     _input: Future[None] | None = field(default=None, init=False, repr=False)
     _input_failure: GatewayFailure | None = field(default=None, init=False, repr=False)
@@ -133,17 +137,25 @@ class GuardrailSession:
         )
 
     def can_overlap_input(self, request: GatewayRequest) -> bool:
-        """Overlap read-only input decisions only when generation cannot cause side effects."""
+        """Overlap read-only generation only when dispatch has no external tool effects."""
         inputs = tuple(p for p in self.enforcing_policies if p.input_checks)
         return (
-            bool(inputs)
-            and all(p.input_execution == "parallel" for p in inputs)
-            and all(c.action is not GuardrailAction.MODIFY for p in inputs for c in p.input_checks)
+            self.can_defer_input(request)
             and not request.provider_native_tools
             and not request.provider_server_tools
-            and request.web_search is None
             and request.tool_search is None
             and request.service_tier is None
+            and request.speed is None
+            and all(p.input_execution == "parallel" for p in inputs)
+        )
+
+    def can_defer_input(self, request: GatewayRequest) -> bool:
+        """Transfer read-only inspection to Rust without waiting in host admission."""
+        inputs = tuple(p for p in self.enforcing_policies if p.input_checks)
+        return (
+            request.web_search is None
+            and bool(inputs)
+            and all(c.action is not GuardrailAction.MODIFY for p in inputs for c in p.input_checks)
         )
 
     def inspect_input(self, request: GatewayRequest, *, defer: bool = False) -> GatewayRequest:
@@ -195,7 +207,10 @@ class GuardrailSession:
             inspection = NativeInputInspection(
                 json.dumps(input_registration(self, (request,), policies=(policy,))),
                 max(0.0, self.deadline_monotonic - time.monotonic()),
+                prior=self._native_blocking_input,
             )
+            if self._native_blocking_input is None:
+                self._native_blocking_input = inspection
             self.native_completed.append(inspection)
             decision = json.loads(await asyncio.to_thread(inspection.wait_json))
             if decision["action"] == "error":
@@ -263,7 +278,7 @@ class GuardrailSession:
         if overlap and not all(self.can_overlap_input(subject) for subject in remaining):
             raise RuntimeError("guardrail input cannot overlap this request")
         self._input_approved_at = None
-        if overlap and self.native_execution:
+        if self.native_execution and all(self.can_defer_input(s) for s in remaining):
             self.native_input = NativeInputInspection(
                 json.dumps(input_registration(self, tuple(remaining)), ensure_ascii=False),
                 max(0.0, self.deadline_monotonic - time.monotonic()),

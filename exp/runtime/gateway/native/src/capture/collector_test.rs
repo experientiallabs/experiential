@@ -535,8 +535,12 @@ fn hosted_oversized_prompt_keeps_a_marked_copy_instead_of_rejecting_inference() 
     }}));
     assert!(collector.begin(input));
     collector.settle("large", true, false);
-    let records = drain(&collector, receiver);
-    let context = &records[0].request.context;
+    // Encoding the multi-megabyte record is not a one-second latency contract.
+    // Wait for its actual delivery before checking that cleanup drains promptly.
+    let record = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(collector.close_until(Instant::now() + Duration::from_secs(1)));
+    assert!(receiver.try_iter().next().is_none());
+    let context = &record.request.context;
     assert_eq!(
         context["request"]["messages"][0]["content"],
         "system prompt"

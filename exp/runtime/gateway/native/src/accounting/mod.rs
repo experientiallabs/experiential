@@ -28,6 +28,7 @@ mod inspection_http;
 mod prices;
 mod registry;
 mod resources;
+pub(crate) use resources::Resources as InputResources;
 mod route_config;
 mod rung;
 mod shared;
@@ -95,6 +96,9 @@ mod inspection_recording_tests;
 
 #[cfg(test)]
 mod input_tests;
+
+#[cfg(test)]
+mod input_reporting_tests;
 
 mod session_recovery;
 pub use session_recovery::python::NativeSessionRecovery;

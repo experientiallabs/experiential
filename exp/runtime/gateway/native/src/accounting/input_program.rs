@@ -16,7 +16,7 @@ fn coverage(check: Option<&str>) -> Value {
         "Content inspection does not support this complete request. Use a supported context or modality.")
 }
 
-fn prepare(check: &Check, subject: &Subject) -> Result<Check, ()> {
+pub(super) fn prepare(check: &Check, subject: &Subject) -> Result<Check, ()> {
     let mut c = check.clone();
     match c.adapter["kind"].as_str() {
         Some("keyword" | "regex") => {
@@ -77,19 +77,32 @@ async fn one(
     check: &Check,
     subject: &Subject,
     deadline: Instant,
+    boundary: Instant,
     observed: &mut Value,
     classification: &mut Value,
 ) -> Result<Subject, Value> {
     let id = check.check["check_id"].as_str();
+    let unavailable = |failure: Value, observed: &mut Value| {
+        *observed = failure.clone();
+        if check.policy["input_fail_open"] == true {
+            Ok(subject.clone())
+        } else {
+            Err(failure)
+        }
+    };
     if check.adapter["input_limit"]
         .as_u64()
         .is_some_and(|limit| subject.size().map_or(true, |size| size as u64 > limit))
     {
-        return Err(coverage(None));
+        return unavailable(coverage(None), observed);
     }
     let started = Instant::now();
     let budget = Duration::from_millis(check.check["timeout_ms"].as_u64().unwrap_or(0))
-        .min(deadline.saturating_duration_since(started));
+        .min(deadline.saturating_duration_since(started))
+        .min(
+            input::response_deadline(check, Some(boundary))
+                .map_or(Duration::MAX, |at| at.saturating_duration_since(started)),
+        );
     if budget.is_zero() {
         *observed = inspection::decision(
             "error",
@@ -97,23 +110,20 @@ async fn one(
             "unavailable",
             "Content inspection is unavailable. Retry later.",
         );
-        return inspection::uncertain(check).map_or_else(|| Ok(subject.clone()), Err);
+        return inspection::uncertain(check).map_or_else(
+            || Ok(subject.clone()),
+            |failure| unavailable(failure, observed),
+        );
     }
     let check_for_input = prepare(check, subject).ok();
+    let remaining = input::response_deadline(check, Some(boundary)).map_or(budget, |at| {
+        budget.min(at.saturating_duration_since(Instant::now()))
+    });
     let result = match &check_for_input {
-        Some(prepared) => input::inspect(prepared, budget).await,
-        None => Err(()),
+        Some(prepared) if !remaining.is_zero() => input::inspect(prepared, remaining).await,
+        _ => Err(()),
     };
-    let result = result.and_then(|mut verdict| {
-        if started.elapsed() > budget {
-            return Err(());
-        }
-        if check.adapter["kind"] == "http_json" && !verdict["replacement_messages"].is_null() {
-            verdict["replacement_messages"] = json!(input_rewrite::hosted(
-                subject,
-                &verdict["replacement_messages"]
-            )?);
-        }
+    let result = result.and_then(|verdict| {
         if started.elapsed() > budget {
             return Err(());
         }
@@ -137,9 +147,12 @@ async fn one(
                 "unavailable",
                 "Content inspection is unavailable. Retry later.",
             );
-            return inspection::uncertain(check).map_or_else(|| Ok(subject.clone()), Err);
+            return inspection::uncertain(check).map_or_else(
+                || Ok(subject.clone()),
+                |failure| unavailable(failure, observed),
+            );
         }
-        Ok(v) if v["coverage_error"] == true => return Err(coverage(id)),
+        Ok(v) if v["coverage_error"] == true => return unavailable(coverage(id), observed),
         Ok(v) => v,
     };
     if verdict["flagged"] != true || check.check["action"] == "allow" {
@@ -149,11 +162,27 @@ async fn one(
     if action != "modify" {
         return Err(inspection::failed(action, id));
     }
-    let replacement = verdict["replacement_messages"]
-        .as_array()
-        .cloned()
-        .and_then(|m| input_rewrite::restore(subject, m).ok())
-        .ok_or_else(|| inspection::failed("error", id))?;
+    let replacement = if check.adapter["kind"] == "http_json" {
+        input_rewrite::hosted(subject, &verdict["replacement_messages"]).ok()
+    } else {
+        verdict["replacement_messages"].as_array().cloned()
+    }
+    .and_then(|m| input_rewrite::restore(subject, m).ok());
+    if started.elapsed() > budget {
+        *observed = inspection::decision(
+            "error",
+            id,
+            "unavailable",
+            "Content inspection is unavailable. Retry later.",
+        );
+        return inspection::uncertain(check).map_or_else(
+            || Ok(subject.clone()),
+            |failure| unavailable(failure, observed),
+        );
+    }
+    let Some(replacement) = replacement else {
+        return Err(inspection::failed("error", id));
+    };
     let mut result = subject.clone();
     result.set_messages(replacement);
     Ok(result)
@@ -163,12 +192,21 @@ async fn recorded(
     check: &Check,
     subject: &Subject,
     deadline: Instant,
+    boundary: Instant,
     reporting: Option<&super::input_reports::Factory>,
 ) -> Result<Subject, Value> {
     let started = Instant::now();
     let mut observed = Value::Null;
     let mut classification = Value::Null;
-    let result = one(check, subject, deadline, &mut observed, &mut classification).await;
+    let result = one(
+        check,
+        subject,
+        deadline,
+        boundary,
+        &mut observed,
+        &mut classification,
+    )
+    .await;
     if let Some(reporting) = reporting {
         let mut decision = if !observed.is_null() {
             observed
@@ -180,6 +218,12 @@ async fn recorded(
                 Err(failure) => failure.clone(),
             }
         };
+        if result.is_ok()
+            && decision["failure"].is_object()
+            && check.policy["input_fail_open"] == true
+        {
+            decision["failed_open"] = json!(true);
+        }
         if let Some(fields) = classification.as_object() {
             for (key, value) in fields {
                 decision[key] = value.clone();
@@ -194,17 +238,18 @@ pub(super) async fn enforce(
     checks: &[Check],
     subject: &Subject,
     deadline: Instant,
+    boundary: Instant,
     reporting: Option<&super::input_reports::Factory>,
 ) -> Result<Subject, Value> {
     let mut current = subject.clone();
     let mut approved = Vec::new();
     for (i, check) in checks.iter().enumerate() {
-        current = recorded(check, &current, deadline, reporting).await?;
+        current = recorded(check, &current, deadline, boundary, reporting).await?;
         approved.push((i, current.request.clone()));
     }
     for (i, prior) in approved {
         if prior != current.request
-            && recorded(&checks[i], &current, deadline, reporting)
+            && recorded(&checks[i], &current, deadline, boundary, reporting)
                 .await?
                 .request
                 != current.request
@@ -244,6 +289,7 @@ mod tests {
                 &check,
                 &subject,
                 Instant::now() + Duration::from_secs(1),
+                Instant::now(),
                 &mut observed,
                 &mut classification,
             )
@@ -264,6 +310,171 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn mixed_programs_spend_one_parallel_budget_without_waiving_strict_checks() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/input", listener.local_addr().unwrap());
+        let received = Arc::new(AtomicUsize::new(0));
+        let accepted = received.clone();
+        let server = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                sockets.push(socket);
+                accepted.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let case: Value = crate::lossless_json::from_str(
+            include_str!("../../tests/generated/input_programs.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let subject: Subject = crate::lossless_json::from_value(case["subject"].clone()).unwrap();
+        let mut optional = super::super::input_tests::check(&url, true);
+        optional.policy["input_execution"] = json!("parallel");
+        optional.policy["input_fail_open"] = json!(true);
+        optional.policy["input_max_wait_ms"] = json!(250);
+        let boundary = Instant::now() - Duration::from_millis(200);
+        let started = Instant::now();
+        let first = enforce(
+            &[optional.clone()],
+            &subject,
+            started + Duration::from_secs(3),
+            boundary,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.request, subject.request);
+        assert!(started.elapsed() < Duration::from_millis(150));
+        assert_eq!(received.load(Ordering::Relaxed), 1);
+        let second = enforce(
+            &[optional.clone()],
+            &subject,
+            Instant::now() + Duration::from_secs(3),
+            boundary,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.request, subject.request);
+        let mut strict = optional.clone();
+        strict.policy["input_fail_open"] = json!(false);
+        strict.adapter = json!({"kind":"keyword", "needles":["secret"]});
+        let denied = enforce(
+            &[optional, strict],
+            &subject,
+            Instant::now() + Duration::from_secs(3),
+            boundary,
+            None,
+        )
+        .await
+        .err()
+        .expect("the strict sibling must still deny");
+        assert_eq!(denied["failure"]["failure_class"], "guardrail");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(received.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    #[test]
+    fn flagged_immutable_context_cannot_fail_open_when_redaction_is_impossible() {
+        let mut case: Value = crate::lossless_json::from_str(
+            include_str!("../../tests/generated/input_programs.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        case["checks"][0]["policy"]["input_fail_open"] = json!(true);
+        case["checks"][0]["check"]["action"] = json!("modify");
+        case["checks"][0]["adapter"]["input_limit"] = json!(1_048_576);
+        let check: Check = crate::lossless_json::from_value(case["checks"][0].clone()).unwrap();
+        let subject: Subject = crate::lossless_json::from_value(case["subject"].clone()).unwrap();
+        let result = super::super::inspection_http::runtime()
+            .unwrap()
+            .block_on(one(
+                &check,
+                &subject,
+                Instant::now() + Duration::from_secs(1),
+                Instant::now(),
+                &mut Value::Null,
+                &mut Value::Null,
+            ));
+        let failure = result
+            .err()
+            .expect("a matched tool definition must not reach dispatch");
+        assert_eq!(failure["failure"]["failure_class"], "guardrail");
+        assert_eq!(failure["action"], "error");
+    }
+
+    #[test]
+    fn modifying_followups_fail_open_on_missing_coverage_but_keep_known_denials() {
+        let runtime = super::super::inspection_http::runtime().unwrap();
+        let case: Value = crate::lossless_json::from_str(
+            include_str!("../../tests/generated/input_programs.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let subject: Subject = crate::lossless_json::from_value(case["subject"].clone()).unwrap();
+        let mut check: Check = crate::lossless_json::from_value(case["checks"][0].clone()).unwrap();
+        check.policy["input_fail_open"] = json!(true);
+        check.policy["input_max_wait_ms"] = json!(1000);
+        check.policy["protected"] = json!(true);
+        check.check["action"] = json!("modify");
+        for adapter in [
+            json!({"kind": "unavailable"}),
+            json!({"kind": "coverage_error"}),
+            json!({"kind": "allow", "input_limit": 0}),
+            json!({"kind": "decision_model"}),
+        ] {
+            check.adapter = adapter;
+            let actual = runtime
+                .block_on(one(
+                    &check,
+                    &subject,
+                    Instant::now() + Duration::from_secs(1),
+                    Instant::now(),
+                    &mut Value::Null,
+                    &mut Value::Null,
+                ))
+                .unwrap();
+            assert_eq!(actual.request, subject.request);
+        }
+        let denied_case: Value = crate::lossless_json::from_str(
+            include_str!("../../tests/generated/input_programs.jsonl")
+                .lines()
+                .nth(4)
+                .unwrap(),
+        )
+        .unwrap();
+        let subject: Subject =
+            crate::lossless_json::from_value(denied_case["subject"].clone()).unwrap();
+        let mut check: Check =
+            crate::lossless_json::from_value(denied_case["checks"][0].clone()).unwrap();
+        check.policy["input_fail_open"] = json!(true);
+        check.policy["input_max_wait_ms"] = json!(1000);
+        let denied = runtime
+            .block_on(one(
+                &check,
+                &subject,
+                Instant::now() + Duration::from_secs(1),
+                Instant::now(),
+                &mut Value::Null,
+                &mut Value::Null,
+            ))
+            .err()
+            .expect("an explicit detected violation still denies the request");
+        assert_eq!(denied["action"], "block");
+    }
+
     #[test]
     fn evolving_input_programs_match_python_including_final_revalidation() {
         let runtime = super::super::inspection_http::runtime().unwrap();
@@ -279,6 +490,7 @@ mod tests {
                 &checks,
                 &subject,
                 Instant::now() + Duration::from_secs(30),
+                Instant::now(),
                 None,
             )) {
                 Ok(s) => json!({"request": s.request}),

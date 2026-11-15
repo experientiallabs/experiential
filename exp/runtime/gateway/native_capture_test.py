@@ -965,14 +965,17 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
             for request_id in awaiting_settlement:
                 collector.settle(request_id, True, True)
     finally:
+        if process_collector is not None:
+            # Synthetic process-owned prompts have no provider to settle them.
+            # Release them before the server drains its capture owner at shutdown.
+            for request_id in process_request_ids:
+                process_collector.settle(request_id, False, False)
         shutdown.request_shutdown()
         worker.join(timeout=10)
         assert control.close(2)
         if process is not control:
             assert process.close(2)
         if process_collector is not None:
-            for request_id in process_request_ids:
-                process_collector.settle(request_id, False, False)
             assert process_collector.close(2)
             assert process_collector.counts()[0] == 0
         components.write_ledger.close()

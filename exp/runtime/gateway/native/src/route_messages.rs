@@ -208,6 +208,11 @@ pub(crate) async fn messages(
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
     guard.record_web_search(admission.web_search_meter());
 
+    if let Err(error) =
+        crate::guardrails::input::before_dispatch(&state.bridge, &admission, &mut guard).await
+    {
+        return messages_error_response(&error);
+    }
     let permit = match acquire_permit(&state, &mut guard, deadline, admission.class).await {
         Ok(permit) => permit,
         Err(response) => return *response,
@@ -254,6 +259,14 @@ pub(crate) async fn messages(
     let mut won =
         acquire_guarded_attempt(&context, &mut guard, admission.guardrail_input_pending).await;
     adopt_outcome(&mut admission, &mut won);
+    won = crate::guardrails::input::prepare_response(
+        &state.bridge,
+        &admission,
+        &mut guard,
+        won,
+        deadline,
+    )
+    .await;
     won = checkpoint_winner(
         state.capture.as_ref(),
         &admission,

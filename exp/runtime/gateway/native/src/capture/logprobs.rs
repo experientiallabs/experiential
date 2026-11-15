@@ -641,9 +641,23 @@ pub(crate) struct Held {
     pub pending: Vec<ChoiceLogprobsDelta>,
     pending_bytes: usize,
     truncated: bool,
+    response_lease: Option<crate::retained::RetainedLease>,
 }
 
 impl Held {
+    /// Budget the complete winner's side buffer while input approval is pending.
+    pub(crate) fn buffer_response(&mut self) {
+        if self.response_lease.is_some() || self.truncated {
+            return;
+        }
+        let mut lease = crate::retained::RetainedLease::default();
+        if lease.reserve(self.pending_bytes) {
+            self.response_lease = Some(lease);
+        } else {
+            self.truncated = true;
+        }
+    }
+
     /// Forward newly parsed deltas to the observer, or hold them until it attaches.
     pub(crate) fn forward(
         &mut self,
@@ -659,12 +673,21 @@ impl Held {
                 observer.logprobs(deltas, self.truncated);
             }
             None => {
-                // Held outside the collector's budget until the winner attaches,
-                // so the hold has its own small bound; beyond it, truncate.
+                // Ordinary precommit holds stay small. A buffered winner uses
+                // the normal capture cap and the worker's retention budget.
+                let limit = if self.response_lease.is_some() {
+                    MAXIMUM_CAPTURED_LOGPROB_BYTES
+                } else {
+                    MAXIMUM_HELD_LOGPROB_BYTES
+                };
                 for delta in deltas {
                     let bytes = delta.retained_bytes();
                     if self.truncated
-                        || self.pending_bytes.saturating_add(bytes) > MAXIMUM_HELD_LOGPROB_BYTES
+                        || self.pending_bytes.saturating_add(bytes) > limit
+                        || self
+                            .response_lease
+                            .as_mut()
+                            .is_some_and(|lease| !lease.reserve(bytes))
                     {
                         self.truncated = true;
                         break;
@@ -684,6 +707,8 @@ impl Held {
             observer.logprobs_injected();
             observer.logprobs(std::mem::take(&mut self.pending), self.truncated);
         }
+        self.response_lease = None;
+        self.pending_bytes = 0;
     }
 }
 

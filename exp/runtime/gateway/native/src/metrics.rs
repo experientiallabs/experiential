@@ -137,6 +137,7 @@ pub struct Metrics {
     pub request_duration_ms: Histogram,
     pub permit_wait_ms: Histogram,
     pub bridge_call_ms: Histogram,
+    pub settlement_wait_ms: Histogram,
 }
 
 /// The one registry shared by the serving runtime and the snapshot readers.
@@ -166,6 +167,7 @@ impl Metrics {
             request_duration_ms: Histogram::new(),
             permit_wait_ms: Histogram::new(),
             bridge_call_ms: Histogram::new(),
+            settlement_wait_ms: Histogram::new(),
         }
     }
 
@@ -268,6 +270,7 @@ impl Metrics {
             "request_duration_ms": self.request_duration_ms.snapshot(),
             "permit_wait_ms": self.permit_wait_ms.snapshot(),
             "bridge_call_ms": self.bridge_call_ms.snapshot(),
+            "settlement_wait_ms": self.settlement_wait_ms.snapshot(),
         })
     }
 }
@@ -392,6 +395,7 @@ mod tests {
                 "request_duration_ms",
                 "permit_wait_ms",
                 "bridge_call_ms",
+                "settlement_wait_ms",
             ]
         );
     }

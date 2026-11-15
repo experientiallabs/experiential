@@ -15,12 +15,13 @@ from typing import Literal, Protocol
 
 import httpx
 import pytest
+from exp_gateway_native import CaptureCollector
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import BillingSource, GatewayTokenPrices, ModelCapabilities
 from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.contracts import GatewayRequest
-from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry
+from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry, KeywordClassifier
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
 from exp.runtime.gateway.guardrails.config import engine_from_document
 from exp.runtime.gateway.guardrails.contracts import (
@@ -37,11 +38,12 @@ from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeControlPlane
-from exp.runtime.gateway.native_capture import CaptureController
+from exp.runtime.gateway.native_capture import CaptureConfiguration, CaptureController
 from exp.runtime.gateway.tests.guardrail_policy_integrity_test import _provider
 from exp.runtime.gateway.tests.mandatory_guardrails_paths_test import _serving
 from exp.runtime.gateway.tests.mandatory_guardrails_test import _tool_chunk
 from exp.runtime.gateway.tests.native_waterfall_test import _content_chunk, _terminal_frames
+from exp.runtime.gateway.tests.web_search_backend_fixture_test import StaticWebSearchBackend
 
 
 class _Endpoint:
@@ -54,6 +56,7 @@ class _Endpoint:
         self.started = threading.Event()
         self.release = threading.Event()
         self.finished = threading.Event()
+        self.prefix_sent = threading.Event()
         self.tail_release = threading.Event()
         self.requests: list[bytes] = []
         self.intercept: Callable[[BaseHTTPRequestHandler], bool] | None = None
@@ -77,6 +80,7 @@ class _Endpoint:
                     self.end_headers()
                     self.wfile.write(body)
                     self.wfile.flush()
+                    endpoint.prefix_sent.set()
                     if tail and endpoint.tail_release.wait(8):
                         self.wfile.write(tail)
                         self.wfile.flush()
@@ -110,7 +114,7 @@ class _ClassifierEndpoint(Protocol):
 
 
 class _Classifier:
-    """Supply native parallel inspection and synchronous admission inspection."""
+    """Export the HTTP classifier contract; Python cannot execute an inspection."""
 
     def __init__(self, endpoint: _ClassifierEndpoint) -> None:
         """Bind the loopback detector endpoint."""
@@ -140,14 +144,8 @@ class _Classifier:
     async def inspect_input(
         self, *, request: GatewayRequest, check: GuardrailCheck
     ) -> ClassifierVerdict:
-        """Run serial admission inspection against the same loopback detector."""
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                self.endpoint.url,
-                json={"request": request.model_dump(mode="json"), "check_id": check.check_id},
-            )
-            response.raise_for_status()
-            return ClassifierVerdict.model_validate(response.json())
+        """Reject a Python inspection fallback."""
+        raise AssertionError("input inspection must execute in Rust")
 
     async def inspect_output(
         self, *, completion: GuardrailCompletion, check: GuardrailCheck
@@ -201,10 +199,17 @@ class _Scenario:
     database: Path
 
     def request(
-        self, surface: str = "chat", *, stream: bool = True, tool: bool = False
+        self,
+        surface: str = "chat",
+        *,
+        stream: bool = True,
+        tool: bool = False,
+        web_search: bool = False,
     ) -> httpx.Response:
         """Read a complete native response on the selected public API surface."""
         body: JsonObject = {"model": "coding", "stream": stream, "max_tokens": 100}
+        if web_search:
+            body["model"] = "coding:online"
         path = "/v1/chat/completions"
         if surface == "responses":
             body.pop("max_tokens")
@@ -230,6 +235,15 @@ class _Scenario:
             timeout=5,
         )
 
+    def records(self) -> list[JsonObject]:
+        """Drain native background reports before reading their durable evidence."""
+        assert self.control.close(timeout_seconds=2)
+        with connect_sqlite(self.database) as db:
+            return [
+                json.loads(row[0])
+                for row in db.execute("SELECT result FROM gateway_input_moderation")
+            ]
+
 
 @contextmanager
 def _scenario(
@@ -240,12 +254,15 @@ def _scenario(
     provider_status: int = 200,
     empty: bool = False,
     pause_stream: bool = False,
+    wait_ms: int = 0,
+    fail_open: bool = True,
     timeout_ms: int = 3000,
     mode: Literal["enforce", "observe"] = "enforce",
     execution: Literal["parallel", "before_dispatch"] = "parallel",
     tool: bool = False,
     billing_source: BillingSource = BillingSource.HOST_MANAGED,
     capture: CaptureController | None = None,
+    buffer_output: bool = False,
 ) -> Iterator[_Scenario]:
     """Compose an input policy, real SQLite owner, and real native gateway."""
     marker = "provider-marker"
@@ -287,6 +304,8 @@ def _scenario(
                     revision="fixture-v1",
                     protected=True,
                     input_execution=execution,
+                    input_fail_open=fail_open,
+                    input_max_wait_ms=wait_ms,
                     mode=mode,
                     checks=(
                         GuardrailCheck(
@@ -297,11 +316,32 @@ def _scenario(
                             adapter_id="detector",
                             timeout_ms=timeout_ms,
                         ),
+                    )
+                    + (
+                        (
+                            GuardrailCheck(
+                                check_id="output-content",
+                                capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+                                stage=GuardrailCheckStage.OUTPUT,
+                                action=GuardrailAction.BLOCK,
+                                adapter_id="output-detector",
+                                timeout_ms=1000,
+                            ),
+                        )
+                        if buffer_output
+                        else ()
                     ),
                 ),
             )
         ),
-        client=DirectClassifierClient(ClassifierRegistry({"detector": _Classifier(moderator)})),
+        client=DirectClassifierClient(
+            ClassifierRegistry(
+                {
+                    "detector": _Classifier(moderator),
+                    "output-detector": KeywordClassifier(("withheld-output-marker",)),
+                }
+            )
+        ),
         monotonic=time.monotonic,
     )
     control = _NativeOnlyControl(components, guardrails=engine, capture=capture)
@@ -326,8 +366,8 @@ def _scenario(
 def test_parallel_verdict_controls_text_and_tools(
     tmp_path: Path, surface: str, stream: bool, blocked: bool, tool: bool
 ) -> None:
-    """Native accounting preserves input gating and zero customer charge for denied work."""
-    with _scenario(tmp_path, blocked=blocked, tool=tool) as case:
+    """Generation and moderation overlap; a timely denial cancels before any answer escapes."""
+    with _scenario(tmp_path, blocked=blocked, wait_ms=1000, tool=tool) as case:
         with ThreadPoolExecutor(max_workers=1) as executor:
             response = executor.submit(case.request, surface, stream=stream, tool=tool)
             try:
@@ -335,13 +375,17 @@ def test_parallel_verdict_controls_text_and_tools(
                 assert case.moderator.started.wait(2)
                 case.moderator.release.set()
                 assert case.moderator.finished.wait(2)
-                case.provider.release.set()
+                if not blocked:
+                    case.provider.release.set()
                 result = response.result(timeout=3)
                 assert result.status_code == (400 if blocked else 200), result.text
                 assert ("provider-marker" in result.text) is not blocked
                 if blocked:
+                    assert not case.provider.release.is_set()
                     assert "content_filter" in result.text or "invalid_request_error" in result.text
-                assert case.control.close(timeout_seconds=2)
+                records = case.records()
+                assert len(records) == 1
+                assert records[0]["status"] == ("denied" if blocked else "allowed")
                 with connect_sqlite(case.database) as db:
                     rows = db.execute(
                         "SELECT state, budget_settled_nano_usd FROM gateway_attempts"
@@ -354,9 +398,358 @@ def test_parallel_verdict_controls_text_and_tools(
                 case.moderator.release.set()
 
 
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("decision_ready", [False, True])
+def test_deferred_required_capture_failure_prevents_response_and_charge(
+    tmp_path: Path, surface: str, stream: bool, decision_ready: bool
+) -> None:
+    """Capture exhaustion remains a 503 after either approval or moderation fail-open."""
+    records: list[str] = []
+    collector = CaptureCollector(
+        CaptureConfiguration(
+            maximum_pending_records=1, settlement_required=True, asynchronous_delivery=True
+        ).model_dump_json(),
+        records.append,
+    )
+    capture = CaptureController(collector, application_for=lambda _auth: "application")
+    try:
+        with _scenario(tmp_path, capture=capture) as case:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                response = executor.submit(case.request, surface, stream=stream)
+                try:
+                    assert case.provider.started.wait(2)
+                    assert case.moderator.started.wait(2)
+                    assert collector.begin(
+                        json.dumps(
+                            {
+                                "request_id": "occupied",
+                                "scope": {
+                                    "organization_id": "org",
+                                    "identity_id": "identity",
+                                    "application_id": "application",
+                                },
+                                "protocol": "chat_completions",
+                                "model_id": "model",
+                                "context": {"schema_version": 1, "request": {}},
+                            }
+                        )
+                    )
+                    if decision_ready:
+                        case.moderator.release.set()
+                        assert case.moderator.finished.wait(2)
+                    else:
+                        case.provider.release.set()
+                    result = response.result(timeout=3)
+                    assert result.status_code == 503, result.text
+                    assert "provider-marker" not in result.text
+                    assert (
+                        "overloaded_error" if surface == "messages" else "capture_unavailable"
+                    ) in result.text
+                    observations = case.records()
+                    assert observations[0]["status"] == (
+                        "allowed" if decision_ready else "failed_open"
+                    )
+                    with connect_sqlite(case.database) as db:
+                        rows = db.execute(
+                            "SELECT state, budget_settled_nano_usd FROM gateway_attempts"
+                        ).fetchall()
+                    assert rows == [("failed", 0)]
+                finally:
+                    case.provider.release.set()
+                    case.moderator.release.set()
+    finally:
+        collector.settle("occupied", False, False)
+        assert collector.close(2)
+    assert not records
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("blocked", [False, True])
+@pytest.mark.parametrize("buffered_stream", [False, True])
+def test_buffered_response_keeps_inspection_live_after_first_provider_content(
+    tmp_path: Path, surface: str, blocked: bool, buffered_stream: bool
+) -> None:
+    """An undeliverable prefix never consumes the complete response's zero-grace budget."""
+    with _scenario(
+        tmp_path, blocked=blocked, pause_stream=True, wait_ms=0, buffer_output=buffered_stream
+    ) as case:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            response = executor.submit(case.request, surface, stream=buffered_stream)
+            try:
+                assert case.provider.started.wait(2)
+                assert case.moderator.started.wait(2)
+                case.provider.release.set()
+                assert case.provider.prefix_sent.wait(2)
+                time.sleep(0.1)
+                # The provider remains incomplete while classification finishes.
+                assert not case.provider.finished.is_set()
+                case.moderator.release.set()
+                assert case.moderator.finished.wait(2)
+                deadline = time.monotonic() + 2
+                records: list[JsonObject] = []
+                while time.monotonic() < deadline:
+                    with connect_sqlite(case.database) as db:
+                        records = [
+                            json.loads(row[0])
+                            for row in db.execute("SELECT result FROM gateway_input_moderation")
+                        ]
+                    if records:
+                        break
+                    time.sleep(0.01)
+                assert len(records) == 1
+                assert records[0]["status"] == ("denied" if blocked else "allowed")
+                if not blocked:
+                    case.provider.tail_release.set()
+                result = response.result(timeout=2)
+                assert result.status_code == (400 if blocked else 200), result.text
+                assert ("provider-marker" in result.text) is not blocked
+                with connect_sqlite(case.database) as db:
+                    attempts = db.execute(
+                        "SELECT state, budget_settled_nano_usd FROM gateway_attempts"
+                    ).fetchall()
+                assert len(attempts) == 1
+                assert attempts[0][0] == ("failed" if blocked else "completed")
+                if blocked:
+                    assert attempts[0][1] == 0
+                    assert not case.provider.tail_release.is_set()
+            finally:
+                case.provider.tail_release.set()
+                case.moderator.release.set()
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("tool", [False, True])
+def test_denied_buffered_answer_keeps_completed_provider_meter(
+    tmp_path: Path, surface: str, tool: bool
+) -> None:
+    """A verdict after provider completion waives the charge but keeps observed work."""
+    with _scenario(tmp_path, blocked=True, tool=tool, wait_ms=3000) as case:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            response = executor.submit(case.request, surface, stream=False, tool=tool)
+            try:
+                assert case.provider.started.wait(2)
+                assert case.moderator.started.wait(2)
+                case.provider.release.set()
+                assert case.provider.finished.wait(2)
+                time.sleep(0.1)
+                assert not response.done()
+                case.moderator.release.set()
+                result = response.result(timeout=2)
+                assert result.status_code == 400, result.text
+                assert "provider-marker" not in result.text
+                with connect_sqlite(case.database) as db:
+                    row = db.execute(
+                        "SELECT state, input_tokens, output_tokens, budget_settled_nano_usd "
+                        "FROM gateway_attempts"
+                    ).fetchone()
+                assert row is not None and row[0] == "failed"
+                assert row[1] > 0 and row[2] > 0
+                assert row[3] == 0
+            finally:
+                case.moderator.release.set()
+
+
+def test_input_denial_reports_failed_terminal_write(tmp_path: Path) -> None:
+    """A failed durable refusal is an accounting error until recovery can write it."""
+    with _scenario(tmp_path, blocked=True, wait_ms=3000) as case:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            response = executor.submit(case.request, stream=False)
+            try:
+                assert case.provider.started.wait(2)
+                assert case.moderator.started.wait(2)
+                with connect_sqlite(case.database) as db:
+                    db.execute(
+                        "CREATE TRIGGER deny_terminal BEFORE UPDATE OF state ON gateway_attempts "
+                        "WHEN NEW.state='failed' BEGIN "
+                        "SELECT RAISE(ABORT, 'synthetic terminal unavailability'); END"
+                    )
+                case.moderator.release.set()
+                result = response.result(timeout=5)
+                assert result.status_code >= 500, result.text
+                assert result.json()["error"]["code"] != "content_filter"
+                assert "provider-marker" not in result.text
+            finally:
+                with connect_sqlite(case.database) as db:
+                    db.execute("DROP TRIGGER IF EXISTS deny_terminal")
+                case.provider.release.set()
+                case.moderator.release.set()
+
+
+@pytest.mark.parametrize("wait_ms", [0, 100])
+def test_retry_does_not_start_response_grace_before_an_answer_is_ready(
+    tmp_path: Path, wait_ms: int
+) -> None:
+    """A withheld provider failure cannot discard a denial before its fallback answers."""
+    with _scenario(tmp_path, blocked=True, wait_ms=wait_ms, timeout_ms=3000) as case:
+        calls = 0
+        second = threading.Event()
+        lock = threading.Lock()
+
+        def fail_first(server: BaseHTTPRequestHandler) -> bool:
+            """Fail one physical attempt, then hold the retry's output behind the fixture event."""
+            nonlocal calls
+            with lock:
+                calls += 1
+                ordinal = calls
+            if ordinal != 1:
+                second.set()
+                return False
+            server.rfile.read(int(server.headers["Content-Length"]))
+            case.provider.started.set()
+            assert case.moderator.started.wait(2)
+            body = b'{"error":{"message":"synthetic first-attempt failure"}}'
+            server.send_response(500)
+            server.send_header("Content-Type", "application/json")
+            server.send_header("Content-Length", str(len(body)))
+            server.end_headers()
+            server.wfile.write(body)
+            server.wfile.flush()
+            return True
+
+        case.provider.intercept = fail_first
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            response = executor.submit(case.request)
+            try:
+                assert second.wait(3)
+                case.moderator.release.set()
+                assert case.moderator.finished.wait(2)
+                result = response.result(timeout=3)
+                assert result.status_code == 400, result.text
+                assert "provider-marker" not in result.text
+                assert not case.provider.release.is_set()
+                assert case.records()[0]["status"] == "denied"
+            finally:
+                case.provider.release.set()
+                case.moderator.release.set()
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_exhausted_provider_response_still_waits_for_its_input_decision(
+    tmp_path: Path, empty: bool
+) -> None:
+    """An error or empty answer reaching the caller is also a response-ready boundary."""
+    with _scenario(
+        tmp_path, blocked=True, provider_status=200 if empty else 400, empty=empty, wait_ms=1000
+    ) as case:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            response = executor.submit(case.request)
+            assert case.moderator.started.wait(2)
+            case.provider.release.set()
+            assert case.provider.finished.wait(2)
+            with pytest.raises(TimeoutError):
+                response.result(timeout=0.1)
+            case.moderator.release.set()
+            result = response.result(timeout=3)
+            assert result.status_code == 400, result.text
+            assert "guardrail" in result.text
+            assert case.records()[0]["status"] == "denied"
+
+
+@pytest.mark.parametrize("wait_ms", [0, 100])
+def test_response_ready_has_bounded_grace_and_late_denial_cannot_revoke(
+    tmp_path: Path, wait_ms: int
+) -> None:
+    """Host-funded generation allows delivery after the configured moderation grace."""
+    with _scenario(tmp_path, blocked=True, wait_ms=wait_ms) as case:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            response = executor.submit(case.request)
+            try:
+                assert case.provider.started.wait(2)
+                assert case.moderator.started.wait(2)
+                start = time.monotonic()
+                case.provider.release.set()
+                result = response.result(timeout=1.5)
+                elapsed = time.monotonic() - start
+                assert elapsed < wait_ms / 1000 + 0.75
+                assert elapsed >= wait_ms / 1000 * 0.8
+                assert not case.moderator.release.is_set()
+                assert result.status_code == 200 and "provider-marker" in result.text
+                case.moderator.release.set()
+                assert case.moderator.finished.wait(2)
+                records = case.records()
+                assert len(records) == 1
+                assert records[0]["status"] == "failed_open"
+                assert records[0]["reason"] == "response_ready_timeout"
+                assert _first_observation(records[0])["policy_id"] == "input-policy"
+            finally:
+                case.provider.release.set()
+                case.moderator.release.set()
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_customer_credentials_wait_for_approval_before_provider_dispatch(
+    tmp_path: Path, blocked: bool
+) -> None:
+    """A denied prompt cannot spend on a customer credential before inspection."""
+    with _scenario(
+        tmp_path, blocked=blocked, billing_source=BillingSource.CUSTOMER_MANAGED, fail_open=False
+    ) as case:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            response = executor.submit(case.request)
+            try:
+                assert case.moderator.started.wait(2)
+                assert not case.provider.started.wait(0.1)
+                case.moderator.release.set()
+                if not blocked:
+                    assert case.provider.started.wait(2)
+                    case.provider.release.set()
+                result = response.result(timeout=3)
+                assert result.status_code == (400 if blocked else 200), result.text
+                assert case.provider.started.is_set() is not blocked
+                assert case.records()[0]["status"] == ("denied" if blocked else "allowed")
+            finally:
+                case.provider.release.set()
+                case.moderator.release.set()
+
+
+@pytest.mark.parametrize("failure", ["http", "timeout"])
+def test_detector_failure_is_recorded_without_refusing_request(
+    tmp_path: Path, failure: str
+) -> None:
+    """A detector failure releases generation and retains a failed-moderation flag."""
+    with _scenario(
+        tmp_path, detector_status=503 if failure == "http" else 200, timeout_ms=100, wait_ms=1000
+    ) as case:
+        case.provider.release.set()
+        if failure == "http":
+            case.moderator.release.set()
+        result = case.request()
+        assert result.status_code == 200 and "provider-marker" in result.text
+        record = case.records()[0]
+        assert record["status"] == "failed_open"
+        assert _first_observation(record)["outcome"] in {"error", "timeout", "unavailable"}
+
+
+def _first_observation(record: JsonObject) -> JsonObject:
+    """Validate the persisted nested JSON before asserting content-free decision metadata."""
+    observations = record["observations"]
+    assert isinstance(observations, list) and observations
+    first = observations[0]
+    assert isinstance(first, dict)
+    return first
+
+
+def test_observation_finishes_after_delivery_and_shutdown_drains_it(tmp_path: Path) -> None:
+    """Observe mode never gates delivery, but shutdown retains an in-flight score report."""
+    with _scenario(tmp_path, blocked=True, mode="observe", wait_ms=1000) as case:
+        case.provider.release.set()
+        result = case.request()
+        assert result.status_code == 200 and "provider-marker" in result.text
+        assert case.moderator.started.wait(2)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            drained = executor.submit(case.control.close, 2)
+            assert not drained.done()
+            case.moderator.release.set()
+            assert drained.result(timeout=3)
+        records = case.records()
+        assert len(records) == 1 and records[0]["status"] == "observed"
+        assert _first_observation(records[0])["outcome"] == "flagged"
+
+
 @pytest.mark.parametrize("blocked", [False, True])
 def test_serial_configuration_waits_before_dispatch(tmp_path: Path, blocked: bool) -> None:
-    """A serial policy still inspects admission before any provider dispatch."""
+    """A serial policy protects third-party dispatch while sharing the native detector."""
     with _scenario(tmp_path, blocked=blocked, execution="before_dispatch") as case:
         case.provider.release.set()
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -368,9 +761,54 @@ def test_serial_configuration_waits_before_dispatch(tmp_path: Path, blocked: boo
                 result = response.result(timeout=3)
                 assert result.status_code == (400 if blocked else 200), result.text
                 assert case.provider.started.is_set() is not blocked
-                assert case.control.close(timeout_seconds=2)
+                assert case.records()[0]["status"] == ("denied" if blocked else "allowed")
             finally:
                 case.moderator.release.set()
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("blocked", [False, True])
+def test_serial_inspection_releases_admission_capacity(
+    tmp_path: Path, surface: str, blocked: bool
+) -> None:
+    """More inspections than bridge workers can wait without holding admission slots."""
+    with _scenario(tmp_path, blocked=blocked, execution="before_dispatch") as case:
+        case.provider.release.set()
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            responses = [executor.submit(case.request, surface) for _ in range(8)]
+            try:
+                deadline = time.monotonic() + 2
+                while len(case.moderator.requests) < 8 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert len(case.moderator.requests) == 8
+                assert not case.provider.started.is_set()
+                case.moderator.release.set()
+                results = [response.result(timeout=3) for response in responses]
+                assert [result.status_code for result in results] == [400 if blocked else 200] * 8
+                assert len(case.records()) == 8
+                with connect_sqlite(case.database) as db:
+                    attempts = db.execute("SELECT state FROM gateway_attempts").fetchall()
+                    states = db.execute("SELECT terminal_state FROM gateway_requests").fetchall()
+                assert attempts == ([] if blocked else [("completed",)] * 8)
+                assert states == [("failed" if blocked else "completed",)] * 8
+            finally:
+                case.moderator.release.set()
+
+
+@pytest.mark.parametrize("execution", ["before_dispatch", "parallel"])
+def test_denied_input_never_starts_admission_web_search(
+    tmp_path: Path, execution: Literal["before_dispatch", "parallel"]
+) -> None:
+    """Admission side effects remain behind inspection before native handoff."""
+    search = StaticWebSearchBackend(())
+    with _scenario(tmp_path, blocked=True, execution=execution, fail_open=False) as case:
+        case.control._web_search = search
+        case.moderator.release.set()
+        result = case.request(web_search=True)
+        assert result.status_code == 400, result.text
+        assert not search.queries
+        assert not case.provider.started.is_set()
+        assert case.records()[0]["status"] == "denied"
 
 
 @pytest.mark.parametrize("stage", ["input", "output"])
@@ -463,3 +901,97 @@ def test_ordered_redaction_precedes_blocking_through_native_http(
                 ]
         finally:
             components.write_ledger.close()
+
+
+@pytest.mark.parametrize("wait_ms", [0, 100])
+def test_a_ready_stream_releases_its_first_content_before_generation_or_moderation_finishes(
+    tmp_path: Path, wait_ms: int
+) -> None:
+    """The response grace starts at the first deliverable event, never the provider terminal."""
+    with _scenario(tmp_path, pause_stream=True, wait_ms=wait_ms) as case:
+        case.provider.release.set()
+        started = time.monotonic()
+        try:
+            with httpx.stream(
+                "POST",
+                case.url + "/v1/chat/completions",
+                headers={"authorization": f"Bearer {case.key}"},
+                json={
+                    "model": "coding",
+                    "stream": True,
+                    "max_tokens": 100,
+                    "messages": [{"role": "user", "content": "stream fixture"}],
+                },
+                timeout=3,
+            ) as response:
+                assert response.status_code == 200
+                for line in response.iter_lines():
+                    if "provider-marker" in line:
+                        break
+                else:
+                    pytest.fail("no content arrived before the provider terminal")
+                assert time.monotonic() - started < 1.5
+                assert not case.provider.finished.is_set()
+                assert not case.moderator.release.is_set()
+        finally:
+            case.provider.tail_release.set()
+            case.moderator.release.set()
+        assert case.records()[0]["status"] == "failed_open"
+
+
+def test_shutdown_drains_only_its_own_moderation_records(tmp_path: Path) -> None:
+    """Another worker's pending observation cannot hold this worker's storage lifetime open."""
+    with _scenario(tmp_path / "other", mode="observe") as other:
+        other.provider.release.set()
+        assert other.request().status_code == 200
+        assert other.moderator.started.wait(2)
+        with _scenario(tmp_path / "first") as first:
+            first.provider.release.set()
+            first.moderator.release.set()
+            assert first.request().status_code == 200
+            assert first.control.close(timeout_seconds=0.5)
+            assert not other.moderator.release.is_set()
+        other.moderator.release.set()
+        assert other.records()[0]["status"] == "observed"
+
+
+@pytest.mark.parametrize("wait_ms", [0, 250])
+@pytest.mark.parametrize("web_search", [False, True])
+def test_parallel_effects_fail_open_at_the_blocking_budget(
+    tmp_path: Path, wait_ms: int, web_search: bool
+) -> None:
+    """A stalled classifier adds only the configured grace before paid work."""
+    with _scenario(
+        tmp_path,
+        blocked=True,
+        billing_source=BillingSource.HOST_MANAGED if web_search else BillingSource.CUSTOMER_MANAGED,
+        wait_ms=wait_ms,
+        timeout_ms=5000,
+    ) as case:
+        search = StaticWebSearchBackend(())
+        case.control._web_search = search
+        case.provider.release.set()
+        started = time.monotonic()
+        try:
+            result = case.request(web_search=web_search)
+            elapsed = time.monotonic() - started
+            assert elapsed < wait_ms / 1000 + 0.75
+            assert elapsed >= wait_ms / 1000 * 0.8
+            assert result.status_code == 200, result.text
+            assert case.provider.started.is_set()
+            assert bool(search.queries) is web_search
+            assert not case.moderator.release.is_set()
+            assert case.records()[0]["status"] == "failed_open"
+            assert case.records()[0]["reason"] == "response_ready_timeout"
+            with connect_sqlite(case.database) as db:
+                attempts = db.execute(
+                    "SELECT state, budget_settled_nano_usd, input_tokens, output_tokens "
+                    "FROM gateway_attempts"
+                ).fetchall()
+                requests = db.execute("SELECT terminal_state FROM gateway_requests").fetchall()
+            assert requests == [("completed",)]
+            assert len(attempts) == 1 and attempts[0][0] == "completed"
+            assert attempts[0][1] == attempts[0][2] * 1000 + attempts[0][3] * 2000
+            assert attempts[0][1] > 0
+        finally:
+            case.moderator.release.set()

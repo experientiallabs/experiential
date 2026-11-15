@@ -69,6 +69,8 @@ pub enum Won {
 pub struct CommittedAttempt {
     pub depth: usize,
     pub prefix: Vec<Event>,
+    /// A fully collected response keeps its budget while input approval is pending.
+    pub collected_retention: Option<crate::retained::RetainedLease>,
     pub relay: UpstreamRelay,
     pub usage: Option<Usage>,
     pub tool_names: Vec<String>,
@@ -398,16 +400,57 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
         // A rung a tool-search round rebuilt dials its rebuilt wire; the
         // route's own entry still answers every policy question above.
         let dial_wire = search_wires[depth].as_ref().unwrap_or(wire);
-        let mut end = run_attempt(
-            ctx,
-            guard,
-            dial_wire,
-            depth,
-            &mut repaired[depth],
-            repair_redial,
-            &tool_search_rounds,
-        )
-        .await;
+        let gate = guard.input_gate.as_ref().map(|gate| {
+            if total_attempts == 1 {
+                gate.clone()
+            } else {
+                crate::guardrails::input::InputGate::new(ctx)
+            }
+        });
+        guard.input_gate = gate.clone();
+        let end = {
+            let attempt = run_attempt(
+                ctx,
+                guard,
+                dial_wire,
+                depth,
+                &mut repaired[depth],
+                repair_redial,
+                &tool_search_rounds,
+            );
+            match gate {
+                Some(gate) => gate.inspect_attempt(ctx.bridge, attempt).await,
+                None => Ok(attempt.await),
+            }
+        };
+        let mut end = match end {
+            Ok(end) => end,
+            Err(failure) => {
+                // The dropped generation closes its transport before durable settlement.
+                return Won::Failed(if guard.fail_before_release(&failure.failure).await {
+                    failure.public_error()
+                } else {
+                    guard.settlement_error()
+                });
+            }
+        };
+        // A settled answer is complete. Committed answers reach the surface's
+        // release boundary after any required whole-response collection.
+        if matches!(end, AttemptEnd::Settled(_)) {
+            if let Some(gate) = guard.input_gate.clone() {
+                if let Err(failure) = gate
+                    .response_ready(ctx.bridge)
+                    .await
+                    .and_then(|decision| decision.require_allow())
+                {
+                    return Won::Failed(if guard.fail_before_release(&failure.failure).await {
+                        failure.public_error()
+                    } else {
+                        guard.settlement_error()
+                    });
+                }
+            }
+        }
         // Every pre-commit failure of a tenant origin answers opaquely; the
         // relay marks the failures it yields after an open the same way.
         if let AttemptEnd::Ladder { failure, .. } | AttemptEnd::Repair { failure, .. } = &mut end {
@@ -596,6 +639,23 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                         &failure,
                         refusal_eligible,
                     );
+                if !possible {
+                    if let Some(gate) = guard.input_gate.clone() {
+                        if let Err(failure) = gate
+                            .response_ready(ctx.bridge)
+                            .await
+                            .and_then(|decision| decision.require_allow())
+                        {
+                            return Won::Failed(
+                                if guard.fail_before_release(&failure.failure).await {
+                                    failure.public_error()
+                                } else {
+                                    guard.settlement_error()
+                                },
+                            );
+                        }
+                    }
+                }
                 if !possible
                     && (!exhaustion_flush.is_empty()
                         || failure.failure_class == FailureClass::EmptyCompletion)

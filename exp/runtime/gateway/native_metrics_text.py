@@ -44,6 +44,7 @@ _HISTOGRAMS: tuple[tuple[str, str], ...] = (
     ("request_duration_ms", "Total milliseconds spent serving one request."),
     ("permit_wait_ms", "Milliseconds a request waited for an admission permit."),
     ("bridge_call_ms", "Milliseconds one control-plane bridge call took."),
+    ("settlement_wait_ms", "Milliseconds a settlement waited for execution and bridge permits."),
 )
 
 _CONTROL_PLANE_COUNTERS: tuple[tuple[str, str], ...] = (

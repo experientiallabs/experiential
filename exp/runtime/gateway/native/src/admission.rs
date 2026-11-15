@@ -74,9 +74,12 @@ pub(crate) struct Admission {
     /// callback. See [`OutputGuardrailMode`].
     #[serde(default)]
     pub output_guardrail: OutputGuardrailMode,
-    /// Generation may start before input classification, but no output can be released.
+    /// Native input classification must approve before any output can be released.
     #[serde(default)]
     pub guardrail_input_pending: bool,
+    /// Serial inspection waits outside host admission and before dispatch capacity.
+    #[serde(default)]
+    pub guardrail_input_before_dispatch: bool,
     /// The resolved output chain when every check binds a deterministic
     /// detector. The data plane enforces it in place, so the request pays no
     /// python callback. A chain with any non-deterministic adapter omits the

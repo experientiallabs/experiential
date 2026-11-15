@@ -60,7 +60,7 @@ pub(super) struct Dispatch {
     admitted_attempts: Mutex<HashMap<String, terminal::Terms>>,
     pub(super) inspection: Option<super::inspection::Inspection>,
     pub(super) deadline: std::time::Instant,
-    pub(super) resources: super::resources::Resources,
+    pub(super) resources: Arc<super::resources::Resources>,
     cache: Option<super::cache::Cache>,
 }
 
@@ -141,7 +141,7 @@ impl Dispatch {
             host,
             inspection,
             deadline,
-            resources,
+            resources: Arc::new(resources),
             cache,
             admitted_attempts: Mutex::new(HashMap::new()),
             state: Mutex::new(State {
@@ -187,6 +187,9 @@ impl Dispatch {
         };
         let tool_round =
             start.tool_search_round && start.current_depth.is_some() && start.failure.is_none();
+        if tool_round {
+            self.resources.activate_reinspection()?;
+        }
         let repair = start.reasoning_repair && start.current_depth.is_some();
         let mut failover = FailoverPass::begin(
             &c.rules,
@@ -814,9 +817,46 @@ impl Driver for Dispatch {
             };
         }
         if method == "tool_search_round" {
-            if let Some(input) = &self.resources.input {
-                input.wait();
+            let runtime = super::inspection_http::runtime().map_err(|_| PublicError::internal())?;
+            // Cancellation and terminal writes must retain access to dispatch while
+            // a strict classifier is pending. Revalidate the attempt under the lock below.
+            let approved = runtime.block_on(self.resources.wait_for_tools());
+            if approved["action"] != "allow" && approved["action"] != "pending" {
+                if approved["failure"].is_object() {
+                    return Ok(json!({"inspection_failure": approved["failure"], "rounds": []}));
+                }
+                return Err(PublicError::internal());
             }
+            let mut serial_gate = None;
+            let (response, attempt) = {
+                let mut state = self.state.lock().map_err(|_| PublicError::internal())?;
+                let attempt = state.active.clone();
+                (
+                    self.search_round(input, &mut state, &mut serial_gate)?,
+                    attempt,
+                )
+            };
+            if let Some(gate) = serial_gate {
+                let decision = gate.wait();
+                let state = self.state.lock().map_err(|_| PublicError::internal())?;
+                if state.active != attempt
+                    || !state
+                        .active
+                        .as_ref()
+                        .and_then(|id| state.attempts.get(id))
+                        .is_some_and(|a| !a.cancelled && a.terminal.is_none())
+                {
+                    return Err(PublicError::internal());
+                }
+                if decision["action"] != "allow" {
+                    self.resources
+                        .deny_reinspection(decision["failure"].clone())?;
+                    return Ok(
+                        json!({"inspection_failure": decision["failure"], "rounds": response["rounds"]}),
+                    );
+                }
+            }
+            return Ok(response);
         }
         let mut state = self.state.lock().map_err(|_| PublicError::internal())?;
         match method {
@@ -828,7 +868,6 @@ impl Driver for Dispatch {
                     && !self.config.paid_prework;
                 self.finish(input, &mut state, certify)
             }
-            "tool_search_round" => self.search_round(input, &mut state),
             "enforce_output" => self
                 .inspection
                 .as_ref()

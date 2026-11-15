@@ -57,6 +57,9 @@ pub(crate) trait CallbackTarget: Send + Sync {
     fn retain_request(&self, _request_id: &str) -> Option<Arc<dyn Send + Sync>> {
         None
     }
+    fn input_resources(&self, _request_id: &str) -> Option<Arc<crate::accounting::InputResources>> {
+        None
+    }
 }
 
 pub(crate) struct NativeTarget {
@@ -80,6 +83,12 @@ impl NativeTarget {
     }
     pub(crate) fn retain_request(&self, request_id: &str) -> Option<Arc<dyn Send + Sync>> {
         self.target.retain_request(request_id)
+    }
+    pub(crate) fn input_resources(
+        &self,
+        request_id: &str,
+    ) -> Option<Arc<crate::accounting::InputResources>> {
+        self.target.input_resources(request_id)
     }
 }
 

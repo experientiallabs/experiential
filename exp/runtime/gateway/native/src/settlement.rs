@@ -560,9 +560,9 @@ impl AttemptGuard {
         if !self.armed {
             return None;
         }
-        let input_failure = match self.input_gate.clone() {
+        let input_failure = match self.input_gate.clone().filter(|_| finalize) {
             Some(gate) => gate
-                .wait(&self.bridge)
+                .response_ready(&self.bridge)
                 .await
                 .and_then(|d| d.require_allow())
                 .err()
@@ -934,3 +934,7 @@ mod tests;
 #[cfg(test)]
 #[path = "settlement_refusal_tests.rs"]
 mod refusal_tests;
+
+#[cfg(test)]
+#[path = "settlement_acknowledgement_tests.rs"]
+mod acknowledgement_tests;

@@ -55,10 +55,11 @@ class ObservationRecord:
     def log_outcome(self) -> None:
         """Emit the default content-free observation when no host sink overrides it."""
         logging.getLogger(__name__).info(
-            "guardrail observation policy_id=%s revision=%s organization_id=%s identity_id=%s "
+            "guardrail observation policy_id=%s revision_sha256=%s "
+            "organization_id=%s identity_id=%s "
             "check_id=%s capability=%s would_action=%s outcome=%s latency_ms=%.1f",
             self.policy.policy_id,
-            self.policy.revision,
+            sha256(self.policy.revision.encode()).hexdigest(),
             self.policy.organization_id,
             self.policy.identity_id,
             None if self.check is None else self.check.check_id,
