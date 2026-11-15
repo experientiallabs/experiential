@@ -136,7 +136,14 @@ window of the request (a `WindowedClassifier`) declares a configuration digest. 
 joins the replay revision, and a policy whose input checks are all windowed is not refused
 for its total request size.
 
-Startup requires `GUARDRAIL_CONTRACT_VERSION=6`. Publish coordinated engine and
+Optional-only parallel input uses one native decision shared by response release
+and settlement. Rust expires pending inspection without a Python status callback.
+Late decisions cannot change its financial disposition. Required capture is prepared
+without registering or spilling content, then registered through the existing
+collector after approval or expiry. Capture failure still withholds output and
+waives the customer charge. Strict or mixed input policies retain required approval.
+
+Startup requires `GUARDRAIL_CONTRACT_VERSION=7`. Publish coordinated engine and
 native packages before a downstream host updates its exact release pins. There
 are no synchronous adapter wrappers, alternate mandatory-policy entry points, or
 package-version fallbacks.

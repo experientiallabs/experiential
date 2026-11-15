@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future
@@ -30,6 +31,8 @@ from exp.runtime.gateway.guardrails.streaming import StreamSegment
 from exp.runtime.gateway.guardrails.subjects import ObservedSubjects
 
 if TYPE_CHECKING:
+    from exp_gateway_native import OptionalInputDecision
+
     from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
     from exp.runtime.gateway.native_execution import InflightRequest
 
@@ -70,6 +73,8 @@ class GuardrailSession:
         _input_wait: First blocking boundary shared by optional input checks and tool rounds.
         _inspected: Exact input and approved-result pairs, empty before inspection.
         _observed: Content-free subject identities and optional observation admission state.
+        native_input: Optional native release capability shared with settlement.
+        _native_expiry_recorded: Whether the native expiry has entered decision observations.
     """
 
     engine: GuardrailEngine
@@ -86,6 +91,34 @@ class GuardrailSession:
         default_factory=list, init=False, repr=False
     )
     _observed: ObservedSubjects = field(default_factory=ObservedSubjects, init=False, repr=False)
+    native_input: OptionalInputDecision | None = field(default=None, init=False, repr=False)
+    _native_expiry_recorded: bool = field(default=False, init=False, repr=False)
+
+    def optional_input_wait_ms(self) -> int | None:
+        """Authorize native expiry only when every enforcing input check is optional."""
+        policies = tuple(p for p in self.enforcing_policies if p.input_checks)
+        if not policies or any(
+            not p.fail_open or p.input_execution != "parallel" for p in policies
+        ):
+            return None
+        return max(p.input_max_wait_ms for p in policies)
+
+    def _publish_native_input(self, future: Future[None]) -> None:
+        """Publish a completed verdict without renewing an expired native decision."""
+        native = self.native_input
+        assert native is not None
+        try:
+            future.result()
+        except GuardrailRejected as error:
+            decision = {
+                "action": "error",
+                "failure": denied_input_failure(error.failure).model_dump(mode="json"),
+            }
+        except Exception:  # noqa: BLE001 - optional infrastructure failures fail open.
+            decision = {"action": "allow"}
+        else:
+            decision = {"action": "allow"}
+        native.publish(json.dumps(decision))
 
     @property
     def enforcing_policies(self) -> tuple[GuardrailPolicy, ...]:
@@ -191,6 +224,22 @@ class GuardrailSession:
 
         if policy.input_execution != "parallel" or not policy.fail_open:
             return await inspect()
+        if self.native_input is not None:
+            elapsed = self.native_input.elapsed_seconds()
+            if elapsed is None:
+                try:
+                    result = await inspect()
+                except GuardrailRejected:
+                    elapsed = self.native_input.elapsed_seconds()
+                    if elapsed is None or elapsed * 1000 < policy.input_max_wait_ms:
+                        raise
+                else:
+                    elapsed = self.native_input.elapsed_seconds()
+                    if elapsed is None or elapsed * 1000 < policy.input_max_wait_ms:
+                        return result
+                self.engine.record_input_expiry(policy)
+                return request
+            self._input_wait.begin(elapsed_seconds=elapsed)
         result = await self._input_wait.run(
             inspect, wait_ms=policy.input_max_wait_ms, deadline=self.deadline_monotonic
         )
@@ -242,6 +291,8 @@ class GuardrailSession:
         if not overlap:
             self.begin_input_wait()
         self._input = start_on_native_loop(self._inspect_subjects(tuple(remaining)))
+        if self.native_input is not None:
+            self._input.add_done_callback(self._publish_native_input)
         if not overlap:
             try:
                 self._input.result(timeout=max(0, self.deadline_monotonic - time.monotonic()))
@@ -285,6 +336,23 @@ class GuardrailSession:
         """Poll approval without tying up a bridge worker or renewing its deadline."""
         if self._input_failure is not None:
             return {"action": "error", "failure": self._input_failure.model_dump(mode="json")}
+        if self.native_input is not None:
+            if self.native_input.expired() and not self._native_expiry_recorded:
+                self._native_expiry_recorded = True
+                for policy in self.enforcing_policies:
+                    if policy.input_checks:
+                        self.engine.record_input_expiry(policy)
+            decision = json.loads(self.native_input.decision_json())
+            if decision["action"] == "closed":
+                return {
+                    "action": "error",
+                    "failure": denied_input_failure().model_dump(mode="json"),
+                }
+            if decision["action"] == "error":
+                decision["failure"] = denied_input_failure(
+                    GatewayFailure.model_validate(decision["failure"])
+                ).model_dump(mode="json")
+            return decision
         if not self.enforcing_policies:
             return {"action": "allow"}
         future = self._input
@@ -328,6 +396,8 @@ class GuardrailSession:
         if failure is not None:
             self._input_failure = denied_input_failure(failure)
         self._closed = True
+        if self.native_input is not None:
+            self.native_input.close()
         if self._input is not None:
             self._input.cancel()
 

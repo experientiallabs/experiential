@@ -343,14 +343,14 @@ def test_scope_configuration_is_strict() -> None:
         GuardrailPolicy(policy_id="unprotected-platform")
 
 
-@pytest.mark.parametrize("marker", [None, True, "6", 0, 1, 2, 3, 4, 5])
+@pytest.mark.parametrize("marker", [None, True, "7", 0, 1, 2, 3, 4, 5, 6])
 def test_mismatched_native_contract_fails_at_startup(marker: object) -> None:
     """There is no package-version compatibility path that can omit an approval gate."""
     with patch(
         "exp.runtime.gateway.guardrails.native.importlib.import_module",
         return_value=SimpleNamespace(GUARDRAIL_CONTRACT_VERSION=marker),
     ):
-        with pytest.raises(ValueError, match="GUARDRAIL_CONTRACT_VERSION=6"):
+        with pytest.raises(ValueError, match="GUARDRAIL_CONTRACT_VERSION=7"):
             validate_guardrail_engine(_engine(_Classifier("allow")))
 
 

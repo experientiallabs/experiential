@@ -28,6 +28,8 @@ from exp.runtime.gateway.native_capture import (
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 if TYPE_CHECKING:
+    from exp_gateway_native import OptionalInputDecision
+
     from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 
@@ -71,9 +73,9 @@ def validate_guardrail_engine(engine: GuardrailEngine | None) -> None:
     if engine is None:
         return
     native = importlib.import_module("exp_gateway_native")
-    if getattr(native, "GUARDRAIL_CONTRACT_VERSION", None) != 6:
+    if getattr(native, "GUARDRAIL_CONTRACT_VERSION", None) != 7:
         raise ValueError(
-            "guardrails require native GUARDRAIL_CONTRACT_VERSION=6; "
+            "guardrails require native GUARDRAIL_CONTRACT_VERSION=7; "
             "install the coordinated native package"
         )
 
@@ -279,8 +281,45 @@ class _GuardrailPlane(Protocol):
     _capture: CaptureController | None
 
 
+def prepare_native_optional_input(
+    session: GuardrailSession,
+    controller: CaptureController | None,
+    authorization: AuthorizationSnapshot,
+    pending: PendingCapture | None,
+    model_id: str,
+) -> bool:
+    """Bind optional expiry to a native capability without retaining unapproved input."""
+    wait_ms = session.optional_input_wait_ms()
+    if wait_ms is None:
+        return False
+    from exp_gateway_native import OptionalInputDecision
+
+    try:
+        prepared = (
+            None
+            if controller is None or pending is None
+            else controller.prepare(
+                authorization, pending.request, model_id, session_id=pending.session_id
+            )
+        )
+        collector = None if prepared is None or controller is None else controller.native
+        session.native_input = OptionalInputDecision(
+            authorization.request_id, wait_ms, collector, prepared
+        )
+    except Exception:  # noqa: BLE001 - required capture preparation remains a sanitized refusal.
+        raise GuardrailRejected(capture_unavailable_failure()) from None
+    return True
+
+
 class NativeGuardrailsMixin:
     """Resolve native operations to one frozen session, independent of policy scope."""
+
+    def guardrail_input_latch(self: _GuardrailPlane, argument: str) -> OptionalInputDecision:
+        """Return the exact admitted request's in-process capability in the admission crossing."""
+        entry = self._accounting.entry(str(json.loads(argument)["request_id"]))
+        if entry is None or entry.guardrails is None or entry.guardrails.native_input is None:
+            raise RuntimeError("native optional input owner is unavailable")
+        return entry.guardrails.native_input
 
     def guardrail_input_status(self: _GuardrailPlane, argument: str) -> str:
         """Poll the shared input session and register capture once before allowing release.

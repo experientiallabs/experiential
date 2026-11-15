@@ -325,11 +325,11 @@ async fn generate(
         "capture_session_id": crate::capture::session_id(&headers),
     });
     with_app_identity(&mut admit_value, &headers);
-    let admission_text = match state.bridge.call("admit", compact_json(&admit_value)).await {
+    let admission_reply = match state.bridge.admit(compact_json(&admit_value)).await {
         Ok(text) => text,
         Err(error) => return google_error_response(&error),
     };
-    let admission_value: Value = match serde_json::from_str(&admission_text) {
+    let admission_value: Value = match serde_json::from_str(&admission_reply.text) {
         Ok(value) => value,
         Err(_) => return google_error_response(&PublicError::internal()),
     };
@@ -342,6 +342,7 @@ async fn generate(
         Err(_) => return wire_drift_response(&state, &admission_value, started).await,
     };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
+    guard.input_latch = admission_reply.input;
     guard.record_web_search(admission.web_search_meter());
     let permit = match acquire_permit_with(
         &state,
