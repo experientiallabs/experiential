@@ -27,6 +27,10 @@ def _source_gate() -> str:
     ("changes", "success"),
     [
         ({}, True),
+        ({"DEPENDENCY": "missing"}, False),
+        ({"DEPENDENCY": "exp-gateway-native>=0.3.190rc1"}, False),
+        ({"DEPENDENCY": "exp-gateway-native==0.3.190"}, False),
+        ({"DEPENDENCY": "exp-gateway-native==0.3.190rc1|exp-gateway-native==0.3.190rc1"}, False),
         ({"REF_PROTECTED": "false"}, False),
         ({"GITHUB_REPOSITORY": "other/experiential"}, False),
         ({"PROJECT": "0.7.243rc2"}, False),
@@ -138,8 +142,11 @@ def test_publication_requires_protected_tags_and_stable_main_ancestry(
     git("update-ref", "refs/remotes/origin/main", "HEAD")
     native = tmp_path / NATIVE
     native.mkdir(parents=True)
+    dependency = values.get("DEPENDENCY", f"exp-gateway-native=={values['NATIVE']}")
+    dependencies = [] if dependency == "missing" else dependency.split("|")
     (tmp_path / "pyproject.toml").write_text(
         f'[project]\nname = "experiential"\nversion = "{values["PROJECT"]}"\n'
+        f"dependencies = {json.dumps(dependencies)}\n"
     )
     (native / "pyproject.toml").write_text(
         f'[project]\nname = "exp-gateway-native"\nversion = "{values["NATIVE"]}"\n'
