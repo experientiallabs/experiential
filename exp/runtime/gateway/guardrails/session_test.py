@@ -777,3 +777,26 @@ def test_optional_wait_deducts_native_callback_queue_time() -> None:
     finally:
         classifier.release.set()
         engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize("later_wait", [50, 250])
+def test_native_optional_eligibility_preserves_distinct_policy_budgets(later_wait: int) -> None:
+    """Only a uniform optional budget can replace the per-policy input timers."""
+    optional = _observer_policy().model_copy(
+        update={
+            "mode": "enforce",
+            "input_execution": "parallel",
+            "fail_open": True,
+            "input_max_wait_ms": 50,
+        }
+    )
+    later = optional.model_copy(update={"policy_id": "later", "input_max_wait_ms": later_wait})
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((optional, later)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": ScriptedClassifier()})),
+        monotonic=time.monotonic,
+    )
+    try:
+        assert _session(engine).optional_input_wait_ms() == (50 if later_wait == 50 else None)
+    finally:
+        engine.close()

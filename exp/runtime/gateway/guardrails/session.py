@@ -101,7 +101,10 @@ class GuardrailSession:
             not p.fail_open or p.input_execution != "parallel" for p in policies
         ):
             return None
-        return max(p.input_max_wait_ms for p in policies)
+        budgets = {p.input_max_wait_ms for p in policies}
+        # Differing budgets need the existing per-policy timer so an expired
+        # early check cannot prevent a later check from using its longer budget.
+        return budgets.pop() if len(budgets) == 1 else None
 
     def _publish_native_input(self, future: Future[None]) -> None:
         """Publish a completed verdict without renewing an expired native decision."""
@@ -339,6 +342,8 @@ class GuardrailSession:
         if self.native_input is not None:
             if self.native_input.expired() and not self._native_expiry_recorded:
                 self._native_expiry_recorded = True
+                if self._input is not None:
+                    self._input.cancel()
                 for policy in self.enforcing_policies:
                     if policy.input_checks:
                         self.engine.record_input_expiry(policy)
@@ -444,7 +449,7 @@ class GuardrailSession:
 
     def inspect_output(self, completion: GuardrailCompletion) -> GuardrailCompletion:
         """Enforce every output policy before releasing a buffered completion."""
-        if self._input is not None and not self._input.done():
+        if self.native_input is None and self._input is not None and not self._input.done():
             self.begin_input_wait()
             try:
                 self._input.result(timeout=max(0, self.deadline_monotonic - time.monotonic()))
