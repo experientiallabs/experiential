@@ -205,6 +205,7 @@ impl Bridge {
         argument: String,
     ) -> Result<String, PublicError> {
         let settlement = matches!(method, "settle" | "abandon");
+        let waiting = std::time::Instant::now();
         // Supplied capacity is acquired before a shared worker. Individual
         // execution has no additional pool, identity lookup or allocation policy.
         let execution_permit = if let Some(execution) = &self.execution {
@@ -238,6 +239,11 @@ impl Bridge {
             .acquire_owned()
             .await
             .map_err(|_| PublicError::internal())?;
+        if settlement {
+            crate::metrics::METRICS
+                .settlement_wait_ms
+                .record(waiting.elapsed());
+        }
         // Latency is measured from permit grant so it reflects the python
         // callback itself, not queueing behind other bridge calls.
         let call_started = std::time::Instant::now();

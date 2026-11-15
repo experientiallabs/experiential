@@ -420,7 +420,7 @@ impl InputGate {
     /// Publish the outward boundary once; each policy owns its own grace.
     pub fn begin_response(&self, at: Instant) {
         self.response_ready.send_if_modified(|value| {
-            if value.is_some() {
+            if value.is_some_and(|prior| prior <= at) {
                 false
             } else {
                 *value = Some(at);
@@ -446,7 +446,12 @@ impl InputGate {
         self.publish();
     }
 
+    pub fn boundary(&self) -> Option<Instant> {
+        *self.response_ready.borrow()
+    }
+
     pub fn wait(&self) -> Value {
+        self.begin_response(Instant::now());
         let Ok(mut state) = self.state.lock() else {
             return unavailable();
         };
@@ -647,8 +652,11 @@ async fn run(
     decision
 }
 
-fn response_deadline(check: &Check, ready: Option<Instant>) -> Option<Instant> {
-    if check.policy["mode"] == "observe" || check.policy["input_fail_open"] != true {
+pub(super) fn response_deadline(check: &Check, ready: Option<Instant>) -> Option<Instant> {
+    if check.policy["mode"] == "observe"
+        || check.policy["input_fail_open"] != true
+        || check.policy["input_execution"] == "before_dispatch"
+    {
         return None;
     }
     ready.map(|at| {
@@ -789,10 +797,22 @@ pub(crate) struct NativeInputInspection {
 #[pymethods]
 impl NativeInputInspection {
     #[new]
-    fn new(py: Python<'_>, checks_json: &str, remaining_seconds: f64) -> PyResult<Self> {
+    #[pyo3(signature = (checks_json, remaining_seconds, *, prior=None))]
+    fn new(
+        py: Python<'_>,
+        checks_json: &str,
+        remaining_seconds: f64,
+        prior: Option<&NativeInputInspection>,
+    ) -> PyResult<Self> {
+        let boundary = prior.and_then(|prior| prior.inner.boundary());
         py.detach(|| {
             let checks = crate::lossless_json::from_str(checks_json).map_err(|_| ())?;
-            InputGate::start(checks, remaining_seconds).map(|inner| Self { inner })
+            InputGate::start(checks, remaining_seconds).map(|inner| {
+                if let Some(at) = boundary {
+                    inner.begin_response(at);
+                }
+                Self { inner }
+            })
         })
         .map_err(|_| PyValueError::new_err("Invalid native input inspection contract"))
     }

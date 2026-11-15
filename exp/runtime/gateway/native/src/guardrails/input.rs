@@ -170,7 +170,7 @@ pub(crate) async fn before_dispatch(
     let gate = InputGate::for_request(&admission.request_id);
     guard.input_gate = Some(gate.clone());
     match gate
-        .wait(bridge)
+        .response_ready(bridge)
         .await
         .and_then(InputDecision::require_allow)
     {

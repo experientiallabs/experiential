@@ -255,6 +255,7 @@ def _scenario(
     empty: bool = False,
     pause_stream: bool = False,
     wait_ms: int = 0,
+    fail_open: bool = True,
     timeout_ms: int = 3000,
     mode: Literal["enforce", "observe"] = "enforce",
     execution: Literal["parallel", "before_dispatch"] = "parallel",
@@ -303,7 +304,7 @@ def _scenario(
                     revision="fixture-v1",
                     protected=True,
                     input_execution=execution,
-                    input_fail_open=True,
+                    input_fail_open=fail_open,
                     input_max_wait_ms=wait_ms,
                     mode=mode,
                     checks=(
@@ -682,7 +683,7 @@ def test_customer_credentials_wait_for_approval_before_provider_dispatch(
 ) -> None:
     """A denied prompt cannot spend on a customer credential before inspection."""
     with _scenario(
-        tmp_path, blocked=blocked, billing_source=BillingSource.CUSTOMER_MANAGED
+        tmp_path, blocked=blocked, billing_source=BillingSource.CUSTOMER_MANAGED, fail_open=False
     ) as case:
         with ThreadPoolExecutor(max_workers=1) as executor:
             response = executor.submit(case.request)
@@ -800,7 +801,7 @@ def test_denied_input_never_starts_admission_web_search(
 ) -> None:
     """Admission side effects remain behind inspection before native handoff."""
     search = StaticWebSearchBackend(())
-    with _scenario(tmp_path, blocked=True, execution=execution) as case:
+    with _scenario(tmp_path, blocked=True, execution=execution, fail_open=False) as case:
         case.control._web_search = search
         case.moderator.release.set()
         result = case.request(web_search=True)
@@ -952,3 +953,45 @@ def test_shutdown_drains_only_its_own_moderation_records(tmp_path: Path) -> None
             assert not other.moderator.release.is_set()
         other.moderator.release.set()
         assert other.records()[0]["status"] == "observed"
+
+
+@pytest.mark.parametrize("wait_ms", [0, 250])
+@pytest.mark.parametrize("web_search", [False, True])
+def test_parallel_effects_fail_open_at_the_blocking_budget(
+    tmp_path: Path, wait_ms: int, web_search: bool
+) -> None:
+    """A stalled classifier adds only the configured grace before paid work."""
+    with _scenario(
+        tmp_path,
+        blocked=True,
+        billing_source=BillingSource.HOST_MANAGED if web_search else BillingSource.CUSTOMER_MANAGED,
+        wait_ms=wait_ms,
+        timeout_ms=5000,
+    ) as case:
+        search = StaticWebSearchBackend(())
+        case.control._web_search = search
+        case.provider.release.set()
+        started = time.monotonic()
+        try:
+            result = case.request(web_search=web_search)
+            elapsed = time.monotonic() - started
+            assert elapsed < wait_ms / 1000 + 0.75
+            assert elapsed >= wait_ms / 1000 * 0.8
+            assert result.status_code == 200, result.text
+            assert case.provider.started.is_set()
+            assert bool(search.queries) is web_search
+            assert not case.moderator.release.is_set()
+            assert case.records()[0]["status"] == "failed_open"
+            assert case.records()[0]["reason"] == "response_ready_timeout"
+            with connect_sqlite(case.database) as db:
+                attempts = db.execute(
+                    "SELECT state, budget_settled_nano_usd, input_tokens, output_tokens "
+                    "FROM gateway_attempts"
+                ).fetchall()
+                requests = db.execute("SELECT terminal_state FROM gateway_requests").fetchall()
+            assert requests == [("completed",)]
+            assert len(attempts) == 1 and attempts[0][0] == "completed"
+            assert attempts[0][1] == attempts[0][2] * 1000 + attempts[0][3] * 2000
+            assert attempts[0][1] > 0
+        finally:
+            case.moderator.release.set()

@@ -79,7 +79,12 @@ policies also stop on classifier uncertainty. With `input_fail_open=true`, class
 errors, overload and timeouts allow the request and record the uncertainty.
 `input_max_wait_ms` bounds additional waiting once the first streaming content or
 complete buffered response is ready. A final provider error is also a response
-boundary. A verdict arriving after fail-open delivery cannot revoke that response.
+boundary. For a parallel fail-open policy that must wait before dispatch, the
+same budget starts at that blocking boundary. One request retains the earliest
+boundary through admission, retries, tool successors and input revalidation;
+each round does not receive a fresh wait. Strict policies and explicitly serial
+policies keep their configured classifier deadlines. A verdict arriving after
+fail-open delivery cannot revoke that response.
 The trusted `input_guardrail_denied` settlement detail requires zero customer charge
 while retaining available provider usage. Missing final usage uses the existing
 estimated or unknown-cost accounting contract. The host bears provider work that
@@ -144,7 +149,7 @@ window of the request (a `WindowedClassifier`) declares a configuration digest. 
 joins the replay revision, and a policy whose input checks are all windowed is not refused
 for its total request size.
 
-Startup requires `GUARDRAIL_CONTRACT_VERSION=4`. Publish coordinated engine and
+Startup requires `GUARDRAIL_CONTRACT_VERSION=5`. Publish coordinated engine and
 native packages before a downstream host updates its exact release pins. There
 are no synchronous adapter wrappers, alternate mandatory-policy entry points, or
 package-version fallbacks.

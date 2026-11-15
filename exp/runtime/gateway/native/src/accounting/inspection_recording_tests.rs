@@ -69,6 +69,7 @@ fn optional_inspection_failure_allows_delivery_but_retains_an_error_record() {
             &checks[..1],
             &subject,
             Instant::now() + Duration::from_secs(1),
+            Instant::now(),
             Some(&factory),
         ))
         .unwrap();
@@ -182,6 +183,7 @@ fn reinspection_retains_classifier_scores_cache_hits_and_failures() {
                 std::slice::from_ref(&check),
                 &subject,
                 Instant::now() + Duration::from_secs(5),
+                Instant::now(),
                 Some(&factory),
             ))
             .unwrap();
@@ -244,6 +246,7 @@ fn reinspection_retains_classifier_scores_cache_hits_and_failures() {
             &[check],
             &subject,
             Instant::now() + Duration::from_secs(5),
+            Instant::now(),
             Some(&empty_factory),
         ))
         .unwrap();
@@ -290,6 +293,7 @@ fn modifications_record_the_effective_action_and_underlying_outcome() {
                     &checks[..1],
                     &subject,
                     Instant::now() + Duration::from_secs(5),
+                    Instant::now(),
                     Some(&factory),
                 ));
         let denied = outcome == "flagged";
