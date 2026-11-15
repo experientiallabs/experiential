@@ -564,12 +564,14 @@ impl AttemptGuard {
             return None;
         }
         let input_failure = match self.input_gate.clone() {
-            Some(gate) => gate
-                .wait(&self.bridge)
-                .await
-                .and_then(|d| d.require_allow())
-                .err()
-                .map(|failure| failure.failure),
+            Some(gate) => {
+                gate.begin_response();
+                gate.wait(&self.bridge)
+                    .await
+                    .and_then(|d| d.require_allow())
+                    .err()
+                    .map(|failure| failure.failure)
+            }
             None => None,
         };
         let outcome = if input_failure.is_some() {

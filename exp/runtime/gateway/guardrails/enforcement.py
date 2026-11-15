@@ -252,7 +252,7 @@ class GuardrailEngine:
         limit = self._input_limit(policy)
         if limit is not None and request_exceeds_inspection_limit(request, limit):
             self._decision(policy, None, GuardrailAction.ERROR, GuardrailOutcome.UNSUPPORTED, 0.0)
-            if policy.mode == "observe":
+            if policy.mode == "observe" or policy.fail_open:
                 return request
             raise GuardrailRejected(coverage_failure())
         current = request
@@ -491,7 +491,7 @@ class GuardrailEngine:
     def record_unsupported_observations(self, policies: tuple[GuardrailPolicy, ...]) -> None:
         """Record incomplete observation coverage on a surface with no inspection boundary."""
         for policy in policies:
-            if policy.mode == "observe":
+            if policy.mode == "observe" or policy.fail_open:
                 self._emit_observation(policy, None, GuardrailOutcome.UNSUPPORTED, 0.0)
 
     def close(self, *, timeout_seconds: float = 1.0) -> None:
@@ -741,7 +741,7 @@ class GuardrailEngine:
                 GuardrailOutcome.UNSUPPORTED,
                 self._monotonic() - started,
             )
-            if policy.mode == "enforce":
+            if policy.mode == "enforce" and not policy.fail_open:
                 raise GuardrailRejected(coverage_failure(check_id=check.check_id)) from None
             return None
         except ClassifierUncertainError:
@@ -801,7 +801,7 @@ class GuardrailEngine:
     ) -> ClassifierVerdict | None:
         """Apply fail-closed or skip-and-continue for an uncertain check."""
         self._decision(policy, check, GuardrailAction.ERROR, outcome, latency_seconds)
-        if policy.protected and policy.mode == "enforce":
+        if policy.protected and policy.mode == "enforce" and not policy.fail_open:
             raise GuardrailRejected(
                 GatewayFailure(
                     failure_class=GatewayFailureClass.UNAVAILABLE,
@@ -810,6 +810,13 @@ class GuardrailEngine:
                 )
             )
         return None
+
+    def record_input_expiry(self, policy: GuardrailPolicy) -> None:
+        """Record skipped optional coverage without adding a serving-path write."""
+        for check in policy.input_checks:
+            self._emit_observation(
+                policy, check, GuardrailOutcome.TIMEOUT, policy.input_max_wait_ms / 1000
+            )
 
     def _decision(
         self,
@@ -820,7 +827,9 @@ class GuardrailEngine:
         latency_seconds: float,
     ) -> None:
         """Separate observed outcomes from actions that actually affect customer requests."""
-        if policy.mode == "observe":
+        if policy.mode == "observe" or (
+            policy.fail_open and outcome not in (GuardrailOutcome.ALLOW, GuardrailOutcome.FLAGGED)
+        ):
             self._emit_observation(policy, check, outcome, latency_seconds)
         else:
             self._record(policy, check, action, latency_seconds)

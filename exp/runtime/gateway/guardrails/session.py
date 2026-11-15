@@ -25,6 +25,7 @@ from exp.runtime.gateway.guardrails.deterministic import (
     native_input_request,
     native_output_plan,
 )
+from exp.runtime.gateway.guardrails.input_wait import InputWait
 from exp.runtime.gateway.guardrails.streaming import StreamSegment
 from exp.runtime.gateway.guardrails.subjects import ObservedSubjects
 
@@ -66,6 +67,7 @@ class GuardrailSession:
         _input_failure: Retained input or required capture rejection, or None before failure.
         _input_approved_at: Approval time, or None before the current subject is approved.
         _closed: Whether cancellation closed this session, false initially.
+        _input_wait: First blocking boundary shared by optional input checks and tool rounds.
         _inspected: Exact input and approved-result pairs, empty before inspection.
         _observed: Content-free subject identities and optional observation admission state.
     """
@@ -79,6 +81,7 @@ class GuardrailSession:
     _input_failure: GatewayFailure | None = field(default=None, init=False, repr=False)
     _input_approved_at: float | None = field(default=None, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
+    _input_wait: InputWait = field(default_factory=InputWait, init=False, repr=False)
     _inspected: list[tuple[GatewayRequest, GatewayRequest]] = field(
         default_factory=list, init=False, repr=False
     )
@@ -114,6 +117,7 @@ class GuardrailSession:
             and request.web_search is None
             and request.tool_search is None
             and request.service_tier is None
+            and request.speed != "fast"
         )
 
     def inspect_input(self, request: GatewayRequest, *, defer: bool = False) -> GatewayRequest:
@@ -133,6 +137,7 @@ class GuardrailSession:
             if subject == request:
                 return result
         self._input_approved_at = None
+        self.begin_input_wait()
         try:
             result = run_on_native_loop(self._inspect_input(request))
             self._input_approved_at = time.monotonic()
@@ -159,27 +164,40 @@ class GuardrailSession:
         self, policy: GuardrailPolicy, request: GatewayRequest
     ) -> GatewayRequest:
         """Apply the same native or bounded adapter strategy during execution and validation."""
-        native = (
-            native_input_request(
-                policy,
-                self.detectors,
-                request,
-                monotonic=time.monotonic,
-                deadline_monotonic=self.deadline_monotonic,
+
+        async def inspect() -> GatewayRequest:
+            """Run this check through its existing native or isolated adapter."""
+            native = (
+                native_input_request(
+                    policy,
+                    self.detectors,
+                    request,
+                    monotonic=time.monotonic,
+                    deadline_monotonic=self.deadline_monotonic,
+                )
+                if self.detectors and not policy.fail_open
+                else None
             )
-            if self.detectors
-            else None
-        )
-        return (
-            native
-            if native is not None
-            else await self.engine.enforce_input(
-                policy=policy,
-                request=request,
-                deadline_monotonic=self.deadline_monotonic,
-                request_id=self.request_id,
+            return (
+                native
+                if native is not None
+                else await self.engine.enforce_input(
+                    policy=policy,
+                    request=request,
+                    deadline_monotonic=self.deadline_monotonic,
+                    request_id=self.request_id,
+                )
             )
+
+        if policy.input_execution != "parallel" or not policy.fail_open:
+            return await inspect()
+        result = await self._input_wait.run(
+            inspect, wait_ms=policy.input_max_wait_ms, deadline=self.deadline_monotonic
         )
+        if result is None:
+            self.engine.record_input_expiry(policy)
+            return request
+        return result
 
     async def _inspect_input(self, request: GatewayRequest) -> GatewayRequest:
         """Require the final rewrite to preserve every preceding check's constraint."""
@@ -221,6 +239,8 @@ class GuardrailSession:
         if overlap and not all(self.can_overlap_input(subject) for subject in remaining):
             raise RuntimeError("guardrail input cannot overlap this request")
         self._input_approved_at = None
+        if not overlap:
+            self.begin_input_wait()
         self._input = start_on_native_loop(self._inspect_subjects(tuple(remaining)))
         if not overlap:
             try:
@@ -251,6 +271,10 @@ class GuardrailSession:
             self._input_approved_at is not None
             and self._input_approved_at < self.deadline_monotonic
         )
+
+    def begin_input_wait(self, *, elapsed_seconds: float = 0.0) -> None:
+        """Start the request-wide optional grace at the first blocking boundary."""
+        self._input_wait.begin(elapsed_seconds=elapsed_seconds)
 
     @property
     def input_pending(self) -> bool:
@@ -351,6 +375,7 @@ class GuardrailSession:
     def inspect_output(self, completion: GuardrailCompletion) -> GuardrailCompletion:
         """Enforce every output policy before releasing a buffered completion."""
         if self._input is not None and not self._input.done():
+            self.begin_input_wait()
             try:
                 self._input.result(timeout=max(0, self.deadline_monotonic - time.monotonic()))
             except Exception:  # noqa: BLE001 - a late allow cannot rescue an expired wait.

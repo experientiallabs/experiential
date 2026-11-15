@@ -343,14 +343,14 @@ def test_scope_configuration_is_strict() -> None:
         GuardrailPolicy(policy_id="unprotected-platform")
 
 
-@pytest.mark.parametrize("marker", [None, True, "3", 0, 1, 2, 4])
+@pytest.mark.parametrize("marker", [None, True, "6", 0, 1, 2, 3, 4, 5])
 def test_mismatched_native_contract_fails_at_startup(marker: object) -> None:
     """There is no package-version compatibility path that can omit an approval gate."""
     with patch(
         "exp.runtime.gateway.guardrails.native.importlib.import_module",
         return_value=SimpleNamespace(GUARDRAIL_CONTRACT_VERSION=marker),
     ):
-        with pytest.raises(ValueError, match="GUARDRAIL_CONTRACT_VERSION=3"):
+        with pytest.raises(ValueError, match="GUARDRAIL_CONTRACT_VERSION=6"):
             validate_guardrail_engine(_engine(_Classifier("allow")))
 
 
@@ -669,3 +669,111 @@ def test_later_modifier_cannot_undo_an_earlier_redaction(
         assert session.output_plan() is None
         with pytest.raises(GuardrailRejected):
             session.inspect_output(GuardrailCompletion(text=original))
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_optional_input_has_one_response_wait_budget_across_subjects(overlap: bool) -> None:
+    """A slow optional classifier cannot renew its grace on later tool context."""
+    classifier = _Classifier("allow")
+    policy = _observer_policy().model_copy(
+        update={"mode": "enforce", "input_execution": "parallel"}
+    )
+    policy = GuardrailPolicy.model_validate(
+        {**policy.model_dump(), "fail_open": True, "input_max_wait_ms": 250}
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": classifier})),
+        monotonic=time.monotonic,
+    )
+    try:
+        session = _session(engine)
+        request = _request()
+        if overlap:
+            session.prepare_dispatch((request,), overlap=True)
+            assert classifier.started.wait(1)
+            time.sleep(0.30)
+            assert session.input_decision()["action"] == "pending"
+            started = time.monotonic()
+            session.begin_input_wait()
+            _await(session)
+        else:
+            started = time.monotonic()
+            assert session.inspect_input(request) == request
+        assert time.monotonic() - started < 0.40
+        assert session.input_decision()["action"] == "allow"
+        assert session.settlement_failure() is None
+        calls = len(classifier.requests)
+        started = time.monotonic()
+        assert session.inspect_input(_request("tool result")) == _request("tool result")
+        assert time.monotonic() - started < 0.10
+        assert len(classifier.requests) == calls
+        session.cancel(capture_unavailable_failure())
+        assert session.input_decision()["action"] == "error"
+    finally:
+        classifier.release.set()
+        engine.close(timeout_seconds=2)
+
+
+def test_optional_input_expiry_preserves_strict_sibling_denial() -> None:
+    """Only the optional policy expires; a later strict check still rejects."""
+    classifier = _Classifier("allow")
+    optional = GuardrailPolicy.model_validate(
+        {
+            **_observer_policy().model_dump(),
+            "mode": "enforce",
+            "input_execution": "parallel",
+            "fail_open": True,
+            "input_max_wait_ms": 25,
+        }
+    )
+    strict = optional.model_copy(
+        update={
+            "policy_id": "strict",
+            "fail_open": False,
+            "checks": (optional.checks[0].model_copy(update={"adapter_id": "strict"}),),
+        }
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((optional, strict)),
+        client=DirectClassifierClient(
+            ClassifierRegistry({"criminal": classifier, "strict": KeywordClassifier(("blocked",))})
+        ),
+        monotonic=time.monotonic,
+    )
+    try:
+        with pytest.raises(GuardrailRejected):
+            _session(engine).inspect_input(_request("blocked"))
+    finally:
+        classifier.release.set()
+        engine.close(timeout_seconds=2)
+
+
+def test_optional_wait_deducts_native_callback_queue_time() -> None:
+    """A status callback delayed past the grace must not start another inspection."""
+    classifier = _Classifier("block")
+    policy = GuardrailPolicy.model_validate(
+        {
+            **_observer_policy().model_dump(),
+            "mode": "enforce",
+            "input_execution": "parallel",
+            "fail_open": True,
+            "input_max_wait_ms": 250,
+        }
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": classifier})),
+        monotonic=time.monotonic,
+    )
+    try:
+        session = _session(engine)
+        session.begin_input_wait(elapsed_seconds=0.30)
+        started = time.monotonic()
+        assert session.inspect_input(_request()) == _request()
+        assert time.monotonic() - started < 0.10
+        assert not classifier.requests
+        assert session.input_decision()["action"] == "allow"
+    finally:
+        classifier.release.set()
+        engine.close(timeout_seconds=2)

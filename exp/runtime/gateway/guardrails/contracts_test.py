@@ -247,3 +247,38 @@ def test_output_guardrail_preserves_long_tool_id(length: int) -> None:
     """An output check accepts every bounded tool identifier emitted by the engine."""
     call = GuardrailToolCall(call_id="x" * length, name="terminal", arguments="{}")
     assert GuardrailCompletion(tool_calls=(call,)).tool_calls[0].call_id == "x" * length
+
+
+@pytest.mark.parametrize("wait_ms", [-1, 251])
+def test_optional_parallel_wait_cannot_exceed_the_budget(wait_ms: int) -> None:
+    """An authored policy cannot disable the response ceiling with an invalid allowance."""
+    with pytest.raises(ValueError):
+        GuardrailPolicy(
+            policy_id="optional-input",
+            protected=True,
+            fail_open=True,
+            input_execution="parallel",
+            input_max_wait_ms=wait_ms,
+            checks=(_check("input"),),
+        )
+
+
+@pytest.mark.parametrize(
+    ("stage", "action"),
+    [
+        (GuardrailCheckStage.OUTPUT, GuardrailAction.BLOCK),
+        (GuardrailCheckStage.INPUT, GuardrailAction.MODIFY),
+    ],
+)
+def test_fail_open_cannot_skip_output_or_rewrite_checks(
+    stage: GuardrailCheckStage,
+    action: GuardrailAction,
+) -> None:
+    """Optional input uncertainty never weakens output or privacy rewrite contracts."""
+    with pytest.raises(ValueError, match="fail-open requires read-only input checks"):
+        GuardrailPolicy(
+            policy_id="optional-input",
+            protected=True,
+            fail_open=True,
+            checks=(_check("input", stage=stage, action=action),),
+        )

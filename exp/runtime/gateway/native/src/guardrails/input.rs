@@ -1,6 +1,6 @@
 //! Withhold the first outward event while the shared engine checks the input.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -19,6 +19,7 @@ pub(crate) struct InputGate {
     request_id: String,
     deadline: Instant,
     decision: OnceCell<Result<InputDecision, InputFailure>>,
+    wait_started: Arc<OnceLock<Instant>>,
 }
 
 #[derive(Clone, Copy)]
@@ -95,17 +96,21 @@ fn unavailable() -> InputFailure {
 }
 
 impl InputGate {
+    pub(crate) fn begin_response(&self) {
+        self.wait_started.get_or_init(Instant::now);
+    }
+
     pub(crate) async fn wait(&self, bridge: &Bridge) -> Result<InputDecision, InputFailure> {
         self.decision
             .get_or_init(|| async {
                 // Each callback is a nonblocking poll. No classifier can occupy
                 // all bridge workers and prevent provider dispatch/settlement.
-                let argument = compact_json(&json!({"request_id": self.request_id}));
                 let mut delay_ms = 1;
                 loop {
+                    let argument = compact_json(&json!({"request_id": self.request_id}));
                     let response = tokio::time::timeout(
                         remaining(self.deadline),
-                        bridge.call("guardrail_input_status", argument.clone()),
+                        bridge.call_input_status(argument, self.wait_started.clone()),
                     )
                     .await
                     .map_err(|_| unavailable())?
@@ -154,6 +159,7 @@ pub(crate) async fn acquire_guarded_attempt(
         request_id: ctx.request_id.to_owned(),
         deadline: ctx.deadline,
         decision: OnceCell::new(),
+        wait_started: Arc::new(OnceLock::new()),
     });
     guard.input_gate = Some(gate.clone());
     let outcome = {
@@ -169,6 +175,7 @@ pub(crate) async fn acquire_guarded_attempt(
                 if matches!(won, Won::Failed(_)) {
                     Ok(won)
                 } else {
+                    gate.begin_response();
                     gate.wait(ctx.bridge).await.and_then(|decision| release(won, decision))
                 }
             },
@@ -205,6 +212,7 @@ mod tests {
                 request_id: "request".into(),
                 deadline: Instant::now() + Duration::from_secs(2),
                 decision: OnceCell::new(),
+                wait_started: Arc::new(OnceLock::new()),
             });
             let mut guard = AttemptGuard::new(
                 bridge.clone(),

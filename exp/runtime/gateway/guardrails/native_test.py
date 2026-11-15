@@ -543,3 +543,34 @@ def test_upstream_reasoning_defaults_rule_out_incremental_streaming() -> None:
     assert not upstream_requests_reasoning(
         [{"upstream_payload": {"reasoning": {"effort": "high"}}}, {"upstream_payload": None}]
     )
+
+
+@pytest.mark.parametrize("strict_sibling", [False, True])
+def test_optional_unsupported_surface_preserves_strict_sibling(strict_sibling: bool) -> None:
+    """An optional policy skips missing coverage; an assigned strict policy still refuses."""
+    original = _engine()
+    policy = original.policies_for(_authorization())[0]
+    original.close()
+    optional = policy.model_copy(
+        update={
+            "checks": policy.input_checks,
+            "fail_open": True,
+            "organization_id": None,
+            "identity_id": None,
+            "protected": True,
+        }
+    )
+    strict = policy.model_copy(update={"policy_id": "strict-sibling"})
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((optional, strict) if strict_sibling else (optional,)),
+        client=DirectClassifierClient(ClassifierRegistry()),
+        monotonic=time.monotonic,
+    )
+    try:
+        if strict_sibling:
+            with pytest.raises(NativeBridgeError, match="do not support native images"):
+                require_unguarded_surface(engine, _authorization(), "images")
+        else:
+            require_unguarded_surface(engine, _authorization(), "images")
+    finally:
+        engine.close()

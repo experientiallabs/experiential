@@ -4,6 +4,7 @@ from collections.abc import Callable, Mapping
 from typing import Literal, Protocol, overload
 
 __version__: str
+GUARDRAIL_CONTRACT_VERSION: int
 MODEL_STAGE_CONTRACT_VERSION: int
 AUTOMATIC_VERTEX_CACHE_CONTRACT_VERSION: int
 

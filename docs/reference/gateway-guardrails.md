@@ -136,7 +136,7 @@ window of the request (a `WindowedClassifier`) declares a configuration digest. 
 joins the replay revision, and a policy whose input checks are all windowed is not refused
 for its total request size.
 
-Startup requires `GUARDRAIL_CONTRACT_VERSION=3`. Publish coordinated engine and
+Startup requires `GUARDRAIL_CONTRACT_VERSION=6`. Publish coordinated engine and
 native packages before a downstream host updates its exact release pins. There
 are no synchronous adapter wrappers, alternate mandatory-policy entry points, or
 package-version fallbacks.
@@ -487,3 +487,25 @@ errors. Protected streaming may add classifier latency before the first token.
   finishes.
 - Oversized tool arguments count against the response byte bound and are
   blocked, not rewritten.
+
+
+### Optional parallel input deadlines
+
+A read-only input policy can explicitly set `fail_open=true`. Unavailable,
+unsupported, malformed, and timed-out classifier results then leave the request
+unchanged. A timely flagged result still applies the authored action. Other
+policies keep their existing uncertainty behavior.
+
+For `input_execution="parallel"`, `input_max_wait_ms` is between 0 and 250
+(default 250). Generation and inspection overlap. The first serving-path or mandatory predispatch boundary blocked on moderation
+starts one request-wide wait budget. Later tool
+contexts share the remaining budget and cannot renew it. Expiry records missing
+coverage through the bounded observation recorder. It cannot waive strict sibling
+policies, request ownership, or required capture. Explicit before-dispatch policies
+keep their authored check deadlines.
+
+The parallel wait starts when the gateway first needs the input decision to
+proceed, including the first committed provider content for buffered responses.
+Time waiting to run the status callback consumes that same allowance. The cap
+bounds optional inspection waiting; it does not waive strict checks, required
+capture, admission, or settlement work. Later tool contexts do not renew it.

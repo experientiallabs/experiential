@@ -71,9 +71,9 @@ def validate_guardrail_engine(engine: GuardrailEngine | None) -> None:
     if engine is None:
         return
     native = importlib.import_module("exp_gateway_native")
-    if getattr(native, "GUARDRAIL_CONTRACT_VERSION", None) != 3:
+    if getattr(native, "GUARDRAIL_CONTRACT_VERSION", None) != 6:
         raise ValueError(
-            "guardrails require native GUARDRAIL_CONTRACT_VERSION=3; "
+            "guardrails require native GUARDRAIL_CONTRACT_VERSION=6; "
             "install the coordinated native package"
         )
 
@@ -118,7 +118,7 @@ def require_unguarded_surface(
     policies = () if engine is None else engine.policies_for(authorization)
     if engine is not None:
         engine.record_unsupported_observations(policies)
-    if any(policy.mode == "enforce" for policy in policies):
+    if any(policy.mode == "enforce" and not policy.fail_open for policy in policies):
         raise NativeBridgeError(
             OpenAIProtocolError(
                 status_code=400,
@@ -300,10 +300,14 @@ class NativeGuardrailsMixin:
             NativeBridgeError: A concurrent abandonment's durable terminal write failed;
                 accounting keeps the request for retry and the native gate fails closed.
         """
-        request_id = str(json.loads(argument).get("request_id") or "")
+        payload = json.loads(argument)
+        request_id = str(payload.get("request_id") or "")
         entry = self._accounting.entry(request_id)
         if entry is None or entry.pending_abandon is not None:
             return '{"action":"closed"}'
+        elapsed = payload.get("input_wait_elapsed_seconds")
+        if isinstance(elapsed, (float, int)) and elapsed >= 0 and entry.guardrails is not None:
+            entry.guardrails.begin_input_wait(elapsed_seconds=elapsed)
         decision = (
             {"action": "error", "failure": denied_input_failure().model_dump(mode="json")}
             if entry.guardrails is None
