@@ -32,11 +32,17 @@ struct Job {
     method: &'static str,
     argument: String,
     input_wait_started: Option<Arc<OnceLock<Instant>>>,
-    responder: oneshot::Sender<Result<String, PublicError>>,
+    responder: oneshot::Sender<Result<AdmissionReply, PublicError>>,
     // Cancellation of the awaiting request cannot release queued/running capacity.
     _permit: OwnedSemaphorePermit,
     _execution_permit: Option<OwnedSemaphorePermit>,
     execution: Option<Arc<ExecutionLease>>,
+}
+
+/// JSON reply plus an admission-owned optional release capability.
+pub(crate) struct AdmissionReply {
+    pub(crate) text: String,
+    pub(crate) input: Option<Arc<crate::guardrails::input_latch::InputLatch>>,
 }
 
 /// Bounded bridge to one Python `NativeControlPlane` instance.
@@ -127,7 +133,14 @@ impl Bridge {
         method: &'static str,
         argument: String,
     ) -> Result<String, PublicError> {
-        self.call_timed(method, argument, None).await
+        self.call_timed(method, argument, None)
+            .await
+            .map(|reply| reply.text)
+    }
+
+    /// Return admission and its exact request-owned release capability in one crossing.
+    pub(crate) async fn admit(&self, argument: String) -> Result<AdmissionReply, PublicError> {
+        self.call_timed("admit", argument, None).await
     }
 
     /// Count input-status permit and interpreter queueing against the same grace.
@@ -138,6 +151,7 @@ impl Bridge {
     ) -> Result<String, PublicError> {
         self.call_timed("guardrail_input_status", argument, Some(started))
             .await
+            .map(|reply| reply.text)
     }
 
     async fn call_timed(
@@ -145,7 +159,7 @@ impl Bridge {
         method: &'static str,
         argument: String,
         input_wait_started: Option<Arc<OnceLock<Instant>>>,
-    ) -> Result<String, PublicError> {
+    ) -> Result<AdmissionReply, PublicError> {
         let settlement = matches!(method, "settle" | "abandon");
         // Supplied capacity is acquired before a shared worker. Individual
         // execution has no additional pool, identity lookup or allocation policy.
@@ -273,7 +287,35 @@ fn worker_loop(receiver: &Mutex<mpsc::Receiver<Job>>, object: &Py<PyAny>) {
                     body["input_wait_elapsed_seconds"] = started.elapsed().as_secs_f64().into();
                     argument = crate::encode::compact_json(&body);
                 }
-                control_plane_call(py, target, job.method, &argument)
+                let text = control_plane_call(py, target, job.method, &argument)?;
+                let input = if job.method == "admit" {
+                    let data: serde_json::Value =
+                        serde_json::from_str(&text).map_err(|_| PublicError::internal())?;
+                    if data.get("guardrail_input_native").and_then(|v| v.as_bool()) == Some(true) {
+                        let value = target
+                            .bind(py)
+                            .call_method1("guardrail_input_latch", (&text,))
+                            .map_err(|error| public_error_from_pyerr(py, &error))?;
+                        let latch =
+                                value
+                                    .extract::<PyRef<
+                                        '_,
+                                        crate::guardrails::input_latch::PyOptionalInputDecision,
+                                    >>()
+                                    .map_err(|_| PublicError::internal())?;
+                        if data.get("request_id").and_then(|v| v.as_str())
+                            != Some(latch.inner.request_id.as_str())
+                        {
+                            return Err(PublicError::internal());
+                        }
+                        Some(latch.inner.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                Ok(AdmissionReply { text, input })
             }))
             .unwrap_or_else(|_| Err(PublicError::internal()));
             // Shared workers must not retain a departed target's per-path

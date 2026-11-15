@@ -10,6 +10,7 @@
 
 pub mod detector;
 pub(crate) mod input;
+pub(crate) mod input_latch;
 pub mod plan;
 mod syntax;
 

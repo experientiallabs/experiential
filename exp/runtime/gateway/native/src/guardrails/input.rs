@@ -3,7 +3,7 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::OnceCell;
 
@@ -20,6 +20,7 @@ pub(crate) struct InputGate {
     deadline: Instant,
     decision: OnceCell<Result<InputDecision, InputFailure>>,
     wait_started: Arc<OnceLock<Instant>>,
+    native: Option<Arc<super::input_latch::InputLatch>>,
 }
 
 #[derive(Clone, Copy)]
@@ -44,20 +45,20 @@ struct Decision {
 }
 
 /// Closed vocabulary of public errors authorized by the request-owned input session.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum InputFailureCode {
     CaptureUnavailable,
 }
 
 /// Only the typed public code is consumed; other session facts remain control-plane owned.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct InputFailureDetails {
     code: Option<InputFailureCode>,
 }
 
 /// One cached session failure with its public code and unchanged settlement facts.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct InputFailure {
     #[serde(flatten)]
     pub(crate) failure: Failure,
@@ -85,7 +86,7 @@ impl InputFailure {
     }
 }
 
-fn unavailable() -> InputFailure {
+pub(crate) fn unavailable() -> InputFailure {
     InputFailure {
         failure: Failure::new(
             FailureClass::Unavailable,
@@ -95,14 +96,32 @@ fn unavailable() -> InputFailure {
     }
 }
 
+pub(crate) fn capture_unavailable() -> InputFailure {
+    InputFailure {
+        failure: Failure::new(
+            FailureClass::Unavailable,
+            "Traffic capture is unavailable or at capacity. Restore capacity and retry.",
+        ),
+        safe_details: InputFailureDetails {
+            code: Some(InputFailureCode::CaptureUnavailable),
+        },
+    }
+}
+
 impl InputGate {
     pub(crate) fn begin_response(&self) {
         self.wait_started.get_or_init(Instant::now);
+        if let Some(native) = &self.native {
+            native.begin();
+        }
     }
 
     pub(crate) async fn wait(&self, bridge: &Bridge) -> Result<InputDecision, InputFailure> {
         self.decision
             .get_or_init(|| async {
+                if let Some(native) = &self.native {
+                    return native.wait(self.deadline).await;
+                }
                 // Each callback is a nonblocking poll. No classifier can occupy
                 // all bridge workers and prevent provider dispatch/settlement.
                 let mut delay_ms = 1;
@@ -160,6 +179,7 @@ pub(crate) async fn acquire_guarded_attempt(
         deadline: ctx.deadline,
         decision: OnceCell::new(),
         wait_started: Arc::new(OnceLock::new()),
+        native: guard.input_latch.clone(),
     });
     guard.input_gate = Some(gate.clone());
     let outcome = {
@@ -213,6 +233,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(2),
                 decision: OnceCell::new(),
                 wait_started: Arc::new(OnceLock::new()),
+                native: None,
             });
             let mut guard = AttemptGuard::new(
                 bridge.clone(),

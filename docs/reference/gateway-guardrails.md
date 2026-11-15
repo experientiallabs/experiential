@@ -136,7 +136,18 @@ window of the request (a `WindowedClassifier`) declares a configuration digest. 
 joins the replay revision, and a policy whose input checks are all windowed is not refused
 for its total request size.
 
-Startup requires `GUARDRAIL_CONTRACT_VERSION=6`. Publish coordinated engine and
+Optional-only parallel input with a shared wait budget uses one native decision
+shared by response release and settlement. Rust expires pending inspection without a Python status callback.
+Late decisions cannot change its financial disposition. Required capture is prepared
+without registering or spilling content, then registered through the existing
+collector after approval or expiry. Capture failure still withholds output and
+waives the customer charge. Strict or mixed input policies retain required approval.
+Optional policies with differing budgets retain their per-policy timers, so an
+expired earlier check cannot prevent a later check from using its remaining time.
+Required output inspection consumes the released input decision and never rejoins
+an expired optional classification task.
+
+Startup requires `GUARDRAIL_CONTRACT_VERSION=7`. Publish coordinated engine and
 native packages before a downstream host updates its exact release pins. There
 are no synchronous adapter wrappers, alternate mandatory-policy entry points, or
 package-version fallbacks.
@@ -506,6 +517,15 @@ keep their authored check deadlines.
 
 The parallel wait starts when the gateway first needs the input decision to
 proceed, including the first committed provider content for buffered responses.
-Time waiting to run the status callback consumes that same allowance. The cap
+For a uniform optional-only input policy set, the native timer enforces the
+allowance without waiting for a Python status callback. The cap
 bounds optional inspection waiting; it does not waive strict checks, required
 capture, admission, or settlement work. Later tool contexts do not renew it.
+
+
+Optional enforcing inspections use a separate bounded isolation pool (at most 32
+workers, started on demand). Expiry retains an abandoned worker until it actually
+exits, but its quarantine and capacity cannot refuse a strict check using the
+same adapter. Native release expiry records each policy/check once, only when a
+required authenticated subject remains unchecked. Classifier outcomes arriving
+after that release cannot be reported as enforced actions or duplicate timeouts.

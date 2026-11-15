@@ -31,6 +31,7 @@ from exp.runtime.gateway.guardrails.native import (
     NativeGuardrailsMixin,
     native_output_mode,
     open_admission_guardrails,
+    prepare_native_optional_input,
     require_capture,
     validate_guardrail_engine,
 )
@@ -719,13 +720,24 @@ class NativeControlPlane(
 
         if guardrails is not None:
             try:
-                guardrails.prepare_dispatch(
-                    (original_guardrail_request, captured_request, request, public_request),
-                    overlap=parallel_guardrail
+                overlap = (
+                    parallel_guardrail
                     and cache_state is None
                     and all(
                         d.billing_source is BillingSource.HOST_MANAGED for d in route.deployments
-                    ),
+                    )
+                )
+                if overlap and prepare_native_optional_input(
+                    guardrails,
+                    self._capture,
+                    authorization,
+                    pending_capture,
+                    route.snapshot.exact_model_id,
+                ):
+                    pending_capture = None
+                guardrails.prepare_dispatch(
+                    (original_guardrail_request, captured_request, request, public_request),
+                    overlap=overlap,
                 )
             except GuardrailRejected as exc:
                 discard_capture(self._capture, authorization.request_id)
@@ -802,6 +814,8 @@ class NativeControlPlane(
             **attempt_policy(request.gateway).model_dump(mode="json"),
             "refusal_failover": authorization.refusal_failover,
             "guardrail_input_pending": guardrails is not None and guardrails.input_pending,
+            "guardrail_input_native": guardrails is not None
+            and guardrails.native_input is not None,
             "output_guardrail": native_output_mode(
                 guardrails,
                 public_request,

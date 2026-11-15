@@ -12,6 +12,12 @@ import pytest
 from exp.common.models import BillingSource, GatewayTokenPrices
 from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
+from exp.runtime.gateway.guardrails.contracts import (
+    ClassifierVerdict,
+    GuardrailCheck,
+    GuardrailCheckStage,
+    GuardrailCompletion,
+)
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 from exp.runtime.gateway.guardrails.store_test import _authorization
@@ -34,7 +40,12 @@ def test_stalled_optional_inspection_releases_response_and_preserves_charge(
     classifier = _Classifier("allow")
     template = _engine(classifier)
     policy = template.policies_for(_authorization())[0].model_copy(
-        update={"fail_open": True, "input_max_wait_ms": 250}
+        update={
+            "fail_open": True,
+            "input_max_wait_ms": 250,
+            "organization_id": None,
+            "identity_id": None,
+        }
     )
     template.close()
     engine = GuardrailEngine(
@@ -67,6 +78,7 @@ def test_stalled_optional_inspection_releases_response_and_preserves_charge(
                 assert response.status_code == 200, response.text
                 assert "safe-answer" in response.text
                 assert elapsed < 0.65, elapsed
+                assert classifier.started.is_set()
                 assert not classifier.release.is_set()
                 assert len(received) == 1
                 deadline = time.monotonic() + 2
@@ -93,6 +105,137 @@ def test_stalled_optional_inspection_releases_response_and_preserves_charge(
                         funding.value,
                     )
                 ]
+        finally:
+            classifier.release.set()
+            engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_timely_optional_violation_remains_a_zero_charge_denial(
+    tmp_path: Path, surface: str, stream: bool
+) -> None:
+    """The native optional path preserves a real violation delivered before its deadline."""
+    classifier = _Classifier("block")
+    classifier.release.set()
+    template = _engine(classifier)
+    policy = template.policies_for(_authorization())[0].model_copy(
+        update={
+            "fail_open": True,
+            "input_max_wait_ms": 250,
+            "organization_id": None,
+            "identity_id": None,
+        }
+    )
+    template.close()
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": classifier})),
+        monotonic=time.monotonic,
+    )
+    with _provider(
+        _content_chunk("unapproved-answer")
+        + _terminal_frames(prompt_tokens=80, completion_tokens=5)
+    ) as (base, _received):
+        _, key = _configured_gateway(
+            tmp_path, base_url=base, billing_source=BillingSource.HOST_MANAGED
+        )
+        components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"})
+        control = NativeControlPlane(components, guardrails=engine)
+        try:
+            with _serving(control) as url, httpx.Client() as client:
+                path, body = _body(surface, stream)
+                response = client.post(
+                    url + path, headers={"authorization": f"Bearer {key}"}, json=body, timeout=3
+                )
+                assert classifier.started.is_set()
+                assert response.status_code == 400, response.text
+                assert "unapproved-answer" not in response.text
+                deadline = time.monotonic() + 2
+                while True:
+                    with sqlite3.connect(components.ledger.database_path) as db:
+                        requests = db.execute(
+                            "select terminal_state from gateway_requests"
+                        ).fetchall()
+                    if requests == [("failed",)] or time.monotonic() > deadline:
+                        break
+                    time.sleep(0.01)
+                assert requests == [("failed",)]
+                with sqlite3.connect(components.ledger.database_path) as db:
+                    assert all(
+                        charge == 0
+                        for (charge,) in db.execute(
+                            "select budget_settled_nano_usd from gateway_attempts"
+                        ).fetchall()
+                    )
+        finally:
+            engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize("flagged", [False, True])
+def test_optional_expiry_does_not_delay_or_skip_required_output_inspection(
+    tmp_path: Path, flagged: bool
+) -> None:
+    """A mandatory output check follows native input expiry without rejoining its old task."""
+    classifier = _Classifier("block")
+    template = _engine(classifier)
+    bound = template.policies_for(_authorization())[0]
+    optional = bound.model_copy(
+        update={"fail_open": True, "organization_id": None, "identity_id": None}
+    )
+    output = bound.model_copy(
+        update={
+            "policy_id": "required-output",
+            "organization_id": None,
+            "identity_id": None,
+            "checks": (
+                bound.checks[0].model_copy(
+                    update={"stage": GuardrailCheckStage.OUTPUT, "adapter_id": "output"}
+                ),
+            ),
+        }
+    )
+    template.close()
+    output_calls: list[GuardrailCompletion] = []
+
+    class RequiredOutput(_Classifier):
+        """Decide immediately while the independent input classifier stays stalled."""
+
+        async def inspect_output(
+            self, *, completion: GuardrailCompletion, check: GuardrailCheck
+        ) -> ClassifierVerdict:
+            """Retain proof that the mandatory output check actually ran."""
+            output_calls.append(completion)
+            return ClassifierVerdict(flagged=flagged)
+
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((optional, output)),
+        client=DirectClassifierClient(
+            ClassifierRegistry({"criminal": classifier, "output": RequiredOutput("allow")})
+        ),
+        monotonic=time.monotonic,
+    )
+    with _provider(
+        _content_chunk("safe-answer") + _terminal_frames(prompt_tokens=80, completion_tokens=5)
+    ) as (base, _received):
+        _, key = _configured_gateway(
+            tmp_path, base_url=base, billing_source=BillingSource.HOST_MANAGED
+        )
+        components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"})
+        control = NativeControlPlane(components, guardrails=engine)
+        try:
+            with _serving(control) as url, httpx.Client() as client:
+                path, body = _body("chat", False)
+                started = time.monotonic()
+                response = client.post(
+                    url + path, headers={"authorization": f"Bearer {key}"}, json=body, timeout=2
+                )
+                assert time.monotonic() - started < 0.65
+                assert classifier.started.is_set() and not classifier.release.is_set()
+                assert len(output_calls) == 1
+                assert response.status_code == (400 if flagged else 200), response.text
+                assert ("safe-answer" in response.text) is not flagged
+                assert classifier.cancelled.wait(0.5)
         finally:
             classifier.release.set()
             engine.close(timeout_seconds=2)

@@ -369,38 +369,7 @@ impl CaptureCollector {
     /// Borrow immutable UTF-8 bytes without widening and re-encoding a Python string.
     fn begin_bytes(&self, py: Python<'_>, request_json: &[u8]) -> bool {
         let collector = self.inner.clone();
-        py.detach(|| {
-            if !collector.config.truncate_request
-                && request_json.len() > collector.config.maximum_request_bytes
-            {
-                return collector.skip();
-            }
-            let Ok(mut request) = serde_json::from_slice::<Request>(request_json) else {
-                return collector.skip();
-            };
-            // The ordinary JSON projection uses finite-width numbers. Keep the
-            // original context only for exceptional numeric values, using the
-            // same lossless sidecar consumed by capture ingestion. Do not change
-            // the gateway's global number representation to repair capture.
-            if request
-                .context
-                .get("source_json")
-                .is_none_or(Value::is_null)
-                && super::response::contains_wide_number(&request.context)
-            {
-                let Ok(source) = serde_json::from_slice::<ContextSource>(request_json) else {
-                    return collector.skip();
-                };
-                let Some(context) = Arc::make_mut(&mut request.context).as_object_mut() else {
-                    return collector.skip();
-                };
-                context.insert(
-                    "source_json".into(),
-                    Value::String(source.context.get().to_owned()),
-                );
-            }
-            collector.begin(request)
-        })
+        py.detach(|| begin_bytes(&collector, request_json))
     }
 
     /// Freeze resolved model provenance before response collection begins.
@@ -467,4 +436,38 @@ impl CaptureCollector {
     fn checkpoint_discarded(&self) -> u64 {
         self.inner.checkpoint_discarded()
     }
+}
+
+/// Register an already prepared authenticated envelope through the one capture boundary.
+pub(crate) fn begin_bytes(collector: &Collector, request_json: &[u8]) -> bool {
+    if !collector.config.truncate_request
+        && request_json.len() > collector.config.maximum_request_bytes
+    {
+        return collector.skip();
+    }
+    let Ok(mut request) = serde_json::from_slice::<Request>(request_json) else {
+        return collector.skip();
+    };
+    // The ordinary JSON projection uses finite-width numbers. Keep the
+    // original context only for exceptional numeric values, using the
+    // same lossless sidecar consumed by capture ingestion. Do not change
+    // the gateway's global number representation to repair capture.
+    if request
+        .context
+        .get("source_json")
+        .is_none_or(Value::is_null)
+        && super::response::contains_wide_number(&request.context)
+    {
+        let Ok(source) = serde_json::from_slice::<ContextSource>(request_json) else {
+            return collector.skip();
+        };
+        let Some(context) = Arc::make_mut(&mut request.context).as_object_mut() else {
+            return collector.skip();
+        };
+        context.insert(
+            "source_json".into(),
+            Value::String(source.context.get().to_owned()),
+        );
+    }
+    collector.begin(request)
 }

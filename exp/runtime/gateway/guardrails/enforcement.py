@@ -112,6 +112,9 @@ class GuardrailEngine:
         self._monotonic = monotonic
         self._owns_inspects = inspects is None
         self._inspects = inspects or BoundedInspect()
+        # Optional cancellation/quarantine cannot consume mandatory capacity or
+        # quarantine a strict policy that happens to use the same adapter.
+        self._optional_inspects = BoundedInspect()
         self._observation_inspects = BoundedInspect(max_inflight=max_observations)
         self._observations = ObservationOwner(
             max_jobs=max_observations, max_bytes=max_observation_bytes
@@ -207,6 +210,7 @@ class GuardrailEngine:
         request: GatewayRequest,
         deadline_monotonic: float,
         request_id: str | None = None,
+        decision_current: Callable[[], bool] | None = None,
     ) -> GatewayRequest:
         """Run the input chain once and return the validated or transformed request.
 
@@ -216,6 +220,8 @@ class GuardrailEngine:
             deadline_monotonic: Remaining request-wide deadline.
             request_id: Authenticated request identity for score records, or
                 ``None`` to record no scores.
+            decision_current: Native optional release eligibility, or None for
+                the ordinary classifier deadline. Expired outcomes cannot act.
 
         Returns:
             The original request, or the last successful modification.
@@ -236,6 +242,7 @@ class GuardrailEngine:
             request=request,
             deadline_monotonic=deadline_monotonic,
             request_id=request_id,
+            decision_current=decision_current,
         )
 
     async def _inspect_input(
@@ -246,6 +253,7 @@ class GuardrailEngine:
         deadline_monotonic: float,
         retention: ObservationLease | None = None,
         request_id: str | None = None,
+        decision_current: Callable[[], bool] | None = None,
     ) -> GatewayRequest:
         """Evaluate the same bounded checks while granting actions only to enforcing policies."""
         self.input_invocations += 1
@@ -267,6 +275,7 @@ class GuardrailEngine:
                 deadline_monotonic=deadline_monotonic,
                 retention=retention,
                 request_id=request_id,
+                decision_current=decision_current,
             )
             if verdict is None or policy.mode == "observe":
                 continue
@@ -499,6 +508,7 @@ class GuardrailEngine:
         deadline = time.monotonic() + timeout_seconds
         self._observations.close(timeout_seconds=timeout_seconds)
         self._observation_inspects.close(timeout_seconds=max(0.0, deadline - time.monotonic()))
+        self._optional_inspects.close(timeout_seconds=max(0.0, deadline - time.monotonic()))
         if self._owns_inspects:
             self._inspects.close(timeout_seconds=max(0.0, deadline - time.monotonic()))
         self._observation_records.close(timeout_seconds=max(0.0, deadline - time.monotonic()))
@@ -705,6 +715,7 @@ class GuardrailEngine:
         deadline_monotonic: float,
         retention: ObservationLease | None = None,
         request_id: str | None = None,
+        decision_current: Callable[[], bool] | None = None,
     ) -> ClassifierVerdict | None:
         """Invoke one adapter under the tighter of check timeout and request deadline.
 
@@ -721,10 +732,18 @@ class GuardrailEngine:
         """
         remaining = deadline_monotonic - self._monotonic()
         timeout = min(check.timeout_ms / 1000.0, remaining)
+        if decision_current is not None and not decision_current():
+            return None
         if timeout <= 0:
             return self._uncertain(policy, check, GuardrailOutcome.TIMEOUT)
         started = self._monotonic()
-        inspects = self._observation_inspects if policy.mode == "observe" else self._inspects
+        inspects = (
+            self._observation_inspects
+            if policy.mode == "observe"
+            else self._optional_inspects
+            if policy.fail_open
+            else self._inspects
+        )
         try:
             self.classifier_calls += 1
             verdict = await inspects.run(
@@ -734,6 +753,8 @@ class GuardrailEngine:
                 retention=retention,
             )
         except ClassifierCoverageError:
+            if decision_current is not None and not decision_current():
+                return None
             self._decision(
                 policy,
                 check,
@@ -745,17 +766,25 @@ class GuardrailEngine:
                 raise GuardrailRejected(coverage_failure(check_id=check.check_id)) from None
             return None
         except ClassifierUncertainError:
+            if decision_current is not None and not decision_current():
+                return None
             return self._uncertain(
                 policy, check, GuardrailOutcome.UNCERTAIN, self._monotonic() - started
             )
         except ClassifierTimeoutError:
+            if decision_current is not None and not decision_current():
+                return None
             return self._uncertain(
                 policy, check, GuardrailOutcome.TIMEOUT, self._monotonic() - started
             )
         except Exception:  # noqa: BLE001 - classifier failures are fail-closed or skipped
+            if decision_current is not None and not decision_current():
+                return None
             return self._uncertain(
                 policy, check, GuardrailOutcome.UNAVAILABLE, self._monotonic() - started
             )
+        if decision_current is not None and not decision_current():
+            return None
         elapsed = self._monotonic() - started
         outcome = GuardrailOutcome.FLAGGED if verdict.flagged else GuardrailOutcome.ALLOW
         if isinstance(verdict, ScoredVerdict) and request_id is not None:

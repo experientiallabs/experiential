@@ -131,7 +131,7 @@ pub(crate) async fn chat(
     }
     with_app_identity(&mut admit_value, &headers);
     let admit_argument = compact_json(&admit_value);
-    let admission_text = match state.bridge.call("admit", admit_argument).await {
+    let admission_reply = match state.bridge.admit(admit_argument).await {
         Ok(text) => text,
         Err(error) => {
             // A failed keyed admission abandons ownership so waiting
@@ -142,7 +142,7 @@ pub(crate) async fn chat(
             return error_response(&error);
         }
     };
-    let admission_value: Value = match serde_json::from_str(&admission_text) {
+    let admission_value: Value = match serde_json::from_str(&admission_reply.text) {
         Ok(value) => value,
         Err(_) => return error_response(&PublicError::internal()),
     };
@@ -168,6 +168,7 @@ pub(crate) async fn chat(
             }
         };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
+    guard.input_latch = admission_reply.input;
     guard.record_web_search(admission.web_search_meter());
     // The replay key was authorized independently of admission. If an alias
     // activation landed between the two, the admitted work belongs to a newer
