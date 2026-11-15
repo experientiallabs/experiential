@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from exp.runtime.gateway.ledger_crash_recovery import CrashReconcileFollowUp
+from exp.runtime.gateway.ledger_crash_recovery import (
+    CrashReconcileFollowUp,
+    pending_crash_follow_up,
+)
 
 
 class _FixedClock:
@@ -89,3 +93,28 @@ def test_follow_up_re_arms_when_the_clock_steps_back_during_a_pass() -> None:
         time.sleep(0.01)
     assert follow_up.finished
     assert calls == [1, 1]
+
+
+def test_pre_dispatch_rows_are_due_at_their_deadline_and_attempted_rows_after_grace() -> None:
+    """The follow-up uses the startup pass's bounds: grace applies only once an attempt exists."""
+    deadline = datetime(2026, 8, 18, 20, 0, tzinfo=UTC)
+    grace = timedelta(seconds=5)
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.executescript(
+        """
+        CREATE TABLE gateway_requests (request_id TEXT, deadline_at TEXT, terminal_state TEXT);
+        CREATE TABLE gateway_attempts (request_id TEXT, state TEXT);
+        """
+    )
+    connection.execute(
+        "INSERT INTO gateway_requests VALUES ('pre-dispatch', ?, NULL)", (deadline.isoformat(),)
+    )
+    follow_up = pending_crash_follow_up(connection, cleanup_grace=grace)
+    assert follow_up is not None
+    assert follow_up.due_at == deadline
+
+    connection.execute("INSERT INTO gateway_attempts VALUES ('pre-dispatch', 'failed')")
+    follow_up = pending_crash_follow_up(connection, cleanup_grace=grace)
+    assert follow_up is not None
+    assert follow_up.due_at == deadline + grace

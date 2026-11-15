@@ -153,21 +153,33 @@ def pending_crash_follow_up(
         request_ids: When given, only these requests are considered.
 
     Returns:
-        The still open requests and their earliest deadline plus grace, or
-        ``None`` when nothing is open.
+        The still open requests and when the earliest is due (its deadline, plus
+        ``cleanup_grace`` once it has an attempt), or ``None`` when nothing is open.
     """
     rows = [
         row
         for row in connection.execute(
-            "SELECT request_id, deadline_at FROM gateway_requests WHERE terminal_state IS NULL"
+            """
+            SELECT r.request_id, r.deadline_at,
+                   EXISTS(SELECT 1 FROM gateway_attempts a WHERE a.request_id = r.request_id)
+                     AS has_attempt
+              FROM gateway_requests r
+             WHERE r.terminal_state IS NULL
+            """
         ).fetchall()
         if request_ids is None or str(row["request_id"]) in request_ids
     ]
     if not rows:
         return None
+    # The same bounds reconcile_crashed applies: a request with no attempt expires
+    # at its deadline, one with attempts only after its deadline plus the grace.
     return CrashFollowUp(
         request_ids=frozenset(str(row["request_id"]) for row in rows),
-        due_at=min(datetime.fromisoformat(str(row["deadline_at"])) for row in rows) + cleanup_grace,
+        due_at=min(
+            datetime.fromisoformat(str(row["deadline_at"]))
+            + (cleanup_grace if row["has_attempt"] else timedelta(0))
+            for row in rows
+        ),
     )
 
 
