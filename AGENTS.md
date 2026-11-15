@@ -441,8 +441,11 @@ Rules of the road:
 - **Publishing**: `.github/workflows/python-package.yml` builds the flagship
   `experiential` distribution and the `exp-gateway-native` abi3 wheel matrix. PRs and main
   pushes build and smoke-test without publishing. Publication requires a protected release
-  tag (`v<version>`) reachable from main, or an explicit latest-release replay on protected
-  main, and uses PyPI trusted publishing from the `pypi` environment. Only the isolated
+  stable tag (`v<version>`) reachable from main, or an explicit latest-release replay on
+  protected main. An explicitly authorized protected prerelease tag (`v<version>rc<N>`)
+  may publish a reviewed unmerged candidate for testing without authorizing its feature
+  merge. All forms require exact coordinated package pins and use PyPI trusted publishing
+  from the `pypi` environment. Only the isolated
   publish jobs have `id-token: write`. Publish the native distribution before the flagship.
   `docs/gitlab-ci.md` documents GitHub operation and the retained GitLab configuration.
 - **The exp-code npm carve-out**: `agent/` is the npm package `exp-code`, released separately
