@@ -149,7 +149,7 @@ window of the request (a `WindowedClassifier`) declares a configuration digest. 
 joins the replay revision, and a policy whose input checks are all windowed is not refused
 for its total request size.
 
-Startup requires `GUARDRAIL_CONTRACT_VERSION=4`. Publish coordinated engine and
+Startup requires `GUARDRAIL_CONTRACT_VERSION=5`. Publish coordinated engine and
 native packages before a downstream host updates its exact release pins. There
 are no synchronous adapter wrappers, alternate mandatory-policy entry points, or
 package-version fallbacks.

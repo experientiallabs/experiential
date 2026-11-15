@@ -116,9 +116,12 @@ async fn one(
         );
     }
     let check_for_input = prepare(check, subject).ok();
+    let remaining = input::response_deadline(check, Some(boundary)).map_or(budget, |at| {
+        budget.min(at.saturating_duration_since(Instant::now()))
+    });
     let result = match &check_for_input {
-        Some(prepared) => input::inspect(prepared, budget).await,
-        None => Err(()),
+        Some(prepared) if !remaining.is_zero() => input::inspect(prepared, remaining).await,
+        _ => Err(()),
     };
     let result = result.and_then(|verdict| {
         if started.elapsed() > budget {
@@ -305,6 +308,78 @@ mod tests {
                 assert_eq!(error["failure"]["failure_class"], "unavailable");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn mixed_programs_spend_one_parallel_budget_without_waiving_strict_checks() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/input", listener.local_addr().unwrap());
+        let received = Arc::new(AtomicUsize::new(0));
+        let accepted = received.clone();
+        let server = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                sockets.push(socket);
+                accepted.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let case: Value = crate::lossless_json::from_str(
+            include_str!("../../tests/generated/input_programs.jsonl")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let subject: Subject = crate::lossless_json::from_value(case["subject"].clone()).unwrap();
+        let mut optional = super::super::input_tests::check(&url, true);
+        optional.policy["input_execution"] = json!("parallel");
+        optional.policy["input_fail_open"] = json!(true);
+        optional.policy["input_max_wait_ms"] = json!(250);
+        let boundary = Instant::now() - Duration::from_millis(200);
+        let started = Instant::now();
+        let first = enforce(
+            &[optional.clone()],
+            &subject,
+            started + Duration::from_secs(3),
+            boundary,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.request, subject.request);
+        assert!(started.elapsed() < Duration::from_millis(150));
+        assert_eq!(received.load(Ordering::Relaxed), 1);
+        let second = enforce(
+            &[optional.clone()],
+            &subject,
+            Instant::now() + Duration::from_secs(3),
+            boundary,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.request, subject.request);
+        let mut strict = optional.clone();
+        strict.policy["input_fail_open"] = json!(false);
+        strict.adapter = json!({"kind":"keyword", "needles":["secret"]});
+        let denied = enforce(
+            &[optional, strict],
+            &subject,
+            Instant::now() + Duration::from_secs(3),
+            boundary,
+            None,
+        )
+        .await
+        .err()
+        .expect("the strict sibling must still deny");
+        assert_eq!(denied["failure"]["failure_class"], "guardrail");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(received.load(Ordering::Relaxed), 1);
+        server.abort();
     }
 
     #[test]
