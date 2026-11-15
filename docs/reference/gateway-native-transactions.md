@@ -107,3 +107,9 @@ and run tests with `uv run --no-sync pytest`. The fixture validates issued recei
 current grants and epochs inside the same native financial transaction. Normal
 SQLite gateways still reject chain authority, including in this development build.
 Release wheels omit this feature and its fixture constructor.
+
+The native metrics snapshot includes `settlement_wait_ms`, measured from the
+settlement callback request until its execution and bridge permits are granted.
+`bridge_call_ms` begins after those permits. Compare both with complete HTTP
+latency when diagnosing a completion backlog; neither histogram contains request
+identities or content.

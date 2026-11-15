@@ -147,6 +147,7 @@ impl Dispatch {
                 &session.checks,
                 &subject,
                 self.deadline,
+                self.resources.blocking_boundary()?,
                 self.resources.reporting.as_ref(),
             ))
         };

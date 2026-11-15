@@ -24,6 +24,7 @@ pub(crate) struct Resources {
 
 #[derive(Default)]
 struct Followup {
+    boundary: Option<std::time::Instant>,
     active: Vec<Arc<InputGate>>,
     pending: Option<Arc<InputGate>>,
 }
@@ -42,6 +43,9 @@ impl Resources {
         if followup.pending.is_some() || followup.active.len() >= 8 {
             return Err(PublicError::internal());
         }
+        if let Some(at) = followup.boundary {
+            gate.begin_response(at);
+        }
         followup.pending = Some(gate);
         Ok(())
     }
@@ -49,6 +53,13 @@ impl Resources {
     pub(super) fn activate_reinspection(&self) -> Result<(), PublicError> {
         let mut followup = self.followup.lock().map_err(|_| PublicError::internal())?;
         if let Some(gate) = followup.pending.take() {
+            if let Some(at) = gate.boundary() {
+                let at = followup.boundary.map_or(at, |prior| prior.min(at));
+                followup.boundary = Some(at);
+                for input in self.input.iter().chain(followup.active.iter()) {
+                    input.begin_response(at);
+                }
+            }
             followup.active.push(gate);
         }
         Ok(())
@@ -85,10 +96,31 @@ impl Resources {
     }
 
     pub fn begin_response(&self) {
-        let at = std::time::Instant::now();
-        for input in self.inputs() {
-            input.begin_response(at);
+        self.inherit_boundary(std::time::Instant::now());
+    }
+
+    pub fn inherit_boundary(&self, at: std::time::Instant) {
+        if let Ok(mut followup) = self.followup.lock() {
+            let at = followup.boundary.map_or(at, |prior| prior.min(at));
+            followup.boundary = Some(at);
+            for input in self
+                .input
+                .iter()
+                .chain(followup.active.iter())
+                .chain(followup.pending.iter())
+            {
+                input.begin_response(at);
+            }
         }
+    }
+
+    pub fn blocking_boundary(&self) -> Result<std::time::Instant, PublicError> {
+        self.begin_response();
+        self.followup
+            .lock()
+            .map_err(|_| PublicError::internal())?
+            .boundary
+            .ok_or_else(PublicError::internal)
     }
 
     /// Strict policies protect tool side effects; fail-open parallel policies keep running.
@@ -204,9 +236,13 @@ impl Resources {
                 return Err(PublicError::internal());
             }
         }
+        let boundary = input.as_ref().and_then(|gate| gate.boundary());
         Ok(Self {
             input,
-            followup: Mutex::new(Followup::default()),
+            followup: Mutex::new(Followup {
+                boundary,
+                ..Followup::default()
+            }),
             reporting: None,
             capture,
             pending_capture: Mutex::new(pending),

@@ -485,6 +485,11 @@ impl NativeAccounting {
         ledger: &NativeCallbacks,
         request_id: String,
     ) {
+        if let (Some(at), Some(entry)) =
+            (inspection.inner.boundary(), self.inner.lookup(&request_id))
+        {
+            entry.resources.inherit_boundary(at);
+        }
         inspection
             .inner
             .bind_reporter(super::input_reports::Reporter::new(

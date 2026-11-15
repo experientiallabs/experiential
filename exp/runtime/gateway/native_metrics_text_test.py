@@ -93,6 +93,7 @@ def _snapshot() -> JsonObject:
             "request_duration_ms": empty,
             "permit_wait_ms": empty,
             "bridge_call_ms": empty,
+            "settlement_wait_ms": empty,
         },
         "control_plane": _control_plane(),
     }
@@ -264,6 +265,10 @@ exp_gateway_time_to_first_byte_ms_count 4
     + _empty_histogram_lines(
         "exp_gateway_bridge_call_ms", "Milliseconds one control-plane bridge call took."
     )
+    + _empty_histogram_lines(
+        "exp_gateway_settlement_wait_ms",
+        "Milliseconds a settlement waited for execution and bridge permits.",
+    )
     + _EXPECTED_CONTROL_PLANE
 )
 
@@ -309,7 +314,7 @@ def test_counters_end_in_total_and_histograms_close_at_inf() -> None:
         if not line.startswith("#") and line.rsplit(" ", 1)[0].endswith("_ms_count")
     }
     assert inf_counts == totals
-    assert len(inf_counts) == 4
+    assert len(inf_counts) == 5
 
 
 def test_a_torn_snapshot_still_renders_an_internally_consistent_histogram() -> None:

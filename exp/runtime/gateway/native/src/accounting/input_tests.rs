@@ -813,3 +813,41 @@ fn serial_enforcement_short_circuits_before_a_later_fail_open_classifier() {
     );
     server.join().unwrap();
 }
+
+#[tokio::test]
+async fn a_successor_inherits_the_spent_response_budget() {
+    let mut gates = Vec::new();
+    let mut servers = Vec::new();
+    for _ in 0..2 {
+        let (url, received, release, server) = server("{\"flagged\":true}", 200);
+        let mut check = check(&url, true);
+        check.policy["input_fail_open"] = json!(true);
+        check.policy["input_max_wait_ms"] = json!(250);
+        let gate = InputGate::start(vec![check], 5.0).unwrap();
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        gates.push(gate);
+        servers.push((release, server));
+    }
+    let resources = Resources::new(Some(gates[0].clone()), None, None, "request").unwrap();
+    resources.begin_response();
+    let first = tokio::time::timeout(Duration::from_secs(1), resources.wait())
+        .await
+        .unwrap();
+    assert_eq!(first["moderation"]["status"], "failed_open");
+    // A gate staged after the first grace was spent receives no new grace.
+    resources.stage_reinspection(gates[1].clone()).unwrap();
+    resources.activate_reinspection().unwrap();
+    resources.begin_response();
+    let second = tokio::time::timeout(Duration::from_millis(100), resources.wait())
+        .await
+        .unwrap();
+    assert_eq!(second["action"], "allow");
+    assert_eq!(
+        gates[1].decision()["moderation"]["reason"],
+        "response_ready_timeout"
+    );
+    for (release, server) in servers {
+        release.send(()).unwrap();
+        server.join().unwrap();
+    }
+}

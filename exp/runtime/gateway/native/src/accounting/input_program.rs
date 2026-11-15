@@ -77,6 +77,7 @@ async fn one(
     check: &Check,
     subject: &Subject,
     deadline: Instant,
+    boundary: Instant,
     observed: &mut Value,
     classification: &mut Value,
 ) -> Result<Subject, Value> {
@@ -97,7 +98,11 @@ async fn one(
     }
     let started = Instant::now();
     let budget = Duration::from_millis(check.check["timeout_ms"].as_u64().unwrap_or(0))
-        .min(deadline.saturating_duration_since(started));
+        .min(deadline.saturating_duration_since(started))
+        .min(
+            input::response_deadline(check, Some(boundary))
+                .map_or(Duration::MAX, |at| at.saturating_duration_since(started)),
+        );
     if budget.is_zero() {
         *observed = inspection::decision(
             "error",
@@ -184,12 +189,21 @@ async fn recorded(
     check: &Check,
     subject: &Subject,
     deadline: Instant,
+    boundary: Instant,
     reporting: Option<&super::input_reports::Factory>,
 ) -> Result<Subject, Value> {
     let started = Instant::now();
     let mut observed = Value::Null;
     let mut classification = Value::Null;
-    let result = one(check, subject, deadline, &mut observed, &mut classification).await;
+    let result = one(
+        check,
+        subject,
+        deadline,
+        boundary,
+        &mut observed,
+        &mut classification,
+    )
+    .await;
     if let Some(reporting) = reporting {
         let mut decision = if !observed.is_null() {
             observed
@@ -221,17 +235,18 @@ pub(super) async fn enforce(
     checks: &[Check],
     subject: &Subject,
     deadline: Instant,
+    boundary: Instant,
     reporting: Option<&super::input_reports::Factory>,
 ) -> Result<Subject, Value> {
     let mut current = subject.clone();
     let mut approved = Vec::new();
     for (i, check) in checks.iter().enumerate() {
-        current = recorded(check, &current, deadline, reporting).await?;
+        current = recorded(check, &current, deadline, boundary, reporting).await?;
         approved.push((i, current.request.clone()));
     }
     for (i, prior) in approved {
         if prior != current.request
-            && recorded(&checks[i], &current, deadline, reporting)
+            && recorded(&checks[i], &current, deadline, boundary, reporting)
                 .await?
                 .request
                 != current.request
@@ -271,6 +286,7 @@ mod tests {
                 &check,
                 &subject,
                 Instant::now() + Duration::from_secs(1),
+                Instant::now(),
                 &mut observed,
                 &mut classification,
             )
@@ -311,6 +327,7 @@ mod tests {
                 &check,
                 &subject,
                 Instant::now() + Duration::from_secs(1),
+                Instant::now(),
                 &mut Value::Null,
                 &mut Value::Null,
             ));
@@ -334,6 +351,7 @@ mod tests {
         let subject: Subject = crate::lossless_json::from_value(case["subject"].clone()).unwrap();
         let mut check: Check = crate::lossless_json::from_value(case["checks"][0].clone()).unwrap();
         check.policy["input_fail_open"] = json!(true);
+        check.policy["input_max_wait_ms"] = json!(1000);
         check.policy["protected"] = json!(true);
         check.check["action"] = json!("modify");
         for adapter in [
@@ -348,6 +366,7 @@ mod tests {
                     &check,
                     &subject,
                     Instant::now() + Duration::from_secs(1),
+                    Instant::now(),
                     &mut Value::Null,
                     &mut Value::Null,
                 ))
@@ -366,11 +385,13 @@ mod tests {
         let mut check: Check =
             crate::lossless_json::from_value(denied_case["checks"][0].clone()).unwrap();
         check.policy["input_fail_open"] = json!(true);
+        check.policy["input_max_wait_ms"] = json!(1000);
         let denied = runtime
             .block_on(one(
                 &check,
                 &subject,
                 Instant::now() + Duration::from_secs(1),
+                Instant::now(),
                 &mut Value::Null,
                 &mut Value::Null,
             ))
@@ -394,6 +415,7 @@ mod tests {
                 &checks,
                 &subject,
                 Instant::now() + Duration::from_secs(30),
+                Instant::now(),
                 None,
             )) {
                 Ok(s) => json!({"request": s.request}),
