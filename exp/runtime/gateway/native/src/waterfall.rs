@@ -427,8 +427,11 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
             Ok(end) => end,
             Err(failure) => {
                 // The dropped generation closes its transport before durable settlement.
-                guard.fail_before_release(&failure.failure).await;
-                return Won::Failed(failure.public_error());
+                return Won::Failed(if guard.fail_before_release(&failure.failure).await {
+                    failure.public_error()
+                } else {
+                    guard.settlement_error()
+                });
             }
         };
         // A settled answer is complete. Committed answers reach the surface's
@@ -440,8 +443,11 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                     .await
                     .and_then(|decision| decision.require_allow())
                 {
-                    guard.fail_before_release(&failure.failure).await;
-                    return Won::Failed(failure.public_error());
+                    return Won::Failed(if guard.fail_before_release(&failure.failure).await {
+                        failure.public_error()
+                    } else {
+                        guard.settlement_error()
+                    });
                 }
             }
         }
@@ -640,8 +646,13 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                             .await
                             .and_then(|decision| decision.require_allow())
                         {
-                            guard.fail_before_release(&failure.failure).await;
-                            return Won::Failed(failure.public_error());
+                            return Won::Failed(
+                                if guard.fail_before_release(&failure.failure).await {
+                                    failure.public_error()
+                                } else {
+                                    guard.settlement_error()
+                                },
+                            );
                         }
                     }
                 }
