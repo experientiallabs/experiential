@@ -46,7 +46,7 @@ fn serialized_failure_cannot_invent_a_graceful_retirement_hint() {
 async fn denied_input_retry_keeps_the_meter_without_abandoning_the_attempt() {
     Python::initialize();
     let plane = Python::attach(|py| {
-        pyo3::types::PyModule::from_code(py, c"import json\nclass Plane:\n def __init__(self): self.writes = []; self.abandons = []\n def settle(self, argument):\n  self.writes.append(json.loads(argument))\n  raise RuntimeError('temporary ledger failure')\n def abandon(self, argument):\n  self.abandons.append(json.loads(argument))\n  return '{}'\n def close_thread_resources(self, argument): return '{}'\n", c"retry_input_plane.py", c"retry_input_plane")
+        pyo3::types::PyModule::from_code(py, c"import json\nclass Plane:\n def __init__(self): self.writes = []; self.abandons = []\n def settle(self, argument):\n  self.writes.append(json.loads(argument))\n  raise RuntimeError('temporary ledger failure')\n def abandon(self, argument):\n  self.abandons.append(json.loads(argument))\n  return '{\"terminalized\":true}'\n def close_thread_resources(self, argument): return '{}'\n", c"retry_input_plane.py", c"retry_input_plane")
             .unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
     });
     let bridge = Arc::new(Bridge::scripted(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
@@ -869,22 +869,14 @@ fn settle_argument_carries_the_twelve_hour_write_subset_only_when_observed() {
         .is_none());
 }
 
-/// A Python control plane that records every `price` and `settle` call in order.
-fn ordering_plane(price_fails: bool) -> Py<PyAny> {
+/// A bounded write fixture that records the terminal and can withhold its acknowledgement.
+fn ordering_plane(settle_fails: bool) -> Py<PyAny> {
     Python::initialize();
-    let code = format!(
-        "import json\nclass Plane:\n def __init__(self): self.calls = []\n def price(self, argument):\n  self.calls.append(['price', json.loads(argument)])\n  if {price_fails}: raise RuntimeError('quote unavailable')\n  return '{{}}'\n def settle(self, argument):\n  self.calls.append(['settle', json.loads(argument)])\n  return '{{}}'\n def close_thread_resources(self, argument): return '{{}}'\n",
-        price_fails = if price_fails { "True" } else { "False" },
-    );
-    let code = std::ffi::CString::new(code).unwrap();
     Python::attach(|py| {
-        pyo3::types::PyModule::from_code(py, &code, c"ordering_plane.py", c"ordering_plane")
-            .unwrap()
-            .getattr("Plane")
-            .unwrap()
-            .call0()
-            .unwrap()
-            .unbind()
+        let plane = pyo3::types::PyModule::from_code(py, c"import json, threading\nclass Plane:\n def __init__(self):\n  self.calls = []; self.fail = False; self.entered = threading.Event(); self.release = threading.Event(); self.release.set()\n def price(self, argument): raise AssertionError('a quote cannot authorize completion')\n def settle(self, argument):\n  self.calls.append(['settle', json.loads(argument)]); self.entered.set()\n  if not self.release.wait(5): raise RuntimeError('bounded fixture acknowledgement timeout')\n  if self.fail: raise RuntimeError('settlement unavailable')\n  return '{}'\n def close_thread_resources(self, argument): return '{}'\n", c"ordering_plane.py", c"ordering_plane")
+            .unwrap().getattr("Plane").unwrap().call0().unwrap();
+        plane.setattr("fail", settle_fails).unwrap();
+        plane.unbind()
     })
 }
 
@@ -902,7 +894,7 @@ fn recorded_calls(plane: &Py<PyAny>) -> Vec<(String, Value)> {
 }
 
 /// A guard bound to one dispatched attempt that observed final usage.
-fn priced_guard(plane: &Py<PyAny>) -> AttemptGuard {
+fn terminal_guard(plane: &Py<PyAny>) -> AttemptGuard {
     let bridge = Arc::new(Bridge::scripted(Python::attach(|py| plane.clone_ref(py)), 4).unwrap());
     let mut guard = AttemptGuard::new(
         bridge,
@@ -921,56 +913,155 @@ fn priced_guard(plane: &Py<PyAny>) -> AttemptGuard {
 }
 
 #[tokio::test]
-async fn a_priced_terminal_settles_the_exact_priced_argument_afterwards() {
+async fn a_terminal_response_requires_a_durable_settlement_acknowledgement() {
     let plane = ordering_plane(false);
-    let mut guard = priced_guard(&plane);
-    assert!(guard.price_or_settle("completed", None, &[], None).await);
+    let mut guard = terminal_guard(&plane);
+    assert!(
+        guard
+            .settle_before_terminal("completed", None, &[], None)
+            .await
+    );
     let calls = recorded_calls(&plane);
-    assert_eq!(calls.len(), 1, "a successful quote writes nothing yet");
-    assert_eq!(calls[0].0, "price");
-    // A disconnect after the quote never downgrades the priced outcome.
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "settle", "a quote is not a durable write");
+    assert_eq!(calls[0].1["usage"]["input_tokens"], 21);
+    assert_eq!(calls[0].1["outcome"], "completed");
+    assert!(
+        !guard.armed,
+        "completion must not leave in-process financial debt"
+    );
     assert!(guard.settle_cancelled(None, &[]).await);
-    assert!(!guard.armed);
-    let calls = recorded_calls(&plane);
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[1].0, "settle");
-    assert_eq!(calls[1].1, calls[0].1);
-    assert_eq!(calls[1].1["outcome"], "completed");
-    assert_eq!(calls[1].1["usage"]["input_tokens"], 21);
-    assert!(guard.settle_priced().await);
-    assert_eq!(recorded_calls(&plane).len(), 2, "settled exactly once");
-}
-
-#[tokio::test]
-async fn a_failed_quote_settles_before_any_terminal_byte() {
-    let plane = ordering_plane(true);
-    let mut guard = priced_guard(&plane);
-    assert!(guard.price_or_settle("incomplete", None, &[], None).await);
-    let calls = recorded_calls(&plane);
-    let methods: Vec<&str> = calls.iter().map(|(method, _)| method.as_str()).collect();
-    assert_eq!(methods, ["price", "settle"]);
-    assert_eq!(calls[1].1, calls[0].1);
-    assert!(!guard.armed);
-    assert!(guard.settle_priced().await);
-    assert_eq!(recorded_calls(&plane).len(), 2);
-}
-
-#[tokio::test]
-async fn a_priced_terminal_dropped_unsettled_is_delivered_by_the_backstop() {
-    let plane = ordering_plane(false);
-    let pending = Arc::new(AtomicUsize::new(0));
-    let mut guard = priced_guard(&plane);
-    guard.pending = pending.clone();
-    assert!(guard.price_or_settle("completed", None, &[], None).await);
     drop(guard);
+    assert_eq!(
+        recorded_calls(&plane).len(),
+        1,
+        "delivery cancellation cannot replace or repeat a completed settlement"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_durable_write_never_authorizes_terminal_delivery() {
+    let plane = ordering_plane(true);
+    let mut guard = terminal_guard(&plane);
+    assert!(
+        !guard
+            .settle_before_terminal("incomplete", None, &[], None)
+            .await
+    );
+    let calls = recorded_calls(&plane);
+    assert!(calls.len() > 1, "bounded write retries were exercised");
+    assert!(calls
+        .iter()
+        .all(|(method, argument)| method == "settle" && argument == &calls[0].1));
+    assert_eq!(calls[0].1["outcome"], "incomplete");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_terminal_waits_while_the_durable_write_is_unacknowledged() {
+    let plane = ordering_plane(false);
+    Python::attach(|py| {
+        plane
+            .bind(py)
+            .getattr("release")
+            .unwrap()
+            .call_method0("clear")
+            .unwrap();
+    });
+    let mut guard = terminal_guard(&plane);
+    let task = tokio::spawn(async move {
+        guard
+            .settle_before_terminal("completed", None, &[], None)
+            .await
+    });
+    let mut entered = false;
     for _ in 0..200 {
-        if recorded_calls(&plane).len() == 2 && pending.load(Ordering::SeqCst) == 0 {
+        entered = Python::attach(|py| {
+            plane
+                .bind(py)
+                .getattr("entered")
+                .unwrap()
+                .call_method0("is_set")
+                .unwrap()
+                .extract::<bool>()
+                .unwrap()
+        });
+        if entered {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    let calls = recorded_calls(&plane);
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[1].0, "settle");
-    assert_eq!(calls[1].1, calls[0].1);
+    let completed_before_ack = task.is_finished();
+    Python::attach(|py| {
+        plane
+            .bind(py)
+            .getattr("release")
+            .unwrap()
+            .call_method0("set")
+            .unwrap();
+    });
+    assert!(
+        entered,
+        "the write never reached its acknowledgement barrier"
+    );
+    assert!(
+        !completed_before_ack,
+        "completion escaped before the durable acknowledgement"
+    );
+    assert!(task.await.unwrap());
+    assert_eq!(recorded_calls(&plane).len(), 1);
+}
+
+#[tokio::test]
+async fn an_explicitly_unacknowledged_abandon_is_retried_and_never_delivered() {
+    Python::initialize();
+    let plane = Python::attach(|py| {
+        pyo3::types::PyModule::from_code(py,
+            c"import json\nclass Plane:\n def __init__(self): self.calls = 0\n def abandon(self, argument):\n  self.calls += 1\n  return '{\"terminalized\":false}'\n def close_thread_resources(self, argument): return '{}'\n",
+            c"unacknowledged.py", c"unacknowledged")
+            .unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
+    });
+    let bridge = Arc::new(Bridge::scripted(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
+    let mut guard = AttemptGuard::new(
+        bridge,
+        Arc::new(AtomicUsize::new(0)),
+        "request".into(),
+        Instant::now(),
+    );
+    assert!(
+        !guard
+            .abandon(&Failure::new(
+                FailureClass::Guardrail,
+                "Input was rejected."
+            ))
+            .await
+    );
+    assert_eq!(guard.settlement_error().code, "accounting_unavailable");
+    Python::attach(|py| {
+        assert_eq!(
+            plane
+                .bind(py)
+                .getattr("calls")
+                .unwrap()
+                .extract::<u32>()
+                .unwrap(),
+            4
+        )
+    });
+}
+
+#[test]
+fn acknowledgement_requires_a_typed_write_result() {
+    for value in [
+        Value::Null,
+        json!([]),
+        json!(true),
+        json!({"terminalized": false}),
+        json!({"terminalized": null}),
+    ] {
+        assert!(acknowledged("settle", &value).is_err());
+        assert!(acknowledged("abandon", &value).is_err());
+    }
+    assert!(acknowledged("abandon", &json!({})).is_err());
+    assert!(acknowledged("abandon", &json!({"terminalized": true})).is_ok());
+    assert!(acknowledged("settle", &json!({})).is_ok());
 }

@@ -93,7 +93,7 @@ class Plane:
         return "{}"
 
     def abandon(self, argument):
-        return "{}"
+        return '{"terminalized":true}'
 
     def dump(self, argument):
         with self.lock:

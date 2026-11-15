@@ -345,9 +345,12 @@ async fn run_ladder(
         };
         guard.rebind(attempt_id);
         let Some(wire) = admission.route.get(depth) else {
-            guard
+            if !guard
                 .settle("failed", None, &[], Some(&wire_failure()), true)
-                .await;
+                .await
+            {
+                return Err(guard.settlement_error());
+            }
             return Err(PublicError::internal());
         };
         // Re-check caps locally before dispatch, even if the bridge returns an
@@ -356,9 +359,12 @@ async fn run_ladder(
         if total_attempts >= policy.maximum_total_attempts
             || counts[depth] >= policy.maximum_same_deployment_attempts
         {
-            guard
+            if !guard
                 .settle("failed", None, &[], Some(&wire_failure()), true)
-                .await;
+                .await
+            {
+                return Err(guard.settlement_error());
+            }
             return Err(PublicError::internal());
         }
         if current_depth == Some(depth) {

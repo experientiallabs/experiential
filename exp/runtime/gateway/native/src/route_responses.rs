@@ -32,8 +32,8 @@ use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey};
 use crate::respond::{
     bearer_key, cached_response, capture_frame, client_ip, complete_visible_refusal,
     emit_responses_failure, error_response, escalation_error, finish_stream_terminal,
-    json_response, latin1_header, outward_event, price_stream_end, read_body, settle_stream_end,
-    sse_body_response, stream_delivery::Delivery, with_app_identity,
+    json_response, latin1_header, log_stream_exit, outward_event, read_body, settle_stream_end,
+    settle_stream_terminal, sse_body_response, stream_delivery::Delivery, with_app_identity,
 };
 use crate::responses_retention::{remember_argument, remember_continuation, ResponsesRetention};
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
@@ -196,12 +196,15 @@ pub(crate) async fn responses(
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
         }
-        guard
+        if !guard
             .abandon(&Failure::new(
                 FailureClass::Internal,
                 "the alias revision changed during keyed admission",
             ))
-            .await;
+            .await
+        {
+            return error_response(&guard.settlement_error());
+        }
         let mut error = PublicError::new(
             409,
             "idempotency_replay_unavailable",
@@ -392,9 +395,12 @@ async fn respond_from_responses_events(
             Ok(carrier) => carrier,
             Err(failure) => {
                 let failure = failure.boundary();
-                guard
+                if !guard
                     .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
-                    .await;
+                    .await
+                {
+                    return error_response(&guard.settlement_error());
+                }
                 if let Some(mut owner) = lease.take() {
                     owner.abandon().await;
                 }
@@ -410,7 +416,7 @@ async fn respond_from_responses_events(
     ) {
         Ok(aggregated) => aggregated,
         Err(error) => {
-            guard
+            if !guard
                 .settle(
                     "failed",
                     usage.as_ref(),
@@ -424,7 +430,10 @@ async fn respond_from_responses_events(
                     ),
                     true,
                 )
-                .await;
+                .await
+            {
+                return error_response(&guard.settlement_error());
+            }
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
             }
@@ -434,7 +443,7 @@ async fn respond_from_responses_events(
     if let Some(failure) = &aggregated.failure {
         let failure = failure.clone().boundary();
         let error = failure.public_error();
-        guard
+        if !guard
             .settle(
                 "failed",
                 aggregated.usage.as_ref().or(usage.as_ref()),
@@ -442,7 +451,10 @@ async fn respond_from_responses_events(
                 Some(&failure),
                 true,
             )
-            .await;
+            .await
+        {
+            return error_response(&guard.settlement_error());
+        }
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
         }
@@ -488,6 +500,13 @@ async fn respond_from_responses_events(
             )
             .await
     };
+    if !settled {
+        // Success is only reported once the terminal accounting write landed.
+        if let Some(mut owner) = lease.take() {
+            owner.abandon().await;
+        }
+        return error_response(&guard.settlement_error());
+    }
     if let Err(error) = remembered {
         // The provider outcome already settled above, exactly like the python
         // executor; only the HTTP result reports the retention failure.
@@ -495,13 +514,6 @@ async fn respond_from_responses_events(
             owner.abandon().await;
         }
         return error_response(&error);
-    }
-    if !settled {
-        // Success is only reported once the terminal accounting write landed.
-        if let Some(mut owner) = lease.take() {
-            owner.abandon().await;
-        }
-        return error_response(&guard.settlement_error());
     }
     let headers = served_headers(&admission, client_request_id.as_deref(), served);
     if stream_body {
@@ -571,7 +583,7 @@ async fn completed_responses(
         Err(failure) => {
             let failure = failure.boundary();
             let error = collection_public_error(&failure);
-            guard
+            if !guard
                 .settle(
                     "failed",
                     committed.usage.as_ref(),
@@ -579,7 +591,10 @@ async fn completed_responses(
                     Some(&failure),
                     true,
                 )
-                .await;
+                .await
+            {
+                return error_response(&guard.settlement_error());
+            }
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
             }
@@ -626,7 +641,7 @@ async fn guarded_responses(
         Err(failure) => {
             let failure = failure.boundary();
             let error = collection_public_error(&failure);
-            guard
+            if !guard
                 .settle(
                     "failed",
                     committed.usage.as_ref(),
@@ -634,7 +649,10 @@ async fn guarded_responses(
                     Some(&failure),
                     true,
                 )
-                .await;
+                .await
+            {
+                return error_response(&guard.settlement_error());
+            }
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
             }
@@ -645,7 +663,7 @@ async fn guarded_responses(
     let events = match apply_output_guardrail(&state, &admission, collected, deadline, true).await {
         Ok(events) => events,
         Err(failure) => {
-            guard
+            if !guard
                 .settle(
                     "failed",
                     committed.usage.as_ref(),
@@ -653,7 +671,10 @@ async fn guarded_responses(
                     Some(&failure),
                     true,
                 )
-                .await;
+                .await
+            {
+                return error_response(&guard.settlement_error());
+            }
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
             }
@@ -725,10 +746,14 @@ async fn stream_responses(
             ($failure:expr) => {{
                 committed.relay.close_transport();
                 let failure = $failure.boundary();
-                emit_responses_failure(&sender, deadline, &mut encoder, &failure).await;
-                guard
+                if !guard
                     .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
-                    .await;
+                    .await
+                {
+                    log_stream_exit(&request_id, "settlement_unavailable");
+                    return;
+                }
+                emit_responses_failure(&sender, deadline, &mut encoder, &failure).await;
                 return;
             }};
         }
@@ -910,13 +935,14 @@ async fn stream_responses(
             )
             .await
             .is_ok();
-        // Price each terminal once (even a failed continuation write); failed quotes settle here.
+        // Settle observed work even when retaining the continuation failed.
         let settled = match terminal.as_ref() {
-            Some(event) => price_stream_end(&mut guard, event, usage.as_ref(), &tool_names).await,
+            Some(event) => {
+                settle_stream_terminal(&mut guard, event, usage.as_ref(), &tool_names).await
+            }
             None => true,
         };
         if !retained || !settled {
-            guard.settle_priced().await;
             return;
         }
         if matches!(terminal, Some(Event::Failed(_))) {
@@ -934,10 +960,9 @@ async fn stream_responses(
             terminal_frames.into_iter().map(Bytes::from).collect(),
         )
         .await;
-        // Close the body before the durable write; the caller holds its terminal frames till then.
+        // Settlement was acknowledged before terminal publication.
         drop(delivery);
         drop(sender);
-        guard.settle_priced().await;
     });
 
     let body = Body::from_stream(ReceiverStream::new(receiver));
