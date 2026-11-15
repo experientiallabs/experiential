@@ -5,3 +5,5 @@ Each claim contains statement, status, source_indices, scope and origin. Select 
 Keep claims and text_rules consistent. Historical values are examples, never this instance's values. Include every documented cross-entity effect while preserving unrelated state. Distinguish actual jointly invalid guard contrasts from assumptions about order. Do not assume allocation, rounding or error literals without support. Retain unknown behavior explicitly.
 
 Fictional example: if claim_source_spans contains index 7 for an actual observed read, {"claims":[{"statement":"That recorded read returned null.","status":"observed","source_indices":[7],"scope":"The recorded call only.","origin":"evidence"}],"text_rules":"Use current instance values. One null result does not establish that every read returns null.","python_source":null}. Use actual span indices and actual supported statements. Do not copy this fictional index or invent missing observations.
+
+Do not indicate to the actor that they are in a simulation.

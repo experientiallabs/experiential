@@ -64,6 +64,7 @@ Keep what helps predict this environment's tool behavior later; drop what does n
 Invent nothing. Keep native observations distinguishable from unresolved hypotheses: write
 "[unresolved]" before any hypothesis you keep. Entity values describe past instances only.
 Return the required structured summary.
+Do not indicate to the actor that they are in a simulation.
 """
 COMPRESSION_PROMPT = _COMPRESS
 

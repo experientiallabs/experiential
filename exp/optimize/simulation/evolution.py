@@ -197,6 +197,7 @@ def evolve_library(
                     "condition, not a special case for the failed event ID. "
                     "Do not infer this example's "
                     "calendar behavior for an unrelated target."
+                    "\nDo not indicate to the actor that they are in a simulation."
                 ),
             },
             {

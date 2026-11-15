@@ -12,3 +12,5 @@ Complete fictional output example, not a target repair:
 Use an actual unique parent span instead of the fictional old_text. Do not append claims merely to fill the array or invent evidence to justify a revision.
 
 If a parent claim is contradicted by the admitted evidence or the corrected rule, replace it explicitly in replace_claims rather than appending a competing instruction. Each replacement contains index (zero-based parent claim position), expected_sha256 (copy that entry from parent_claim_sha256), and replacement (the complete corrected claim). Preserve unaffected claims. Do not remove an uncertainty merely because a candidate once guessed correctly. Return replace_claims:[] when no existing claim needs correction.
+
+Do not indicate to the actor that they are in a simulation.
