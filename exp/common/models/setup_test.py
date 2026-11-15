@@ -21,6 +21,30 @@ from exp.common.models import (
     configure_provider_catalog,
     write_model_catalog,
 )
+from exp.common.models.gateway_catalog_test import unavailable_child_catalog
+
+
+def test_provider_setup_preserves_authored_gateway_routing(tmp_path: Path) -> None:
+    """Editing provider roles retains certified pools and authored model chains on disk."""
+    path = tmp_path / "models.toml"
+    routing = unavailable_child_catalog()
+    configured = configure_provider_catalog(path, _setup())
+    authored = ModelCatalog.model_validate(
+        {
+            **configured.model_dump(),
+            "connections": {**configured.connections, **routing.connections},
+            "models": {**configured.models, **routing.models},
+            "gateway_pools": routing.gateway_pools,
+            "gateway_model_chains": routing.gateway_model_chains,
+        }
+    )
+    write_model_catalog(path, authored)
+
+    updated = configure_provider_catalog(path, _setup())
+
+    assert updated.gateway_pools == authored.gateway_pools
+    assert updated.gateway_model_chains == authored.gateway_model_chains
+    assert updated.models == authored.models
 
 
 def _setup(*, judge_model: str = "judge-id") -> ProviderSetup:
