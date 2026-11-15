@@ -8,7 +8,6 @@ import time
 from collections.abc import Callable
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import BillingSource
 from exp.runtime.gateway.attempt_tokens import counted_input_tokens
 from exp.runtime.gateway.class_throttles import admission_priority_class, tier_authorization
 from exp.runtime.gateway.client_apps import with_client_identity
@@ -31,7 +30,7 @@ from exp.runtime.gateway.guardrails.native import (
     NativeGuardrailsMixin,
     native_output_mode,
     open_admission_guardrails,
-    prepare_native_optional_input,
+    prepare_admitted_input,
     require_capture,
     validate_guardrail_engine,
 )
@@ -369,7 +368,7 @@ class NativeControlPlane(
             )
             raise NativeBridgeError(error) from exc
 
-        original_guardrail_request = request
+        original_subject = request
         guardrails = open_admission_guardrails(
             self._guardrails, authorization, request, data, deadline_monotonic=deadline
         )
@@ -720,24 +719,14 @@ class NativeControlPlane(
 
         if guardrails is not None:
             try:
-                overlap = (
-                    parallel_guardrail
-                    and cache_state is None
-                    and all(
-                        d.billing_source is BillingSource.HOST_MANAGED for d in route.deployments
-                    )
-                )
-                if overlap and prepare_native_optional_input(
+                pending_capture = prepare_admitted_input(
                     guardrails,
                     self._capture,
                     authorization,
                     pending_capture,
-                    route.snapshot.exact_model_id,
-                ):
-                    pending_capture = None
-                guardrails.prepare_dispatch(
-                    (original_guardrail_request, captured_request, request, public_request),
-                    overlap=overlap,
+                    route,
+                    (original_subject, captured_request, request, public_request),
+                    parallel=parallel_guardrail and cache_state is None,
                 )
             except GuardrailRejected as exc:
                 discard_capture(self._capture, authorization.request_id)
@@ -964,10 +953,8 @@ class NativeControlPlane(
         """Retain one finished Responses continuation within strict bounds.
 
         Args:
-            argument: JSON object with ``request_id``, aggregated ``text``,
-                ``refusal`` presence, and completed ``tool_calls``; an
-                output-less turn carries all of them empty and is retained as
-                the conversation so far.
+            argument: JSON with ``request_id``, aggregated ``text``, ``refusal`` and
+                completed ``tool_calls``. Empty output retains the conversation so far.
 
         Returns:
             An empty JSON object; retention that does not apply (a

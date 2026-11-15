@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol, cast
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models import BillingSource
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
 from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
 
     from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+    from exp.runtime.gateway.routing import GatewayRoute
 
 
 def require_capture(
@@ -281,7 +283,29 @@ class _GuardrailPlane(Protocol):
     _capture: CaptureController | None
 
 
-def prepare_native_optional_input(
+def prepare_admitted_input(
+    session: GuardrailSession,
+    controller: CaptureController | None,
+    authorization: AuthorizationSnapshot,
+    pending: PendingCapture | None,
+    route: GatewayRoute,
+    subjects: Sequence[GatewayRequest],
+    *,
+    parallel: bool,
+) -> PendingCapture | None:
+    """Prepare one authenticated inspection owner before handing the route to dispatch."""
+    overlap = parallel and all(
+        deployment.billing_source is BillingSource.HOST_MANAGED for deployment in route.deployments
+    )
+    if overlap and _prepare_native_optional_input(
+        session, controller, authorization, pending, route.snapshot.exact_model_id
+    ):
+        pending = None
+    session.prepare_dispatch(subjects, overlap=overlap)
+    return pending
+
+
+def _prepare_native_optional_input(
     session: GuardrailSession,
     controller: CaptureController | None,
     authorization: AuthorizationSnapshot,
