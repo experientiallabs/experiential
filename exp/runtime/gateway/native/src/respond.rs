@@ -441,13 +441,11 @@ pub(crate) async fn settle_stream_end(
     }
 }
 
-/// Price a stream's provider terminal before its terminal frames flush.
+/// Commit a stream's provider terminal before publishing terminal frames.
 ///
-/// Returns whether the frames may flush: true once the host priced the
-/// decided settlement (the caller then closes the stream and calls
-/// [`AttemptGuard::settle_priced`]) or, when the quote failed, once the
-/// settlement itself landed; false when neither did.
-pub(crate) async fn price_stream_end(
+/// Only an acknowledged durable settlement permits completion. A failed write
+/// leaves recovery ownership intact and the stream ends without a terminal.
+pub(crate) async fn settle_stream_terminal(
     guard: &mut AttemptGuard,
     terminal: &Event,
     usage: Option<&Usage>,
@@ -457,17 +455,17 @@ pub(crate) async fn price_stream_end(
         Event::Failed(failure) => {
             let failure = failure.clone().boundary();
             guard
-                .price_or_settle("failed", usage, tool_names, Some(&failure))
+                .settle_before_terminal("failed", usage, tool_names, Some(&failure))
                 .await
         }
         Event::Incomplete => {
             guard
-                .price_or_settle("incomplete", usage, tool_names, None)
+                .settle_before_terminal("incomplete", usage, tool_names, None)
                 .await
         }
         _ => {
             guard
-                .price_or_settle("completed", usage, tool_names, None)
+                .settle_before_terminal("completed", usage, tool_names, None)
                 .await
         }
     }

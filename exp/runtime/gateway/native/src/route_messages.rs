@@ -31,8 +31,8 @@ use crate::reasoning_display::ReasoningOutput;
 use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::respond::{
     bearer_key, client_ip, complete_visible_refusal, escalation_error, json_response,
-    latin1_header_list, outward_event, price_stream_end, read_body, send_bounded,
-    settle_stream_end, sse_body_response, with_app_identity,
+    latin1_header_list, outward_event, read_body, send_bounded, settle_stream_end,
+    settle_stream_terminal, sse_body_response, with_app_identity,
 };
 use crate::respond::{log_stream_exit, stream_delivery::Delivery};
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
@@ -819,7 +819,7 @@ async fn stream_messages(
                 terminal = Some(event.clone());
                 let settled = if empty_completion {
                     guard
-                        .price_or_settle(
+                        .settle_before_terminal(
                             "failed",
                             usage.as_ref(),
                             &tool_names,
@@ -827,7 +827,7 @@ async fn stream_messages(
                         )
                         .await
                 } else {
-                    price_stream_end(&mut guard, &event, usage.as_ref(), &tool_names).await
+                    settle_stream_terminal(&mut guard, &event, usage.as_ref(), &tool_names).await
                 };
                 if !settled {
                     log_stream_exit(&request_id, "settlement_unavailable");
@@ -839,9 +839,8 @@ async fn stream_messages(
                     Ok(encoded) => encoded,
                     Err(_) => {
                         if terminal.is_some() {
-                            // The provider terminal is already settled, or
-                            // priced and settled by the drop backstop; the
-                            // stream simply ends short.
+                            // The provider terminal is already durably settled;
+                            // encoding failure only truncates delivery.
                             log_stream_exit(&request_id, "terminal_encoding_failed");
                             return;
                         }
@@ -867,11 +866,9 @@ async fn stream_messages(
                     }
                 }
                 if outward.is_terminal() {
-                    // Close the body before the durable write: the caller
-                    // holds its terminal frames while settlement lands.
+                    // Settlement was acknowledged before terminal publication.
                     drop(delivery);
                     drop(sender);
-                    guard.settle_priced().await;
                     return;
                 }
             }
