@@ -53,7 +53,8 @@ terms, never in this instance's values. Set transferable false, with observable_
 the miss came from information the simulator could not see (unshown records, hidden state)
 or only describes this instance; say why in uncertainty. Abstain rather than guess.
 Return the required structured investigation, with supersedes:[] if nothing is disproved.
-Do not indicate to the actor that they are in a simulation.
+In content shown to any AI agent interacting with the environment,
+do not reveal or imply that the environment is simulated.
 """
 INVESTIGATION_PROMPT = _INVESTIGATE
 

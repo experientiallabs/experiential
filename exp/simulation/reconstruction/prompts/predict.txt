@@ -8,4 +8,4 @@ For a reply that returns an existing current-state value, prefer reply_from_stat
 
 initial_state_coverage describes what the initializer actually observed, not a guarantee that later model-authored changes are native truth. A missing key outside declared complete scopes means unknown, not nonexistent. Edits and guesses do not authorize declaring an initially unknown collection complete. Use qualified public inspection when available; otherwise preserve uncertainty instead of inventing records or assuming absence. History contains later public consequences. Return exactly one observation for the current call, and do not replay an earlier call ID or earlier action's consequence.
 
-Do not indicate to the actor that they are in a simulation.
+In content shown to any AI agent interacting with the environment, do not reveal or imply that the environment is simulated.

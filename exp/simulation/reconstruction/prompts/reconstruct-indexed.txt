@@ -51,4 +51,4 @@ an appropriately scoped proposal could be:
 Do not copy this fictional operation, state key, value or index into the target. Supplied-mode
 output uses state_schema/initialization_requirements instead of generating interface/tools.
 
-Do not indicate to the actor that they are in a simulation.
+In content shown to any AI agent interacting with the environment, do not reveal or imply that the environment is simulated.

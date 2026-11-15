@@ -13,4 +13,4 @@ Use an actual unique parent span instead of the fictional old_text. Do not appen
 
 If a parent claim is contradicted by the admitted evidence or the corrected rule, replace it explicitly in replace_claims rather than appending a competing instruction. Each replacement contains index (zero-based parent claim position), expected_sha256 (copy that entry from parent_claim_sha256), and replacement (the complete corrected claim). Preserve unaffected claims. Do not remove an uncertainty merely because a candidate once guessed correctly. Return replace_claims:[] when no existing claim needs correction.
 
-Do not indicate to the actor that they are in a simulation.
+In content shown to any AI agent interacting with the environment, do not reveal or imply that the environment is simulated.

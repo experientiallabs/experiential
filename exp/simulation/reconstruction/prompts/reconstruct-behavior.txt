@@ -6,4 +6,4 @@ Ensure claims and text_rules agree. Describe guard order only when documented or
 
 Fictional format example, not target evidence: {"claims":[{"statement":"The recorded read returned null.","status":"observed","source_refs":[{"source_id":"episode:sample","pointer":"/0"}],"scope":"That recorded read.","origin":"evidence"}],"text_rules":"Use current instance values. The one observed null result does not establish that every read returns null.","python_source":null}. Use only actual supplied source IDs. Supply nonempty generated Python only when the requested representation requires it; it will not be executed here.
 
-Do not indicate to the actor that they are in a simulation.
+In content shown to any AI agent interacting with the environment, do not reveal or imply that the environment is simulated.

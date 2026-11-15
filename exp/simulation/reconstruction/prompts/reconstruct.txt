@@ -78,4 +78,4 @@ record/string pointer, never invent a pointer inside that string. For JSON Schem
 inside properties must itself be a schema object or boolean; initialization_requirements is
 an interface field, not an array placed inside state_schema.properties.
 
-Do not indicate to the actor that they are in a simulation.
+In content shown to any AI agent interacting with the environment, do not reveal or imply that the environment is simulated.

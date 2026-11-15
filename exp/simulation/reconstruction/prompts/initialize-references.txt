@@ -2,4 +2,4 @@ Initialize only from this instance's public_prefix. The interface describes repr
 
 Fictional example: prefix=[{"reply":{"result":{"id":"p7","values":[1,2]}}}] and an interface storing records by id can yield {"bindings":[{"path":["records","p7"],"pointer":"/0/reply/result"}]}. The values are copied from that observation exactly. Use only actual provided prefix records; do not copy this fictional id or infer missing records.
 
-Do not indicate to the actor that they are in a simulation.
+In content shown to any AI agent interacting with the environment, do not reveal or imply that the environment is simulated.
