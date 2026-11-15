@@ -1739,6 +1739,52 @@ def test_follow_up_reconciles_dispatched_work_still_inside_its_bound_at_startup(
         assert follow_up.close(timeout_seconds=5)
 
 
+def test_follow_up_settles_each_row_at_its_own_bound(tmp_path: Path) -> None:
+    """A long-deadline row does not hold a short-deadline row open until the latest bound."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    attempts: list[str] = []
+    for name, seconds in (("short-at-crash", 10), ("long-at-crash", 600)):
+        authorization = store.authorize_request(
+            raw_key=raw_key,
+            alias="coding",
+            request=_request(name),
+            deadline_monotonic=clock.monotonic() + seconds,
+        )
+        ledger.accept_request(authorization=authorization)
+        attempts.append(
+            ledger.start_attempt(
+                snapshot=_execution(authorization),
+                deployment=_deployment(),
+                attempt_ordinal=0,
+                route_depth=0,
+            )
+        )
+    short_attempt, long_attempt = attempts
+    grace = timedelta(seconds=5)
+    follow_up = ledger.start_crash_follow_up(cleanup_grace=grace, poll_seconds=0.01)
+    assert follow_up is not None
+    try:
+        clock.advance(16)
+        deadline = time.monotonic() + 10
+        while (
+            _attempt_row(tmp_path, short_attempt)["state"] == "dispatched"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert _attempt_row(tmp_path, short_attempt)["state"] == "unknown_after_crash"
+        assert _attempt_row(tmp_path, long_attempt)["state"] == "dispatched"
+        assert not follow_up.finished
+        clock.advance(600)
+        deadline = time.monotonic() + 10
+        while not follow_up.finished and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert follow_up.finished
+        assert _attempt_row(tmp_path, long_attempt)["state"] == "unknown_after_crash"
+    finally:
+        assert follow_up.close(timeout_seconds=5)
+
+
 def test_follow_up_is_cancelled_at_shutdown_without_touching_rows(tmp_path: Path) -> None:
     """Closing a pending follow-up stops it before its bound and leaves rows as they were."""
     clock = FakeLedgerClock()

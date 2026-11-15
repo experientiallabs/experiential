@@ -305,6 +305,7 @@ def load_router(
     key_id = f"python-{uuid4().hex}"
     issued = manager.issue_key(identity_id=alias.identity_id, key_id=key_id)
     gateway: _OwnedGateway | None = None
+    components: LocalGatewayComponents | None = None
     try:
         components = load_gateway_components(
             root,
@@ -327,6 +328,8 @@ def load_router(
         gateway.start()
     except BaseException:
         if gateway is None:
+            if components is not None and components.crash_follow_up is not None:
+                components.crash_follow_up.close()
             manager.revoke_key(key_id=key_id)
         raise
     return OpenAI(

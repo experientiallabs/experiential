@@ -851,7 +851,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
     def start_crash_follow_up(
         self, *, cleanup_grace: timedelta, poll_seconds: float = FOLLOW_UP_POLL_SECONDS
     ) -> CrashReconcileFollowUp | None:
-        """Schedule one reconcile of the rows a startup reconcile left open.
+        """Schedule reconciles of the rows a startup reconcile left open, each when due.
 
         Call it right after the startup reconcile and before serving, so every
         open row belongs to a stopped process.
@@ -867,13 +867,24 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
             pending = pending_crash_follow_up(connection, cleanup_grace=cleanup_grace)
         if pending is None:
             return None
+        request_ids = pending.request_ids
+
+        def next_due() -> datetime | None:
+            """Return when the next still-open startup row is due, or ``None``."""
+            with self._connect() as connection:
+                remaining = pending_crash_follow_up(
+                    connection, cleanup_grace=cleanup_grace, request_ids=request_ids
+                )
+            return None if remaining is None else remaining.due_at
+
         return CrashReconcileFollowUp(
             due_at=pending.due_at,
             reconcile=lambda: self.reconcile_crashed_requests(
-                cleanup_grace=cleanup_grace, request_ids=pending.request_ids
+                cleanup_grace=cleanup_grace, request_ids=request_ids
             ),
             clock=self._clock,
             poll_seconds=poll_seconds,
+            next_due=next_due,
         )
 
     def usage(

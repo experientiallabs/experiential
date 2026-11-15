@@ -28,6 +28,7 @@ from exp.runtime.gateway.alias_authority import (
     _AliasAuthorityReloader,
     _AliasAuthorityState,
     _project_resolver,
+    _served_triple,
     _ServedFallback,
 )
 from exp.runtime.gateway.contracts import (
@@ -97,25 +98,6 @@ def _revision_served(
     """
     key = (authorization.alias_revision_id, authorization.catalog_sha256)
     return key in state.normalized_catalogs and key in state.runtime_catalogs
-
-
-def _served_triple(
-    state: _AliasAuthorityState,
-    triple: tuple[str, str, str],
-) -> tuple[str, str, str] | None:
-    """Return the served authority triple for one granted active triple, or None.
-
-    The granted triple names the alias's active revision. When that revision is
-    served it is returned verbatim; when it pins an unservable snapshot its
-    last-good fallback triple is returned; otherwise ``None``.
-    """
-    if triple in state.authorities:
-        return triple
-    alias, active_revision_id, _digest = triple
-    fallback = state.fallback_revisions.get((alias, active_revision_id))
-    if fallback is None:
-        return None
-    return (alias, fallback.alias_revision_id, fallback.catalog_sha256)
 
 
 def _serve_or_fallback(
@@ -322,6 +304,7 @@ def load_gateway_components(
     project_repository: ProjectActivationRepository | None = None,
     decision_sink: DecisionSink | None = None,
     only_aliases: frozenset[str] | None = None,
+    exclusive_owner: bool = False,
 ) -> LocalGatewayComponents:
     """Load granted active aliases into engine-neutral gateway components.
 
@@ -331,6 +314,9 @@ def load_gateway_components(
         project_repository: Repository for verified immutable project activations.
         decision_sink: Optional aggregate-safe recorder for served project selections.
         only_aliases: Optional exact public aliases to expose.
+        exclusive_owner: Whether the caller holds ``gateway_instance_lock`` for
+            ``root``. Only an exclusive owner schedules the crash follow-up pass:
+            without the lock another live gateway may own the open rows.
 
     Returns:
         Hot-reloadable authority, ledger, routes, and startup proof.
@@ -375,8 +361,13 @@ def load_gateway_components(
         selection_workers=selection_workers,
     )
     video_jobs = SQLiteVideoJobStore(manager.database_path)
-    # Rows still inside their bound at startup belong to no live process either.
-    crash_follow_up = ledger.start_crash_follow_up(cleanup_grace=_CRASH_CLEANUP_GRACE)
+    # Rows still inside their bound at startup belong to no live process only when
+    # this caller owns the root exclusively; otherwise another gateway may own them.
+    crash_follow_up = (
+        ledger.start_crash_follow_up(cleanup_grace=_CRASH_CLEANUP_GRACE)
+        if exclusive_owner
+        else None
+    )
     return LocalGatewayComponents(
         manager=manager,
         store=_ReadyControlStore(store=store, reloader=reloader),

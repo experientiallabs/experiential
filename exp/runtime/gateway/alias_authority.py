@@ -145,6 +145,9 @@ class _AliasAuthorityReloader:
                 loaded = self._loader()
             except Exception as exc:  # noqa: BLE001 - any load failure keeps the previous generation.
                 _logger.warning("gateway alias authority reload failed: %s", exc)
+                # A loader that raises (no alias servable at all) leaves the authority
+                # unserved exactly like one that loads it UNAVAILABLE.
+                self._remember_unserved(authority)
                 raise GatewayRoutingError(
                     "alias authority changed but the new revision failed to load; "
                     "previously ready revisions keep serving; "
@@ -152,13 +155,26 @@ class _AliasAuthorityReloader:
                 ) from exc
             self._swap(state, loaded)
             if not _authority_served(self._state, authority):
-                self._unserved = {
-                    key: at
-                    for key, at in self._unserved.items()
-                    if now - at < UNSERVED_AUTHORITY_RELOAD_BACKOFF_SECONDS
-                }
-                self._unserved[authority] = now
+                self._remember_unserved(authority)
             return self._state
+
+    def _remember_unserved(self, authority: tuple[str, str, str]) -> None:
+        """Start the reload backoff for ``authority`` from the end of the reload.
+
+        The window is measured from when the reload finished, not when it
+        started, so a load slower than the backoff still suppresses the next
+        one. Caller holds the reload lock.
+
+        Args:
+            authority: Alias, revision, and catalog digest triple left unserved.
+        """
+        now = self._monotonic()
+        self._unserved = {
+            key: at
+            for key, at in self._unserved.items()
+            if now - at < UNSERVED_AUTHORITY_RELOAD_BACKOFF_SECONDS
+        }
+        self._unserved[authority] = now
 
     def _swap(self, previous: _AliasAuthorityState, loaded: _AliasAuthorityState) -> None:
         """Publish one validated generation while retaining recent retired revisions."""
@@ -237,13 +253,30 @@ def _authority_served(state: _AliasAuthorityState, authority: tuple[str, str, st
     Returns:
         True when a request naming ``authority`` would be served without a reload.
     """
-    alias, revision_id, catalog_sha256 = authority
+    _alias, revision_id, catalog_sha256 = authority
     key = (revision_id, catalog_sha256)
-    return (
-        authority in state.authorities
-        or (key in state.normalized_catalogs and key in state.runtime_catalogs)
-        or (alias, revision_id) in state.fallback_revisions
+    return _served_triple(state, authority) is not None or (
+        key in state.normalized_catalogs and key in state.runtime_catalogs
     )
+
+
+def _served_triple(
+    state: _AliasAuthorityState,
+    triple: tuple[str, str, str],
+) -> tuple[str, str, str] | None:
+    """Return the served authority triple for one granted active triple, or None.
+
+    The granted triple names the alias's active revision. When that revision is
+    served it is returned verbatim; when it pins an unservable snapshot its
+    last-good fallback triple is returned; otherwise ``None``.
+    """
+    if triple in state.authorities:
+        return triple
+    alias, active_revision_id, _digest = triple
+    fallback = state.fallback_revisions.get((alias, active_revision_id))
+    if fallback is None:
+        return None
+    return (alias, fallback.alias_revision_id, fallback.catalog_sha256)
 
 
 def _project_resolver(

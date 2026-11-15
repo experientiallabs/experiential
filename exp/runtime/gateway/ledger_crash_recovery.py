@@ -3,8 +3,8 @@
 A gateway that dies mid-request leaves rows no live process will ever finish.
 Startup settles every such row already past its deadline plus the cleanup
 grace. Rows still inside that bound at startup are owned by no live process
-either, so one follow-up pass settles exactly those rows once the latest of
-their bounds has passed.
+either, so a follow-up settles exactly those rows, each as soon as its own
+bound has passed.
 """
 
 from __future__ import annotations
@@ -28,12 +28,12 @@ FOLLOW_UP_POLL_SECONDS = 1.0
 
 @dataclass(frozen=True)
 class CrashFollowUp:
-    """Open rows a startup reconcile left for one later pass.
+    """Open rows a startup reconcile left for later passes.
 
     Attributes:
         request_ids: Open requests present at startup; no other row is touched.
-        due_at: Wall time when every listed request is past its deadline plus
-            the cleanup grace.
+        due_at: Wall time when the earliest listed request is past its deadline
+            plus the cleanup grace.
     """
 
     request_ids: frozenset[str]
@@ -139,31 +139,45 @@ def reconcile_crashed(
 
 
 def pending_crash_follow_up(
-    connection: sqlite3.Connection, *, cleanup_grace: timedelta
+    connection: sqlite3.Connection,
+    *,
+    cleanup_grace: timedelta,
+    request_ids: frozenset[str] | None = None,
 ) -> CrashFollowUp | None:
-    """Return the open requests a reconcile left and when all of them are due.
+    """Return the open requests a reconcile left and when the earliest is due.
 
     Args:
-        connection: Open connection read before this process serves any request.
+        connection: Open connection; at startup, read before this process
+            serves any request.
         cleanup_grace: The same bound the startup reconcile applied.
+        request_ids: When given, only these requests are considered.
 
     Returns:
-        The still open requests and their latest deadline plus grace, or
+        The still open requests and their earliest deadline plus grace, or
         ``None`` when nothing is open.
     """
-    rows = connection.execute(
-        "SELECT request_id, deadline_at FROM gateway_requests WHERE terminal_state IS NULL"
-    ).fetchall()
+    rows = [
+        row
+        for row in connection.execute(
+            "SELECT request_id, deadline_at FROM gateway_requests WHERE terminal_state IS NULL"
+        ).fetchall()
+        if request_ids is None or str(row["request_id"]) in request_ids
+    ]
     if not rows:
         return None
     return CrashFollowUp(
         request_ids=frozenset(str(row["request_id"]) for row in rows),
-        due_at=max(datetime.fromisoformat(str(row["deadline_at"])) for row in rows) + cleanup_grace,
+        due_at=min(datetime.fromisoformat(str(row["deadline_at"])) for row in rows) + cleanup_grace,
     )
 
 
 class CrashReconcileFollowUp:
-    """Run one deferred crash reconcile on a daemon thread, cancellable at shutdown."""
+    """Run deferred crash reconcile passes on a daemon thread, cancellable at shutdown.
+
+    Each pass runs when the earliest remaining row is due, so one long-deadline
+    row never holds every other crashed request (and its idempotency key) open
+    until the latest bound.
+    """
 
     def __init__(
         self,
@@ -172,14 +186,17 @@ class CrashReconcileFollowUp:
         reconcile: Callable[[], tuple[int, int]],
         clock: GatewayClock,
         poll_seconds: float = FOLLOW_UP_POLL_SECONDS,
+        next_due: Callable[[], datetime | None] | None = None,
     ) -> None:
         """Start waiting for ``due_at`` on the gateway clock.
 
         Args:
-            due_at: Wall time after which ``reconcile`` runs once.
+            due_at: Wall time after which ``reconcile`` first runs.
             reconcile: The restricted reconcile pass; returns its two counts.
-            clock: Gateway clock whose wall time decides when the pass is due.
+            clock: Gateway clock whose wall time decides when a pass is due.
             poll_seconds: Longest real wait between two clock reads.
+            next_due: After each pass, the wall time the next remaining row is
+                due, or ``None`` when nothing remains. Omitted, a single pass runs.
 
         Raises:
             ValueError: ``poll_seconds`` is not positive.
@@ -188,6 +205,7 @@ class CrashReconcileFollowUp:
             raise ValueError("crash reconcile poll interval must be positive")
         self._due_at = due_at
         self._reconcile = reconcile
+        self._next_due = next_due
         self._clock = clock
         self._poll_seconds = poll_seconds
         self._stop = threading.Event()
@@ -198,7 +216,7 @@ class CrashReconcileFollowUp:
 
     @property
     def finished(self) -> bool:
-        """Whether the pass has run, failed, or been cancelled."""
+        """Whether every pass has run, one failed, or the runner was cancelled."""
         return not self._thread.is_alive()
 
     def close(self, timeout_seconds: float = 5.0) -> bool:
@@ -215,7 +233,7 @@ class CrashReconcileFollowUp:
         return not self._thread.is_alive()
 
     def _run(self) -> None:
-        """Wait on the gateway clock until due, then reconcile once unless cancelled."""
+        """Wait on the gateway clock until due, reconcile, and re-arm until nothing remains."""
         while not self._stop.is_set():
             remaining = (self._due_at - self._clock.now()).total_seconds()
             if remaining > 0:
@@ -223,12 +241,20 @@ class CrashReconcileFollowUp:
                 continue
             try:
                 requests, attempts = self._reconcile()
+                _logger.info(
+                    "gateway follow-up crash reconcile settled %d requests and %d attempts",
+                    requests,
+                    attempts,
+                )
+                next_due = None if self._next_due is None else self._next_due()
             except Exception:  # noqa: BLE001 - a failed pass leaves rows for the next startup.
                 _logger.exception("gateway follow-up crash reconcile failed")
                 return
-            _logger.info(
-                "gateway follow-up crash reconcile settled %d requests and %d attempts",
-                requests,
-                attempts,
-            )
-            return
+            if next_due is None:
+                return
+            if next_due <= self._due_at:
+                # Every row past the pass's bound was settled, so a remaining row
+                # cannot be due again; stop rather than spin on one that is not.
+                _logger.warning("gateway follow-up crash reconcile left a due row open")
+                return
+            self._due_at = next_due
