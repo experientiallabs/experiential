@@ -252,7 +252,9 @@ def test_every_scope_uses_the_same_parallel_approval_and_settlement(
         session.cancel()
 
 
-@pytest.mark.parametrize("kind", ["provider_native", "provider_server", "tool_search", "tier"])
+@pytest.mark.parametrize(
+    "kind", ["provider_native", "provider_server", "tool_search", "tier", "speed"]
+)
 def test_external_execution_waits_for_input_approval_in_rust(kind: str) -> None:
     """External tools and paid tiers cannot execute before the input decision."""
     session = _session(_engine(_Classifier("allow")))
@@ -278,6 +280,8 @@ def test_external_execution_waits_for_input_approval_in_rust(kind: str) -> None:
                 )
             }
         )
+    elif kind == "speed":
+        request = request.model_copy(update={"speed": "fast"})
     else:
         request = request.model_copy(update={"service_tier": "priority"})
     assert session.can_defer_input(request)
