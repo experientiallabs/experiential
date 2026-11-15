@@ -287,3 +287,97 @@ fn recovered_nonfinal_quote_and_later_delivery_commit_the_attempt_once() {
         .unwrap();
     assert!(owner.retired());
 }
+
+#[test]
+fn a_healthy_refusal_write_does_not_fence_other_requests() {
+    struct Refusal {
+        state: Mutex<(bool, bool)>,
+        wake: Condvar,
+    }
+    impl Driver for Refusal {
+        fn call(&self, method: &str, _input: &Value) -> Result<Value, PublicError> {
+            if method == "start_attempt" {
+                return Ok(json!({"refused": {
+                    "error": PublicError::new(429, "rate_limit_exceeded", "Key daily cap reached.", "rate_limit_error"),
+                    "failure": {"failure_class": "invalid_request", "safe_message": "Key daily cap reached."}
+                }}));
+            }
+            assert_eq!(method, "abandon");
+            let mut state = self.state.lock().unwrap();
+            state.0 = true;
+            self.wake.notify_all();
+            while !state.1 {
+                let result = self
+                    .wake
+                    .wait_timeout(state, Duration::from_secs(2))
+                    .unwrap();
+                state = result.0;
+                assert!(!result.1.timed_out(), "refusal fixture was not released");
+            }
+            Ok(json!({"terminalized": true}))
+        }
+    }
+    let driver = Arc::new(Refusal {
+        state: Mutex::new((false, false)),
+        wake: Condvar::new(),
+    });
+    let owner = Owner::new(
+        "request".into(),
+        "tenant".into(),
+        Instant::now() + Duration::from_secs(60),
+        driver.clone(),
+    );
+    let other = owner.clone();
+    let task =
+        std::thread::spawn(move || other.call("start_attempt", json!({"request_id":"request"})));
+    let mut state = driver.state.lock().unwrap();
+    while !state.0 {
+        let result = driver
+            .wake
+            .wait_timeout(state, Duration::from_secs(2))
+            .unwrap();
+        state = result.0;
+        assert!(
+            !result.1.timed_out(),
+            "the ordinary refusal write did not start"
+        );
+    }
+    let fenced_during_healthy_write = owner.fenced();
+    state.1 = true;
+    driver.wake.notify_all();
+    drop(state);
+    assert_eq!(task.join().unwrap().unwrap_err().status_code, 429);
+    assert!(
+        !fenced_during_healthy_write,
+        "ordinary finalization must not reject unrelated admissions"
+    );
+    assert!(owner.retired());
+}
+
+#[test]
+fn a_failed_refusal_write_stays_fenced_until_recovery_acknowledges_it() {
+    struct Failing(std::sync::atomic::AtomicBool);
+    impl Driver for Failing {
+        fn call(&self, method: &str, _input: &Value) -> Result<Value, PublicError> {
+            assert_eq!(method, "abandon");
+            if self.0.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(PublicError::internal());
+            }
+            Ok(json!({"terminalized":true}))
+        }
+    }
+    let driver = Arc::new(Failing(std::sync::atomic::AtomicBool::new(true)));
+    let owner = Owner::new(
+        "request".into(),
+        "tenant".into(),
+        Instant::now() + Duration::from_secs(60),
+        driver.clone(),
+    );
+    assert!(owner
+        .call("abandon", json!({"request_id":"request"}))
+        .is_err());
+    assert!(owner.fenced());
+    driver.0.store(false, std::sync::atomic::Ordering::Release);
+    assert!(owner.recover(Instant::now()).unwrap());
+    assert!(!owner.fenced());
+}

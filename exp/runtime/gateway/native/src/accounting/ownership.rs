@@ -73,9 +73,7 @@ impl Owner {
 
     pub fn fenced(&self) -> bool {
         self.state.lock().map_or(true, |state| {
-            (!state.finished
-                && (state.failed_write || state.failed_quote || state.abandon.is_some()))
-                || state.late.is_some()
+            (!state.finished && (state.failed_write || state.failed_quote)) || state.late.is_some()
         })
     }
 
@@ -314,7 +312,9 @@ impl Owner {
         if let Some(abandon) = abandon {
             let result = self.driver.call("abandon", &abandon);
             let mut state = self.state()?;
-            state.failed_write = result.is_err();
+            state.failed_write = result
+                .as_ref()
+                .map_or(true, |value| value["terminalized"] != true);
             let result = result?;
             // Evidence may arrive while a cancellation is writing. Keep that
             // evidence owned even if the host's cancellation already committed.

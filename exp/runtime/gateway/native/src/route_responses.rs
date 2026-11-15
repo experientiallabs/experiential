@@ -32,7 +32,7 @@ use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey};
 use crate::respond::{
     bearer_key, cached_response, capture_frame, client_ip, complete_visible_refusal,
     emit_responses_failure, error_response, escalation_error, finish_stream_terminal,
-    json_response, latin1_header, outward_event, read_body, settle_stream_end,
+    json_response, latin1_header, log_stream_exit, outward_event, read_body, settle_stream_end,
     settle_stream_terminal, sse_body_response, stream_delivery::Delivery, with_app_identity,
 };
 use crate::responses_retention::{remember_argument, remember_continuation, ResponsesRetention};
@@ -709,10 +709,14 @@ async fn stream_responses(
             ($failure:expr) => {{
                 committed.relay.close_transport();
                 let failure = $failure.boundary();
-                emit_responses_failure(&sender, deadline, &mut encoder, &failure).await;
-                guard
+                if !guard
                     .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
-                    .await;
+                    .await
+                {
+                    log_stream_exit(&request_id, "settlement_unavailable");
+                    return;
+                }
+                emit_responses_failure(&sender, deadline, &mut encoder, &failure).await;
                 return;
             }};
         }

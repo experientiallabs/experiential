@@ -685,9 +685,13 @@ async fn stream_messages(
                 committed.relay.close_transport();
                 log_stream_exit(&request_id, "provider_or_encoding_failure");
                 let failure = $failure.boundary();
-                guard
+                if !guard
                     .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
-                    .await;
+                    .await
+                {
+                    log_stream_exit(&request_id, "settlement_unavailable");
+                    return;
+                }
                 emit_messages_failure(&sender, deadline, &mut encoder, &failure).await;
                 return;
             }};
