@@ -86,7 +86,7 @@ estimated or unknown-cost accounting contract. The host bears provider work that
 already occurred; cancellation cannot undo it.
 
 Provider-native or provider-server tools, gateway web or tool search, explicit cache
-operations, service tiers, and routes with customer-managed credentials require
+operations, service tiers, premium fast mode, and customer-managed credentials require
 approval before dispatch. Read-only checks on direct routes wait in Rust after host
 admission has returned, so the classifier does not occupy an admission worker.
 Requests requiring admission-time web search and input rewrites complete inspection

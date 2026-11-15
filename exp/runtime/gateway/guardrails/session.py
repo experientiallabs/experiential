@@ -141,6 +141,7 @@ class GuardrailSession:
             and not request.provider_server_tools
             and request.tool_search is None
             and request.service_tier is None
+            and request.speed is None
             and all(p.input_execution == "parallel" for p in inputs)
         )
 
