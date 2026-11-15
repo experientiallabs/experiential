@@ -124,7 +124,12 @@ class _DeploymentHealth:
 
 
 class DeploymentHealthRegistry:
-    """Apply isolated circuits and throttle windows without changing logical models."""
+    """Apply isolated circuits and throttle windows without changing logical models.
+
+    Only negative outcomes (a failure, an exhausted plan window, a last-resort
+    probe) record state; a success or released probe drops any key left with
+    nothing to remember, so healthy keys of retired catalogs never accumulate.
+    """
 
     def __init__(
         self,
@@ -199,7 +204,11 @@ class DeploymentHealthRegistry:
         """
         now = self._clock()
         with self._lock:
-            state = self._states.setdefault(key, _DeploymentHealth())
+            state = self._states.get(key)
+            if state is None:
+                # No recorded state is a fresh, closed circuit; nothing is inserted.
+                self._lanes.claimed(_lane(key), now)
+                return True
             if state.throttle_until > now:
                 return False
             if state.open_until > now:
@@ -258,8 +267,8 @@ class DeploymentHealthRegistry:
         """
         now = self._clock()
         with self._lock:
-            state = self._states.setdefault(key, _DeploymentHealth())
-            if state.throttle_until > now:
+            state = self._states.get(key)
+            if state is not None and state.throttle_until > now:
                 return False
             self._lanes.claimed(_lane(key), now)
             return True
@@ -282,8 +291,8 @@ class DeploymentHealthRegistry:
         """
         now = self._clock()
         with self._lock:
-            state = self._states.setdefault(key, _DeploymentHealth())
-            return state.open_until <= now
+            state = self._states.get(key)
+            return state is None or state.open_until <= now
 
     def claim_throttle_probe(self, key: DeploymentHealthKey) -> bool:
         """Admit one paced dispatch through a hintless throttle window.
@@ -311,8 +320,8 @@ class DeploymentHealthRegistry:
         """
         now = self._clock()
         with self._lock:
-            state = self._states.setdefault(key, _DeploymentHealth())
-            if state.throttle_until <= now or state.stated_throttle_until > now:
+            state = self._states.get(key)
+            if state is None or state.throttle_until <= now or state.stated_throttle_until > now:
                 return False
             last = self._probe_paced_at.get(_lane(key))
             if last is not None and now - last < THROTTLE_PROBE_INTERVAL_SECONDS:
@@ -361,15 +370,7 @@ class DeploymentHealthRegistry:
             attempt_id: The opened attempt; a bound throttle probe lifts its
                 hintless window.
         """
-        with self._lock:
-            state = self._states.setdefault(key, _DeploymentHealth())
-            state.consecutive_failures = 0
-            state.open_until = 0.0
-            state.half_open_probe = False
-            state.last_resort_probe = False
-            state.circuit_failure = None
-            self._lift_probed_throttle(state, attempt_id)
-            self._lanes.succeeded(_lane(key))
+        self._recovered(key, attempt_id)
 
     def succeeded(self, key: DeploymentHealthKey, attempt_id: str | None = None) -> None:
         """Close one circuit after a successful terminal provider result.
@@ -379,15 +380,7 @@ class DeploymentHealthRegistry:
             attempt_id: The settled attempt; a bound throttle probe lifts its
                 hintless window.
         """
-        with self._lock:
-            state = self._states.setdefault(key, _DeploymentHealth())
-            state.consecutive_failures = 0
-            state.open_until = 0.0
-            state.half_open_probe = False
-            state.last_resort_probe = False
-            state.circuit_failure = None
-            self._lift_probed_throttle(state, attempt_id)
-            self._lanes.succeeded(_lane(key))
+        self._recovered(key, attempt_id)
 
     def failed(
         self, key: DeploymentHealthKey, failure: GatewayFailure, attempt_id: str | None = None
@@ -463,6 +456,53 @@ class DeploymentHealthRegistry:
             state.throttle_until = max(state.throttle_until, now + window)
             state.newer_throttle_until = max(state.newer_throttle_until, now + window)
             state.stated_throttle_until = max(state.stated_throttle_until, now + window)
+
+    def _recovered(self, key: DeploymentHealthKey, attempt_id: str | None) -> None:
+        """Close one deployment's circuit after a proven dispatch and prune clear state.
+
+        Args:
+            key: Catalog, deployment, and connection identity tuple.
+            attempt_id: The proving attempt; a bound throttle probe lifts its
+                hintless window.
+        """
+        with self._lock:
+            state = self._states.get(key)
+            if state is not None:
+                state.consecutive_failures = 0
+                state.open_until = 0.0
+                state.half_open_probe = False
+                state.last_resort_probe = False
+                state.circuit_failure = None
+                self._lift_probed_throttle(state, attempt_id)
+                self._prune(key, state, self._clock())
+            self._lanes.succeeded(_lane(key))
+
+    def _prune(self, key: DeploymentHealthKey, state: _DeploymentHealth, now: float) -> None:
+        """Drop ``key`` once its state is indistinguishable from a fresh deployment.
+
+        Every catalog publish mints new keys, so a key that carries no live
+        window, failure count, probe, or refusal tally is removed rather than
+        retained forever; a later claim treats the missing key as a closed
+        circuit. Caller holds the registry lock.
+
+        Args:
+            key: Catalog, deployment, and connection identity tuple.
+            state: The key's current mutable state.
+            now: Monotonic instant the windows are judged against.
+        """
+        if (
+            state.consecutive_failures == 0
+            and state.open_until <= now
+            and state.throttle_until <= now
+            and state.newer_throttle_until <= now
+            and state.stated_throttle_until <= now
+            and not state.half_open_probe
+            and not state.last_resort_probe
+            and state.refusal_count == 0
+            and state.circuit_failure is None
+            and not state.probe_attempts
+        ):
+            del self._states[key]
 
     def _lift_probed_throttle(self, state: _DeploymentHealth, attempt_id: str | None) -> None:
         """Lift a hintless throttle window once the provider served the probe itself.
@@ -614,6 +654,7 @@ class DeploymentHealthRegistry:
                 state.last_resort_probe = False
                 if attempt_id is not None:
                     state.probe_attempts.discard(attempt_id)
+                self._prune(key, state, self._clock())
             self._lanes.released(_lane(key))
 
 

@@ -705,6 +705,7 @@ def test_explicit_router_selection_builds_and_composes_provisional_router(
         *,
         project_repository: object,
         only_aliases: frozenset[str] | None,
+        exclusive_owner: bool,
     ) -> SimpleNamespace:
         """Return loaded-component evidence for the mocked launch seam.
 
@@ -712,13 +713,15 @@ def test_explicit_router_selection_builds_and_composes_provisional_router(
             run_root: Gateway and artifact root.
             project_repository: Injected selection-only project repository.
             only_aliases: Optional compatibility alias filter.
+            exclusive_owner: Whether the launch holds the instance lock (always true).
 
         Returns:
             Component fixture consumed by the native launch composition.
         """
         del run_root, project_repository
         assert only_aliases == frozenset({"support"})
-        return SimpleNamespace(unavailable_aliases=())
+        assert exclusive_owner is True
+        return SimpleNamespace(unavailable_aliases=(), crash_follow_up=None)
 
     def _control_plane(components: object, **_kwargs: object) -> SimpleNamespace:
         """Return startup-receipt facts without loading real authority.

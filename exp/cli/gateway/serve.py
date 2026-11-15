@@ -274,6 +274,7 @@ def _run_gateway(
             _emit_setup_credentials(port=port, setup=setup)
 
     guardrails = None
+    components = None
     try:
         with usage_error(ValueError):
             with gateway_instance_lock(root, port=port):
@@ -287,6 +288,7 @@ def _run_gateway(
                     only_aliases=(
                         None if compatibility is None else frozenset({compatibility.alias})
                     ),
+                    exclusive_owner=True,
                 )
                 # The catalog build is per-alias fail-safe: a granted alias the
                 # native engine cannot serve is excluded (marked UNAVAILABLE and
@@ -370,6 +372,8 @@ def _run_gateway(
                         timeout_seconds=min(300.0, max(0.1, graceful_timeout))
                     ):
                         _logger.warning("Waiting for retained gateway accounting before shutdown")
+                    if components.crash_follow_up is not None:
+                        components.crash_follow_up.close(timeout_seconds=graceful_timeout)
                     if capture_controller is not None:
                         capture_controller.native.close(0)
     except typer.BadParameter:
@@ -377,6 +381,10 @@ def _run_gateway(
             _emit_setup_recovery(setup=setup)
         raise
     finally:
+        # Idempotent: the inner finally closes it on the served path; this covers
+        # a failure between loading the components and starting the control plane.
+        if components is not None and components.crash_follow_up is not None:
+            components.crash_follow_up.close(timeout_seconds=graceful_timeout)
         if guardrails is not None:
             guardrails.close(timeout_seconds=graceful_timeout)
 

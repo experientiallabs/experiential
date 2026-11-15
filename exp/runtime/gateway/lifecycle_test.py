@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from inspect import signature
 from pathlib import Path
 from types import SimpleNamespace
@@ -270,6 +270,41 @@ def test_launch_uses_stored_openai_compatible_credential(tmp_path: Path) -> None
 
     (proof,) = components.readiness
     assert proof.authorization.alias == "coding"
+
+
+def test_crash_follow_up_is_scheduled_only_for_an_exclusive_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the instance lock another gateway may own open rows, so no follow-up runs."""
+    scheduled: list[timedelta] = []
+
+    def record(_self: object, *, cleanup_grace: timedelta) -> None:
+        """Record that the loader asked for a follow-up pass."""
+        scheduled.append(cleanup_grace)
+
+    monkeypatch.setattr(
+        "exp.runtime.gateway.ledger.SQLiteAttemptLedger.start_crash_follow_up", record
+    )
+    _manager, _raw_key = _configured_gateway(tmp_path)
+    connection = ConnectionConfig(
+        provider="openai-compatible",
+        base_url="http://127.0.0.1:9/v1",
+        api_key_env="TEST_PROVIDER_KEY",
+    )
+    ProviderAuthStore(default_auth_path()).put(
+        "provider-main",
+        "stored-loopback-key",
+        binding=StoredCredentialBinding(
+            provider=connection.provider,
+            endpoint_sha256=connection.identity_sha256(),
+        ),
+    )
+
+    load_gateway_components(tmp_path, environment={})
+    assert scheduled == []
+
+    load_gateway_components(tmp_path, environment={}, exclusive_owner=True)
+    assert len(scheduled) == 1
 
 
 def test_unavailable_alias_reports_its_provider_readiness_reason(tmp_path: Path) -> None:

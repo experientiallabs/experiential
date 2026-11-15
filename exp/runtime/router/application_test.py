@@ -175,6 +175,7 @@ def test_load_router_serves_the_native_gateway_and_revokes_its_key(
     prepared: list[tuple[str, Path, str | None]] = []
     loaded: list[tuple[Path, object, frozenset[str] | None]] = []
     components = SimpleNamespace(
+        crash_follow_up=None,
         selection_workers=SimpleNamespace(shutdown=lambda: shut.append("workers")),
         write_ledger=SimpleNamespace(close=lambda: shut.append("ledger")),
     )
@@ -242,6 +243,7 @@ def test_load_router_startup_failure_stops_and_revokes(
 ) -> None:
     """A serving failure surfaces as the typed error and revokes the key."""
     components = SimpleNamespace(
+        crash_follow_up=None,
         selection_workers=SimpleNamespace(shutdown=lambda: None),
         write_ledger=SimpleNamespace(close=lambda: None),
     )
@@ -272,7 +274,7 @@ def test_load_router_control_plane_failure_closes_the_loaded_engine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Initialization failure cannot orphan an engine before the gateway object is returned."""
-    components = SimpleNamespace()
+    components = SimpleNamespace(crash_follow_up=None)
     _install_common_stubs(monkeypatch, tmp_path, prepared=[], loaded=[], components=components)
     closed: list[float] = []
     monkeypatch.setattr(
@@ -300,6 +302,7 @@ def test_startup_failure_retains_cleanup_ownership_until_recovered(
     """A failed startup has no returned client to retry a timed-out accounting drain."""
     events: list[str] = []
     components = SimpleNamespace(
+        crash_follow_up=None,
         selection_workers=SimpleNamespace(shutdown=lambda: events.append("workers")),
         write_ledger=SimpleNamespace(close=lambda: events.append("ledger")),
     )
@@ -332,6 +335,7 @@ def test_owned_gateway_shares_join_and_observation_drain_deadline(
     """Time spent draining native serving is not granted again to background observations."""
     released: list[str] = []
     components = SimpleNamespace(
+        crash_follow_up=None,
         selection_workers=SimpleNamespace(shutdown=lambda: released.append("workers")),
         write_ledger=SimpleNamespace(close=lambda: released.append("ledger")),
     )
@@ -375,6 +379,7 @@ def test_owned_gateway_keeps_dependencies_until_recovery_completes(
     """A timed-out close retains the ledger and can be retried by the same owner."""
     released: list[str] = []
     components = SimpleNamespace(
+        crash_follow_up=None,
         selection_workers=SimpleNamespace(shutdown=lambda: released.append("workers")),
         write_ledger=SimpleNamespace(close=lambda: released.append("ledger")),
     )

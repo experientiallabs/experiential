@@ -18,6 +18,7 @@ from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, Gat
 from exp.runtime.gateway.guardrails.bounded import (
     BoundedInspect,
     ClassifierTimeoutError,
+    _IsolationPool,
     _IsolationWorker,
     _NativeCallbackRunner,
     run_on_native_loop,
@@ -1181,6 +1182,32 @@ def test_pool_close_wakes_queued_acquisition_and_refuses_new_admission() -> None
     finally:
         release.set()
         bound.close(timeout_seconds=2)
+
+
+def test_waiter_cancelled_after_delivery_returns_the_worker_to_the_pool() -> None:
+    """A worker handed to a waiter that is cancelled before resuming is not lost."""
+    pool = _IsolationPool(1)
+
+    async def scenario() -> None:
+        """Deliver the sole worker to a queued waiter, then cancel that waiter."""
+        worker = await pool.acquire(5)
+        assert worker is not None
+        waiting = asyncio.create_task(pool.acquire(5))
+        await _wait_until(lambda: bool(pool._waiters))
+        delivered = pool._waiters[0]
+        pool.release(worker)
+        while not delivered.done():
+            await asyncio.sleep(0)
+        assert delivered.result() is worker
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        assert await pool.acquire(0.5) is worker
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        pool.close(timeout_seconds=2)
 
 
 def test_pool_close_stops_a_worker_whose_startup_finishes_after_shutdown(

@@ -171,6 +171,7 @@ def test_project_option_launches_the_native_gateway_on_loopback(
         )
 
     components = SimpleNamespace(
+        crash_follow_up=None,
         reconciled_expired_requests=0,
         reconciled_unknown_attempts=0,
         unavailable_aliases=(),
@@ -181,6 +182,7 @@ def test_project_option_launches_the_native_gateway_on_loopback(
         *,
         project_repository: object,
         only_aliases: frozenset[str] | None,
+        exclusive_owner: bool,
     ) -> object:
         """Capture the one shared engine-neutral component load.
 
@@ -188,11 +190,14 @@ def test_project_option_launches_the_native_gateway_on_loopback(
             root: Gateway and artifact root.
             project_repository: Injected immutable project activation repository.
             only_aliases: Optional compatibility alias filter.
+            exclusive_owner: Whether serve holds the instance lock (always true).
 
         Returns:
             Component fixture consumed by the native control plane.
         """
         del project_repository
+        # serve holds gateway_instance_lock, so it alone may schedule the crash follow-up.
+        assert exclusive_owner is True
         loaded.append((root, only_aliases))
         return components
 
@@ -329,6 +334,7 @@ def test_unbindable_port_fails_before_any_ready_receipt(
         )
 
     components = SimpleNamespace(
+        crash_follow_up=None,
         reconciled_expired_requests=0,
         reconciled_unknown_attempts=0,
         unavailable_aliases=(),
@@ -493,9 +499,10 @@ def test_first_run_delivers_credentials_before_readiness_failure(
         *,
         project_repository: object,
         only_aliases: frozenset[str] | None,
+        exclusive_owner: bool,
     ) -> object:
         """Fail readiness only after confirming that setup credentials were printed."""
-        del root, project_repository, only_aliases
+        del root, project_repository, only_aliases, exclusive_owner
         transcript = output.getvalue()
         assert transcript.index(f"export EXP_GATEWAY_KEY={raw_key}") < len(transcript)
         raise ValueError(
