@@ -827,6 +827,36 @@ impl Driver for Dispatch {
                 }
                 return Err(PublicError::internal());
             }
+            let mut serial_gate = None;
+            let (response, attempt) = {
+                let mut state = self.state.lock().map_err(|_| PublicError::internal())?;
+                let attempt = state.active.clone();
+                (
+                    self.search_round(input, &mut state, &mut serial_gate)?,
+                    attempt,
+                )
+            };
+            if let Some(gate) = serial_gate {
+                let decision = gate.wait();
+                let state = self.state.lock().map_err(|_| PublicError::internal())?;
+                if state.active != attempt
+                    || !state
+                        .active
+                        .as_ref()
+                        .and_then(|id| state.attempts.get(id))
+                        .is_some_and(|a| !a.cancelled && a.terminal.is_none())
+                {
+                    return Err(PublicError::internal());
+                }
+                if decision["action"] != "allow" {
+                    self.resources
+                        .deny_reinspection(decision["failure"].clone())?;
+                    return Ok(
+                        json!({"inspection_failure": decision["failure"], "rounds": response["rounds"]}),
+                    );
+                }
+            }
+            return Ok(response);
         }
         let mut state = self.state.lock().map_err(|_| PublicError::internal())?;
         match method {
@@ -838,7 +868,6 @@ impl Driver for Dispatch {
                     && !self.config.paid_prework;
                 self.finish(input, &mut state, certify)
             }
-            "tool_search_round" => self.search_round(input, &mut state),
             "enforce_output" => self
                 .inspection
                 .as_ref()

@@ -646,14 +646,11 @@ def test_exhausted_provider_response_still_waits_for_its_input_decision(
 
 
 @pytest.mark.parametrize("wait_ms", [0, 100])
-@pytest.mark.parametrize(
-    "billing_source", [BillingSource.HOST_MANAGED, BillingSource.CUSTOMER_MANAGED]
-)
 def test_response_ready_has_bounded_grace_and_late_denial_cannot_revoke(
-    tmp_path: Path, wait_ms: int, billing_source: BillingSource
+    tmp_path: Path, wait_ms: int
 ) -> None:
-    """Either funding source allows delivery after the configured moderation grace."""
-    with _scenario(tmp_path, blocked=True, wait_ms=wait_ms, billing_source=billing_source) as case:
+    """Host-funded generation allows delivery after the configured moderation grace."""
+    with _scenario(tmp_path, blocked=True, wait_ms=wait_ms) as case:
         with ThreadPoolExecutor(max_workers=1) as executor:
             response = executor.submit(case.request)
             try:
@@ -674,6 +671,32 @@ def test_response_ready_has_bounded_grace_and_late_denial_cannot_revoke(
                 assert records[0]["status"] == "failed_open"
                 assert records[0]["reason"] == "response_ready_timeout"
                 assert _first_observation(records[0])["policy_id"] == "input-policy"
+            finally:
+                case.provider.release.set()
+                case.moderator.release.set()
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_customer_credentials_wait_for_approval_before_provider_dispatch(
+    tmp_path: Path, blocked: bool
+) -> None:
+    """A denied prompt cannot spend on a customer credential before inspection."""
+    with _scenario(
+        tmp_path, blocked=blocked, billing_source=BillingSource.CUSTOMER_MANAGED
+    ) as case:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            response = executor.submit(case.request)
+            try:
+                assert case.moderator.started.wait(2)
+                assert not case.provider.started.wait(0.1)
+                case.moderator.release.set()
+                if not blocked:
+                    assert case.provider.started.wait(2)
+                    case.provider.release.set()
+                result = response.result(timeout=3)
+                assert result.status_code == (400 if blocked else 200), result.text
+                assert case.provider.started.is_set() is not blocked
+                assert case.records()[0]["status"] == ("denied" if blocked else "allowed")
             finally:
                 case.provider.release.set()
                 case.moderator.release.set()

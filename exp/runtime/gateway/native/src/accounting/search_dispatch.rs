@@ -1,5 +1,7 @@
 //! Request-owned tool execution and the next physical dispatch on the same rung.
 
+use std::sync::Arc;
+
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -57,6 +59,7 @@ impl Dispatch {
         &self,
         input: &Value,
         state: &mut State,
+        serial_gate: &mut Option<Arc<super::input::InputGate>>,
     ) -> Result<Value, PublicError> {
         let depth = input["route_depth"]
             .as_u64()
@@ -127,23 +130,18 @@ impl Dispatch {
             )
             .map_err(|_| PublicError::internal())?;
             gate.bind_reporter(self.resources.reporting.as_ref().and_then(|r| r.reporter()));
-            if session
+            if !session
                 .checks
                 .iter()
                 .all(|check| check.policy["input_execution"] == "parallel")
             {
-                // The prior search turn settles under its original decision. Activate
-                // this inspection only when its successor attempt is reserved.
-                self.resources.stage_reinspection(gate)?;
-                Ok(subject)
-            } else {
-                let decision = gate.wait();
-                if decision["action"] == "allow" {
-                    Ok(subject)
-                } else {
-                    Err(decision)
-                }
+                // The caller releases dispatch before waiting on this decision.
+                *serial_gate = Some(gate.clone());
             }
+            // The prior search turn settles under its original decision. Activate
+            // this inspection only when its successor attempt is reserved.
+            self.resources.stage_reinspection(gate)?;
+            Ok(subject)
         } else {
             runtime.block_on(input_program::enforce(
                 &session.checks,

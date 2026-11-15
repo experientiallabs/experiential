@@ -101,6 +101,11 @@ def test_serial_tool_successor_waits_for_its_own_decision(tmp_path: Path, outcom
     _round_case(tmp_path, stream=False, outcome=outcome, execution="before_dispatch")
 
 
+def test_serial_tool_successor_does_not_block_cancellation(tmp_path: Path) -> None:
+    """A slow successor classifier cannot prevent its admitted request from retiring."""
+    _round_case(tmp_path, stream=False, outcome="cancel", execution="before_dispatch")
+
+
 def _round_case(
     tmp_path: Path, *, stream: bool, outcome: str, execution: Literal["parallel", "before_dispatch"]
 ) -> None:
@@ -128,7 +133,7 @@ def _round_case(
     )
     control = _NativeOnlyControl(components, guardrails=engine)
     try:
-        with _serving(control) as url, ThreadPoolExecutor(max_workers=1) as executor:
+        with _serving(control) as url, ThreadPoolExecutor(max_workers=2) as executor:
             result = executor.submit(
                 httpx.post,
                 url + "/v1/chat/completions",
@@ -149,6 +154,34 @@ def _round_case(
                     )
                 else:
                     assert not provider.started.is_set()
+                if outcome == "cancel":
+                    with connect_sqlite(components.ledger.database_path) as db:
+                        request_id = db.execute(
+                            "SELECT request_id FROM gateway_requests"
+                        ).fetchone()[0]
+                    cancellation = executor.submit(
+                        control._accounting.call,  # noqa: SLF001 - exercise the native owner.
+                        "abandon",
+                        json.dumps(
+                            {
+                                "request_id": request_id,
+                                "failure": {
+                                    "failure_class": "cancelled",
+                                    "safe_message": "Fixture disconnected.",
+                                },
+                            }
+                        ),
+                    )
+                    assert json.loads(cancellation.result(timeout=0.75))["terminalized"] is True
+                    assert not moderator.release.is_set()
+                    assert not provider.started.is_set()
+                    assert result.result(timeout=2).status_code >= 400
+                    with connect_sqlite(components.ledger.database_path) as db:
+                        assert (
+                            db.execute("SELECT terminal_state FROM gateway_requests").fetchone()[0]
+                            == "cancelled"
+                        )
+                    return
                 started = time.monotonic()
                 if outcome != "grace":
                     moderator.release.set()

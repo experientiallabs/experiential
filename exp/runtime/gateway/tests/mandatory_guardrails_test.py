@@ -34,8 +34,7 @@ from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
-from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
-from exp.runtime.gateway.native_bridge_test import _admit, _chat_body
+from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_server import serve_native_gateway
 from exp.runtime.gateway.tests.native_classifier_fixture_test import NativeClassifierFixture
 from exp.runtime.gateway.tests.native_waterfall_test import (
@@ -119,22 +118,6 @@ class _Guard(GuardrailEngine):
             or any("withhold-marker" in item for item in completion.context)
             or any("withhold-marker" in call.arguments for call in completion.tool_calls)
         )
-
-
-def test_mandatory_input_records_refusal_without_provider_dispatch(tmp_path: Path) -> None:
-    """Missing optional policies cannot disable a host admission decision."""
-    _, raw_key = _configured_gateway(tmp_path)
-    components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "synthetic"})
-    guard = _Guard(block_input=True)
-    control = NativeControlPlane(components, guardrails=guard)
-    with pytest.raises(NativeBridgeError):
-        _admit(control, raw_key, _chat_body())
-    assert len(guard.requests) == 1
-    with connect_sqlite(components.ledger.database_path) as connection:
-        assert connection.execute("select terminal_state from gateway_requests").fetchall() == [
-            ("failed",)
-        ]
-        assert connection.execute("select count(*) from gateway_attempts").fetchone()[0] == 0
 
 
 @pytest.mark.parametrize("surface", ["chat", "responses", "messages"])

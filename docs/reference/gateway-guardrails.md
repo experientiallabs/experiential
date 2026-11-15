@@ -74,15 +74,23 @@ retention also wait. Approval releases the pending prefix and resumes normal
 streaming, without waiting for full completion. Function declarations supplied by
 clients do not execute remote tools.
 
-A block, classifier error, or timeout cancels the provider request and discards its
-response. The trusted `input_guardrail_denied` settlement detail requires zero
-customer charge while retaining available provider usage. Missing final usage uses
-the existing estimated or unknown-cost accounting contract. The platform bears
-provider work that already occurred; cancellation cannot undo it.
+A confirmed block cancels the provider request and discards its response. Strict
+policies also stop on classifier uncertainty. With `input_fail_open=true`, classifier
+errors, overload and timeouts allow the request and record the uncertainty.
+`input_max_wait_ms` bounds additional waiting once the first streaming content or
+complete buffered response is ready. A final provider error is also a response
+boundary. A verdict arriving after fail-open delivery cannot revoke that response.
+The trusted `input_guardrail_denied` settlement detail requires zero customer charge
+while retaining available provider usage. Missing final usage uses the existing
+estimated or unknown-cost accounting contract. The host bears provider work that
+already occurred; cancellation cannot undo it.
 
 Provider-native or provider-server tools, gateway web or tool search, explicit cache
 operations, service tiers, and routes with customer-managed credentials require
-approval before dispatch. These are execution constraints of the same session.
+approval before dispatch. Read-only checks on direct routes wait in Rust after host
+admission has returned, so the classifier does not occupy an admission worker.
+Requests requiring admission-time web search and input rewrites complete inspection
+before that work. These are execution constraints of the same session.
 Customers cannot choose the operator policy's mode or forge its settlement detail.
 
 Project aliases complete input inspection before learned routing. Selection may
