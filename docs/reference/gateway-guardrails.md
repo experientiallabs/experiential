@@ -136,7 +136,7 @@ window of the request (a `WindowedClassifier`) declares a configuration digest. 
 joins the replay revision, and a policy whose input checks are all windowed is not refused
 for its total request size.
 
-Startup requires `GUARDRAIL_CONTRACT_VERSION=3`. Publish coordinated engine and
+Startup requires `GUARDRAIL_CONTRACT_VERSION=4`. Publish coordinated engine and
 native packages before a downstream host updates its exact release pins. There
 are no synchronous adapter wrappers, alternate mandatory-policy entry points, or
 package-version fallbacks.
@@ -270,7 +270,20 @@ failed check and continue the remaining chain.
 ## Latency
 
 With `input_execution="before_dispatch"`, input inspection follows continuation
-expansion and delays dispatch. Parallel input inspection uses the overlap rules above. Output enforcement for a protected identity delays the
+expansion and delays dispatch. On direct aliases, read-only serial checks wait in
+Rust after host admission releases its capacity, before acquiring dispatch capacity
+or reserving a provider attempt. A denied request has a failed request record with
+no attempt or customer charge. Checks that rewrite input still finish before
+acceptance and routing. Gateway-run web search also requires inspection before its
+admission-time search call; it does not use deferred admission.
+
+Parallel input inspection uses the overlap rules above. Its response-ready grace
+starts at the first deliverable event for an incremental stream, or after the full
+provider response for non-streaming and buffered output. Input denial still cancels
+generation during that collection. Required capture, continuation retention and
+replay publication remain behind input approval.
+
+Output enforcement for a protected identity delays the
 first visible byte until the winning completion is buffered and the output
 chain returns.
 

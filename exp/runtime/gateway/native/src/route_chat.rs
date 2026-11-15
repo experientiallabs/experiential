@@ -202,6 +202,14 @@ pub(crate) async fn chat(
         return error_response(&error);
     }
 
+    if let Err(error) =
+        crate::guardrails::input::before_dispatch(&state.bridge, &admission, &mut guard).await
+    {
+        if let Some(mut owner) = lease.take() {
+            owner.abandon().await;
+        }
+        return error_response(&error);
+    }
     let permit = match acquire_permit(&state, &mut guard, deadline, admission.class).await {
         Ok(permit) => permit,
         Err(response) => {
@@ -253,6 +261,14 @@ pub(crate) async fn chat(
     let mut won =
         acquire_guarded_attempt(&context, &mut guard, admission.guardrail_input_pending).await;
     adopt_outcome(&mut admission, &mut won);
+    won = crate::guardrails::input::prepare_response(
+        &state.bridge,
+        &admission,
+        &mut guard,
+        won,
+        deadline,
+    )
+    .await;
     won = checkpoint_winner(
         state.capture.as_ref(),
         &admission,

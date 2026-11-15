@@ -397,6 +397,7 @@ pub(super) async fn run_attempt(
                     return AttemptEnd::Committed(Box::new(CommittedAttempt {
                         depth,
                         prefix,
+                        collected_retention: None,
                         relay,
                         usage,
                         tool_names,
@@ -428,6 +429,7 @@ pub(super) async fn run_attempt(
                 return AttemptEnd::Committed(Box::new(CommittedAttempt {
                     depth,
                     prefix,
+                    collected_retention: None,
                     relay,
                     usage,
                     tool_names,

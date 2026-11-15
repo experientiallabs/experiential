@@ -21,7 +21,7 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models import BillingSource, GatewayTokenPrices, ModelCapabilities
 from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.contracts import GatewayRequest
-from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry
+from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry, KeywordClassifier
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
 from exp.runtime.gateway.guardrails.config import engine_from_document
 from exp.runtime.gateway.guardrails.contracts import (
@@ -43,6 +43,7 @@ from exp.runtime.gateway.tests.guardrail_policy_integrity_test import _provider
 from exp.runtime.gateway.tests.mandatory_guardrails_paths_test import _serving
 from exp.runtime.gateway.tests.mandatory_guardrails_test import _tool_chunk
 from exp.runtime.gateway.tests.native_waterfall_test import _content_chunk, _terminal_frames
+from exp.runtime.gateway.tests.web_search_backend_fixture_test import StaticWebSearchBackend
 
 
 class _Endpoint:
@@ -55,6 +56,7 @@ class _Endpoint:
         self.started = threading.Event()
         self.release = threading.Event()
         self.finished = threading.Event()
+        self.prefix_sent = threading.Event()
         self.tail_release = threading.Event()
         self.requests: list[bytes] = []
         self.intercept: Callable[[BaseHTTPRequestHandler], bool] | None = None
@@ -78,6 +80,7 @@ class _Endpoint:
                     self.end_headers()
                     self.wfile.write(body)
                     self.wfile.flush()
+                    endpoint.prefix_sent.set()
                     if tail and endpoint.tail_release.wait(8):
                         self.wfile.write(tail)
                         self.wfile.flush()
@@ -196,10 +199,17 @@ class _Scenario:
     database: Path
 
     def request(
-        self, surface: str = "chat", *, stream: bool = True, tool: bool = False
+        self,
+        surface: str = "chat",
+        *,
+        stream: bool = True,
+        tool: bool = False,
+        web_search: bool = False,
     ) -> httpx.Response:
         """Read a complete native response on the selected public API surface."""
         body: JsonObject = {"model": "coding", "stream": stream, "max_tokens": 100}
+        if web_search:
+            body["model"] = "coding:online"
         path = "/v1/chat/completions"
         if surface == "responses":
             body.pop("max_tokens")
@@ -251,6 +261,7 @@ def _scenario(
     tool: bool = False,
     billing_source: BillingSource = BillingSource.HOST_MANAGED,
     capture: CaptureController | None = None,
+    buffer_output: bool = False,
 ) -> Iterator[_Scenario]:
     """Compose an input policy, real SQLite owner, and real native gateway."""
     marker = "provider-marker"
@@ -304,11 +315,32 @@ def _scenario(
                             adapter_id="detector",
                             timeout_ms=timeout_ms,
                         ),
+                    )
+                    + (
+                        (
+                            GuardrailCheck(
+                                check_id="output-content",
+                                capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+                                stage=GuardrailCheckStage.OUTPUT,
+                                action=GuardrailAction.BLOCK,
+                                adapter_id="output-detector",
+                                timeout_ms=1000,
+                            ),
+                        )
+                        if buffer_output
+                        else ()
                     ),
                 ),
             )
         ),
-        client=DirectClassifierClient(ClassifierRegistry({"detector": _Classifier(moderator)})),
+        client=DirectClassifierClient(
+            ClassifierRegistry(
+                {
+                    "detector": _Classifier(moderator),
+                    "output-detector": KeywordClassifier(("withheld-output-marker",)),
+                }
+            )
+        ),
         monotonic=time.monotonic,
     )
     control = _NativeOnlyControl(components, guardrails=engine, capture=capture)
@@ -429,6 +461,60 @@ def test_deferred_required_capture_failure_prevents_response_and_charge(
         collector.settle("occupied", False, False)
         assert collector.close(2)
     assert not records
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("blocked", [False, True])
+@pytest.mark.parametrize("buffered_stream", [False, True])
+def test_buffered_response_keeps_inspection_live_after_first_provider_content(
+    tmp_path: Path, surface: str, blocked: bool, buffered_stream: bool
+) -> None:
+    """An undeliverable prefix never consumes the complete response's zero-grace budget."""
+    with _scenario(
+        tmp_path, blocked=blocked, pause_stream=True, wait_ms=0, buffer_output=buffered_stream
+    ) as case:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            response = executor.submit(case.request, surface, stream=buffered_stream)
+            try:
+                assert case.provider.started.wait(2)
+                assert case.moderator.started.wait(2)
+                case.provider.release.set()
+                assert case.provider.prefix_sent.wait(2)
+                time.sleep(0.1)
+                # The provider remains incomplete while classification finishes.
+                assert not case.provider.finished.is_set()
+                case.moderator.release.set()
+                assert case.moderator.finished.wait(2)
+                deadline = time.monotonic() + 2
+                records: list[JsonObject] = []
+                while time.monotonic() < deadline:
+                    with connect_sqlite(case.database) as db:
+                        records = [
+                            json.loads(row[0])
+                            for row in db.execute("SELECT result FROM gateway_input_moderation")
+                        ]
+                    if records:
+                        break
+                    time.sleep(0.01)
+                assert len(records) == 1
+                assert records[0]["status"] == ("denied" if blocked else "allowed")
+                if not blocked:
+                    case.provider.tail_release.set()
+                result = response.result(timeout=2)
+                assert result.status_code == (400 if blocked else 200), result.text
+                assert ("provider-marker" in result.text) is not blocked
+                with connect_sqlite(case.database) as db:
+                    attempts = db.execute(
+                        "SELECT state, budget_settled_nano_usd FROM gateway_attempts"
+                    ).fetchall()
+                assert len(attempts) == 1
+                assert attempts[0][0] == ("failed" if blocked else "completed")
+                if blocked:
+                    assert attempts[0][1] == 0
+                    assert not case.provider.tail_release.is_set()
+            finally:
+                case.provider.tail_release.set()
+                case.moderator.release.set()
 
 
 @pytest.mark.parametrize("wait_ms", [0, 100])
@@ -596,6 +682,51 @@ def test_serial_configuration_waits_before_dispatch(tmp_path: Path, blocked: boo
                 assert case.records()[0]["status"] == ("denied" if blocked else "allowed")
             finally:
                 case.moderator.release.set()
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("blocked", [False, True])
+def test_serial_inspection_releases_admission_capacity(
+    tmp_path: Path, surface: str, blocked: bool
+) -> None:
+    """More inspections than bridge workers can wait without holding admission slots."""
+    with _scenario(tmp_path, blocked=blocked, execution="before_dispatch") as case:
+        case.provider.release.set()
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            responses = [executor.submit(case.request, surface) for _ in range(8)]
+            try:
+                deadline = time.monotonic() + 2
+                while len(case.moderator.requests) < 8 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert len(case.moderator.requests) == 8
+                assert not case.provider.started.is_set()
+                case.moderator.release.set()
+                results = [response.result(timeout=3) for response in responses]
+                assert [result.status_code for result in results] == [400 if blocked else 200] * 8
+                assert len(case.records()) == 8
+                with connect_sqlite(case.database) as db:
+                    attempts = db.execute("SELECT state FROM gateway_attempts").fetchall()
+                    states = db.execute("SELECT terminal_state FROM gateway_requests").fetchall()
+                assert attempts == ([] if blocked else [("completed",)] * 8)
+                assert states == [("failed" if blocked else "completed",)] * 8
+            finally:
+                case.moderator.release.set()
+
+
+@pytest.mark.parametrize("execution", ["before_dispatch", "parallel"])
+def test_denied_input_never_starts_admission_web_search(
+    tmp_path: Path, execution: Literal["before_dispatch", "parallel"]
+) -> None:
+    """Admission side effects remain behind inspection before native handoff."""
+    search = StaticWebSearchBackend(())
+    with _scenario(tmp_path, blocked=True, execution=execution) as case:
+        case.control._web_search = search
+        case.moderator.release.set()
+        result = case.request(web_search=True)
+        assert result.status_code == 400, result.text
+        assert not search.queries
+        assert not case.provider.started.is_set()
+        assert case.records()[0]["status"] == "denied"
 
 
 @pytest.mark.parametrize("stage", ["input", "output"])

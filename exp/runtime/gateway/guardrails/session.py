@@ -135,9 +135,16 @@ class GuardrailSession:
     def can_overlap_input(self, request: GatewayRequest) -> bool:
         """Use the configured execution order for every read-only input policy."""
         inputs = tuple(p for p in self.enforcing_policies if p.input_checks)
+        return self.can_defer_input(request) and all(
+            p.input_execution == "parallel" for p in inputs
+        )
+
+    def can_defer_input(self, request: GatewayRequest) -> bool:
+        """Transfer read-only inspection to Rust without waiting in host admission."""
+        inputs = tuple(p for p in self.enforcing_policies if p.input_checks)
         return (
-            bool(inputs)
-            and all(p.input_execution == "parallel" for p in inputs)
+            request.web_search is None
+            and bool(inputs)
             and all(c.action is not GuardrailAction.MODIFY for p in inputs for c in p.input_checks)
         )
 
@@ -258,7 +265,7 @@ class GuardrailSession:
         if overlap and not all(self.can_overlap_input(subject) for subject in remaining):
             raise RuntimeError("guardrail input cannot overlap this request")
         self._input_approved_at = None
-        if overlap and self.native_execution:
+        if self.native_execution and all(self.can_defer_input(s) for s in remaining):
             self.native_input = NativeInputInspection(
                 json.dumps(input_registration(self, tuple(remaining)), ensure_ascii=False),
                 max(0.0, self.deadline_monotonic - time.monotonic()),

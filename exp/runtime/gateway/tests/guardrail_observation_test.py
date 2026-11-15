@@ -884,8 +884,7 @@ def test_native_denial_retains_one_observation_and_one_terminal_owner(
                 assert response.status_code == 400, response.text
                 assert response.json()["error"]["code"] == "content_filter"
                 if execution == "before_dispatch":
-                    assert finish.call_count == 1
-                    assert finish.call_args.args[1].failure_class is GatewayFailureClass.GUARDRAIL
+                    assert finish.call_count == 0
                     assert not received
                 else:
                     assert finish.call_count == 0
@@ -895,6 +894,11 @@ def test_native_denial_retains_one_observation_and_one_terminal_owner(
                 assert control.close(timeout_seconds=2)
             with connect_sqlite(manager.database_path) as db:
                 reports = db.execute("SELECT result FROM gateway_input_moderation").fetchall()
+                assert db.execute("SELECT terminal_state FROM gateway_requests").fetchall() == [
+                    ("failed",)
+                ]
+                if execution == "before_dispatch":
+                    assert db.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone() == (0,)
             observed = [
                 record
                 for report in reports

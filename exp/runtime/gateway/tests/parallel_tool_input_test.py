@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 from exp.common.sqlite.native import connect as connect_sqlite
+from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
@@ -172,7 +173,13 @@ def _round_case(
                 json.loads(row[0])
                 for row in db.execute("SELECT result FROM gateway_input_moderation")
             ]
-        assert len(records) == (2 if execution == "parallel" else 3)
+        # Admission freezes one inspection containing its distinct subjects;
+        # the tool successor owns the second inspection in either mode.
+        assert len(records) == 2
+        assert any(
+            any(m.role == "tool" for m in GatewayRequest.model_validate(body["request"]).messages)
+            for body in moderator.requests
+        )
         assert any(
             record["status"]
             == (

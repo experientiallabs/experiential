@@ -79,11 +79,16 @@ impl InputGate {
         {
             return Err(());
         }
-        // Strict, fail-open, and observe policies progress independently.
+        // Serial enforcement keeps authored order and short-circuits before a
+        // later classifier sees a denied subject. Parallel policy groups can
+        // progress independently; observers remain optional in either mode.
+        let serial = checks.iter().any(|c| {
+            c.policy["mode"] != "observe" && c.policy["input_execution"] == "before_dispatch"
+        });
         let group = |c: &Check| {
             if c.policy["mode"] == "observe" {
                 2
-            } else if c.policy["input_fail_open"] == true {
+            } else if !serial && c.policy["input_fail_open"] == true {
                 1
             } else {
                 0

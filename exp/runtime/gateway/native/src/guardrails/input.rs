@@ -3,7 +3,6 @@
 use std::sync::Arc;
 #[cfg(test)]
 use std::time::Duration;
-#[cfg(test)]
 use std::time::Instant;
 
 use serde::Deserialize;
@@ -11,6 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::OnceCell;
 
+use crate::admission::Admission;
 use crate::bridge::Bridge;
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::relay::collection_public_error;
@@ -130,8 +130,12 @@ impl InputGate {
     }
 
     pub(crate) fn new(ctx: &WaterfallContext<'_>) -> Arc<Self> {
+        Self::for_request(ctx.request_id)
+    }
+
+    fn for_request(request_id: &str) -> Arc<Self> {
         Arc::new(Self {
-            request_id: ctx.request_id.to_owned(),
+            request_id: request_id.to_owned(),
             decision: OnceCell::new(),
         })
     }
@@ -154,13 +158,108 @@ impl InputGate {
     }
 }
 
+/// Release host admission before serial inspection waits, without dispatching upstream.
+pub(crate) async fn before_dispatch(
+    bridge: &Bridge,
+    admission: &Admission,
+    guard: &mut AttemptGuard,
+) -> Result<(), PublicError> {
+    if !admission.guardrail_input_before_dispatch {
+        return Ok(());
+    }
+    let gate = InputGate::for_request(&admission.request_id);
+    guard.input_gate = Some(gate.clone());
+    match gate
+        .wait(bridge)
+        .await
+        .and_then(InputDecision::require_allow)
+    {
+        Ok(()) => Ok(()),
+        Err(failure) => {
+            if guard.abandon(&failure.failure).await {
+                Err(failure.public_error())
+            } else {
+                Err(guard.settlement_error())
+            }
+        }
+    }
+}
+
+/// Start grace only when this surface can deliver its first outward response.
+pub(crate) async fn prepare_response(
+    bridge: &Bridge,
+    admission: &Admission,
+    guard: &mut AttemptGuard,
+    mut won: Won,
+    deadline: Instant,
+) -> Won {
+    let (Some(gate), Won::Committed(committed)) = (guard.input_gate.clone(), &mut won) else {
+        return won;
+    };
+    let buffered = !admission.stream
+        || (admission.buffers_output() && !admission.stream_incremental(committed.depth));
+    if buffered {
+        let phase_timeout = admission.phase_timeout(committed.depth);
+        let collection = gate
+            .inspect_attempt(
+                bridge,
+                crate::relay::buffer_committed(committed, deadline, phase_timeout, guard.started),
+            )
+            .await;
+        match collection {
+            Ok(Ok(())) => {}
+            Ok(Err(failure)) => {
+                committed.relay.close_transport();
+                let failure = failure.boundary();
+                let delivered = guard
+                    .settle(
+                        "failed",
+                        committed.usage.as_ref(),
+                        &committed.tool_names,
+                        Some(&failure),
+                        true,
+                    )
+                    .await;
+                return Won::Failed(if delivered {
+                    collection_public_error(&failure)
+                } else {
+                    guard.settlement_error()
+                });
+            }
+            Err(failure) => {
+                committed.relay.close_transport();
+                let delivered = guard.fail_before_release(&failure.failure).await;
+                return Won::Failed(if delivered {
+                    failure.public_error()
+                } else {
+                    guard.settlement_error()
+                });
+            }
+        }
+    }
+    if let Err(failure) = gate
+        .response_ready(bridge)
+        .await
+        .and_then(InputDecision::require_allow)
+    {
+        committed.relay.close_transport();
+        let delivered = guard.fail_before_release(&failure.failure).await;
+        return Won::Failed(if delivered {
+            failure.public_error()
+        } else {
+            guard.settlement_error()
+        });
+    }
+    won
+}
+
 /// Enable request-owned input decisions for each physical generation.
 pub(crate) async fn acquire_guarded_attempt(
     ctx: &WaterfallContext<'_>,
     guard: &mut AttemptGuard,
     enabled: bool,
 ) -> Won {
-    if enabled {
+    if enabled && guard.input_gate.is_none() {
         guard.input_gate = Some(InputGate::new(ctx));
     }
     acquire_attempt(ctx, guard).await

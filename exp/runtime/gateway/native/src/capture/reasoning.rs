@@ -69,14 +69,20 @@ pub(crate) async fn checkpoint_winner(
     attempt.relay.close_transport();
     let usage = attempt.usage.clone();
     let tool_names = attempt.tool_names.clone();
+    let buffered = attempt.collected_retention.is_some();
     drop(won);
     drop(unfinished);
-    if failure.failure_class == FailureClass::Timeout {
-        guard.settle_cancelled(usage.as_ref(), &tool_names).await;
+    let delivered = if failure.failure_class == FailureClass::Timeout && !buffered {
+        guard.settle_cancelled(usage.as_ref(), &tool_names).await
     } else {
+        // A buffered provider terminal was never released. A failed required
+        // checkpoint must not turn that terminal into a successful settlement.
         guard
             .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
-            .await;
+            .await
+    };
+    if !delivered {
+        return Won::Failed(guard.settlement_error());
     }
     Won::Failed(if failure.failure_class == FailureClass::Timeout {
         crate::relay::collection_public_error(&failure)

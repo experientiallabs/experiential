@@ -679,11 +679,11 @@ impl AttemptGuard {
     }
 
     /// Fail unreleased work without replacing a retained meter after delivery failure.
-    pub(crate) async fn fail_before_release(&mut self, failure: &Failure) {
+    pub(crate) async fn fail_before_release(&mut self, failure: &Failure) -> bool {
         if self.attempt_id.is_some() {
-            self.settle("failed", None, &[], Some(failure), true).await;
+            self.settle("failed", None, &[], Some(failure), true).await
         } else {
-            self.abandon(failure).await;
+            self.abandon(failure).await
         }
     }
 

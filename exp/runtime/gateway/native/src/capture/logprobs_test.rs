@@ -238,6 +238,46 @@ fn a_relay_holds_only_a_bounded_prefix_before_its_attempt_wins() {
 }
 
 #[test]
+fn a_buffered_winner_retains_full_capture_under_the_worker_budget() {
+    let budget = Box::leak(Box::new(crate::retained::RetainedOutputBudget::new(
+        MAXIMUM_CAPTURED_LOGPROB_BYTES,
+    )));
+    crate::retained::with_test_budget(budget, || {
+        let mut held = Held::default();
+        let size = delta("a").retained_bytes();
+        held.forward(Some((vec![delta("a")], false)), None);
+        held.buffer_response();
+        assert_eq!(budget.held(), size);
+        let fits = MAXIMUM_CAPTURED_LOGPROB_BYTES / size;
+        held.forward(
+            Some(((0..fits - 1).map(|_| delta("a")).collect(), false)),
+            None,
+        );
+        assert_eq!(held.pending.len(), fits);
+        assert!(!held.truncated);
+        assert_eq!(budget.held(), size * fits);
+        held.forward(Some((vec![delta("a")], false)), None);
+        assert!(held.truncated);
+        drop(held);
+        assert_eq!(budget.held(), 0);
+    });
+}
+
+#[test]
+fn a_buffered_hold_never_expands_when_existing_bytes_cannot_be_reserved() {
+    let budget = Box::leak(Box::new(crate::retained::RetainedOutputBudget::new(0)));
+    crate::retained::with_test_budget(budget, || {
+        let mut held = Held::default();
+        held.forward(Some((vec![delta("a")], false)), None);
+        held.buffer_response();
+        held.forward(Some((vec![delta("b")], false)), None);
+        assert_eq!(held.pending.len(), 1);
+        assert!(held.truncated);
+        assert_eq!(budget.held(), 0);
+    });
+}
+
+#[test]
 fn records_must_reproduce_the_emitted_text_exactly() {
     let record = |token: &str, bytes: Option<Vec<u8>>| json!({"token": token, "logprob": -1.0, "bytes": bytes, "top_logprobs": []});
     let frame = |records: Vec<serde_json::Value>, text: &str| {

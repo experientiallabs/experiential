@@ -69,6 +69,8 @@ pub enum Won {
 pub struct CommittedAttempt {
     pub depth: usize,
     pub prefix: Vec<Event>,
+    /// A fully collected response keeps its budget while input approval is pending.
+    pub collected_retention: Option<crate::retained::RetainedLease>,
     pub relay: UpstreamRelay,
     pub usage: Option<Usage>,
     pub tool_names: Vec<String>,
@@ -389,10 +391,13 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
         // A rung a tool-search round rebuilt dials its rebuilt wire; the
         // route's own entry still answers every policy question above.
         let dial_wire = search_wires[depth].as_ref().unwrap_or(wire);
-        let gate = guard
-            .input_gate
-            .as_ref()
-            .map(|_| crate::guardrails::input::InputGate::new(ctx));
+        let gate = guard.input_gate.as_ref().map(|gate| {
+            if total_attempts == 1 {
+                gate.clone()
+            } else {
+                crate::guardrails::input::InputGate::new(ctx)
+            }
+        });
         guard.input_gate = gate.clone();
         let end = {
             let attempt = run_attempt(
@@ -417,9 +422,9 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 return Won::Failed(failure.public_error());
             }
         };
-        // Retries, repaired requests and withheld search turns have no outward
-        // response yet. Only a deliverable answer starts the fail-open grace.
-        if matches!(end, AttemptEnd::Committed(_) | AttemptEnd::Settled(_)) {
+        // A settled answer is complete. Committed answers reach the surface's
+        // release boundary after any required whole-response collection.
+        if matches!(end, AttemptEnd::Settled(_)) {
             if let Some(gate) = guard.input_gate.clone() {
                 if let Err(failure) = gate
                     .response_ready(ctx.bridge)

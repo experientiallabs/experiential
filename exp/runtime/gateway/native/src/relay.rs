@@ -810,6 +810,37 @@ pub async fn collect_committed(
     phase_timeout: Duration,
     request_started: Instant,
 ) -> Result<Vec<Event>, Failure> {
+    if committed.collected_retention.is_some() {
+        // Move the already collected response once; its budget stays with the
+        // attempt through response construction and settlement.
+        return Ok(std::mem::take(&mut committed.prefix));
+    }
+    collect_with_retention(committed, deadline, phase_timeout, request_started)
+        .await
+        .map(|(events, _lease)| events)
+}
+
+/// Keep a buffered answer and its retention lease live through input approval.
+pub(crate) async fn buffer_committed(
+    committed: &mut CommittedAttempt,
+    deadline: Instant,
+    phase_timeout: Duration,
+    request_started: Instant,
+) -> Result<(), Failure> {
+    committed.relay.logprobs.buffer_response();
+    let (events, lease) =
+        collect_with_retention(committed, deadline, phase_timeout, request_started).await?;
+    committed.prefix = events;
+    committed.collected_retention = Some(lease);
+    Ok(())
+}
+
+async fn collect_with_retention(
+    committed: &mut CommittedAttempt,
+    deadline: Instant,
+    phase_timeout: Duration,
+    request_started: Instant,
+) -> Result<(Vec<Event>, crate::retained::RetainedLease), Failure> {
     let mut events: Vec<Event> = Vec::new();
     let mut retained_bytes = 0usize;
     let mut lease = crate::retained::RetainedLease::default();
@@ -835,7 +866,7 @@ pub async fn collect_committed(
         retain(&mut events, event)?;
     }
     if events.last().is_some_and(Event::is_terminal) {
-        return Ok(events);
+        return Ok((events, lease));
     }
     loop {
         let next = committed
@@ -851,7 +882,7 @@ pub async fn collect_committed(
                 let terminal = event.is_terminal();
                 retain(&mut events, event)?;
                 if terminal {
-                    return Ok(events);
+                    return Ok((events, lease));
                 }
             }
             None => return Err(ended_without_terminal()),

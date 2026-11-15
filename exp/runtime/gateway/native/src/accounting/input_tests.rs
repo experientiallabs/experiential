@@ -788,3 +788,28 @@ fn request_deadline_labels_unstarted_sibling_checks_as_timed_out() {
     assert_eq!(records.len(), 2);
     assert!(records.iter().all(|record| record["outcome"] == "timeout"));
 }
+
+#[test]
+fn serial_enforcement_short_circuits_before_a_later_fail_open_classifier() {
+    let (url, received, release, server) = server("{\"flagged\":true}", 200);
+    let later = TcpListener::bind("127.0.0.1:0").unwrap();
+    later.set_nonblocking(true).unwrap();
+    let mut first = check(&url, true);
+    first.policy["input_execution"] = json!("before_dispatch");
+    first.policy["input_fail_open"] = json!(false);
+    let mut second = check(
+        &format!("http://{}/input", later.local_addr().unwrap()),
+        true,
+    );
+    second.policy["input_execution"] = json!("parallel");
+    second.policy["input_fail_open"] = json!(true);
+    let gate = InputGate::start(vec![first, second], 5.0).unwrap();
+    received.recv_timeout(Duration::from_secs(2)).unwrap();
+    release.send(()).unwrap();
+    assert_eq!(gate.wait()["action"], "error");
+    assert_eq!(
+        later.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    server.join().unwrap();
+}

@@ -70,9 +70,9 @@ def validate_guardrail_engine(engine: GuardrailEngine | None) -> None:
     if engine is None:
         return
     native = importlib.import_module("exp_gateway_native")
-    if getattr(native, "GUARDRAIL_CONTRACT_VERSION", None) != 3:
+    if getattr(native, "GUARDRAIL_CONTRACT_VERSION", None) != 4:
         raise ValueError(
-            "guardrails require native GUARDRAIL_CONTRACT_VERSION=3; "
+            "guardrails require native GUARDRAIL_CONTRACT_VERSION=4; "
             "install the coordinated native package"
         )
 
