@@ -9,6 +9,8 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol, cast
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models import BillingSource
+from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayFailure, GatewayRequest
 from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
@@ -31,6 +33,24 @@ from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 if TYPE_CHECKING:
     from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+
+def input_may_overlap(
+    session: GuardrailSession | None,
+    subjects: Sequence[GatewayRequest],
+    deployments: Sequence[ExactModelDeployment],
+    *,
+    deferred: bool,
+    cache_bound: bool,
+) -> bool:
+    """Require approval before external tools, cache writes or customer-funded dispatch."""
+    return (
+        deferred
+        and session is not None
+        and not cache_bound
+        and all(session.can_overlap_input(subject) for subject in subjects)
+        and all(d.billing_source is BillingSource.HOST_MANAGED for d in deployments)
+    )
 
 
 def require_capture(
@@ -91,8 +111,6 @@ def open_admission_guardrails(
         if engine is None
         else engine.open_request(authorization, deadline_monotonic=deadline_monotonic)
     )
-    if session is not None:
-        session.native_execution = True
     if session is not None:
         session.native_execution = True
     if request.idempotency_key is not None:

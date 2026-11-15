@@ -934,3 +934,7 @@ mod tests;
 #[cfg(test)]
 #[path = "settlement_refusal_tests.rs"]
 mod refusal_tests;
+
+#[cfg(test)]
+#[path = "settlement_acknowledgement_tests.rs"]
+mod acknowledgement_tests;

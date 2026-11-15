@@ -18,6 +18,7 @@ from exp.common.sqlite.native import connect as connect_sqlite
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.guardrails.contracts import ClassifierVerdict, GuardrailCheck
 from exp.runtime.gateway.lifecycle import load_gateway_components
+from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_server import serve_native_gateway
@@ -85,6 +86,34 @@ def _serving(
         stop.request_shutdown()
         worker.join(5)
         assert not worker.is_alive()
+
+
+def test_mandatory_input_records_refusal_without_provider_dispatch(tmp_path: Path) -> None:
+    """A serial native decision refuses before any provider attempt is created."""
+    _, raw_key = _configured_gateway(tmp_path)
+    components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "synthetic"})
+    guard = _Guard(block_input=True)
+    control = NativeControlPlane(components, guardrails=guard)
+    try:
+        with _serving(control) as url:
+            response = httpx.post(
+                url + "/v1/chat/completions",
+                headers={"authorization": f"Bearer {raw_key}"},
+                json={"model": "coding", "messages": [{"role": "user", "content": "fixture"}]},
+                timeout=5,
+            )
+            assert response.status_code == 400, response.text
+            assert response.json()["error"]["code"] == "content_filter"
+        assert len(guard.requests) == 1
+        with connect_sqlite(components.ledger.database_path) as connection:
+            assert connection.execute("select terminal_state from gateway_requests").fetchall() == [
+                ("failed",)
+            ]
+            assert connection.execute("select count(*) from gateway_attempts").fetchone()[0] == 0
+    finally:
+        control.close(timeout_seconds=2)
+        guard.close(timeout_seconds=2)
+        components.write_ledger.close()
 
 
 @pytest.mark.parametrize("surface", ["chat", "responses", "messages"])

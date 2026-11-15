@@ -44,6 +44,7 @@ from exp.runtime.gateway.guardrails.subjects import observation_subject_bytes
 from exp.runtime.gateway.native_capture import capture_unavailable_failure
 from exp.runtime.gateway.tests.guardrail_fixture_test import _Classifier, _engine
 from exp.runtime.gateway.tool_contracts import GatewayProviderNativeTool
+from exp.runtime.gateway.tool_search.contracts import GatewayToolSearch
 
 
 def _request(text: str = "fixture") -> GatewayRequest:
@@ -251,9 +252,9 @@ def test_every_scope_uses_the_same_parallel_approval_and_settlement(
         session.cancel()
 
 
-@pytest.mark.parametrize("kind", ["provider_native", "provider_server", "tier"])
-def test_configured_parallel_mode_applies_to_tools_and_service_tiers(kind: str) -> None:
-    """Tools and service tiers do not silently replace the configured execution mode."""
+@pytest.mark.parametrize("kind", ["provider_native", "provider_server", "tool_search", "tier"])
+def test_external_execution_waits_for_input_approval_in_rust(kind: str) -> None:
+    """External tools and paid tiers cannot execute before the input decision."""
     session = _session(_engine(_Classifier("allow")))
     request = _request()
     assert session.can_overlap_input(request)
@@ -269,9 +270,18 @@ def test_configured_parallel_mode_applies_to_tools_and_service_tiers(kind: str) 
         request = request.model_copy(
             update={"provider_server_tools": ({"type": "web_search", "name": "web_search"},)}
         )
+    elif kind == "tool_search":
+        request = request.model_copy(
+            update={
+                "tool_search": GatewayToolSearch(
+                    declared_as="openrouter_tool", tool_type="openrouter:tool_search"
+                )
+            }
+        )
     else:
         request = request.model_copy(update={"service_tier": "priority"})
-    assert session.can_overlap_input(request)
+    assert session.can_defer_input(request)
+    assert not session.can_overlap_input(request)
     session.policies = tuple(
         policy.model_copy(update={"input_execution": "before_dispatch"})
         for policy in session.policies

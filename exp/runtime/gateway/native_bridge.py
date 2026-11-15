@@ -29,6 +29,7 @@ from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import (
     NativeGuardrailsMixin,
     discard_unaccepted_input,
+    input_may_overlap,
     native_output_mode,
     open_admission_guardrails,
     require_capture,
@@ -798,14 +799,20 @@ class NativeControlPlane(
             explicit_cache_state=cache_state,
         )
 
+        guardrail_subjects = (original_guardrail_request, captured_request, request, public_request)
+        input_overlap = input_may_overlap(
+            guardrails,
+            guardrail_subjects,
+            route.deployments,
+            deferred=deferred_guardrail,
+            cache_bound=cache_state is not None,
+        )
+
         def prepare_request() -> None:
             """Prepare inspection and capture after selecting this request's owner."""
             if guardrails is not None:
                 try:
-                    guardrails.prepare_dispatch(
-                        (original_guardrail_request, captured_request, request, public_request),
-                        overlap=deferred_guardrail and guardrails.can_overlap_input(request),
-                    )
+                    guardrails.prepare_dispatch(guardrail_subjects, overlap=input_overlap)
                 except GuardrailRejected as exc:
                     discard_capture(self._capture, authorization.request_id)
                     raise NativeBridgeError(
@@ -839,9 +846,7 @@ class NativeControlPlane(
             "refusal_failover": authorization.refusal_failover,
             "guardrail_input_pending": guardrails is not None and guardrails.input_pending,
             "guardrail_input_before_dispatch": (
-                guardrails is not None
-                and guardrails.input_pending
-                and not guardrails.can_overlap_input(request)
+                guardrails is not None and guardrails.input_pending and not input_overlap
             ),
             "output_guardrail": native_output_mode(
                 guardrails,
@@ -900,9 +905,7 @@ class NativeControlPlane(
             client_request_id=optional_text(data.get("client_request_id")),
         )
         request = decoded.request
-        # Only the standard Idempotency-Key names a retriable operation;
-        # client_request_id is a session correlation id real callers reuse
-        # across distinct requests, so it never keys replay.
+        # Only Idempotency-Key keys replay; client_request_id correlates distinct requests.
         caller_operation = request.idempotency_key
         if caller_operation is None:
             raise NativeBridgeError(
