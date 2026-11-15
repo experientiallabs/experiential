@@ -545,9 +545,12 @@ async fn respond_from_chat_events(
         match seal_reasoning_events(&guard.bridge, &admission.request_id, depth, &events).await {
             Ok(carrier) => carrier,
             Err(failure) => {
-                guard
+                if !guard
                     .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
-                    .await;
+                    .await
+                {
+                    return error_response(&guard.settlement_error());
+                }
                 if let Some(mut owner) = lease.take() {
                     owner.abandon().await;
                 }
@@ -566,7 +569,7 @@ async fn respond_from_chat_events(
     ) {
         Ok(aggregated) => aggregated,
         Err(error) => {
-            guard
+            if !guard
                 .settle(
                     "failed",
                     usage.as_ref(),
@@ -580,7 +583,10 @@ async fn respond_from_chat_events(
                     ),
                     true,
                 )
-                .await;
+                .await
+            {
+                return error_response(&guard.settlement_error());
+            }
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
             }
@@ -591,7 +597,7 @@ async fn respond_from_chat_events(
     if let Some(failure) = &aggregated.failure {
         let failure = failure.clone().boundary();
         let error = failure.public_error();
-        guard
+        if !guard
             .settle(
                 "failed",
                 aggregated.usage.as_ref().or(usage.as_ref()),
@@ -599,7 +605,10 @@ async fn respond_from_chat_events(
                 Some(&failure),
                 true,
             )
-            .await;
+            .await
+        {
+            return error_response(&guard.settlement_error());
+        }
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
         }
@@ -709,7 +718,7 @@ async fn completed_response(
         Err(failure) => {
             let failure = failure.boundary();
             let error = collection_public_error(&failure);
-            guard
+            if !guard
                 .settle(
                     "failed",
                     committed.usage.as_ref(),
@@ -717,7 +726,10 @@ async fn completed_response(
                     Some(&failure),
                     true,
                 )
-                .await;
+                .await
+            {
+                return error_response(&guard.settlement_error());
+            }
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
             }
@@ -763,7 +775,9 @@ async fn guarded_chat_response(
         Err(failure) => {
             let failure = failure.boundary();
             let error = collection_public_error(&failure);
-            settle_guarded_failure(&mut guard, &mut committed, &mut lease, &failure).await;
+            if !settle_guarded_failure(&mut guard, &mut committed, &mut lease, &failure).await {
+                return error_response(&guard.settlement_error());
+            }
             return error_response(&error);
         }
     };
@@ -772,7 +786,9 @@ async fn guarded_chat_response(
     {
         Ok(events) => events,
         Err(failure) => {
-            settle_guarded_failure(&mut guard, &mut committed, &mut lease, &failure).await;
+            if !settle_guarded_failure(&mut guard, &mut committed, &mut lease, &failure).await {
+                return error_response(&guard.settlement_error());
+            }
             return error_response(&failure.public_error());
         }
     };

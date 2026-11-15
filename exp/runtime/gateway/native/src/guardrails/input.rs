@@ -180,8 +180,11 @@ pub(crate) async fn acquire_guarded_attempt(
             // Dropping acquire/the committed relay closes upstream immediately.
             // The guard retains witnessed usage for our cost, while the host
             // applies the input verdict to customer settlement.
-            guard.fail_before_release(&failure.failure).await;
-            Won::Failed(failure.public_error())
+            if guard.fail_before_release(&failure.failure).await {
+                Won::Failed(failure.public_error())
+            } else {
+                Won::Failed(guard.settlement_error())
+            }
         }
     }
 }

@@ -379,9 +379,12 @@ async fn respond_from_messages_events(
         match seal_reasoning_events(&guard.bridge, &admission.request_id, depth, &events).await {
             Ok(carrier) => carrier,
             Err(failure) => {
-                guard
+                if !guard
                     .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
-                    .await;
+                    .await
+                {
+                    return messages_error_response(&guard.settlement_error());
+                }
                 return messages_error_response(&failure.public_error());
             }
         }
@@ -390,7 +393,7 @@ async fn respond_from_messages_events(
         match completed_messages_body_for(&admission, &events, carrier.as_deref(), exposed) {
             Ok(aggregated) => aggregated,
             Err(error) => {
-                guard
+                if !guard
                     .settle(
                         "failed",
                         usage.as_ref(),
@@ -404,14 +407,17 @@ async fn respond_from_messages_events(
                         ),
                         true,
                     )
-                    .await;
+                    .await
+                {
+                    return messages_error_response(&guard.settlement_error());
+                }
                 return messages_error_response(&error);
             }
         };
     if let Some(failure) = &aggregated.failure {
         let failure = failure.clone().boundary();
         let error = failure.public_error();
-        guard
+        if !guard
             .settle(
                 "failed",
                 aggregated.usage.as_ref().or(usage.as_ref()),
@@ -419,7 +425,10 @@ async fn respond_from_messages_events(
                 Some(&failure),
                 true,
             )
-            .await;
+            .await
+        {
+            return messages_error_response(&guard.settlement_error());
+        }
         return messages_error_response(&error);
     }
     let empty_completion = refusal_completed.is_none()
@@ -560,7 +569,7 @@ async fn completed_messages(
         Err(failure) => {
             let failure = failure.boundary();
             let error = collection_public_error(&failure);
-            guard
+            if !guard
                 .settle(
                     "failed",
                     committed.usage.as_ref(),
@@ -568,7 +577,10 @@ async fn completed_messages(
                     Some(&failure),
                     true,
                 )
-                .await;
+                .await
+            {
+                return messages_error_response(&guard.settlement_error());
+            }
             return messages_error_response(&error);
         }
     };
@@ -604,7 +616,7 @@ async fn guarded_messages(
         Err(failure) => {
             let failure = failure.boundary();
             let error = collection_public_error(&failure);
-            guard
+            if !guard
                 .settle(
                     "failed",
                     committed.usage.as_ref(),
@@ -612,7 +624,10 @@ async fn guarded_messages(
                     Some(&failure),
                     true,
                 )
-                .await;
+                .await
+            {
+                return messages_error_response(&guard.settlement_error());
+            }
             return messages_error_response(&error);
         }
     };
@@ -621,7 +636,7 @@ async fn guarded_messages(
     {
         Ok(events) => events,
         Err(failure) => {
-            guard
+            if !guard
                 .settle(
                     "failed",
                     committed.usage.as_ref(),
@@ -629,7 +644,10 @@ async fn guarded_messages(
                     Some(&failure),
                     true,
                 )
-                .await;
+                .await
+            {
+                return messages_error_response(&guard.settlement_error());
+            }
             return messages_error_response(&failure.public_error());
         }
     };

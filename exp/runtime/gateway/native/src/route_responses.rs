@@ -376,9 +376,12 @@ async fn respond_from_responses_events(
             Ok(carrier) => carrier,
             Err(failure) => {
                 let failure = failure.boundary();
-                guard
+                if !guard
                     .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
-                    .await;
+                    .await
+                {
+                    return error_response(&guard.settlement_error());
+                }
                 if let Some(mut owner) = lease.take() {
                     owner.abandon().await;
                 }
@@ -394,7 +397,7 @@ async fn respond_from_responses_events(
     ) {
         Ok(aggregated) => aggregated,
         Err(error) => {
-            guard
+            if !guard
                 .settle(
                     "failed",
                     usage.as_ref(),
@@ -408,7 +411,10 @@ async fn respond_from_responses_events(
                     ),
                     true,
                 )
-                .await;
+                .await
+            {
+                return error_response(&guard.settlement_error());
+            }
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
             }
@@ -418,7 +424,7 @@ async fn respond_from_responses_events(
     if let Some(failure) = &aggregated.failure {
         let failure = failure.clone().boundary();
         let error = failure.public_error();
-        guard
+        if !guard
             .settle(
                 "failed",
                 aggregated.usage.as_ref().or(usage.as_ref()),
@@ -426,7 +432,10 @@ async fn respond_from_responses_events(
                 Some(&failure),
                 true,
             )
-            .await;
+            .await
+        {
+            return error_response(&guard.settlement_error());
+        }
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
         }
@@ -555,7 +564,7 @@ async fn completed_responses(
         Err(failure) => {
             let failure = failure.boundary();
             let error = collection_public_error(&failure);
-            guard
+            if !guard
                 .settle(
                     "failed",
                     committed.usage.as_ref(),
@@ -563,7 +572,10 @@ async fn completed_responses(
                     Some(&failure),
                     true,
                 )
-                .await;
+                .await
+            {
+                return error_response(&guard.settlement_error());
+            }
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
             }
@@ -610,7 +622,7 @@ async fn guarded_responses(
         Err(failure) => {
             let failure = failure.boundary();
             let error = collection_public_error(&failure);
-            guard
+            if !guard
                 .settle(
                     "failed",
                     committed.usage.as_ref(),
@@ -618,7 +630,10 @@ async fn guarded_responses(
                     Some(&failure),
                     true,
                 )
-                .await;
+                .await
+            {
+                return error_response(&guard.settlement_error());
+            }
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
             }
@@ -629,7 +644,7 @@ async fn guarded_responses(
     let events = match apply_output_guardrail(&state, &admission, collected, deadline, true).await {
         Ok(events) => events,
         Err(failure) => {
-            guard
+            if !guard
                 .settle(
                     "failed",
                     committed.usage.as_ref(),
@@ -637,7 +652,10 @@ async fn guarded_responses(
                     Some(&failure),
                     true,
                 )
-                .await;
+                .await
+            {
+                return error_response(&guard.settlement_error());
+            }
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
             }

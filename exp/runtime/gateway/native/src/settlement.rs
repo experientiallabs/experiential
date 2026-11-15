@@ -32,9 +32,9 @@ pub(crate) async fn settle_guarded_failure(
     committed: &mut CommittedAttempt,
     lease: &mut Option<OwnerLease>,
     failure: &Failure,
-) {
+) -> bool {
     let usage = committed.usage.clone();
-    guard
+    let settled = guard
         .settle(
             "failed",
             usage.as_ref(),
@@ -46,6 +46,7 @@ pub(crate) async fn settle_guarded_failure(
     if let Some(mut owner) = lease.take() {
         owner.abandon().await;
     }
+    settled
 }
 
 /// Format one wall-clock instant as an RFC 3339 / ISO 8601 UTC string with
@@ -224,7 +225,19 @@ async fn deliver(
             METRICS.record_settlement_retry();
         }
         match bridge.call(method, argument.clone()).await {
-            Ok(_) => return Ok(()),
+            Ok(reply) => {
+                let value: Value =
+                    crate::lossless_json::from_str(&reply).map_err(|_| PublicError::internal())?;
+                if value["terminalized"] != false {
+                    return Ok(());
+                }
+                last = PublicError::new(
+                    503,
+                    "accounting_unavailable",
+                    "Request accounting is awaiting durable acknowledgement. Retry later.",
+                    "server_error",
+                );
+            }
             Err(error) => last = error,
         }
     }
@@ -643,11 +656,11 @@ impl AttemptGuard {
     }
 
     /// Fail unreleased work without replacing a retained meter after delivery failure.
-    pub(crate) async fn fail_before_release(&mut self, failure: &Failure) {
+    pub(crate) async fn fail_before_release(&mut self, failure: &Failure) -> bool {
         if self.attempt_id.is_some() {
-            self.settle("failed", None, &[], Some(failure), true).await;
+            self.settle("failed", None, &[], Some(failure), true).await
         } else {
-            self.abandon(failure).await;
+            self.abandon(failure).await
         }
     }
 

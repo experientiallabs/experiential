@@ -1010,3 +1010,41 @@ async fn a_terminal_waits_while_the_durable_write_is_unacknowledged() {
     assert!(task.await.unwrap());
     assert_eq!(recorded_calls(&plane).len(), 1);
 }
+
+#[tokio::test]
+async fn an_explicitly_unacknowledged_abandon_is_retried_and_never_delivered() {
+    Python::initialize();
+    let plane = Python::attach(|py| {
+        pyo3::types::PyModule::from_code(py,
+            c"import json\nclass Plane:\n def __init__(self): self.calls = 0\n def abandon(self, argument):\n  self.calls += 1\n  return '{\"terminalized\":false}'\n def close_thread_resources(self, argument): return '{}'\n",
+            c"unacknowledged.py", c"unacknowledged")
+            .unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
+    });
+    let bridge = Arc::new(Bridge::scripted(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
+    let mut guard = AttemptGuard::new(
+        bridge,
+        Arc::new(AtomicUsize::new(0)),
+        "request".into(),
+        Instant::now(),
+    );
+    assert!(
+        !guard
+            .abandon(&Failure::new(
+                FailureClass::Guardrail,
+                "Input was rejected."
+            ))
+            .await
+    );
+    assert_eq!(guard.settlement_error().code, "accounting_unavailable");
+    Python::attach(|py| {
+        assert_eq!(
+            plane
+                .bind(py)
+                .getattr("calls")
+                .unwrap()
+                .extract::<u32>()
+                .unwrap(),
+            4
+        )
+    });
+}

@@ -413,7 +413,9 @@ pub(crate) async fn acquire_permit(
                 "gateway_draining" => FailureClass::Cancelled,
                 _ => FailureClass::Internal,
             };
-            guard.abandon(&Failure::new(class, &error.message)).await;
+            if !guard.abandon(&Failure::new(class, &error.message)).await {
+                return Err(Box::new(error_response(&guard.settlement_error())));
+            }
             Err(Box::new(error_response(&error)))
         }
         Err(_) => {
@@ -422,7 +424,9 @@ pub(crate) async fn acquire_permit(
                 "gateway execution queue deadline exceeded",
             );
             let error = failure.public_error();
-            guard.abandon(&failure).await;
+            if !guard.abandon(&failure).await {
+                return Err(Box::new(error_response(&guard.settlement_error())));
+            }
             Err(Box::new(error_response(&error)))
         }
     }

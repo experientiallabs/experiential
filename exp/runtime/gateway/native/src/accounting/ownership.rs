@@ -115,7 +115,7 @@ impl Owner {
         }
         if Instant::now() >= self.deadline {
             self.note_abandon(timeout(&self.request_id))?;
-            self.drain()?;
+            self.drain_acknowledged()?;
             return Ok(exhausted(&timeout(&self.request_id)));
         }
         let result = self.driver.call("start_attempt", &input);
@@ -126,7 +126,7 @@ impl Owner {
             }}))?;
             // An uncertain reservation is owned until cleanup is durable.
             // Preserve its original public error after successful cleanup.
-            self.drain()?;
+            self.drain_acknowledged()?;
             return result;
         }
         if let Some(refused) = result.as_ref().ok().and_then(|value| value.get("refused")) {
@@ -138,7 +138,7 @@ impl Owner {
             self.note_abandon(
                 json!({"request_id": self.request_id, "failure": refused["failure"]}),
             )?;
-            self.drain()?;
+            self.drain_acknowledged()?;
             return Err(error);
         }
         if Instant::now() >= self.deadline {
@@ -148,7 +148,7 @@ impl Owner {
         // A hold that completed late is closed before a dispatch can escape.
         let abandon = self.state()?.abandon.clone();
         if let Some(abandon) = abandon {
-            self.drain()?;
+            self.drain_acknowledged()?;
             return Ok(exhausted(&abandon));
         }
         if let Ok(value) = &result {
@@ -158,7 +158,7 @@ impl Owner {
                     "failure": value["failure"],
                     "certify_no_effects": value["certify_no_effects"] == true,
                 }))?;
-                let terminal = self.drain()?;
+                let terminal = self.drain_acknowledged()?;
                 let mut response = value.clone();
                 response["known_unbilled"] =
                     json!(terminal["terminalized"] == true && terminal["known_unbilled"] == true);
@@ -284,6 +284,14 @@ impl Owner {
         }
     }
 
+    fn drain_acknowledged(&self) -> Result<Value, PublicError> {
+        let result = self.drain()?;
+        if result["terminalized"] != true {
+            return Err(recovering());
+        }
+        Ok(result)
+    }
+
     /// Runs only while the caller owns the execution gate.
     fn drain(&self) -> Result<Value, PublicError> {
         let pending = {
@@ -319,6 +327,7 @@ impl Owner {
             // Evidence may arrive while a cancellation is writing. Keep that
             // evidence owned even if the host's cancellation already committed.
             if state.pending.is_some() {
+                state.failed_write = true;
                 return Ok(json!({"terminalized": false}));
             }
             state.finished = result["terminalized"].as_bool() == Some(true);
@@ -366,4 +375,98 @@ fn exhausted(abandon: &Value) -> Value {
     json!({"exhausted": true, "failure": abandon.get("failure").cloned().unwrap_or_else(|| json!({
         "failure_class": "cancelled", "safe_message": "gateway request was cancelled"
     }))})
+}
+
+#[cfg(test)]
+mod acknowledgement_race {
+    use super::*;
+    use std::sync::Condvar;
+
+    #[derive(Default)]
+    struct Gate {
+        state: Mutex<(bool, bool)>,
+        wake: Condvar,
+    }
+    impl Gate {
+        fn enter(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.0 = true;
+            self.wake.notify_all();
+            let end = Instant::now() + Duration::from_secs(5);
+            while !state.1 {
+                let remaining = end.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "fixture write was never released");
+                state = self.wake.wait_timeout(state, remaining).unwrap().0;
+            }
+        }
+        fn wait(&self) {
+            let mut state = self.state.lock().unwrap();
+            let end = Instant::now() + Duration::from_secs(5);
+            while !state.0 {
+                let remaining = end.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "fixture write never started");
+                state = self.wake.wait_timeout(state, remaining).unwrap().0;
+            }
+        }
+        fn release(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.wake.notify_all();
+        }
+    }
+    #[derive(Default)]
+    struct DriverGates {
+        abandon: Gate,
+        settle: Gate,
+    }
+    impl Driver for DriverGates {
+        fn call(&self, method: &str, _: &Value) -> Result<Value, PublicError> {
+            match method {
+                "abandon" => self.abandon.enter(),
+                "settle" => self.settle.enter(),
+                _ => panic!("unexpected fixture method"),
+            }
+            Ok(json!({"terminalized": true}))
+        }
+    }
+
+    #[test]
+    fn evidence_arriving_during_abandon_keeps_its_fence_until_written() {
+        let driver = Arc::new(DriverGates::default());
+        let owner = Owner::new(
+            "request".into(),
+            "org".into(),
+            Instant::now() + Duration::from_secs(60),
+            driver.clone(),
+        );
+        let cancel_owner = owner.clone();
+        let cancelling = std::thread::spawn(move || {
+            cancel_owner
+                .call("abandon", json!({"request_id": "request"}))
+                .unwrap()
+        });
+        driver.abandon.wait();
+        let settle_owner = owner.clone();
+        let settling =
+            std::thread::spawn(move || {
+                settle_owner.call("settle", json!({
+            "request_id": "request", "attempt_id": "attempt", "outcome": "completed",
+            "finalize": true, "usage": {"input_tokens": 37, "output_tokens": 5}
+        })).unwrap()
+            });
+        let end = Instant::now() + Duration::from_secs(5);
+        while owner.state().unwrap().pending.is_none() {
+            assert!(Instant::now() < end, "meter never reached the owner");
+            std::thread::yield_now();
+        }
+        driver.abandon.release();
+        driver.settle.wait();
+        let cancelled = cancelling.join().unwrap();
+        let fenced = owner.fenced();
+        driver.settle.release();
+        settling.join().unwrap();
+        assert_eq!(cancelled["terminalized"], false);
+        assert!(fenced, "a newer meter remains unacknowledged after abandon");
+        assert!(owner.retired());
+        assert!(!owner.fenced());
+    }
 }
