@@ -521,3 +521,11 @@ For a uniform optional-only input policy set, the native timer enforces the
 allowance without waiting for a Python status callback. The cap
 bounds optional inspection waiting; it does not waive strict checks, required
 capture, admission, or settlement work. Later tool contexts do not renew it.
+
+
+Optional enforcing inspections use a separate bounded isolation pool (at most 32
+workers, started on demand). Expiry retains an abandoned worker until it actually
+exits, but its quarantine and capacity cannot refuse a strict check using the
+same adapter. Native release expiry records each policy/check once, only when a
+required authenticated subject remains unchecked. Classifier outcomes arriving
+after that release cannot be reported as enforced actions or duplicate timeouts.

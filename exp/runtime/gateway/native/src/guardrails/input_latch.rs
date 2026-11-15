@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Notify;
 
@@ -40,7 +41,7 @@ pub(crate) struct InputLatch {
     started: OnceLock<Instant>,
     inspection: Mutex<Inspection>,
     release: Mutex<Release>,
-    capture: Option<DeferredCapture>,
+    capture: Mutex<Option<DeferredCapture>>,
     changed: Notify,
 }
 
@@ -84,6 +85,11 @@ impl InputLatch {
             *release = Release::Closed;
             self.changed.notify_waiters();
         }
+        drop(release);
+        self.capture
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 
     fn decision_json(&self) -> String {
@@ -135,16 +141,26 @@ impl InputLatch {
                 Release::Registering => return Err(super::input::unavailable()),
             }
         }
-        let mut began = false;
+        // Transfer the envelope once; the collector owns its bounded/spilled
+        // representation after registration, so the latch retains no copy.
+        let capture = self
+            .capture
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let mut began = None;
         let decision = match inspected {
             Inspection::Denied(failure) => Err(failure),
             Inspection::Allowed | Inspection::Expired => {
-                if let Some(capture) = &self.capture {
-                    began = crate::capture::python::begin_bytes(&capture.collector, &capture.bytes);
-                    if !began {
-                        Err(super::input::capture_unavailable())
-                    } else {
+                if let Some(capture) = capture {
+                    let registered =
+                        crate::capture::python::begin_bytes(&capture.collector, &capture.bytes);
+                    drop(capture.bytes);
+                    if registered {
+                        began = Some(capture.collector);
                         Ok(InputDecision::Allowed)
+                    } else {
+                        Err(super::input::capture_unavailable())
                     }
                 } else {
                     Ok(InputDecision::Allowed)
@@ -155,10 +171,8 @@ impl InputLatch {
         let mut release = self.release.lock().unwrap_or_else(|e| e.into_inner());
         if matches!(*release, Release::Closed) {
             drop(release);
-            if began {
-                if let Some(capture) = &self.capture {
-                    capture.collector.settle(&self.request_id, false, false);
-                }
+            if let Some(collector) = began {
+                collector.settle(&self.request_id, false, false);
             }
             return Ok(InputDecision::AdmissionClosed);
         }
@@ -190,9 +204,13 @@ impl PyOptionalInputDecision {
         }
         let capture = match (collector, capture_json) {
             (Some(collector), Some(bytes)) => {
-                let value: serde_json::Value = serde_json::from_slice(bytes)
+                #[derive(Deserialize)]
+                struct CaptureOwner {
+                    request_id: String,
+                }
+                let owner: CaptureOwner = serde_json::from_slice(bytes)
                     .map_err(|_| PyValueError::new_err("invalid deferred capture envelope"))?;
-                if value.get("request_id").and_then(|v| v.as_str()) != Some(request_id.as_str()) {
+                if owner.request_id != request_id {
                     return Err(PyValueError::new_err(
                         "deferred capture owner does not match",
                     ));
@@ -211,7 +229,7 @@ impl PyOptionalInputDecision {
                 started: OnceLock::new(),
                 inspection: Mutex::new(Inspection::Pending),
                 release: Mutex::new(Release::Pending),
-                capture,
+                capture: Mutex::new(capture),
                 changed: Notify::new(),
             }),
         })
@@ -266,8 +284,74 @@ mod tests {
             started: OnceLock::new(),
             inspection: Mutex::new(Inspection::Pending),
             release: Mutex::new(Release::Pending),
-            capture: None,
+            capture: Mutex::new(None),
             changed: Notify::new(),
+        }
+    }
+
+    fn captured_latch() -> InputLatch {
+        use crate::capture::delivery::Sink;
+        use crate::capture::record::Record;
+
+        struct DiscardSink;
+        impl Sink for DiscardSink {
+            type Prepared = ();
+            fn preparation_bytes(_: usize) -> usize {
+                0
+            }
+            fn prepare(&self, _: &Record, _: usize) -> Result<(), ()> {
+                Ok(())
+            }
+            fn write(&mut self, _: &()) -> Result<(), ()> {
+                Ok(())
+            }
+        }
+        let config = serde_json::from_value(json!({
+            "delivery": {"maximum_records":8,"maximum_bytes":65536,"maximum_record_bytes":8192},
+            "maximum_pending_records":4,"maximum_pending_bytes":65536,
+            "maximum_request_bytes":4096,"maximum_response_bytes":4096,
+            "ttl_seconds":30,"settlement_required":true
+        }))
+        .unwrap();
+        let input = latch();
+        *input.capture.lock().unwrap() = Some(DeferredCapture {
+            collector: Arc::new(Collector::new(config, DiscardSink).unwrap()),
+            bytes: serde_json::to_vec(&json!({
+                "request_id":"owned-request",
+                "scope":{"organization_id":"org","identity_id":"identity","application_id":"app"},
+                "protocol":"chat_completions","model_id":"model",
+                "context":{"schema_version":1,"request":{"messages":[{"role":"user","content":"task"}]}}
+            })).unwrap(),
+        });
+        input
+    }
+
+    #[tokio::test]
+    async fn deferred_envelope_is_released_after_registration_denial_or_close() {
+        for action in ["allow", "deny", "close"] {
+            let input = captured_latch();
+            let collector = input
+                .capture
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .collector
+                .clone();
+            if action == "close" {
+                input.close();
+            } else {
+                input.publish(if action == "allow" {
+                    Inspection::Allowed
+                } else {
+                    denial()
+                });
+                let decision = input.wait(Instant::now()).await;
+                assert_eq!(decision.is_ok(), action == "allow");
+            }
+            assert!(input.capture.lock().unwrap().is_none());
+            collector.settle("owned-request", false, false);
+            assert!(collector.close_until(Instant::now() + Duration::from_secs(1)));
         }
     }
 

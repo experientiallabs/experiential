@@ -24,7 +24,11 @@ from exp.runtime.gateway.guardrails.store_test import _authorization
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeControlPlane
-from exp.runtime.gateway.native_capture import CaptureConfiguration, CaptureController
+from exp.runtime.gateway.native_capture import (
+    CaptureConfiguration,
+    CaptureController,
+    CaptureDeliveryLimits,
+)
 from exp.runtime.gateway.native_capture_test import _request_json
 from exp.runtime.gateway.native_server import serve_native_gateway
 from exp.runtime.gateway.tests.launch_test import _unused_port
@@ -99,7 +103,9 @@ def _serving_with_capture(
         assert not worker.is_alive()
 
 
-@pytest.mark.parametrize("capture_mode", ["off", "on", "full"])
+@pytest.mark.parametrize(
+    "capture_mode", ["off", "on", "full", "hosted", "hosted-checkpoint-discard"]
+)
 def test_optional_release_survives_occupied_serving_pool_and_late_denial(
     tmp_path: Path, capture_mode: str
 ) -> None:
@@ -129,7 +135,15 @@ def test_optional_release_survives_occupied_serving_pool_and_late_denial(
         if capture_mode == "off"
         else exp_gateway_native.CaptureCollector(
             CaptureConfiguration(
-                settlement_required=False, maximum_pending_records=1
+                settlement_required=capture_mode.startswith("hosted"),
+                asynchronous_delivery=capture_mode.startswith("hosted"),
+                maximum_pending_records=1,
+                checkpoint_failure="discard",
+                delivery=(
+                    CaptureDeliveryLimits(maximum_record_bytes=1024, maximum_bytes=6400)
+                    if capture_mode == "hosted-checkpoint-discard"
+                    else CaptureDeliveryLimits()
+                ),
             ).model_dump_json(),
             records.append,
         )
@@ -147,6 +161,16 @@ def test_optional_release_survives_occupied_serving_pool_and_late_denial(
 
         blocked = 0
         block_lock = threading.Lock()
+
+        def settle(self, argument: str) -> str:
+            """Grant hosted retention only after the real ledger settles the request."""
+            result = super().settle(argument)
+            if capture_mode.startswith("hosted"):
+                import json
+
+                assert collector is not None
+                collector.settle(json.loads(argument)["request_id"], True, True)
+            return result
 
         def models(self, argument: str) -> str:
             """Occupy a serving worker until the response escapes its input gate."""
@@ -185,7 +209,13 @@ def test_optional_release_survives_occupied_serving_pool_and_late_denial(
                         headers={"authorization": f"Bearer {key}"},
                         json={
                             "model": "coding",
-                            "messages": [{"role": "user", "content": "synthetic"}],
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": "synthetic"
+                                    * (400 if capture_mode == "hosted-checkpoint-discard" else 1),
+                                }
+                            ],
                             "stream": True,
                             "max_tokens": 100,
                         },
@@ -247,4 +277,7 @@ def test_optional_release_survives_occupied_serving_pool_and_late_denial(
         engine.close(timeout_seconds=2)
         if collector is not None:
             assert collector.close(2)
-            assert len(records) == (1 if capture_mode == "on" else 0)
+            assert len(records) == {"on": 1, "hosted": 2}.get(capture_mode, 0)
+            assert collector.checkpoint_discarded() == (
+                1 if capture_mode == "hosted-checkpoint-discard" else 0
+            )

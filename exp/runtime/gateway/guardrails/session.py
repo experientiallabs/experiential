@@ -7,6 +7,7 @@ import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import TYPE_CHECKING
 
 from exp.common.core.artifacts import JsonObject
@@ -75,6 +76,8 @@ class GuardrailSession:
         _observed: Content-free subject identities and optional observation admission state.
         native_input: Optional native release capability shared with settlement.
         _native_expiry_recorded: Whether the native expiry has entered decision observations.
+        _input_pending_checks: Remaining authenticated subjects per optional policy/check.
+        _input_outcomes_lock: Serializes check completion against native expiry observation.
     """
 
     engine: GuardrailEngine
@@ -93,6 +96,10 @@ class GuardrailSession:
     _observed: ObservedSubjects = field(default_factory=ObservedSubjects, init=False, repr=False)
     native_input: OptionalInputDecision | None = field(default=None, init=False, repr=False)
     _native_expiry_recorded: bool = field(default=False, init=False, repr=False)
+    _input_pending_checks: dict[tuple[str, str], int] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _input_outcomes_lock: Lock = field(default_factory=Lock, init=False, repr=False)
 
     def optional_input_wait_ms(self) -> int | None:
         """Authorize native expiry only when every enforcing input check is optional."""
@@ -196,6 +203,30 @@ class GuardrailSession:
             if check.stage is stage
         )
 
+    def _finish_input_check(self, policy: GuardrailPolicy, *, expired: bool = False) -> None:
+        """Count each optional check once, preserving already completed coverage."""
+        if self.native_input is None:
+            if expired:
+                self.engine.record_input_expiry(policy)
+            return
+        with self._input_outcomes_lock:
+            remaining = tuple(
+                check
+                for check in policy.input_checks
+                if self._input_pending_checks.get((policy.policy_id, check.check_id), 1) > 0
+            )
+            for check in remaining:
+                key = (policy.policy_id, check.check_id)
+                self._input_pending_checks[key] = (
+                    0 if expired else self._input_pending_checks.get(key, 1) - 1
+                )
+        if expired and remaining:
+            self.engine.record_input_expiry(policy.model_copy(update={"checks": remaining}))
+
+    def _native_decision_current(self) -> bool:
+        """Keep late classifier outcomes from being reported as applied decisions."""
+        return self.native_input is None or not self.native_input.expired()
+
     async def _enforce_input(
         self, policy: GuardrailPolicy, request: GatewayRequest
     ) -> GatewayRequest:
@@ -222,6 +253,9 @@ class GuardrailSession:
                     request=request,
                     deadline_monotonic=self.deadline_monotonic,
                     request_id=self.request_id,
+                    decision_current=(
+                        self._native_decision_current if self.native_input is not None else None
+                    ),
                 )
             )
 
@@ -239,16 +273,18 @@ class GuardrailSession:
                 else:
                     elapsed = self.native_input.elapsed_seconds()
                     if elapsed is None or elapsed * 1000 < policy.input_max_wait_ms:
+                        self._finish_input_check(policy)
                         return result
-                self.engine.record_input_expiry(policy)
+                self._finish_input_check(policy, expired=True)
                 return request
             self._input_wait.begin(elapsed_seconds=elapsed)
         result = await self._input_wait.run(
             inspect, wait_ms=policy.input_max_wait_ms, deadline=self.deadline_monotonic
         )
         if result is None:
-            self.engine.record_input_expiry(policy)
+            self._finish_input_check(policy, expired=True)
             return request
+        self._finish_input_check(policy)
         return result
 
     async def _inspect_input(self, request: GatewayRequest) -> GatewayRequest:
@@ -293,6 +329,13 @@ class GuardrailSession:
         self._input_approved_at = None
         if not overlap:
             self.begin_input_wait()
+        if self.native_input is not None:
+            with self._input_outcomes_lock:
+                self._input_pending_checks = {
+                    (policy.policy_id, check.check_id): len(remaining)
+                    for policy in self.enforcing_policies
+                    for check in policy.input_checks
+                }
         self._input = start_on_native_loop(self._inspect_subjects(tuple(remaining)))
         if self.native_input is not None:
             self._input.add_done_callback(self._publish_native_input)
@@ -346,7 +389,7 @@ class GuardrailSession:
                     self._input.cancel()
                 for policy in self.enforcing_policies:
                     if policy.input_checks:
-                        self.engine.record_input_expiry(policy)
+                        self._finish_input_check(policy, expired=True)
             decision = json.loads(self.native_input.decision_json())
             if decision["action"] == "closed":
                 return {
