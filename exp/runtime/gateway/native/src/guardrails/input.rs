@@ -228,7 +228,15 @@ pub(crate) async fn prepare_response(
             }
             Err(failure) => {
                 committed.relay.close_transport();
-                let delivered = guard.fail_before_release(&failure.failure).await;
+                let delivered = guard
+                    .settle(
+                        "failed",
+                        committed.usage.as_ref(),
+                        &committed.tool_names,
+                        Some(&failure.failure),
+                        true,
+                    )
+                    .await;
                 return Won::Failed(if delivered {
                     failure.public_error()
                 } else {
@@ -243,7 +251,15 @@ pub(crate) async fn prepare_response(
         .and_then(InputDecision::require_allow)
     {
         committed.relay.close_transport();
-        let delivered = guard.fail_before_release(&failure.failure).await;
+        let delivered = guard
+            .settle(
+                "failed",
+                committed.usage.as_ref(),
+                &committed.tool_names,
+                Some(&failure.failure),
+                true,
+            )
+            .await;
         return Won::Failed(if delivered {
             failure.public_error()
         } else {

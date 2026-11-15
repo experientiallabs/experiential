@@ -144,6 +144,7 @@ impl Dispatch {
                 "attempt_id": id, "terminal": attempt.late_terminal}),
             )?;
             if method == "settle" {
+                crate::settlement::acknowledged(method, &result)?;
                 attempt.result = Some(result.clone());
             }
             return Ok(result);
@@ -197,6 +198,7 @@ impl Dispatch {
         if method == "price" {
             return Ok(result);
         }
+        crate::settlement::acknowledged(method, &result)?;
         self.resources.settled(&self.config.request_id, &result);
         if !attempt.recovery_recorded {
             if let (Some(recovery), Some(observed), Some(key)) = (

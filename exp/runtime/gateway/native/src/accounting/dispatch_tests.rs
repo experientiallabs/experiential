@@ -204,13 +204,13 @@ fn exhausted_requests_keep_their_terminal_until_cleanup_is_acknowledged() {
         None,
         shared.now(),
     );
-    let exhausted = owner
+    let error = owner
         .call(
             "start_attempt",
             json!({"request_id": "request", "attempt_ordinal": 0}),
         )
-        .unwrap();
-    assert_eq!(exhausted["exhausted"], true);
+        .unwrap_err();
+    assert_eq!(error.code, "accounting_unavailable");
     assert!(!owner.retired());
     assert!(owner.fenced());
     assert!(owner.needs_recovery(Instant::now()));

@@ -517,6 +517,64 @@ def test_buffered_response_keeps_inspection_live_after_first_provider_content(
                 case.moderator.release.set()
 
 
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("tool", [False, True])
+def test_denied_buffered_answer_keeps_completed_provider_meter(
+    tmp_path: Path, surface: str, tool: bool
+) -> None:
+    """A verdict after provider completion waives the charge but keeps observed work."""
+    with _scenario(tmp_path, blocked=True, tool=tool, wait_ms=3000) as case:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            response = executor.submit(case.request, surface, stream=False, tool=tool)
+            try:
+                assert case.provider.started.wait(2)
+                assert case.moderator.started.wait(2)
+                case.provider.release.set()
+                assert case.provider.finished.wait(2)
+                time.sleep(0.1)
+                assert not response.done()
+                case.moderator.release.set()
+                result = response.result(timeout=2)
+                assert result.status_code == 400, result.text
+                assert "provider-marker" not in result.text
+                with connect_sqlite(case.database) as db:
+                    row = db.execute(
+                        "SELECT state, input_tokens, output_tokens, budget_settled_nano_usd "
+                        "FROM gateway_attempts"
+                    ).fetchone()
+                assert row is not None and row[0] == "failed"
+                assert row[1] > 0 and row[2] > 0
+                assert row[3] == 0
+            finally:
+                case.moderator.release.set()
+
+
+def test_input_denial_reports_failed_terminal_write(tmp_path: Path) -> None:
+    """A failed durable refusal is an accounting error until recovery can write it."""
+    with _scenario(tmp_path, blocked=True, wait_ms=3000) as case:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            response = executor.submit(case.request, stream=False)
+            try:
+                assert case.provider.started.wait(2)
+                assert case.moderator.started.wait(2)
+                with connect_sqlite(case.database) as db:
+                    db.execute(
+                        "CREATE TRIGGER deny_terminal BEFORE UPDATE OF state ON gateway_attempts "
+                        "WHEN NEW.state='failed' BEGIN "
+                        "SELECT RAISE(ABORT, 'synthetic terminal unavailability'); END"
+                    )
+                case.moderator.release.set()
+                result = response.result(timeout=5)
+                assert result.status_code >= 500, result.text
+                assert result.json()["error"]["code"] != "content_filter"
+                assert "provider-marker" not in result.text
+            finally:
+                with connect_sqlite(case.database) as db:
+                    db.execute("DROP TRIGGER IF EXISTS deny_terminal")
+                case.provider.release.set()
+                case.moderator.release.set()
+
+
 @pytest.mark.parametrize("wait_ms", [0, 100])
 def test_retry_does_not_start_response_grace_before_an_answer_is_ready(
     tmp_path: Path, wait_ms: int

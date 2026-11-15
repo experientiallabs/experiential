@@ -349,9 +349,12 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 FailureClass::Internal,
                 "gateway attempt wire contract failed",
             );
-            guard
+            if !guard
                 .settle("failed", None, &[], Some(&failure), true)
-                .await;
+                .await
+            {
+                return Won::Failed(guard.settlement_error());
+            }
             return Won::Failed(PublicError::internal());
         };
         if !fallback_rules::dial_admitted(wire, current_depth, depth, last_failure.as_ref()) {
@@ -364,9 +367,12 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 FailureClass::Internal,
                 "gateway attempt wire contract failed: failover-only rung reserved outside its rules",
             );
-            guard
+            if !guard
                 .settle("failed", None, &[], Some(&failure), true)
-                .await;
+                .await
+            {
+                return Won::Failed(guard.settlement_error());
+            }
             return Won::Failed(PublicError::internal());
         }
         if current_depth == Some(depth) && !search_redial {
@@ -378,9 +384,12 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 FailureClass::Internal,
                 "gateway reserved beyond the request attempt budget",
             );
-            guard
+            if !guard
                 .settle("failed", None, &[], Some(&failure), true)
-                .await;
+                .await
+            {
+                return Won::Failed(guard.settlement_error());
+            }
             return Won::Failed(PublicError::internal());
         }
         total_attempts += 1;
@@ -418,8 +427,11 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
             Ok(end) => end,
             Err(failure) => {
                 // The dropped generation closes its transport before durable settlement.
-                guard.fail_before_release(&failure.failure).await;
-                return Won::Failed(failure.public_error());
+                return Won::Failed(if guard.fail_before_release(&failure.failure).await {
+                    failure.public_error()
+                } else {
+                    guard.settlement_error()
+                });
             }
         };
         // A settled answer is complete. Committed answers reach the surface's
@@ -431,8 +443,11 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                     .await
                     .and_then(|decision| decision.require_allow())
                 {
-                    guard.fail_before_release(&failure.failure).await;
-                    return Won::Failed(failure.public_error());
+                    return Won::Failed(if guard.fail_before_release(&failure.failure).await {
+                        failure.public_error()
+                    } else {
+                        guard.settlement_error()
+                    });
                 }
             }
         }
@@ -485,9 +500,12 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                     } else {
                         search_round::budget_exhausted()
                     };
-                    guard
+                    if !guard
                         .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
-                        .await;
+                        .await
+                    {
+                        return Won::Failed(guard.settlement_error());
+                    }
                     return Won::Failed(if failure.failure_class == FailureClass::Internal {
                         PublicError::internal()
                     } else {
@@ -628,8 +646,13 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                             .await
                             .and_then(|decision| decision.require_allow())
                         {
-                            guard.fail_before_release(&failure.failure).await;
-                            return Won::Failed(failure.public_error());
+                            return Won::Failed(
+                                if guard.fail_before_release(&failure.failure).await {
+                                    failure.public_error()
+                                } else {
+                                    guard.settlement_error()
+                                },
+                            );
                         }
                     }
                 }

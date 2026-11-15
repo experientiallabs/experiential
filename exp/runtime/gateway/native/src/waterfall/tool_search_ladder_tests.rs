@@ -106,7 +106,7 @@ class Plane:
     def abandon(self, argument):
         with self.lock:
             self.abandons.append(json.loads(argument))
-        return "{}"
+        return '{"terminalized":true}'
 
     def dump(self, argument):
         with self.lock:
