@@ -136,6 +136,7 @@ from exp.runtime.gateway.recovery_binding import validated_recovery_binding
 from exp.runtime.gateway.request_policy import attempt_policy
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
+from exp.runtime.gateway.surfaces import reasoning_carrier_parameter
 from exp.runtime.gateway.tool_search.plan import plan_tool_search
 from exp.runtime.gateway.web_search.backend import WebSearchBackend, default_web_search_backend
 from exp.runtime.gateway.web_search.plan import plan_web_search
@@ -361,9 +362,9 @@ class NativeControlPlane(
             raise NativeBridgeError(invalid_field(exc.param, str(exc))) from exc
         except Exception as exc:  # noqa: BLE001 - one public shape prevents an oracle.
             log_reasoning_continuation_rejection(authorization, "authenticate", exc)
+            carrier = reasoning_carrier_parameter(request.surface)
             error = invalid_field(
-                "messages.reasoning_content",
-                "'messages.reasoning_content' must be an authentic continuation for this route.",
+                carrier, f"'{carrier}' must be an authentic continuation for this route."
             )
             raise NativeBridgeError(error) from exc
 
@@ -393,9 +394,9 @@ class NativeControlPlane(
             raise NativeBridgeError(invalid_field(exc.param, str(exc))) from exc
         except Exception as exc:  # noqa: BLE001 - one public shape prevents an oracle.
             log_reasoning_continuation_rejection(authorization, "unseal", exc)
+            carrier = reasoning_carrier_parameter(request.surface)
             error = invalid_field(
-                "messages.reasoning_content",
-                "'messages.reasoning_content' must be an authentic continuation for this route.",
+                carrier, f"'{carrier}' must be an authentic continuation for this route."
             )
             raise NativeBridgeError(error) from exc
         if (
@@ -599,9 +600,8 @@ class NativeControlPlane(
                 route.deployments, resolved_wires, redial_budgets, strict=True
             ):
                 # A reasoning-pinned route's fallback rung is frozen WITHOUT the
-                # pinned provider's sealed reasoning (it cannot unseal it), so a
-                # failover past the issuing rung dispatches the conversation
-                # minus that turn's thinking, never a foreign sealed block.
+                # pinned provider's sealed reasoning (it cannot unseal it): a failover
+                # past the issuer dispatches minus that turn's thinking.
                 dispatch = build_rung_dispatch(
                     route,
                     deployment,
@@ -663,6 +663,7 @@ class NativeControlPlane(
                     public_stream=public_request.stream,
                     public_tools=bool(public_request.tools),
                     developer_messages_param=decoded.developer_messages_param,
+                    structured_text_param=provider_request.structured_text_parameter,
                 )
                 # The ledger keeps the generic sentence, but a bare "cannot
                 # preserve a requested capability" is untriageable from an
@@ -687,9 +688,8 @@ class NativeControlPlane(
             )
             raise NativeBridgeError(public_error) from exc
         except GatewayRoutingError as exc:
-            # A route/catalog that cannot be built during a rolling deploy is a
-            # transient control-plane condition, not a bug: record it retryable
-            # so it never pages as INTERNAL. The public error is already a 503.
+            # A route/catalog unavailable mid-deploy is transient, not a bug:
+            # retryable, never paged as INTERNAL. The public error is already a 503.
             failure = gateway_updating_failure()
             self._accounting.finish_request_quietly(
                 authorization, failure, web_search_requests=int(web_search_admission is not None)
@@ -905,9 +905,8 @@ class NativeControlPlane(
             client_request_id=optional_text(data.get("client_request_id")),
         )
         request = decoded.request
-        # Only the standard Idempotency-Key names a retriable operation;
-        # client_request_id is a session correlation id real callers reuse
-        # across distinct requests, so it never keys replay.
+        # Only Idempotency-Key names a retriable operation; client_request_id is a
+        # session correlation id reused across distinct requests, never a replay key.
         caller_operation = request.idempotency_key
         if caller_operation is None:
             raise NativeBridgeError(

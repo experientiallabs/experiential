@@ -206,11 +206,21 @@ def public_capability_error(
     public_stream: bool,
     public_tools: bool,
     developer_messages_param: str | None = None,
+    structured_text_param: str | None = None,
 ) -> OpenAIProtocolError:
-    """Translate one internal admission label into a stable public 400."""
+    """Translate one internal admission label into a stable public 400.
+
+    ``developer_messages_param`` and ``structured_text_param`` are the caller's
+    recorded spellings, which win over the surface default for their capability.
+    """
+    recorded = {
+        "developer_messages": developer_messages_param,
+        "structured_text": structured_text_param,
+        "structured_output": structured_text_param,
+    }.get(error.capability)
     param = (
-        developer_messages_param
-        if error.capability == "developer_messages" and developer_messages_param is not None
+        recorded
+        if recorded is not None
         else capability_param(
             error.capability,
             surface,

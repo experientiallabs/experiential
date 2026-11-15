@@ -1,8 +1,7 @@
-//! The native Gemini API surface: `POST /v1beta/models/{model}:generateContent`
-//! and `:streamGenerateContent?alt=sse`, the `:countTokens` estimate, the
-//! Google-shaped model listing, and Google's error envelope. Google defines no
-//! idempotency header, so this surface never joins the keyed replay stores,
-//! exactly like the Anthropic Messages surface.
+//! The native Gemini API surface: `POST /v1beta/models/{model}:generateContent`,
+//! `:streamGenerateContent?alt=sse`, `:countTokens`, the Google-shaped model
+//! listing and Google's error envelope. Google defines no idempotency header,
+//! so this surface never joins the keyed replay stores (like Messages).
 
 use crate::guardrails::input::acquire_guarded_attempt;
 use std::sync::atomic::Ordering;
@@ -35,7 +34,7 @@ use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::respond::{
     bearer_key, client_ip, complete_visible_refusal, escalation_error, json_response,
     outward_event, price_stream_end, read_body, send_bounded, settle_stream_end, sse_body_response,
-    with_app_identity,
+    stream_outcome, with_app_identity, StreamOutcome,
 };
 use crate::respond::{log_stream_exit, stream_delivery::Delivery};
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
@@ -105,9 +104,8 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
-/// Google callers present `x-goog-api-key` (the official SDK default), the
-/// `?key=` query parameter (the REST convention), or a standard Bearer
-/// header; all three carry the same virtual key.
+/// `x-goog-api-key` (the SDK default), `?key=` (the REST convention) or a
+/// Bearer header; all three carry the same virtual key.
 pub(crate) fn generate_content_api_key(
     headers: &HeaderMap,
     uri: &Uri,
@@ -134,8 +132,7 @@ pub(crate) fn generate_content_api_key(
     })
 }
 
-/// Split Google's `{model}:{action}` path segment; a segment with no action
-/// is a model name alone (the detail read).
+/// Split Google's `{model}:{action}` segment; no action means a model name alone.
 fn split_action(segment: &str) -> (String, Option<String>) {
     match segment.rsplit_once(':') {
         Some((model, action)) if !action.is_empty() && !model.is_empty() => {
@@ -206,8 +203,7 @@ pub(crate) async fn generate_content_model_action(
     request: axum::extract::Request,
 ) -> Response {
     if request.method() == axum::http::Method::GET {
-        // GET has no action form, so a colon belongs to the alias itself
-        // (`coding:free` is one granted spelling, not an action on `coding`).
+        // GET has no action form: a colon belongs to the alias (`coding:free`).
         return model_detail(state, segment, request).await;
     }
     let (model, action) = split_action(&segment);
@@ -257,9 +253,8 @@ async fn model_detail(state: AppState, model: String, request: axum::extract::Re
     }
 }
 
-/// `:countTokens`: the gateway's own count in Google's `{"totalTokens": N}`
-/// shape, authenticated and granted like a generation but never accepted,
-/// reserved or charged.
+/// `:countTokens`: the gateway's own count as `{"totalTokens": N}`,
+/// authenticated and granted like a generation but never accepted or charged.
 async fn count_tokens(state: AppState, model: String, request: axum::extract::Request) -> Response {
     state.handled_requests.fetch_add(1, Ordering::Relaxed);
     let (parts, raw_body) = request.into_parts();
@@ -524,8 +519,7 @@ async fn settled_response(admission: &Admission, settled: SettledAttempt) -> Res
     }
 }
 
-/// Aggregate one committed non-streaming or guarded attempt and answer it,
-/// settling exactly once.
+/// Aggregate one committed non-streaming or guarded attempt; settles exactly once.
 #[allow(clippy::too_many_arguments)]
 async fn respond_from_events(
     admission: Admission,
@@ -595,9 +589,8 @@ async fn respond_from_events(
             billed_empty_completion(terminal, usage) || unreported_empty_completion(terminal, usage)
         });
     let settled = if empty_completion {
-        // The committed rung closed the turn with nothing this surface can
-        // render: a typed 200 under `x-gateway-warning: empty_completion`,
-        // the typed `empty_completion` failure in the ledger at $0.
+        // Nothing renderable: a typed 200 under `x-gateway-warning:
+        // empty_completion`, the typed failure in the ledger at $0.
         guard
             .settle(
                 "failed",
@@ -883,30 +876,38 @@ async fn stream_response(
                     }
                 }
                 terminal = Some(event.clone());
-                let settled = if empty_completion {
-                    guard
-                        .price_or_settle(
-                            "failed",
-                            usage.as_ref(),
-                            &tool_names,
-                            Some(&Failure::empty_completion()),
-                        )
-                        .await
-                } else if encoder.refusal_seen() && !matches!(event, Event::Failed(_)) {
-                    // A refusal the provider closed with a plain stop has no
-                    // part on this surface: the encoder answers Google's error
-                    // frame, so the ledger records the typed refusal, exactly
-                    // as the non-streaming aggregate settles it.
-                    guard
-                        .price_or_settle(
-                            "failed",
-                            usage.as_ref(),
-                            &tool_names,
-                            Some(&refusal_failure().boundary()),
-                        )
-                        .await
-                } else {
-                    price_stream_end(&mut guard, &event, usage.as_ref(), &tool_names).await
+                let outcome = stream_outcome(
+                    &event,
+                    visible_refusal || encoder.refusal_seen(),
+                    &outward_events,
+                    empty_completion,
+                );
+                let settled = match outcome {
+                    StreamOutcome::Refusal => {
+                        // No refusal part on this surface: the encoder answers Google's
+                        // error frame and the ledger records the typed refusal.
+                        guard
+                            .price_or_settle(
+                                "failed",
+                                usage.as_ref(),
+                                &tool_names,
+                                Some(&refusal_failure().boundary()),
+                            )
+                            .await
+                    }
+                    StreamOutcome::EmptyCompletion => {
+                        guard
+                            .price_or_settle(
+                                "failed",
+                                usage.as_ref(),
+                                &tool_names,
+                                Some(&Failure::empty_completion()),
+                            )
+                            .await
+                    }
+                    StreamOutcome::Terminal => {
+                        price_stream_end(&mut guard, &event, usage.as_ref(), &tool_names).await
+                    }
                 };
                 if !settled {
                     log_stream_exit(&request_id, "settlement_unavailable");

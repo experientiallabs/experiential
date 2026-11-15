@@ -66,11 +66,11 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
+from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.native_execution import select_route_deployments
 from exp.runtime.gateway.native_fallback_rules import rung_rules
 from exp.runtime.gateway.routing import GatewayRoute
-from exp.runtime.gateway.surfaces import prompt_parameter
+from exp.runtime.gateway.surfaces import default_structured_text_parameter, prompt_parameter
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.generation_parameter_validation import (
@@ -381,7 +381,10 @@ def narrow_to_capable_rungs(
                 for index, deployment in enumerate(route.deployments)
                 if serves_structured_output(deployment)
             ),
-            ("text.format" if request.surface == GatewayApiSurface.RESPONSES else "response_format")
+            (
+                request.structured_text_parameter
+                or default_structured_text_parameter(request.surface)
+            )
             + STRUCTURED_OUTPUT_RUNG_SUFFIX,
             disclosures,
         )
