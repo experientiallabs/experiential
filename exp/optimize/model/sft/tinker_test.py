@@ -34,6 +34,64 @@ if TYPE_CHECKING:
 _DIGEST = "a" * 64
 
 
+class _CharacterTokenizer:
+    """Tokenize locally so real cookbook renderer tests require no model download."""
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        """Represent each character as its Unicode code point."""
+        return [ord(character) for character in text]
+
+    def decode(self, tokens: list[int]) -> str:
+        """Recover the text passed to the renderer."""
+        return "".join(chr(token) for token in tokens)
+
+
+def test_real_cookbook_renderer_accepts_history_and_target_tool_calls() -> None:
+    """Tool-using W12 examples render into supervised data with the real Qwen renderer."""
+    from tinker_cookbook.renderers import get_renderer
+    from tinker_cookbook.tokenizer_utils import Tokenizer
+
+    tokenizer = _CharacterTokenizer()
+    renderer = get_renderer("qwen3", cast("Tokenizer", tokenizer), model_name="Qwen/Qwen3-8B")
+    session = TinkerTrainerSession(
+        client=cast("tinker.TrainingClient", _TrainingClient()),
+        renderer=renderer,
+        spec=_spec().model_copy(update={"maximum_datum_tokens": 4096}),
+    )
+
+    (datum,) = session.render_examples((_example(),))
+
+    assert isinstance(datum, TinkerSFTDatum)
+    rendered = tokenizer.decode(datum.datum.model_input.to_ints())
+    assert datum.supervised_token_count > 0
+    assert "lookup_account" in rendered
+    assert "send_confirmation" in rendered
+    assert "<tool_call>" in rendered
+
+
+def test_renderer_failure_identifies_the_example_without_echoing_its_content() -> None:
+    """Rendering failures use the SFT error contract and retain the original cause."""
+
+    class BrokenRenderer:
+        """Reject a local example with a content-bearing dependency error."""
+
+        def build_supervised_example(
+            self, conversation: list[TinkerConversationMessage], train_on_what: TrainOnWhat
+        ) -> tuple[tinker.ModelInput, torch.Tensor]:
+            """Simulate an incompatible renderer without any remote execution."""
+            raise ValueError("private-example-content")
+
+    session = TinkerTrainerSession(
+        client=cast("tinker.TrainingClient", _TrainingClient()),
+        renderer=cast("Renderer", BrokenRenderer()),
+        spec=_spec(),
+    )
+    with pytest.raises(TinkerSFTError, match="example-tinker.*before retrying") as failure:
+        session.render_examples((_example(),))
+    assert "private-example-content" not in str(failure.value)
+    assert isinstance(failure.value.__cause__, ValueError)
+
+
 def _spec() -> TinkerSFTSpec:
     """Build one compact concrete Tinker specification for local adapter tests."""
     return TinkerSFTSpec(
@@ -95,9 +153,19 @@ def _example() -> SFTExample:
 
 def test_messages_preserve_complete_target_action_and_tool_context() -> None:
     """The cookbook conversation retains every target and historical tool field in order."""
+    from tinker_cookbook.renderers import ToolCall as CookbookToolCall
+
     messages = tinker_messages_from_example(_example())
 
-    assert messages == [
+    serialized = []
+    for message in messages:
+        payload = dict(message)
+        if "tool_calls" in message:
+            assert all(isinstance(call, CookbookToolCall) for call in message["tool_calls"])
+            payload["tool_calls"] = [call.model_dump() for call in message["tool_calls"]]
+        serialized.append(payload)
+
+    assert serialized == [
         {"role": "system", "content": "Task:\nResolve an account request."},
         {"role": "system", "content": "Follow the support policy."},
         {"role": "user", "content": "Please inspect my account."},
@@ -157,9 +225,7 @@ def test_messages_canonicalize_provider_tool_argument_formatting() -> None:
 
     messages = tinker_messages_from_example(example.model_copy(update={"target": target}))
 
-    assert messages[-1]["tool_calls"][0]["function"]["arguments"] == (
-        '{"channel":"email","priority":1}'
-    )
+    assert messages[-1]["tool_calls"][0].function.arguments == ('{"channel":"email","priority":1}')
 
 
 class _DatumRenderer:
