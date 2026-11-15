@@ -205,6 +205,28 @@ fn settle_argument(
     compact_json(&argument)
 }
 
+/// Validate the acknowledgement before retiring any retained accounting evidence.
+pub(crate) fn acknowledged(method: &str, reply: &Value) -> Result<(), PublicError> {
+    let valid = reply.is_object()
+        && if method == "abandon" {
+            reply["terminalized"] == true
+        } else {
+            reply
+                .get("terminalized")
+                .is_none_or(|value| value == &json!(true))
+        };
+    if valid {
+        Ok(())
+    } else {
+        Err(PublicError::new(
+            503,
+            "accounting_unavailable",
+            "Request accounting is awaiting durable acknowledgement. Retry later.",
+            "server_error",
+        ))
+    }
+}
+
 /// Deliver one control-plane write with bounded backoff; the control plane
 /// keeps the in-flight entry on a failed terminal write, so retries can
 /// still land. A persistent failure fences only the owning organization's
@@ -226,17 +248,11 @@ async fn deliver(
         }
         match bridge.call(method, argument.clone()).await {
             Ok(reply) => {
-                let value: Value =
-                    crate::lossless_json::from_str(&reply).map_err(|_| PublicError::internal())?;
-                if value["terminalized"] != false {
-                    return Ok(());
+                let value: Value = crate::lossless_json::from_str(&reply).unwrap_or(Value::Null);
+                match acknowledged(method, &value) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => last = error,
                 }
-                last = PublicError::new(
-                    503,
-                    "accounting_unavailable",
-                    "Request accounting is awaiting durable acknowledgement. Retry later.",
-                    "server_error",
-                );
             }
             Err(error) => last = error,
         }

@@ -196,12 +196,15 @@ pub(crate) async fn responses(
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
         }
-        guard
+        if !guard
             .abandon(&Failure::new(
                 FailureClass::Internal,
                 "the alias revision changed during keyed admission",
             ))
-            .await;
+            .await
+        {
+            return error_response(&guard.settlement_error());
+        }
         let mut error = PublicError::new(
             409,
             "idempotency_replay_unavailable",
@@ -481,6 +484,13 @@ async fn respond_from_responses_events(
             )
             .await
     };
+    if !settled {
+        // Success is only reported once the terminal accounting write landed.
+        if let Some(mut owner) = lease.take() {
+            owner.abandon().await;
+        }
+        return error_response(&guard.settlement_error());
+    }
     if let Err(error) = remembered {
         // The provider outcome already settled above, exactly like the python
         // executor; only the HTTP result reports the retention failure.
@@ -488,13 +498,6 @@ async fn respond_from_responses_events(
             owner.abandon().await;
         }
         return error_response(&error);
-    }
-    if !settled {
-        // Success is only reported once the terminal accounting write landed.
-        if let Some(mut owner) = lease.take() {
-            owner.abandon().await;
-        }
-        return error_response(&guard.settlement_error());
     }
     let headers = served_headers(&admission, client_request_id.as_deref(), served);
     if stream_body {

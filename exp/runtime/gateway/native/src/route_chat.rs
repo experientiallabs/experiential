@@ -186,12 +186,15 @@ pub(crate) async fn chat(
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
         }
-        guard
+        if !guard
             .abandon(&Failure::new(
                 FailureClass::Internal,
                 "the alias revision changed during keyed admission",
             ))
-            .await;
+            .await
+        {
+            return error_response(&guard.settlement_error());
+        }
         let mut error = PublicError::new(
             409,
             "idempotency_replay_unavailable",

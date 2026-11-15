@@ -46,7 +46,7 @@ fn serialized_failure_cannot_invent_a_graceful_retirement_hint() {
 async fn denied_input_retry_keeps_the_meter_without_abandoning_the_attempt() {
     Python::initialize();
     let plane = Python::attach(|py| {
-        pyo3::types::PyModule::from_code(py, c"import json\nclass Plane:\n def __init__(self): self.writes = []; self.abandons = []\n def settle(self, argument):\n  self.writes.append(json.loads(argument))\n  raise RuntimeError('temporary ledger failure')\n def abandon(self, argument):\n  self.abandons.append(json.loads(argument))\n  return '{}'\n def close_thread_resources(self, argument): return '{}'\n", c"retry_input_plane.py", c"retry_input_plane")
+        pyo3::types::PyModule::from_code(py, c"import json\nclass Plane:\n def __init__(self): self.writes = []; self.abandons = []\n def settle(self, argument):\n  self.writes.append(json.loads(argument))\n  raise RuntimeError('temporary ledger failure')\n def abandon(self, argument):\n  self.abandons.append(json.loads(argument))\n  return '{\"terminalized\":true}'\n def close_thread_resources(self, argument): return '{}'\n", c"retry_input_plane.py", c"retry_input_plane")
             .unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
     });
     let bridge = Arc::new(Bridge::scripted(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
@@ -1047,4 +1047,21 @@ async fn an_explicitly_unacknowledged_abandon_is_retried_and_never_delivered() {
             4
         )
     });
+}
+
+#[test]
+fn acknowledgement_requires_a_typed_write_result() {
+    for value in [
+        Value::Null,
+        json!([]),
+        json!(true),
+        json!({"terminalized": false}),
+        json!({"terminalized": null}),
+    ] {
+        assert!(acknowledged("settle", &value).is_err());
+        assert!(acknowledged("abandon", &value).is_err());
+    }
+    assert!(acknowledged("abandon", &json!({})).is_err());
+    assert!(acknowledged("abandon", &json!({"terminalized": true})).is_ok());
+    assert!(acknowledged("settle", &json!({})).is_ok());
 }

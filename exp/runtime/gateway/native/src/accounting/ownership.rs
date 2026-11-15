@@ -98,7 +98,7 @@ impl Owner {
             "abandon" => self.abandon(input),
             // Other native operations keep their own resource locks; they may
             // never execute a Python callback or replace terminal evidence.
-            _ => self.driver.call(method, &input),
+            _ => self.write(method, &input),
         }
     }
 
@@ -199,6 +199,14 @@ impl Owner {
         Ok(Some(pending))
     }
 
+    fn write(&self, method: &str, input: &Value) -> Result<Value, PublicError> {
+        let reply = self.driver.call(method, input)?;
+        if method != "price" {
+            crate::settlement::acknowledged(method, &reply)?;
+        }
+        Ok(reply)
+    }
+
     fn terminal(&self, method: &str, input: Value) -> Result<Value, PublicError> {
         let Some(pending) = self.observe(input.clone())? else {
             // A meter that arrives after recovery finished the request is still
@@ -206,7 +214,7 @@ impl Owner {
             // cancelled one records the late meter, so served usage stays billed.
             // A failed delivery stays owned until recovery writes it.
             let _execution = self.execution.lock().map_err(|_| PublicError::internal())?;
-            let result = self.driver.call(method, &input);
+            let result = self.write(method, &input);
             let mut state = self.state()?;
             if result.is_err() {
                 state.late.get_or_insert(input);
@@ -224,7 +232,7 @@ impl Owner {
             let state = self.state()?;
             if state.finished {
                 drop(state);
-                return self.driver.call(method, &input);
+                return self.write(method, &input);
             }
             if !state
                 .pending
@@ -234,7 +242,7 @@ impl Owner {
                 return Ok(json!({}));
             }
         }
-        let result = self.driver.call(method, &pending);
+        let result = self.write(method, &pending);
         if method == "price" {
             // A successful quote retry waits for delivery, but cannot acknowledge
             // a failed committing write. Keep the original meter in either case.
@@ -301,7 +309,7 @@ impl Owner {
                 drop(state);
                 // Recovery and shutdown both deliver a retained late meter.
                 if let Some(late) = late {
-                    self.driver.call("settle", &late)?;
+                    self.write("settle", &late)?;
                     self.state()?.late = None;
                 }
                 return Ok(json!({"terminalized": true}));
@@ -309,7 +317,7 @@ impl Owner {
             state.pending.clone()
         };
         if let Some(pending) = pending {
-            let result = self.driver.call("settle", &pending);
+            let result = self.write("settle", &pending);
             self.committed(&pending, &result)?;
             result?;
         }
@@ -466,6 +474,44 @@ mod acknowledgement_race {
         settling.join().unwrap();
         assert_eq!(cancelled["terminalized"], false);
         assert!(fenced, "a newer meter remains unacknowledged after abandon");
+        assert!(owner.retired());
+        assert!(!owner.fenced());
+    }
+}
+
+#[cfg(test)]
+mod acknowledgement_contract {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Default)]
+    struct PendingWrite(AtomicBool);
+    impl Driver for PendingWrite {
+        fn call(&self, method: &str, _: &Value) -> Result<Value, PublicError> {
+            assert_eq!(method, "settle");
+            Ok(json!({"terminalized": self.0.load(Ordering::SeqCst)}))
+        }
+    }
+
+    #[test]
+    fn a_pending_settlement_keeps_the_meter_owned_until_acknowledged() {
+        let driver = Arc::new(PendingWrite::default());
+        let owner = Owner::new(
+            "request".into(),
+            "org".into(),
+            Instant::now() + Duration::from_secs(60),
+            driver.clone(),
+        );
+        let meter = json!({"request_id":"request", "attempt_id":"attempt", "outcome":"completed", "finalize":true, "usage":{"input_tokens":37,"output_tokens":5}});
+        assert_eq!(
+            owner.call("settle", meter.clone()).unwrap_err().code,
+            "accounting_unavailable"
+        );
+        assert!(owner.fenced());
+        assert!(!owner.retired());
+        assert_eq!(owner.state().unwrap().pending.as_deref(), Some(&meter));
+        driver.0.store(true, Ordering::SeqCst);
+        owner.call("settle", meter).unwrap();
         assert!(owner.retired());
         assert!(!owner.fenced());
     }
