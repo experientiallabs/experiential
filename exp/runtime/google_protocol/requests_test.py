@@ -6,7 +6,12 @@ import pytest
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.content import AudioContentPart, DocumentContentPart, TextContentPart
+from exp.common.models.content import (
+    AudioContentPart,
+    DocumentContentPart,
+    TextContentPart,
+    VideoContentPart,
+)
 from exp.runtime.gateway.contracts import GatewayApiSurface
 from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice, GatewayNamedToolChoice
 from exp.runtime.google_protocol.requests import (
@@ -256,7 +261,13 @@ def test_gemini_audio_spellings_and_file_urls_land_on_their_own_part_kinds() -> 
                             }
                         },
                         {"fileData": {"fileUri": "https://example.com/photo.png"}},
-                        {"fileData": {"fileUri": "https://example.com/clip.mp4"}},
+                        {"fileData": {"fileUri": "https://example.com/clip.mp4#t=10"}},
+                        {
+                            "fileData": {
+                                "mimeType": "video/webm",
+                                "fileUri": "https://cdn.test/v?sig=1",
+                            }
+                        },
                     ],
                 }
             ]
@@ -265,7 +276,10 @@ def test_gemini_audio_spellings_and_file_urls_land_on_their_own_part_kinds() -> 
         stream=False,
     ).request
     parts = request.messages[0].content_parts
-    assert [part.kind for part in parts] == ["audio", "document", "image", "video"]
+    assert [part.kind for part in parts] == ["audio", "document", "image", "video", "video"]
+    signed = parts[4]
+    assert isinstance(signed, VideoContentPart)
+    assert (signed.url, signed.media_type) == ("https://cdn.test/v?sig=1", "video/webm")
     audio, document = parts[0], parts[1]
     assert isinstance(audio, AudioContentPart)
     assert audio.media_type == "audio/mpeg"

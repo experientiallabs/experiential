@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from typing import Literal, cast
+from urllib.parse import urlsplit
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 
@@ -388,9 +389,15 @@ def decode_generate_content(
 ) -> DecodedGatewayRequest:
     """Decode one ``generateContent`` / ``streamGenerateContent`` body.
 
-    ``model`` is the catalog alias from the URL path (the body has no model field);
     Google defines no idempotency header, so this surface never joins keyed replay.
-    Returns the public alias and the lossless canonical gateway request.
+
+    Args:
+        payload: Parsed JSON request body (it carries no model field).
+        model: The catalog alias named in the request path.
+        stream: Whether the action is ``streamGenerateContent``.
+
+    Returns:
+        The public alias and the lossless canonical gateway request.
 
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
@@ -410,8 +417,14 @@ def decode_generate_content_count_tokens(
 ) -> DecodedGatewayRequest:
     """Decode one ``countTokens`` body for prompt counting.
 
-    Google's count carries ``contents`` or a whole ``generateContentRequest``; the
-    returned canonical request (under the path alias ``model``) is only counted.
+    Google's count carries ``contents`` or a whole ``generateContentRequest``.
+
+    Args:
+        payload: Parsed JSON request body.
+        model: The catalog alias named in the request path.
+
+    Returns:
+        The public alias and the canonical request, which is only counted.
 
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
@@ -537,10 +550,8 @@ def _system_text(instruction: _Content | None) -> str | None:
 
 
 def _require_one_payload(part: _Part, param: str) -> None:
-    """Refuse code-execution parts and any part not carrying exactly one payload.
-
-    ``Part`` is a protobuf ``oneof``: JSON setting two members is malformed, and
-    picking one would silently change the caller's content."""
+    """Refuse code-execution parts and any part not carrying exactly one payload
+    (``Part`` is a protobuf ``oneof``; picking one of two would alter the content)."""
     if part.executable_code is not None:
         raise unsupported_field(f"{param}.executableCode")
     if part.code_execution_result is not None:
@@ -574,11 +585,9 @@ def _turn_messages(
 ) -> list[GatewayMessage]:
     """Translate one Gemini content into canonical messages, in part order.
 
-    A ``functionResponse`` part becomes a standalone tool message (``tool_call_id``
-    lives on tool messages only), so a user turn mixing answers and text splits.
-    A response without an ``id`` answers the oldest unanswered call of its name,
-    as Gemini pairs them.
-    """
+    A ``functionResponse`` part is its own tool message (``tool_call_id`` lives on
+    tool messages only), so a mixed user turn splits; a response without an ``id``
+    answers the oldest unanswered call of its name, as Gemini pairs them."""
     role = content.role or "user"
     out: list[GatewayMessage] = []
     thoughts_only = True
@@ -587,10 +596,8 @@ def _turn_messages(
     reasoning: list[ProviderReasoningBlock] = []
 
     def flush() -> None:
-        """Emit the pending segments, calls and reasoning as one message.
-
-        Segments keep the caller's part order; ``content`` is their text flattened
-        in that order and ``content_parts`` is retained only with media."""
+        """Emit the pending segments, calls and reasoning as one message, in part
+        order; ``content_parts`` is retained only when media is present."""
         if not segments and not calls and not reasoning:
             return
         text = "".join(part.text for part in segments if part.kind == "text")
@@ -627,8 +634,7 @@ def _turn_messages(
         if part.thought:
             scheme = scheme_for_carrier(part.text) if part.text else None
             if scheme is not None and role == "model" and part.text is not None:
-                # A gateway-issued sealed carrier replays authenticated; any
-                # other thought text is display copy the provider never sees.
+                # A sealed carrier replays authenticated; other thought text is display copy.
                 try:
                     reasoning.append(parse_reasoning_content_carrier(part.text, scheme=scheme))
                 except ValueError as exc:
@@ -762,8 +768,13 @@ def _file_part(file: _FileData, param: str) -> MessageContentPart:
                 "Audio is served inline only (inlineData); a fileData audio URL is not fetched."
             ),
         )
-    path = uri.lower().split("?")[0]
+    path = urlsplit(uri).path.lower()
     try:
+        if media in VIDEO_MEDIA_TYPES:
+            # The declared type wins over the URL suffix (signed/extensionless URLs).
+            return video_part_from_url(uri).model_copy(
+                update={"media_type": VIDEO_MEDIA_TYPES[media]}
+            )
         if media.startswith("video/") or (not media and path.endswith(_VIDEO_URL_SUFFIXES)):
             return video_part_from_url(uri)
         if media in DOCUMENT_MEDIA_TYPES or (not media and path.endswith(".pdf")):
@@ -869,8 +880,7 @@ def _json_schema(schema: JsonObject, param: str) -> JsonObject:
         else:
             converted[key] = value
     if schema.get("nullable") is True and converted:
-        # Null is an alternative to the WHOLE node, so sibling constraints
-        # (enum, format, minimum) keep applying to the non-null branch only.
+        # Null is an alternative to the WHOLE node; siblings bind the non-null branch.
         return {"anyOf": [converted, {"type": "null"}]}
     return converted
 

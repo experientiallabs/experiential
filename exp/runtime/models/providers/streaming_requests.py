@@ -367,11 +367,12 @@ def route_generation_parameter_requests(
 
     # Sampling penalties are soft preferences: a rung that does not carry them
     # still returns a valid answer, so a route with any rung that lacks support
-    # drops them with disclosure rather than rejecting. Honoring is gated on the
-    # openai_compatible dialect — the ONLY payload that emits penalties — so a
+    # drops them with disclosure rather than rejecting. Honoring is gated on
+    # _PENALTY_WIRES, the dialects whose payload builders emit penalties (the
+    # OpenAI-compatible chat payload and the Gemini generateContent payload), so a
     # capability flag stamped on a non-emitting dialect (e.g. openai_responses)
-    # can never claim "honored" and then silently omit the field. Emission stays
-    # in one place; if another dialect ever emits penalties, add it here too.
+    # can never claim "honored" and then silently omit the field. A dialect that
+    # starts emitting penalties joins _PENALTY_WIRES in the same change.
     def penalty_honored(profile: GatewayWireProfile, *, presence: bool) -> bool:
         supported = (
             profile.supports_presence_penalty if presence else profile.supports_frequency_penalty
