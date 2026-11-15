@@ -56,3 +56,36 @@ def test_follow_up_rejects_a_non_positive_poll_interval() -> None:
         CrashReconcileFollowUp(
             due_at=wall, reconcile=lambda: (0, 0), clock=_FixedClock(wall), poll_seconds=0
         )
+
+
+def test_follow_up_re_arms_when_the_clock_steps_back_during_a_pass() -> None:
+    """A row left open because the wall clock moved back is retried, never abandoned."""
+    wall = datetime(2026, 8, 18, 20, 0, tzinfo=UTC)
+    due = wall - timedelta(seconds=1)
+    clock = _FixedClock(wall)
+    calls: list[int] = []
+
+    def reconcile() -> tuple[int, int]:
+        """Step the clock back on the first pass, so that pass settles nothing."""
+        calls.append(1)
+        if len(calls) == 1:
+            clock.wall = wall - timedelta(seconds=10)
+        return (0, 0)
+
+    def next_due() -> datetime | None:
+        """The row stays open after the first pass and is gone after the second."""
+        return due if len(calls) == 1 else None
+
+    follow_up = CrashReconcileFollowUp(
+        due_at=due, reconcile=reconcile, clock=clock, poll_seconds=0.01, next_due=next_due
+    )
+    deadline = time.monotonic() + 10
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.1)
+    assert not follow_up.finished
+    clock.wall = wall
+    while not follow_up.finished and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert follow_up.finished
+    assert calls == [1, 1]

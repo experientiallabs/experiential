@@ -252,9 +252,11 @@ class CrashReconcileFollowUp:
                 return
             if next_due is None:
                 return
-            if next_due <= self._due_at:
+            if next_due <= self._due_at and next_due <= self._clock.now():
                 # Every row past the pass's bound was settled, so a remaining row
-                # cannot be due again; stop rather than spin on one that is not.
+                # that is still due on the latest clock reading would never settle;
+                # stop rather than spin on it. A row that is no longer due (the wall
+                # clock stepped back during the pass) re-arms below instead.
                 _logger.warning("gateway follow-up crash reconcile left a due row open")
                 return
             self._due_at = next_due
