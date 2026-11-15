@@ -465,6 +465,8 @@ class GatewayRequest(ContractModel):
             schema field (default None, excluded from serialization); errors and routing
             disclosures name it, else the surface default.
         gateway: Optional request routing/retry policy; excluded from provider serialization.
+        zdr_requested: ``provider: {"zdr": true}`` (default false), tightening only: the host
+            applies its require_zdr filter, 403 when no rung qualifies. Part of identity.
     """
 
     surface: GatewayApiSurface
@@ -636,8 +638,6 @@ class GatewayRequest(ContractModel):
     """The caller's normalized tool-search declaration (any spelling); excluded from
     serialization, joins replay identity when present. See ``tool_search.plan``."""
     zdr_requested: bool = False
-    """`provider: {"zdr": true}`: tightening only (the host's require_zdr filter, same 403
-    when no rung qualifies). Part of identity."""
     # Verbatim caller `provider`: forwarded to OpenRouter rungs (tightened when constrained).
     provider_preferences: JsonObject | None = Field(default=None, exclude=True)
     gateway: GatewayRequestPolicy | None = Field(default=None, exclude=True)
