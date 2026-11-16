@@ -21,6 +21,12 @@ use crate::relay::collect_committed;
 /// content frame, then the connection closes mid-body (a provider reset after
 /// the stream began).
 async fn spawn_broken_rung() -> Rung {
+    spawn_broken_rung_after(Duration::ZERO).await
+}
+
+/// [`spawn_broken_rung`], holding the connection open for `hold` after the
+/// content frame before it breaks.
+async fn spawn_broken_rung_after(hold: Duration) -> Rung {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -41,6 +47,7 @@ async fn spawn_broken_rung() -> Rung {
             .write_all(format!("{head}{body}").as_bytes())
             .await
             .expect("write");
+        tokio::time::sleep(hold).await;
         let _ = socket.shutdown().await;
     });
     Rung {
@@ -58,6 +65,16 @@ async fn run_buffered(
     route: &[DeploymentWire],
     buffered: &[bool],
 ) -> (Won, AttemptGuard) {
+    run_buffered_with_budget(harness, route, buffered, None).await
+}
+
+/// [`run_buffered`] under a shared pre-first-byte budget ending at `budget`.
+async fn run_buffered_with_budget(
+    harness: &Harness,
+    route: &[DeploymentWire],
+    buffered: &[bool],
+    budget: Option<Instant>,
+) -> (Won, AttemptGuard) {
     let mut guard = AttemptGuard::new(
         harness.bridge.clone(),
         Arc::new(AtomicUsize::new(0)),
@@ -65,7 +82,7 @@ async fn run_buffered(
         Instant::now(),
     );
     let context = WaterfallContext {
-        pre_first_byte_deadline: None,
+        pre_first_byte_deadline: budget,
         bridge: &harness.bridge,
         http: &harness.http,
         request_id: "request-throttle",
@@ -132,6 +149,26 @@ fn a_buffered_answer_broken_mid_body_restarts_on_the_next_rung() {
         assert_eq!(settles[0]["failure"]["failure_class"], "transport");
         assert_eq!(settles[1]["outcome"], "completed");
         assert_eq!(rung_a.accepted.lock().expect("lock").len(), 1);
+        assert_eq!(rung_b.accepted.lock().expect("lock").len(), 1);
+    });
+}
+
+#[test]
+fn a_restart_after_commit_is_not_bounded_by_the_spent_first_byte_budget() {
+    block_on(async {
+        let harness = Harness::new();
+        // The first byte lands inside the budget; the break comes after it
+        // expired, which a pre-commit failure would read as exhaustion.
+        let rung_a = spawn_broken_rung_after(Duration::from_millis(600)).await;
+        let rung_b = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
+        let route = [wire("a", &rung_a.url, 0), wire("b", &rung_b.url, 0)];
+        let budget = Some(Instant::now() + Duration::from_millis(300));
+        let (won, guard) = run_buffered_with_budget(&harness, &route, &[true, true], budget).await;
+        let Won::Committed(committed) = &won else {
+            panic!("the sibling serves after the budget expired");
+        };
+        assert_eq!(committed.depth, 1);
+        finish(guard, won).await;
         assert_eq!(rung_b.accepted.lock().expect("lock").len(), 1);
     });
 }

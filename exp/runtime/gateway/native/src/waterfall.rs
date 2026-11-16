@@ -218,7 +218,8 @@ enum AttemptEnd {
 /// Every started attempt settles exactly once through `guard`; on return the
 /// request is either finalized (`Settled`/`Failed`) or owned by the single
 /// committed attempt the caller must settle.
-pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuard) -> Won {
+pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut AttemptGuard) -> Won {
+    let ctx = request_ctx;
     if !ctx.policy.valid() {
         guard
             .abandon(&Failure::new(
@@ -262,7 +263,20 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
     // A provider context-window rejection may advance the ladder once per
     // request; a second one is the request's real answer.
     let mut context_window_failover_spent = false;
+    // Once a buffered answer broke mid-body, the caller's first byte is no
+    // longer a pre-commit matter: the shared pre-first-byte budget (often
+    // spent by then) stops bounding the restart, and the request deadline
+    // governs every later dial.
+    let mut restarted_after_commit = false;
+    let mut unbudgeted: Option<WaterfallContext<'_>> = None;
     loop {
+        if restarted_after_commit && unbudgeted.is_none() {
+            unbudgeted = Some(WaterfallContext {
+                pre_first_byte_deadline: None,
+                ..request_ctx.clone()
+            });
+        }
+        let ctx = unbudgeted.as_ref().unwrap_or(request_ctx);
         let search_redial = std::mem::take(&mut tool_search_round);
         let repair_redial = std::mem::take(&mut reasoning_repair);
         let argument = compact_json(&json!({
@@ -414,6 +428,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
             if let AttemptEnd::Committed(committed) = &mut end {
                 if let Some(restart) = buffered::drain(ctx, guard, committed, dial_wire).await {
                     end = restart;
+                    restarted_after_commit = true;
                 }
             }
         }
@@ -611,7 +626,11 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                     || successor_possible(
                         next_policy,
                         ctx.route,
-                        ctx.pre_commit_deadline(),
+                        if restarted_after_commit {
+                            ctx.deadline
+                        } else {
+                            ctx.pre_commit_deadline()
+                        },
                         total_attempts,
                         counts[depth],
                         depth,

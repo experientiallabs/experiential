@@ -564,8 +564,7 @@ def next_route_candidate(
         current_depth,
         unrestricted=failure.failover_eligible or refusal_eligible,
     )
-    if failure.context_window_rejected:
-        depths = wider_windows(depths, failure, current_depth, context_windows)
+    depths = wider_windows(depths, failure, current_depth, context_windows)
     candidate = claim_route_from(health, keys, 0, depths) if depths else None
     if candidate is None and same_redial:
         if health.claim(keys[current_depth]):

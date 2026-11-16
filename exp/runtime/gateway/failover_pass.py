@@ -51,6 +51,7 @@ from exp.runtime.gateway.health import (
 )
 from exp.runtime.gateway.lane_ejection import DEAD_LANE_FAILURES
 from exp.runtime.gateway.lane_saturation import lane_saturated_failure
+from exp.runtime.gateway.native_context_window import route_context_windows, wider_windows
 from exp.runtime.gateway.native_execution import InflightRequest
 from exp.runtime.gateway.native_fallback_rules import route_fallback_rules, untried_depths
 from exp.runtime.gateway.rung_admission import RungShed
@@ -103,8 +104,13 @@ class FailoverPass:
         )
         if not (failure.failover_eligible or refusal):
             return None
-        untried = untried_depths(
-            route_fallback_rules(entry.route), failure, entry.attempt_counts, current_depth
+        untried = wider_windows(
+            untried_depths(
+                route_fallback_rules(entry.route), failure, entry.attempt_counts, current_depth
+            ),
+            failure,
+            current_depth,
+            route_context_windows(entry.route),
         )
         return cls(
             untried=untried,

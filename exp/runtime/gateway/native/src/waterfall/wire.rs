@@ -203,6 +203,7 @@ impl RoutePolicy {
 }
 
 /// Everything one waterfall run needs besides its request guard.
+#[derive(Clone)]
 pub struct WaterfallContext<'a> {
     pub bridge: &'a Arc<Bridge>,
     pub http: &'a crate::upstream::UpstreamClient,
