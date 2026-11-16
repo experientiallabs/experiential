@@ -259,6 +259,7 @@ async fn deliver(
 pub struct AttemptGuard {
     pub bridge: Arc<Bridge>,
     pub(crate) input_gate: Option<Arc<crate::guardrails::input::InputGate>>,
+    pub(crate) input_latch: Option<Arc<crate::guardrails::input_latch::InputLatch>>,
     request_id: String,
     attempt_id: Option<String>,
     pending: Arc<AtomicUsize>,
@@ -345,6 +346,7 @@ impl AttemptGuard {
         Self {
             bridge,
             input_gate: None,
+            input_latch: None,
             request_id,
             attempt_id: None,
             pending,
@@ -564,12 +566,14 @@ impl AttemptGuard {
             return None;
         }
         let input_failure = match self.input_gate.clone() {
-            Some(gate) => gate
-                .wait(&self.bridge)
-                .await
-                .and_then(|d| d.require_allow())
-                .err()
-                .map(|failure| failure.failure),
+            Some(gate) => {
+                gate.begin_response();
+                gate.wait(&self.bridge)
+                    .await
+                    .and_then(|d| d.require_allow())
+                    .err()
+                    .map(|failure| failure.failure)
+            }
             None => None,
         };
         let outcome = if input_failure.is_some() {

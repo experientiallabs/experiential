@@ -700,6 +700,7 @@ fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<execution_binding::ExecutionHandle>()?;
     module.add_class::<execution_binding::ExecutionBindings>()?;
     module.add_class::<RegexDetector>()?;
+    module.add_class::<guardrails::input_latch::PyOptionalInputDecision>()?;
     module.add_class::<capture::python::CaptureCollector>()?;
     module.add_class::<capture::python::CaptureResponse>()?;
     module.add_function(wrap_pyfunction!(shutdown_handle, module)?)?;
@@ -712,7 +713,7 @@ fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(failure_public_error_fixture, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add("AUTOMATIC_VERTEX_CACHE_CONTRACT_VERSION", 1)?;
-    module.add("GUARDRAIL_CONTRACT_VERSION", 3)?;
+    module.add("GUARDRAIL_CONTRACT_VERSION", 7)?;
     module.add("MODEL_STAGE_CONTRACT_VERSION", MODEL_STAGE_CONTRACT_VERSION)?;
     Ok(())
 }

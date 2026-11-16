@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 import time
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from pydantic import ValidationError
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayApiSurface,
@@ -31,12 +34,15 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailCheck,
     GuardrailCheckStage,
     GuardrailCompletion,
+    GuardrailOutcome,
     GuardrailPolicy,
     GuardrailRejected,
+    guardrail_failure,
 )
 from exp.runtime.gateway.guardrails.deterministic import compile_native_detectors
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import validate_guardrail_engine
+from exp.runtime.gateway.guardrails.recording import ObservationRecord
 from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 from exp.runtime.gateway.guardrails.store_test import _authorization
@@ -343,14 +349,14 @@ def test_scope_configuration_is_strict() -> None:
         GuardrailPolicy(policy_id="unprotected-platform")
 
 
-@pytest.mark.parametrize("marker", [None, True, "3", 0, 1, 2, 4])
+@pytest.mark.parametrize("marker", [None, True, "7", 0, 1, 2, 3, 4, 5, 6])
 def test_mismatched_native_contract_fails_at_startup(marker: object) -> None:
     """There is no package-version compatibility path that can omit an approval gate."""
     with patch(
         "exp.runtime.gateway.guardrails.native.importlib.import_module",
         return_value=SimpleNamespace(GUARDRAIL_CONTRACT_VERSION=marker),
     ):
-        with pytest.raises(ValueError, match="GUARDRAIL_CONTRACT_VERSION=3"):
+        with pytest.raises(ValueError, match="GUARDRAIL_CONTRACT_VERSION=7"):
             validate_guardrail_engine(_engine(_Classifier("allow")))
 
 
@@ -669,3 +675,746 @@ def test_later_modifier_cannot_undo_an_earlier_redaction(
         assert session.output_plan() is None
         with pytest.raises(GuardrailRejected):
             session.inspect_output(GuardrailCompletion(text=original))
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_optional_input_has_one_response_wait_budget_across_subjects(overlap: bool) -> None:
+    """A slow optional classifier cannot renew its grace on later tool context."""
+    classifier = _Classifier("allow")
+    policy = _observer_policy().model_copy(
+        update={"mode": "enforce", "input_execution": "parallel"}
+    )
+    policy = GuardrailPolicy.model_validate(
+        {**policy.model_dump(), "fail_open": True, "input_max_wait_ms": 250}
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": classifier})),
+        monotonic=time.monotonic,
+    )
+    try:
+        session = _session(engine)
+        request = _request()
+        if overlap:
+            session.prepare_dispatch((request,), overlap=True)
+            assert classifier.started.wait(1)
+            time.sleep(0.30)
+            assert session.input_decision()["action"] == "pending"
+            started = time.monotonic()
+            session.begin_input_wait()
+            _await(session)
+        else:
+            started = time.monotonic()
+            assert session.inspect_input(request) == request
+        assert time.monotonic() - started < 0.40
+        assert session.input_decision()["action"] == "allow"
+        assert session.settlement_failure() is None
+        calls = len(classifier.requests)
+        started = time.monotonic()
+        assert session.inspect_input(_request("tool result")) == _request("tool result")
+        assert time.monotonic() - started < 0.10
+        assert len(classifier.requests) == calls
+        session.cancel(capture_unavailable_failure())
+        assert session.input_decision()["action"] == "error"
+    finally:
+        classifier.release.set()
+        engine.close(timeout_seconds=2)
+
+
+def test_optional_input_expiry_preserves_strict_sibling_denial() -> None:
+    """Only the optional policy expires; a later strict check still rejects."""
+    classifier = _Classifier("allow")
+    optional = GuardrailPolicy.model_validate(
+        {
+            **_observer_policy().model_dump(),
+            "mode": "enforce",
+            "input_execution": "parallel",
+            "fail_open": True,
+            "input_max_wait_ms": 25,
+        }
+    )
+    strict = optional.model_copy(
+        update={
+            "policy_id": "strict",
+            "fail_open": False,
+            "checks": (optional.checks[0].model_copy(update={"adapter_id": "strict"}),),
+        }
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((optional, strict)),
+        client=DirectClassifierClient(
+            ClassifierRegistry({"criminal": classifier, "strict": KeywordClassifier(("blocked",))})
+        ),
+        monotonic=time.monotonic,
+    )
+    try:
+        with pytest.raises(GuardrailRejected):
+            _session(engine).inspect_input(_request("blocked"))
+    finally:
+        classifier.release.set()
+        engine.close(timeout_seconds=2)
+
+
+def test_optional_wait_deducts_native_callback_queue_time() -> None:
+    """A status callback delayed past the grace must not start another inspection."""
+    classifier = _Classifier("block")
+    policy = GuardrailPolicy.model_validate(
+        {
+            **_observer_policy().model_dump(),
+            "mode": "enforce",
+            "input_execution": "parallel",
+            "fail_open": True,
+            "input_max_wait_ms": 250,
+        }
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": classifier})),
+        monotonic=time.monotonic,
+    )
+    try:
+        session = _session(engine)
+        session.begin_input_wait(elapsed_seconds=0.30)
+        started = time.monotonic()
+        assert session.inspect_input(_request()) == _request()
+        assert time.monotonic() - started < 0.10
+        assert not classifier.requests
+        assert session.input_decision()["action"] == "allow"
+    finally:
+        classifier.release.set()
+        engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize("later_wait", [50, 250])
+def test_native_optional_eligibility_preserves_distinct_policy_budgets(later_wait: int) -> None:
+    """Every optional-only chain retains its largest budget as a native ceiling."""
+    optional = _observer_policy().model_copy(
+        update={
+            "mode": "enforce",
+            "input_execution": "parallel",
+            "fail_open": True,
+            "input_max_wait_ms": 50,
+        }
+    )
+    later = optional.model_copy(update={"policy_id": "later", "input_max_wait_ms": later_wait})
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((optional, later)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": ScriptedClassifier()})),
+        monotonic=time.monotonic,
+    )
+    try:
+        assert _session(engine).optional_input_wait_ms() == max(50, later_wait)
+    finally:
+        engine.close()
+
+
+@pytest.mark.parametrize("settle_without_poll", [False, True])
+def test_native_expiry_counts_only_unfinished_checks_once(settle_without_poll: bool) -> None:
+    """A completed allow is coverage, while a stalled sibling expires exactly once."""
+    classifier = _Classifier("allow")
+    optional = _observer_policy().model_copy(
+        update={"mode": "enforce", "input_execution": "parallel", "fail_open": True}
+    )
+    first = optional.model_copy(
+        update={
+            "policy_id": "completed",
+            "checks": (optional.checks[0].model_copy(update={"adapter_id": "fast"}),),
+        }
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((first, optional)),
+        client=DirectClassifierClient(
+            ClassifierRegistry({"fast": KeywordClassifier(("blocked",)), "criminal": classifier})
+        ),
+        monotonic=time.monotonic,
+    )
+    native = Mock()
+    native.decision_json.return_value = '{"action":"pending"}'
+    native.expired.return_value = False
+    native.elapsed_seconds.return_value = None
+    native.decision_json.return_value = '{"action":"allow"}'
+    session = _session(engine)
+    session.native_input = native
+    try:
+        with patch.object(engine, "record_input_expiry") as record:
+            session.prepare_dispatch((_request(),), overlap=True)
+            assert classifier.started.wait(1)
+            native.expired.return_value = True
+            native.elapsed_seconds.return_value = 0.251
+            if settle_without_poll:
+                native.close.side_effect = lambda: setattr(native.expired, "return_value", False)
+                session.cancel()
+                session.cancel()
+            else:
+                assert session.input_decision()["action"] == "allow"
+                assert session.input_decision()["action"] == "allow"
+            # The inspection completion and native observation can race; the
+            # same expired check remains one observation whichever arrives first.
+            session._finish_input_check(optional, expired=True)
+            session._finish_input_check(first, expired=True)
+            assert record.call_count == 1
+            assert record.call_args.args[0].policy_id == optional.policy_id
+    finally:
+        classifier.release.set()
+        session.cancel()
+        engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize("late_outcome", ["block", "timeout"])
+@pytest.mark.parametrize("boundary_started", [False, True])
+def test_native_late_result_records_one_expiry_without_an_enforced_block(
+    late_outcome: str,
+    boundary_started: bool,
+) -> None:
+    """A long stream cannot turn a late result into duplicate or applied telemetry."""
+    classifier = _Classifier("block")
+    optional = _observer_policy().model_copy(
+        update={
+            "mode": "enforce",
+            "input_execution": "parallel",
+            "fail_open": True,
+            "checks": (_observer_policy().checks[0].model_copy(update={"timeout_ms": 80}),),
+        }
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((optional,)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": classifier})),
+        monotonic=time.monotonic,
+    )
+    native = Mock()
+    native.decision_json.return_value = '{"action":"pending"}'
+    native.expired.return_value = False
+    native.elapsed_seconds.return_value = 0.0 if boundary_started else None
+    native.decision_json.return_value = '{"action":"allow"}'
+    session = _session(engine)
+    session.native_input = native
+    try:
+        with (
+            patch.object(engine, "_emit_observation") as observed,
+            patch.object(engine, "_record") as acted,
+        ):
+            session.prepare_dispatch((_request(),), overlap=True)
+            assert classifier.started.wait(1)
+            native.expired.return_value = True
+            native.elapsed_seconds.return_value = 0.3
+            if late_outcome == "block":
+                classifier.release.set()
+            assert session._input is not None
+            session._input.result(timeout=1)
+            assert session.input_decision()["action"] == "allow"
+            assert observed.call_count == 1
+            assert observed.call_args.args[2] is GuardrailOutcome.TIMEOUT
+            assert not acted.called
+    finally:
+        classifier.release.set()
+        session.cancel()
+        engine.close(timeout_seconds=2)
+
+
+def test_native_expiry_includes_later_authenticated_subject() -> None:
+    """A check allowing one context does not cover a stalled distinct context."""
+
+    class Classifier(_Classifier):
+        """Allow the first context, and hold the reasoning-expanded context."""
+
+        async def inspect_input(
+            self, *, request: GatewayRequest, check: GuardrailCheck
+        ) -> ClassifierVerdict:
+            """Only the second authenticated subject remains in flight."""
+            if request == _request("first"):
+                return ClassifierVerdict(flagged=False)
+            return await super().inspect_input(request=request, check=check)
+
+    classifier = Classifier("allow")
+    optional = _observer_policy().model_copy(
+        update={"mode": "enforce", "input_execution": "parallel", "fail_open": True}
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((optional,)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": classifier})),
+        monotonic=time.monotonic,
+    )
+    native = Mock()
+    native.decision_json.return_value = '{"action":"pending"}'
+    native.expired.return_value = False
+    native.elapsed_seconds.return_value = None
+    native.decision_json.return_value = '{"action":"allow"}'
+    session = _session(engine)
+    session.native_input = native
+    try:
+        with patch.object(engine, "_emit_observation") as observed:
+            session.prepare_dispatch((_request("first"), _request("expanded")), overlap=True)
+            assert classifier.started.wait(1)
+            native.expired.return_value = True
+            native.elapsed_seconds.return_value = 0.3
+            assert session.input_decision()["action"] == "allow"
+            assert session.input_decision()["action"] == "allow"
+            assert observed.call_count == 1
+            assert observed.call_args.args[2] is GuardrailOutcome.TIMEOUT
+    finally:
+        classifier.release.set()
+        session.cancel()
+        engine.close(timeout_seconds=2)
+
+
+def test_optional_cancellation_cannot_quarantine_a_strict_shared_adapter() -> None:
+    """An abandoned optional call cannot refuse a healthy mandatory sibling."""
+    release, cancelled = threading.Event(), threading.Event()
+
+    class Classifier(ScriptedClassifier):
+        """Hold only the optional check, even after its caller cancels."""
+
+        async def inspect_input(
+            self, *, request: GatewayRequest, check: GuardrailCheck
+        ) -> ClassifierVerdict:
+            """Leave the same adapter's strict check healthy while optional work exits."""
+            if check.check_id == "input":
+                while not release.is_set():
+                    try:
+                        await asyncio.sleep(0.001)
+                    except asyncio.CancelledError:
+                        cancelled.set()
+            return await super().inspect_input(request=request, check=check)
+
+    optional = _observer_policy().model_copy(
+        update={
+            "mode": "enforce",
+            "input_execution": "parallel",
+            "fail_open": True,
+            "input_max_wait_ms": 25,
+        }
+    )
+    strict = optional.model_copy(
+        update={
+            "policy_id": "strict",
+            "fail_open": False,
+            "checks": (optional.checks[0].model_copy(update={"check_id": "required"}),),
+        }
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((optional,)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": Classifier()})),
+        monotonic=time.monotonic,
+    )
+    try:
+        assert _session(engine).inspect_input(_request()) == _request()
+        assert cancelled.wait(1)
+        assert engine._optional_inspects.quarantined_adapter_ids() == frozenset({"criminal"})
+        assert (
+            asyncio.run(
+                engine.enforce_input(
+                    policy=strict,
+                    request=_request(),
+                    deadline_monotonic=time.monotonic() + 1,
+                )
+            )
+            == _request()
+        )
+        assert not engine._inspects.quarantined_adapter_ids()
+    finally:
+        release.set()
+        engine.close(timeout_seconds=2)
+
+
+def test_distinct_native_budgets_expire_early_check_and_preserve_timely_later_block() -> None:
+    """A native boundary arriving during inspection leaves the later policy its own time."""
+    first, later = _Classifier("allow"), _Classifier("block")
+    optional = _observer_policy().model_copy(
+        update={
+            "mode": "enforce",
+            "input_execution": "parallel",
+            "fail_open": True,
+            "input_max_wait_ms": 50,
+        }
+    )
+    sibling = optional.model_copy(
+        update={
+            "policy_id": "later",
+            "input_max_wait_ms": 250,
+            "checks": (optional.checks[0].model_copy(update={"adapter_id": "later"}),),
+        }
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((optional, sibling)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": first, "later": later})),
+        monotonic=time.monotonic,
+    )
+    boundary: list[float] = []
+    native = Mock()
+    native.decision_json.return_value = '{"action":"pending"}'
+    native.expired.return_value = False
+    native.elapsed_seconds.side_effect = lambda: (
+        None if not boundary else time.monotonic() - boundary[0]
+    )
+    session = _session(engine)
+    session.native_input = native
+    try:
+        with patch.object(engine, "record_input_expiry") as record:
+            session.prepare_dispatch((_request(),), overlap=True)
+            assert first.started.wait(1)
+            boundary.append(time.monotonic())
+            assert later.started.wait(0.2), "early optional check consumed the later budget"
+            assert first.cancelled.wait(0.1)
+            later.release.set()
+            assert session._input is not None
+            with pytest.raises(GuardrailRejected):
+                session._input.result(timeout=0.2)
+            assert time.monotonic() - boundary[0] < 0.25
+            assert record.call_count == 1
+            assert record.call_args.args[0].policy_id == optional.policy_id
+    finally:
+        first.release.set()
+        later.release.set()
+        session.cancel()
+        engine.close(timeout_seconds=2)
+
+
+def test_cancel_records_a_shorter_pending_policy_before_the_native_ceiling() -> None:
+    """Disconnect cannot erase a shorter policy's expired coverage behind a longer check."""
+    classifier = _Classifier("allow")
+    optional = _observer_policy().model_copy(
+        update={"mode": "enforce", "input_execution": "parallel", "fail_open": True}
+    )
+    shorter = optional.model_copy(update={"policy_id": "shorter", "input_max_wait_ms": 50})
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((optional, shorter)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": classifier})),
+        monotonic=time.monotonic,
+    )
+    native = Mock()
+    native.decision_json.return_value = '{"action":"pending"}'
+    native.expired.return_value = False
+    native.elapsed_seconds.return_value = None
+    session = _session(engine)
+    session.native_input = native
+    try:
+        with patch.object(engine, "record_input_expiry") as record:
+            session.prepare_dispatch((_request(),), overlap=True)
+            assert classifier.started.wait(1)
+            native.elapsed_seconds.return_value = 0.1
+            session.cancel()
+            session.cancel()
+            assert record.call_count == 1
+            assert record.call_args.args[0].policy_id == shorter.policy_id
+    finally:
+        classifier.release.set()
+        session.cancel()
+        engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize("native_present", [False, True])
+@pytest.mark.parametrize("decision_ms", [25, 75])
+def test_shorter_policy_rejection_crossing_native_deadline_keeps_later_check(
+    native_present: bool, decision_ms: int
+) -> None:
+    """A completed exception must obey its own cutoff before ending the policy chain."""
+    shorter = _observer_policy().model_copy(
+        update={
+            "mode": "enforce",
+            "input_execution": "parallel",
+            "fail_open": True,
+            "input_max_wait_ms": 50,
+        }
+    )
+    later = shorter.model_copy(
+        update={
+            "policy_id": "later",
+            "input_max_wait_ms": 250,
+            "checks": (shorter.checks[0].model_copy(update={"check_id": "later"}),),
+        }
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((shorter, later)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": ScriptedClassifier()})),
+        monotonic=time.monotonic,
+    )
+    session = _session(engine)
+    native = Mock()
+    native.decision_json.return_value = '{"action":"pending"}'
+    native.expired.return_value = False
+    native.elapsed_seconds.return_value = 0.001
+    session.native_input = native if native_present else None
+    checked: list[str] = []
+
+    async def reject(*, policy: GuardrailPolicy, **_kwargs: object) -> GatewayRequest:
+        """Move the boundary after the engine's eligibility check but before its exception."""
+        assert session._native_decision_current(policy)
+        checked.append(policy.policy_id)
+        native.elapsed_seconds.return_value = decision_ms / 1000
+        raise GuardrailRejected(
+            guardrail_failure(action=GuardrailAction.BLOCK, check_id=policy.checks[0].check_id)
+        )
+
+    expired = native_present and decision_ms >= shorter.input_max_wait_ms
+    try:
+        with (
+            patch.object(engine, "enforce_input", side_effect=reject),
+            patch.object(engine, "record_input_expiry") as record,
+            pytest.raises(GuardrailRejected) as caught,
+        ):
+            asyncio.run(session._inspect_input(_request()))
+        expected = later if expired else shorter
+        assert caught.value.failure.safe_details["check_id"] == expected.checks[0].check_id
+        assert checked == ([shorter.policy_id, later.policy_id] if expired else [shorter.policy_id])
+        assert record.call_count == int(expired)
+        if expired:
+            assert record.call_args.args[0].policy_id == shorter.policy_id
+    finally:
+        session.cancel()
+        engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "timely",
+        "policy",
+        "publication",
+        "closed",
+        "published_then_closed",
+        "committed_then_closed",
+        "capture_unavailable",
+        "non_native",
+    ],
+)
+def test_optional_block_record_waits_for_native_denial_acceptance(boundary: str) -> None:
+    """Late policy results and native expiry cannot be logged as applied blocks."""
+    optional = _observer_policy().model_copy(
+        update={
+            "mode": "enforce",
+            "input_execution": "parallel",
+            "fail_open": True,
+            "input_max_wait_ms": 50 if boundary == "policy" else 250,
+        }
+    )
+    policies = (optional,)
+    if boundary == "policy":
+        policies += (
+            optional.model_copy(
+                update={
+                    "policy_id": "later",
+                    "input_max_wait_ms": 250,
+                    "checks": (optional.checks[0].model_copy(update={"adapter_id": "allow"}),),
+                }
+            ),
+        )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore(policies),
+        client=DirectClassifierClient(
+            ClassifierRegistry(
+                {
+                    "criminal": ScriptedClassifier(input_verdict=ClassifierVerdict(flagged=True)),
+                    "allow": ScriptedClassifier(),
+                }
+            )
+        ),
+        monotonic=time.monotonic,
+    )
+    session = _session(engine)
+    native = Mock()
+    native.decision_json.return_value = '{"action":"pending"}'
+    native.expired.return_value = False
+    native.elapsed_seconds.return_value = 0.001
+    native.publish.return_value = True
+    released: JsonObject = {"action": "pending"}
+    native.decision_json.side_effect = lambda: json.dumps(released)
+
+    def close_release() -> None:
+        """Mirror native close: terminal releases remain immutable."""
+        if released["action"] == "pending":
+            released["action"] = "closed"
+
+    native.close.side_effect = close_release
+    session.native_input = None if boundary == "non_native" else native
+    defer = session._defer_native_rejection
+
+    def expire_after_record(record: ObservationRecord) -> None:
+        """Cross the smaller policy deadline after its terminal metadata is prepared."""
+        defer(record)
+        if boundary == "policy":
+            native.elapsed_seconds.return_value = 0.075
+
+    future: Future[None] = Future()
+    session._input = future
+    try:
+        with (
+            patch.object(session, "_defer_native_rejection", side_effect=expire_after_record),
+            patch.object(engine, "_record") as actions,
+            patch.object(engine, "record_input_expiry") as expiry,
+        ):
+            try:
+                asyncio.run(session._inspect_input(_request()))
+            except GuardrailRejected as error:
+                future.set_exception(error)
+            else:
+                future.set_result(None)
+
+            def blocks() -> list[object]:
+                """Select only applied terminal actions, excluding successful later checks."""
+                return [c for c in actions.call_args_list if c.args[2] is GuardrailAction.BLOCK]
+
+            if boundary == "non_native":
+                assert len(blocks()) == 1
+                return
+            assert not blocks(), "optional action must wait for the native decision"
+            if boundary == "publication":
+                native.expired.return_value = True
+                native.elapsed_seconds.return_value = 0.251
+            if boundary == "closed":
+                session.cancel()
+            session._publish_native_input(future)
+            assert not blocks(), "publication is not a committed native release"
+            if boundary == "published_then_closed":
+                session.cancel()
+            if boundary in ("timely", "committed_then_closed"):
+                error = future.exception()
+                assert isinstance(error, GuardrailRejected)
+                released.update(action="error", failure=error.failure.model_dump(mode="json"))
+                if boundary == "timely":
+                    assert session.input_decision()["action"] == "error"
+                else:
+                    session.cancel()
+                assert len(blocks()) == 1
+            else:
+                released["action"] = (
+                    "closed" if boundary in ("closed", "published_then_closed") else "allow"
+                )
+                if boundary == "capture_unavailable":
+                    released.update(
+                        action="error",
+                        failure=capture_unavailable_failure().model_dump(mode="json"),
+                    )
+                session._flush_input_rejection()
+                assert not blocks()
+            assert session._native_rejection is None
+            assert expiry.call_count == int(boundary == "policy")
+            session.cancel()
+            session.cancel()
+            assert len(blocks()) == int(boundary in ("timely", "committed_then_closed"))
+            assert expiry.call_count == int(boundary in ("policy", "publication"))
+    finally:
+        session.cancel()
+        engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize("boundary", ["timely", "expired", "cancel_after_commit"])
+def test_later_input_block_records_its_own_committed_gate(boundary: str) -> None:
+    """A prior native allow cannot hide a later synchronous input turn's actual block."""
+    optional = _observer_policy().model_copy(
+        update={"mode": "enforce", "input_execution": "parallel", "fail_open": True}
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((optional,)),
+        client=DirectClassifierClient(
+            ClassifierRegistry(
+                {"criminal": ScriptedClassifier(input_verdict=ClassifierVerdict(flagged=True))}
+            )
+        ),
+        monotonic=time.monotonic,
+    )
+    session = _session(engine)
+    native = Mock()
+    native.decision_json.return_value = '{"action":"allow"}'
+    native.expired.return_value = False
+    native.elapsed_seconds.return_value = 0.251 if boundary == "expired" else 0.001
+    session.native_input = native
+    flush = session._flush_input_rejection
+
+    def cancel_after_commit(decision: JsonObject | None = None) -> None:
+        """Cross the deadline after the synchronous gate has retained its rejection."""
+        if boundary == "cancel_after_commit" and decision is not None:
+            assert session._input_failure is not None
+            native.elapsed_seconds.return_value = 0.251
+            session.cancel()
+        flush(decision)
+
+    try:
+        with (
+            patch.object(engine, "_record") as actions,
+            patch.object(engine, "record_input_expiry") as expiry,
+            patch.object(session, "_flush_input_rejection", side_effect=cancel_after_commit),
+        ):
+            if boundary == "expired":
+                assert session.inspect_input(_request("later turn")) == _request("later turn")
+            else:
+                with pytest.raises(GuardrailRejected):
+                    session.inspect_input(_request("later turn"))
+                assert session.input_decision()["action"] == "error"
+            recorded = [c for c in actions.call_args_list if c.args[2] is GuardrailAction.BLOCK]
+            assert len(recorded) == int(boundary != "expired")
+            assert expiry.call_count == int(boundary == "expired")
+            assert session._native_rejection is None
+            session.cancel()
+            assert len(
+                [c for c in actions.call_args_list if c.args[2] is GuardrailAction.BLOCK]
+            ) == int(boundary != "expired")
+    finally:
+        session.cancel()
+        engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize("cancel_active", [False, True])
+def test_later_fresh_subject_keeps_expiry_coverage_after_prepared_allow(
+    cancel_active: bool,
+) -> None:
+    """Completed preparation cannot hide later expiry, including cleanup during inspection."""
+    started, release = threading.Event(), threading.Event()
+
+    class Classifier(ScriptedClassifier):
+        """Allow preparation, then hold only the fresh synchronous subject."""
+
+        async def inspect_input(
+            self, *, request: GatewayRequest, check: GuardrailCheck
+        ) -> ClassifierVerdict:
+            """Expose the later subject's active lifetime without holding the event loop."""
+            if request.messages[-1].content == "later":
+                started.set()
+                while not release.is_set():
+                    await asyncio.sleep(0.001)
+            return await super().inspect_input(request=request, check=check)
+
+    optional = _observer_policy().model_copy(
+        update={"mode": "enforce", "input_execution": "parallel", "fail_open": True}
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((optional,)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": Classifier()})),
+        monotonic=time.monotonic,
+    )
+    session = _session(engine)
+    native = Mock()
+    native.decision_json.return_value = '{"action":"allow"}'
+    native.expired.return_value = False
+    native.elapsed_seconds.return_value = None
+    session.native_input = native
+    try:
+        session.prepare_dispatch((_request("prepared"),), overlap=True)
+        assert session._input is not None
+        session._input.result(timeout=1)
+        assert all(count == 0 for count in session._input_pending_checks.values())
+        with patch.object(engine, "record_input_expiry") as expiry:
+            if cancel_active:
+                native.elapsed_seconds.return_value = 0.001
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    later = executor.submit(session.inspect_input, _request("later"))
+                    try:
+                        assert started.wait(1)
+                        native.elapsed_seconds.return_value = 0.251
+                        session.cancel()
+                        session.cancel()
+                        assert expiry.call_count == 1
+                    finally:
+                        release.set()
+                    assert later.result(timeout=1) == _request("later")
+            else:
+                native.elapsed_seconds.return_value = 0.251
+                assert session.inspect_input(_request("later")) == _request("later")
+                assert session.inspect_input(_request("later")) == _request("later")
+            assert expiry.call_count == 1
+            assert expiry.call_args.args[0].policy_id == optional.policy_id
+            assert session._synchronous_inputs == 0
+            assert all(count == 0 for count in session._input_pending_checks.values())
+    finally:
+        release.set()
+        session.cancel()
+        engine.close(timeout_seconds=2)

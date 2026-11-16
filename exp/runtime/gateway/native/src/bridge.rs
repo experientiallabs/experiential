@@ -16,8 +16,9 @@
 //! targets share these workers, so their thread-local resources close after
 //! every callback, before its execution lease can retire.
 
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use pyo3::prelude::*;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
@@ -30,11 +31,18 @@ use crate::execution_binding::ExecutionLease;
 struct Job {
     method: &'static str,
     argument: String,
-    responder: oneshot::Sender<Result<String, PublicError>>,
+    input_wait_started: Option<Arc<OnceLock<Instant>>>,
+    responder: oneshot::Sender<Result<AdmissionReply, PublicError>>,
     // Cancellation of the awaiting request cannot release queued/running capacity.
     _permit: OwnedSemaphorePermit,
     _execution_permit: Option<OwnedSemaphorePermit>,
     execution: Option<Arc<ExecutionLease>>,
+}
+
+/// JSON reply plus an admission-owned optional release capability.
+pub(crate) struct AdmissionReply {
+    pub(crate) text: String,
+    pub(crate) input: Option<Arc<crate::guardrails::input_latch::InputLatch>>,
 }
 
 /// Bounded bridge to one Python `NativeControlPlane` instance.
@@ -125,6 +133,33 @@ impl Bridge {
         method: &'static str,
         argument: String,
     ) -> Result<String, PublicError> {
+        self.call_timed(method, argument, None)
+            .await
+            .map(|reply| reply.text)
+    }
+
+    /// Return admission and its exact request-owned release capability in one crossing.
+    pub(crate) async fn admit(&self, argument: String) -> Result<AdmissionReply, PublicError> {
+        self.call_timed("admit", argument, None).await
+    }
+
+    /// Count input-status permit and interpreter queueing against the same grace.
+    pub(crate) async fn call_input_status(
+        &self,
+        argument: String,
+        started: Arc<OnceLock<Instant>>,
+    ) -> Result<String, PublicError> {
+        self.call_timed("guardrail_input_status", argument, Some(started))
+            .await
+            .map(|reply| reply.text)
+    }
+
+    async fn call_timed(
+        &self,
+        method: &'static str,
+        argument: String,
+        input_wait_started: Option<Arc<OnceLock<Instant>>>,
+    ) -> Result<AdmissionReply, PublicError> {
         let settlement = matches!(method, "settle" | "abandon");
         // Supplied capacity is acquired before a shared worker. Individual
         // execution has no additional pool, identity lookup or allocation policy.
@@ -169,6 +204,7 @@ impl Bridge {
                     .send(Job {
                         method,
                         argument,
+                        input_wait_started,
                         responder,
                         _permit: permit,
                         _execution_permit: execution_permit,
@@ -244,7 +280,42 @@ fn worker_loop(receiver: &Mutex<mpsc::Receiver<Job>>, object: &Py<PyAny>) {
                 .as_ref()
                 .map_or(object, |execution| &execution.resources.target);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                control_plane_call(py, target, job.method, &job.argument)
+                let mut argument = job.argument;
+                if let Some(started) = job.input_wait_started.as_ref().and_then(|v| v.get()) {
+                    let mut body: serde_json::Value =
+                        serde_json::from_str(&argument).map_err(|_| PublicError::internal())?;
+                    body["input_wait_elapsed_seconds"] = started.elapsed().as_secs_f64().into();
+                    argument = crate::encode::compact_json(&body);
+                }
+                let text = control_plane_call(py, target, job.method, &argument)?;
+                let input = if job.method == "admit" {
+                    let data: serde_json::Value =
+                        serde_json::from_str(&text).map_err(|_| PublicError::internal())?;
+                    if data.get("guardrail_input_native").and_then(|v| v.as_bool()) == Some(true) {
+                        let value = target
+                            .bind(py)
+                            .call_method1("guardrail_input_latch", (&text,))
+                            .map_err(|error| public_error_from_pyerr(py, &error))?;
+                        let latch =
+                                value
+                                    .extract::<PyRef<
+                                        '_,
+                                        crate::guardrails::input_latch::PyOptionalInputDecision,
+                                    >>()
+                                    .map_err(|_| PublicError::internal())?;
+                        if data.get("request_id").and_then(|v| v.as_str())
+                            != Some(latch.inner.request_id.as_str())
+                        {
+                            return Err(PublicError::internal());
+                        }
+                        Some(latch.inner.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                Ok(AdmissionReply { text, input })
             }))
             .unwrap_or_else(|_| Err(PublicError::internal()));
             // Shared workers must not retain a departed target's per-path
@@ -335,6 +406,9 @@ class Plane:
         self.started.set()
         if not self.release.wait(timeout=10.0):
             raise RuntimeError("blocked callback was not released")
+        return argument
+
+    def guardrail_input_status(self, argument):
         return argument
 
     def echo(self, argument):
@@ -568,6 +642,9 @@ class DatabasePlane:
         self.local = threading.local()
         self.closed = 0
 
+    def guardrail_input_status(self, argument):
+        return argument
+
     def echo(self, argument):
         if not hasattr(self.local, "connection"):
             self.local.connection = sqlite3.connect(self.path)
@@ -697,5 +774,45 @@ class DatabasePlane:
             serde_json::to_value(&error).expect("error serializes"),
             serde_json::to_value(PublicError::internal()).expect("error serializes"),
         );
+    }
+}
+
+#[cfg(test)]
+mod input_wait_tests {
+    use super::*;
+
+    #[test]
+    fn callback_queue_consumes_the_input_wait_budget() {
+        Python::initialize();
+        let object = Python::attach(|py| {
+            pyo3::types::PyModule::from_code(
+                py,
+                c"class Plane:\n def guardrail_input_status(self, argument): return argument\n def close_thread_resources(self, argument): return '{}'\n",
+                c"wait_plane.py", c"wait_plane",
+            ).unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
+        });
+        let bridge = Arc::new(Bridge::new(object, 1).unwrap());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let held = bridge.pool.permits.clone().acquire_owned().await.unwrap();
+                let started = Arc::new(OnceLock::new());
+                let caller = bridge.clone();
+                let boundary = started.clone();
+                let pending =
+                    tokio::spawn(
+                        async move { caller.call_input_status("{}".into(), boundary).await },
+                    );
+                // Readiness happens while the poll is already queued. The worker must
+                // observe this boundary and all subsequent waiting before it invokes Python.
+                started.set(Instant::now()).unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                drop(held);
+                let result: serde_json::Value =
+                    serde_json::from_str(&pending.await.unwrap().unwrap()).unwrap();
+                assert!(result["input_wait_elapsed_seconds"].as_f64().unwrap() >= 0.06);
+            });
     }
 }

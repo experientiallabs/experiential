@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import TYPE_CHECKING
 
 from exp.common.core.artifacts import JsonObject
@@ -25,10 +27,14 @@ from exp.runtime.gateway.guardrails.deterministic import (
     native_input_request,
     native_output_plan,
 )
+from exp.runtime.gateway.guardrails.input_wait import InputWait
+from exp.runtime.gateway.guardrails.recording import ObservationRecord
 from exp.runtime.gateway.guardrails.streaming import StreamSegment
 from exp.runtime.gateway.guardrails.subjects import ObservedSubjects
 
 if TYPE_CHECKING:
+    from exp_gateway_native import OptionalInputDecision
+
     from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
     from exp.runtime.gateway.native_execution import InflightRequest
 
@@ -66,8 +72,15 @@ class GuardrailSession:
         _input_failure: Retained input or required capture rejection, or None before failure.
         _input_approved_at: Approval time, or None before the current subject is approved.
         _closed: Whether cancellation closed this session, false initially.
+        _input_wait: First blocking boundary shared by optional input checks and tool rounds.
         _inspected: Exact input and approved-result pairs, empty before inspection.
         _observed: Content-free subject identities and optional observation admission state.
+        native_input: Optional native release capability shared with settlement.
+        _native_expiry_recorded: Whether the native expiry has entered decision observations.
+        _input_pending_checks: Remaining authenticated subjects per optional policy/check.
+        _input_outcomes_lock: Serializes check completion against native expiry observation.
+        _native_rejection: One content-free terminal record awaiting native release.
+        _synchronous_inputs: Fresh synchronous subjects still running after preparation.
     """
 
     engine: GuardrailEngine
@@ -79,10 +92,77 @@ class GuardrailSession:
     _input_failure: GatewayFailure | None = field(default=None, init=False, repr=False)
     _input_approved_at: float | None = field(default=None, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
+    _input_wait: InputWait = field(default_factory=InputWait, init=False, repr=False)
     _inspected: list[tuple[GatewayRequest, GatewayRequest]] = field(
         default_factory=list, init=False, repr=False
     )
     _observed: ObservedSubjects = field(default_factory=ObservedSubjects, init=False, repr=False)
+    native_input: OptionalInputDecision | None = field(default=None, init=False, repr=False)
+    _native_expiry_recorded: bool = field(default=False, init=False, repr=False)
+    _input_pending_checks: dict[tuple[str, str], int] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _input_outcomes_lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _native_rejection: ObservationRecord | None = field(default=None, init=False, repr=False)
+    _synchronous_inputs: int = field(default=0, init=False, repr=False)
+
+    def optional_input_wait_ms(self) -> int | None:
+        """Authorize native expiry only when every enforcing input check is optional."""
+        policies = tuple(p for p in self.enforcing_policies if p.input_checks)
+        if not policies or any(
+            not p.fail_open or p.input_execution != "parallel" for p in policies
+        ):
+            return None
+        budgets = {p.input_max_wait_ms for p in policies}
+        # Keep smaller per-policy timers, with one independent native ceiling.
+        return max(budgets)
+
+    def _publish_native_input(self, future: Future[None]) -> None:
+        """Publish a completed verdict without renewing an expired native decision."""
+        native = self.native_input
+        assert native is not None
+        try:
+            future.result()
+        except GuardrailRejected as error:
+            decision = {
+                "action": "error",
+                "failure": denied_input_failure(error.failure).model_dump(mode="json"),
+            }
+        except Exception:  # noqa: BLE001 - optional infrastructure failures fail open.
+            decision = {"action": "allow"}
+        else:
+            decision = {"action": "allow"}
+        native.publish(json.dumps(decision))
+        self._flush_input_rejection()
+
+    def _flush_input_rejection(self, decision: JsonObject | None = None) -> None:
+        """Record one terminal action from the input gate that committed its result."""
+        if self._native_rejection is None:
+            return
+        if decision is None:
+            assert self.native_input is not None
+            decision = json.loads(self.native_input.decision_json())
+        with self._input_outcomes_lock:
+            if self._input_failure is not None:
+                decision = {
+                    "action": "error",
+                    "failure": self._input_failure.model_dump(mode="json"),
+                }
+            elif self._synchronous_inputs and not self._closed:
+                return
+            if decision["action"] == "pending":
+                return
+            record, self._native_rejection = self._native_rejection, None
+        if record is not None and decision["action"] == "error":
+            failure = GatewayFailure.model_validate(decision["failure"])
+            if failure.failure_class is GatewayFailureClass.GUARDRAIL:
+                self.engine.record_input_rejection(record)
+
+    def _defer_native_rejection(self, record: ObservationRecord) -> None:
+        """Retain only the current terminal check, without request or response content."""
+        with self._input_outcomes_lock:
+            if not self._closed:
+                self._native_rejection = record
 
     @property
     def enforcing_policies(self) -> tuple[GuardrailPolicy, ...]:
@@ -114,6 +194,7 @@ class GuardrailSession:
             and request.web_search is None
             and request.tool_search is None
             and request.service_tier is None
+            and request.speed != "fast"
         )
 
     def inspect_input(self, request: GatewayRequest, *, defer: bool = False) -> GatewayRequest:
@@ -133,14 +214,24 @@ class GuardrailSession:
             if subject == request:
                 return result
         self._input_approved_at = None
+        self._begin_input_subjects(1, synchronous=True)
+        self.begin_input_wait()
         try:
             result = run_on_native_loop(self._inspect_input(request))
             self._input_approved_at = time.monotonic()
             if not self._approved_before_deadline():
                 raise GuardrailRejected(denied_input_failure())
         except GuardrailRejected as exc:
-            self._input_failure = denied_input_failure(exc.failure)
+            with self._input_outcomes_lock:
+                self._input_failure = denied_input_failure(exc.failure)
+            self._flush_input_rejection(
+                {"action": "error", "failure": self._input_failure.model_dump(mode="json")}
+            )
             raise
+        finally:
+            if self.native_input is not None:
+                with self._input_outcomes_lock:
+                    self._synchronous_inputs -= 1
         self._inspected.append((request, result))
         if result != request:
             self._inspected.append((result, result))
@@ -155,31 +246,141 @@ class GuardrailSession:
             if check.stage is stage
         )
 
+    def _begin_input_subjects(self, count: int, *, synchronous: bool = False) -> None:
+        """Track fresh subjects without replacing prior coverage or renewing the wait."""
+        if self.native_input is None:
+            return
+        with self._input_outcomes_lock:
+            if synchronous:
+                self._synchronous_inputs += 1
+            for policy in self.enforcing_policies:
+                for check in policy.input_checks:
+                    key = (policy.policy_id, check.check_id)
+                    self._input_pending_checks[key] = self._input_pending_checks.get(key, 0) + count
+
+    def _finish_input_check(self, policy: GuardrailPolicy, *, expired: bool = False) -> None:
+        """Count each optional check once, preserving already completed coverage."""
+        if self.native_input is None:
+            if expired:
+                self.engine.record_input_expiry(policy)
+            return
+        with self._input_outcomes_lock:
+            if (
+                expired
+                and self._input_failure is not None
+                and self._input_failure.failure_class is GatewayFailureClass.GUARDRAIL
+            ):
+                return
+            if (
+                expired
+                and self._native_rejection is not None
+                and self._native_rejection.policy.policy_id == policy.policy_id
+            ):
+                self._native_rejection = None
+            remaining = tuple(
+                check
+                for check in policy.input_checks
+                if self._input_pending_checks.get((policy.policy_id, check.check_id), 1) > 0
+            )
+            for check in remaining:
+                key = (policy.policy_id, check.check_id)
+                self._input_pending_checks[key] = (
+                    0 if expired else self._input_pending_checks.get(key, 1) - 1
+                )
+        if expired and remaining:
+            self.engine.record_input_expiry(policy.model_copy(update={"checks": remaining}))
+
+    def _native_decision_current(self, policy: GuardrailPolicy) -> bool:
+        """Keep outcomes after this policy's native boundary from being applied."""
+        native = self.native_input
+        if native is None:
+            return True
+        elapsed = native.elapsed_seconds()
+        return not native.expired() and (
+            elapsed is None or elapsed * 1000 < policy.input_max_wait_ms
+        )
+
     async def _enforce_input(
         self, policy: GuardrailPolicy, request: GatewayRequest
     ) -> GatewayRequest:
         """Apply the same native or bounded adapter strategy during execution and validation."""
-        native = (
-            native_input_request(
-                policy,
-                self.detectors,
-                request,
-                monotonic=time.monotonic,
-                deadline_monotonic=self.deadline_monotonic,
+
+        async def inspect() -> GatewayRequest:
+            """Run this check through its existing native or isolated adapter."""
+            native = (
+                native_input_request(
+                    policy,
+                    self.detectors,
+                    request,
+                    monotonic=time.monotonic,
+                    deadline_monotonic=self.deadline_monotonic,
+                )
+                if self.detectors and not policy.fail_open
+                else None
             )
-            if self.detectors
-            else None
-        )
-        return (
-            native
-            if native is not None
-            else await self.engine.enforce_input(
-                policy=policy,
-                request=request,
-                deadline_monotonic=self.deadline_monotonic,
-                request_id=self.request_id,
+            return (
+                native
+                if native is not None
+                else await self.engine.enforce_input(
+                    policy=policy,
+                    request=request,
+                    deadline_monotonic=self.deadline_monotonic,
+                    request_id=self.request_id,
+                    decision_current=(
+                        (lambda: self._native_decision_current(policy))
+                        if self.native_input is not None
+                        else None
+                    ),
+                    defer_rejection=(
+                        self._defer_native_rejection if self.native_input is not None else None
+                    ),
+                )
             )
-        )
+
+        if policy.input_execution != "parallel" or not policy.fail_open:
+            return await inspect()
+        native_elapsed = None
+        if self.native_input is not None:
+            distinct_budgets = (
+                len({p.input_max_wait_ms for p in self.enforcing_policies if p.input_checks}) > 1
+            )
+            if distinct_budgets:
+                native_elapsed = self.native_input.elapsed_seconds
+            elapsed = self.native_input.elapsed_seconds()
+            if elapsed is None and not distinct_budgets:
+                try:
+                    result = await inspect()
+                except GuardrailRejected:
+                    elapsed = self.native_input.elapsed_seconds()
+                    if elapsed is None or elapsed * 1000 < policy.input_max_wait_ms:
+                        raise
+                else:
+                    elapsed = self.native_input.elapsed_seconds()
+                    if elapsed is None or elapsed * 1000 < policy.input_max_wait_ms:
+                        self._finish_input_check(policy)
+                        return result
+                self._finish_input_check(policy, expired=True)
+                return request
+            if elapsed is not None:
+                self._input_wait.begin(elapsed_seconds=elapsed)
+        try:
+            result = await self._input_wait.run(
+                inspect,
+                wait_ms=policy.input_max_wait_ms,
+                deadline=self.deadline_monotonic,
+                native_elapsed=native_elapsed,
+            )
+        except GuardrailRejected:
+            if self._native_decision_current(policy):
+                raise
+            self._finish_input_check(policy, expired=True)
+            return request
+        if result is None:
+            self._finish_input_check(policy, expired=True)
+            return request
+        expired = not self._native_decision_current(policy)
+        self._finish_input_check(policy, expired=expired)
+        return request if expired else result
 
     async def _inspect_input(self, request: GatewayRequest) -> GatewayRequest:
         """Require the final rewrite to preserve every preceding check's constraint."""
@@ -221,7 +422,12 @@ class GuardrailSession:
         if overlap and not all(self.can_overlap_input(subject) for subject in remaining):
             raise RuntimeError("guardrail input cannot overlap this request")
         self._input_approved_at = None
+        if not overlap:
+            self.begin_input_wait()
+        self._begin_input_subjects(len(remaining))
         self._input = start_on_native_loop(self._inspect_subjects(tuple(remaining)))
+        if self.native_input is not None:
+            self._input.add_done_callback(self._publish_native_input)
         if not overlap:
             try:
                 self._input.result(timeout=max(0, self.deadline_monotonic - time.monotonic()))
@@ -252,15 +458,54 @@ class GuardrailSession:
             and self._input_approved_at < self.deadline_monotonic
         )
 
+    def begin_input_wait(self, *, elapsed_seconds: float = 0.0) -> None:
+        """Start the request-wide optional grace at the first blocking boundary."""
+        self._input_wait.begin(elapsed_seconds=elapsed_seconds)
+
     @property
     def input_pending(self) -> bool:
         """Whether native delivery must await this session's input decision."""
         return self._input is not None
 
+    def _record_native_expiry(self) -> None:
+        """Retain missing coverage before either a decision read or terminal cleanup."""
+        native = self.native_input
+        if native is None:
+            return
+        expired = native.expired()
+        elapsed = native.elapsed_seconds()
+        if expired and not self._native_expiry_recorded:
+            self._native_expiry_recorded = True
+            if self._input is not None:
+                self._input.cancel()
+        elif not expired and (self._input is None or self._input.done()):
+            with self._input_outcomes_lock:
+                if not self._synchronous_inputs:
+                    return
+        for policy in self.enforcing_policies:
+            if policy.input_checks and (
+                expired or (elapsed is not None and elapsed * 1000 >= policy.input_max_wait_ms)
+            ):
+                self._finish_input_check(policy, expired=True)
+
     def input_decision(self) -> JsonObject:
         """Poll approval without tying up a bridge worker or renewing its deadline."""
         if self._input_failure is not None:
             return {"action": "error", "failure": self._input_failure.model_dump(mode="json")}
+        if self.native_input is not None:
+            self._record_native_expiry()
+            decision = json.loads(self.native_input.decision_json())
+            self._flush_input_rejection(decision)
+            if decision["action"] == "closed":
+                return {
+                    "action": "error",
+                    "failure": denied_input_failure().model_dump(mode="json"),
+                }
+            if decision["action"] == "error":
+                decision["failure"] = denied_input_failure(
+                    GatewayFailure.model_validate(decision["failure"])
+                ).model_dump(mode="json")
+            return decision
         if not self.enforcing_policies:
             return {"action": "allow"}
         future = self._input
@@ -302,8 +547,13 @@ class GuardrailSession:
                 marker. None closes the session without replacing an existing failure.
         """
         if failure is not None:
-            self._input_failure = denied_input_failure(failure)
+            with self._input_outcomes_lock:
+                self._input_failure = denied_input_failure(failure)
+        self._record_native_expiry()
         self._closed = True
+        if self.native_input is not None:
+            self.native_input.close()
+            self._flush_input_rejection()
         if self._input is not None:
             self._input.cancel()
 
@@ -350,7 +600,8 @@ class GuardrailSession:
 
     def inspect_output(self, completion: GuardrailCompletion) -> GuardrailCompletion:
         """Enforce every output policy before releasing a buffered completion."""
-        if self._input is not None and not self._input.done():
+        if self.native_input is None and self._input is not None and not self._input.done():
+            self.begin_input_wait()
             try:
                 self._input.result(timeout=max(0, self.deadline_monotonic - time.monotonic()))
             except Exception:  # noqa: BLE001 - a late allow cannot rescue an expired wait.

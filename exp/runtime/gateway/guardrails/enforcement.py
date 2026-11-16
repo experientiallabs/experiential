@@ -112,6 +112,9 @@ class GuardrailEngine:
         self._monotonic = monotonic
         self._owns_inspects = inspects is None
         self._inspects = inspects or BoundedInspect()
+        # Optional cancellation/quarantine cannot consume mandatory capacity or
+        # quarantine a strict policy that happens to use the same adapter.
+        self._optional_inspects = BoundedInspect()
         self._observation_inspects = BoundedInspect(max_inflight=max_observations)
         self._observations = ObservationOwner(
             max_jobs=max_observations, max_bytes=max_observation_bytes
@@ -207,6 +210,8 @@ class GuardrailEngine:
         request: GatewayRequest,
         deadline_monotonic: float,
         request_id: str | None = None,
+        decision_current: Callable[[], bool] | None = None,
+        defer_rejection: Callable[[ObservationRecord], None] | None = None,
     ) -> GatewayRequest:
         """Run the input chain once and return the validated or transformed request.
 
@@ -216,6 +221,10 @@ class GuardrailEngine:
             deadline_monotonic: Remaining request-wide deadline.
             request_id: Authenticated request identity for score records, or
                 ``None`` to record no scores.
+            decision_current: Native optional release eligibility, or None for
+                the ordinary classifier deadline. Expired outcomes cannot act.
+            defer_rejection: Retain terminal action metadata until its input gate commits,
+                or None to record the ordinary synchronous decision immediately.
 
         Returns:
             The original request, or the last successful modification.
@@ -236,6 +245,8 @@ class GuardrailEngine:
             request=request,
             deadline_monotonic=deadline_monotonic,
             request_id=request_id,
+            decision_current=decision_current,
+            defer_rejection=defer_rejection,
         )
 
     async def _inspect_input(
@@ -246,13 +257,15 @@ class GuardrailEngine:
         deadline_monotonic: float,
         retention: ObservationLease | None = None,
         request_id: str | None = None,
+        decision_current: Callable[[], bool] | None = None,
+        defer_rejection: Callable[[ObservationRecord], None] | None = None,
     ) -> GatewayRequest:
         """Evaluate the same bounded checks while granting actions only to enforcing policies."""
         self.input_invocations += 1
         limit = self._input_limit(policy)
         if limit is not None and request_exceeds_inspection_limit(request, limit):
             self._decision(policy, None, GuardrailAction.ERROR, GuardrailOutcome.UNSUPPORTED, 0.0)
-            if policy.mode == "observe":
+            if policy.mode == "observe" or policy.fail_open:
                 return request
             raise GuardrailRejected(coverage_failure())
         current = request
@@ -267,6 +280,8 @@ class GuardrailEngine:
                 deadline_monotonic=deadline_monotonic,
                 retention=retention,
                 request_id=request_id,
+                decision_current=decision_current,
+                defer_rejection=defer_rejection,
             )
             if verdict is None or policy.mode == "observe":
                 continue
@@ -491,7 +506,7 @@ class GuardrailEngine:
     def record_unsupported_observations(self, policies: tuple[GuardrailPolicy, ...]) -> None:
         """Record incomplete observation coverage on a surface with no inspection boundary."""
         for policy in policies:
-            if policy.mode == "observe":
+            if policy.mode == "observe" or policy.fail_open:
                 self._emit_observation(policy, None, GuardrailOutcome.UNSUPPORTED, 0.0)
 
     def close(self, *, timeout_seconds: float = 1.0) -> None:
@@ -499,6 +514,7 @@ class GuardrailEngine:
         deadline = time.monotonic() + timeout_seconds
         self._observations.close(timeout_seconds=timeout_seconds)
         self._observation_inspects.close(timeout_seconds=max(0.0, deadline - time.monotonic()))
+        self._optional_inspects.close(timeout_seconds=max(0.0, deadline - time.monotonic()))
         if self._owns_inspects:
             self._inspects.close(timeout_seconds=max(0.0, deadline - time.monotonic()))
         self._observation_records.close(timeout_seconds=max(0.0, deadline - time.monotonic()))
@@ -705,6 +721,8 @@ class GuardrailEngine:
         deadline_monotonic: float,
         retention: ObservationLease | None = None,
         request_id: str | None = None,
+        decision_current: Callable[[], bool] | None = None,
+        defer_rejection: Callable[[ObservationRecord], None] | None = None,
     ) -> ClassifierVerdict | None:
         """Invoke one adapter under the tighter of check timeout and request deadline.
 
@@ -721,10 +739,18 @@ class GuardrailEngine:
         """
         remaining = deadline_monotonic - self._monotonic()
         timeout = min(check.timeout_ms / 1000.0, remaining)
+        if decision_current is not None and not decision_current():
+            return None
         if timeout <= 0:
             return self._uncertain(policy, check, GuardrailOutcome.TIMEOUT)
         started = self._monotonic()
-        inspects = self._observation_inspects if policy.mode == "observe" else self._inspects
+        inspects = (
+            self._observation_inspects
+            if policy.mode == "observe"
+            else self._optional_inspects
+            if policy.fail_open
+            else self._inspects
+        )
         try:
             self.classifier_calls += 1
             verdict = await inspects.run(
@@ -734,6 +760,8 @@ class GuardrailEngine:
                 retention=retention,
             )
         except ClassifierCoverageError:
+            if decision_current is not None and not decision_current():
+                return None
             self._decision(
                 policy,
                 check,
@@ -741,21 +769,29 @@ class GuardrailEngine:
                 GuardrailOutcome.UNSUPPORTED,
                 self._monotonic() - started,
             )
-            if policy.mode == "enforce":
+            if policy.mode == "enforce" and not policy.fail_open:
                 raise GuardrailRejected(coverage_failure(check_id=check.check_id)) from None
             return None
         except ClassifierUncertainError:
+            if decision_current is not None and not decision_current():
+                return None
             return self._uncertain(
                 policy, check, GuardrailOutcome.UNCERTAIN, self._monotonic() - started
             )
         except ClassifierTimeoutError:
+            if decision_current is not None and not decision_current():
+                return None
             return self._uncertain(
                 policy, check, GuardrailOutcome.TIMEOUT, self._monotonic() - started
             )
         except Exception:  # noqa: BLE001 - classifier failures are fail-closed or skipped
+            if decision_current is not None and not decision_current():
+                return None
             return self._uncertain(
                 policy, check, GuardrailOutcome.UNAVAILABLE, self._monotonic() - started
             )
+        if decision_current is not None and not decision_current():
+            return None
         elapsed = self._monotonic() - started
         outcome = GuardrailOutcome.FLAGGED if verdict.flagged else GuardrailOutcome.ALLOW
         if isinstance(verdict, ScoredVerdict) and request_id is not None:
@@ -763,7 +799,13 @@ class GuardrailEngine:
         if not verdict.flagged:
             self._decision(policy, check, GuardrailAction.ALLOW, outcome, elapsed)
             return None
-        self._decision(policy, check, check.action, outcome, elapsed)
+        if defer_rejection is not None and check.action in (
+            GuardrailAction.BLOCK,
+            GuardrailAction.ERROR,
+        ):
+            defer_rejection(ObservationRecord(policy, check, outcome, elapsed))
+        else:
+            self._decision(policy, check, check.action, outcome, elapsed)
         return verdict
 
     def _submit_classification(
@@ -801,7 +843,7 @@ class GuardrailEngine:
     ) -> ClassifierVerdict | None:
         """Apply fail-closed or skip-and-continue for an uncertain check."""
         self._decision(policy, check, GuardrailAction.ERROR, outcome, latency_seconds)
-        if policy.protected and policy.mode == "enforce":
+        if policy.protected and policy.mode == "enforce" and not policy.fail_open:
             raise GuardrailRejected(
                 GatewayFailure(
                     failure_class=GatewayFailureClass.UNAVAILABLE,
@@ -810,6 +852,20 @@ class GuardrailEngine:
                 )
             )
         return None
+
+    def record_input_rejection(self, record: ObservationRecord) -> None:
+        """Record one terminal action after its input gate commits the denial."""
+        assert record.check is not None
+        self._decision(
+            record.policy, record.check, record.check.action, record.outcome, record.latency_seconds
+        )
+
+    def record_input_expiry(self, policy: GuardrailPolicy) -> None:
+        """Record skipped optional coverage without adding a serving-path write."""
+        for check in policy.input_checks:
+            self._emit_observation(
+                policy, check, GuardrailOutcome.TIMEOUT, policy.input_max_wait_ms / 1000
+            )
 
     def _decision(
         self,
@@ -820,7 +876,9 @@ class GuardrailEngine:
         latency_seconds: float,
     ) -> None:
         """Separate observed outcomes from actions that actually affect customer requests."""
-        if policy.mode == "observe":
+        if policy.mode == "observe" or (
+            policy.fail_open and outcome not in (GuardrailOutcome.ALLOW, GuardrailOutcome.FLAGGED)
+        ):
             self._emit_observation(policy, check, outcome, latency_seconds)
         else:
             self._record(policy, check, action, latency_seconds)

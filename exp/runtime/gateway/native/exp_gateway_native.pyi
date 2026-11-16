@@ -4,6 +4,7 @@ from collections.abc import Callable, Mapping
 from typing import Literal, Protocol, overload
 
 __version__: str
+GUARDRAIL_CONTRACT_VERSION: int
 MODEL_STAGE_CONTRACT_VERSION: int
 AUTOMATIC_VERTEX_CACHE_CONTRACT_VERSION: int
 
@@ -41,6 +42,22 @@ class RegexDetector:
     def __init__(self, spec_json: str) -> None: ...
     def redact(self, text: str) -> str | None: ...
     def matches(self, text: str) -> bool: ...
+
+class OptionalInputDecision:
+    """Request-owned optional input verdict shared by native delivery and settlement."""
+
+    def __init__(
+        self,
+        request_id: str,
+        wait_ms: int,
+        collector: CaptureCollector | None = None,
+        capture_json: bytes | None = None,
+    ) -> None: ...
+    def publish(self, decision_json: str) -> bool: ...
+    def elapsed_seconds(self) -> float | None: ...
+    def expired(self) -> bool: ...
+    def decision_json(self) -> str: ...
+    def close(self) -> None: ...
 
 class ShutdownHandle:
     """Embedder-owned stop signal for one `serve` call."""

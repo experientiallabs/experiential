@@ -126,6 +126,8 @@ class GuardrailPolicy(ContractModel):
         identity_id: Assigned identity, or None for platform scope.
         revision: Detector and rollout revision used to invalidate cached replay.
         input_execution: Inspect before dispatch by default, or overlap safe generation.
+        fail_open: Skip uncertain read-only input checks when explicitly enabled, default False.
+        input_max_wait_ms: One parallel response wait budget per request, default 250 ms.
         mode: Enforce by default, or observe read-only input checks without gating delivery.
         protected: Fail closed on classifier uncertainty; required for platform policies.
         checks: Ordered checks, empty by default.
@@ -139,6 +141,8 @@ class GuardrailPolicy(ContractModel):
     identity_id: IdentityId | None = None
     revision: str = Field(default="configured", min_length=1, max_length=256)
     input_execution: Literal["before_dispatch", "parallel"] = "before_dispatch"
+    fail_open: bool = False
+    input_max_wait_ms: int = Field(default=250, ge=0, le=250)
     mode: Literal["enforce", "observe"] = "enforce"
     protected: bool = False
     checks: tuple[GuardrailCheck, ...] = ()
@@ -165,6 +169,11 @@ class GuardrailPolicy(ContractModel):
             raise ValueError("guardrail scope requires both organization_id and identity_id")
         if self.organization_id is None and not self.protected:
             raise ValueError("platform guardrail policies must be protected")
+        if self.fail_open and any(
+            check.stage is GuardrailCheckStage.OUTPUT or check.action is GuardrailAction.MODIFY
+            for check in self.checks
+        ):
+            raise ValueError("fail-open requires read-only input checks")
         if self.mode == "observe" and any(
             check.stage is GuardrailCheckStage.OUTPUT or check.action is GuardrailAction.MODIFY
             for check in self.checks

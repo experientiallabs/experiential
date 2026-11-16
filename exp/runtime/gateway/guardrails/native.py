@@ -7,7 +7,10 @@ import json
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol, cast
 
+from exp_gateway_native import OptionalInputDecision
+
 from exp.common.core.artifacts import JsonObject
+from exp.common.models import BillingSource
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
 from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
@@ -30,6 +33,7 @@ from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 if TYPE_CHECKING:
     from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+    from exp.runtime.gateway.routing import GatewayRoute
 
 
 def require_capture(
@@ -71,9 +75,9 @@ def validate_guardrail_engine(engine: GuardrailEngine | None) -> None:
     if engine is None:
         return
     native = importlib.import_module("exp_gateway_native")
-    if getattr(native, "GUARDRAIL_CONTRACT_VERSION", None) != 3:
+    if getattr(native, "GUARDRAIL_CONTRACT_VERSION", None) != 7:
         raise ValueError(
-            "guardrails require native GUARDRAIL_CONTRACT_VERSION=3; "
+            "guardrails require native GUARDRAIL_CONTRACT_VERSION=7; "
             "install the coordinated native package"
         )
 
@@ -118,7 +122,7 @@ def require_unguarded_surface(
     policies = () if engine is None else engine.policies_for(authorization)
     if engine is not None:
         engine.record_unsupported_observations(policies)
-    if any(policy.mode == "enforce" for policy in policies):
+    if any(policy.mode == "enforce" and not policy.fail_open for policy in policies):
         raise NativeBridgeError(
             OpenAIProtocolError(
                 status_code=400,
@@ -279,8 +283,65 @@ class _GuardrailPlane(Protocol):
     _capture: CaptureController | None
 
 
+def prepare_admitted_input(
+    session: GuardrailSession,
+    controller: CaptureController | None,
+    authorization: AuthorizationSnapshot,
+    pending: PendingCapture | None,
+    route: GatewayRoute,
+    subjects: Sequence[GatewayRequest],
+    *,
+    parallel: bool,
+) -> PendingCapture | None:
+    """Prepare one authenticated inspection owner before handing the route to dispatch."""
+    overlap = parallel and all(
+        deployment.billing_source is BillingSource.HOST_MANAGED for deployment in route.deployments
+    )
+    if overlap and _prepare_native_optional_input(
+        session, controller, authorization, pending, route.snapshot.exact_model_id
+    ):
+        pending = None
+    session.prepare_dispatch(subjects, overlap=overlap)
+    return pending
+
+
+def _prepare_native_optional_input(
+    session: GuardrailSession,
+    controller: CaptureController | None,
+    authorization: AuthorizationSnapshot,
+    pending: PendingCapture | None,
+    model_id: str,
+) -> bool:
+    """Bind optional expiry to a native capability without retaining unapproved input."""
+    wait_ms = session.optional_input_wait_ms()
+    if wait_ms is None:
+        return False
+    try:
+        prepared = (
+            None
+            if controller is None or pending is None
+            else controller.prepare(
+                authorization, pending.request, model_id, session_id=pending.session_id
+            )
+        )
+        collector = None if prepared is None or controller is None else controller.native
+        session.native_input = OptionalInputDecision(
+            authorization.request_id, wait_ms, collector, prepared
+        )
+    except Exception:  # noqa: BLE001 - required capture preparation remains a sanitized refusal.
+        raise GuardrailRejected(capture_unavailable_failure()) from None
+    return True
+
+
 class NativeGuardrailsMixin:
     """Resolve native operations to one frozen session, independent of policy scope."""
+
+    def guardrail_input_latch(self: _GuardrailPlane, argument: str) -> OptionalInputDecision:
+        """Return the exact admitted request's in-process capability in the admission crossing."""
+        entry = self._accounting.entry(str(json.loads(argument)["request_id"]))
+        if entry is None or entry.guardrails is None or entry.guardrails.native_input is None:
+            raise RuntimeError("native optional input owner is unavailable")
+        return entry.guardrails.native_input
 
     def guardrail_input_status(self: _GuardrailPlane, argument: str) -> str:
         """Poll the shared input session and register capture once before allowing release.
@@ -300,10 +361,14 @@ class NativeGuardrailsMixin:
             NativeBridgeError: A concurrent abandonment's durable terminal write failed;
                 accounting keeps the request for retry and the native gate fails closed.
         """
-        request_id = str(json.loads(argument).get("request_id") or "")
+        payload = json.loads(argument)
+        request_id = str(payload.get("request_id") or "")
         entry = self._accounting.entry(request_id)
         if entry is None or entry.pending_abandon is not None:
             return '{"action":"closed"}'
+        elapsed = payload.get("input_wait_elapsed_seconds")
+        if isinstance(elapsed, (float, int)) and elapsed >= 0 and entry.guardrails is not None:
+            entry.guardrails.begin_input_wait(elapsed_seconds=elapsed)
         decision = (
             {"action": "error", "failure": denied_input_failure().model_dump(mode="json")}
             if entry.guardrails is None
