@@ -425,6 +425,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_wait_preserves_published_denial_but_expires_pending_inspection() {
+        for published_before_boundary in [true, false] {
+            let mut input = latch();
+            input.wait = Duration::ZERO;
+            if published_before_boundary {
+                assert!(input.publish(denial()));
+            }
+            input.begin();
+            if !published_before_boundary {
+                assert!(matches!(input.inspection(), Inspection::Expired));
+                assert!(!input.publish(denial()));
+            }
+            let decision = input.wait(Instant::now()).await;
+            if published_before_boundary {
+                assert_eq!(
+                    decision
+                        .err()
+                        .expect("published denial must survive")
+                        .failure
+                        .failure_class,
+                    FailureClass::Guardrail
+                );
+            } else {
+                assert!(matches!(decision.unwrap(), InputDecision::Allowed));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn cancellation_never_reopens_a_pending_release() {
         let input = latch();
         input.close();

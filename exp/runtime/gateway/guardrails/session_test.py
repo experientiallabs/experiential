@@ -36,6 +36,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailOutcome,
     GuardrailPolicy,
     GuardrailRejected,
+    guardrail_failure,
 )
 from exp.runtime.gateway.guardrails.deterministic import compile_native_detectors
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
@@ -1090,5 +1091,66 @@ def test_cancel_records_a_shorter_pending_policy_before_the_native_ceiling() -> 
             assert record.call_args.args[0].policy_id == shorter.policy_id
     finally:
         classifier.release.set()
+        session.cancel()
+        engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize("native_present", [False, True])
+@pytest.mark.parametrize("decision_ms", [25, 75])
+def test_shorter_policy_rejection_crossing_native_deadline_keeps_later_check(
+    native_present: bool, decision_ms: int
+) -> None:
+    """A completed exception must obey its own cutoff before ending the policy chain."""
+    shorter = _observer_policy().model_copy(
+        update={
+            "mode": "enforce",
+            "input_execution": "parallel",
+            "fail_open": True,
+            "input_max_wait_ms": 50,
+        }
+    )
+    later = shorter.model_copy(
+        update={
+            "policy_id": "later",
+            "input_max_wait_ms": 250,
+            "checks": (shorter.checks[0].model_copy(update={"check_id": "later"}),),
+        }
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((shorter, later)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": ScriptedClassifier()})),
+        monotonic=time.monotonic,
+    )
+    session = _session(engine)
+    native = Mock()
+    native.expired.return_value = False
+    native.elapsed_seconds.return_value = 0.001
+    session.native_input = native if native_present else None
+    checked: list[str] = []
+
+    async def reject(*, policy: GuardrailPolicy, **_kwargs: object) -> GatewayRequest:
+        """Move the boundary after the engine's eligibility check but before its exception."""
+        assert session._native_decision_current(policy)
+        checked.append(policy.policy_id)
+        native.elapsed_seconds.return_value = decision_ms / 1000
+        raise GuardrailRejected(
+            guardrail_failure(action=GuardrailAction.BLOCK, check_id=policy.checks[0].check_id)
+        )
+
+    expired = native_present and decision_ms >= shorter.input_max_wait_ms
+    try:
+        with (
+            patch.object(engine, "enforce_input", side_effect=reject),
+            patch.object(engine, "record_input_expiry") as record,
+            pytest.raises(GuardrailRejected) as caught,
+        ):
+            asyncio.run(session._inspect_input(_request()))
+        expected = later if expired else shorter
+        assert caught.value.failure.safe_details["check_id"] == expected.checks[0].check_id
+        assert checked == ([shorter.policy_id, later.policy_id] if expired else [shorter.policy_id])
+        assert record.call_count == int(expired)
+        if expired:
+            assert record.call_args.args[0].policy_id == shorter.policy_id
+    finally:
         session.cancel()
         engine.close(timeout_seconds=2)

@@ -292,12 +292,18 @@ class GuardrailSession:
                 return request
             if elapsed is not None:
                 self._input_wait.begin(elapsed_seconds=elapsed)
-        result = await self._input_wait.run(
-            inspect,
-            wait_ms=policy.input_max_wait_ms,
-            deadline=self.deadline_monotonic,
-            native_elapsed=native_elapsed,
-        )
+        try:
+            result = await self._input_wait.run(
+                inspect,
+                wait_ms=policy.input_max_wait_ms,
+                deadline=self.deadline_monotonic,
+                native_elapsed=native_elapsed,
+            )
+        except GuardrailRejected:
+            if self._native_decision_current(policy):
+                raise
+            self._finish_input_check(policy, expired=True)
+            return request
         if result is None:
             self._finish_input_check(policy, expired=True)
             return request
