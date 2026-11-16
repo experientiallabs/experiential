@@ -248,6 +248,19 @@ impl Admission {
             && !self.reasoning_exposed_at(depth)
     }
 
+    /// Per route depth, whether the surface assembles the whole answer before
+    /// the caller sees a byte (`WaterfallContext::buffered`): every
+    /// non-streaming request, and a stream an output guardrail buffers. The
+    /// routes branch on the same two facts once a rung commits; tool-search
+    /// rounds adopted later can only turn an incremental stream buffered,
+    /// never the reverse, so this view taken before the waterfall never
+    /// claims a depth the route then streams live.
+    pub(crate) fn buffered_depths(&self) -> Vec<bool> {
+        (0..self.route.len())
+            .map(|depth| !self.stream || (self.buffers_output() && !self.stream_incremental(depth)))
+            .collect()
+    }
+
     /// The per-chunk transport bound of the deployment serving `depth`.
     pub(crate) fn phase_timeout(&self, depth: usize) -> Duration {
         let seconds = self

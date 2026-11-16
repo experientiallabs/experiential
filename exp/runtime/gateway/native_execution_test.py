@@ -1253,6 +1253,189 @@ def test_failover_eligibility_matrix_follows_the_classifier_flags(
     assert candidate == expected
 
 
+def _transport() -> GatewayFailure:
+    """Build one connection reset as the data plane classifies it (open or mid-body)."""
+    return GatewayFailure(
+        failure_class=GatewayFailureClass.TRANSPORT,
+        safe_message="provider transport failed; retry the request",
+        retryable_same_deployment=True,
+        failover_eligible=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "mode", ("maximize_availability", "maximize_cache", "maximize_cache_affinity")
+)
+def test_a_transport_failure_takes_the_sibling_before_redialing_the_warm_rung(
+    mode: FailoverMode,
+) -> None:
+    """A reset advances to an untried sibling under every mode, cache at stake or not.
+
+    A transport failure is the path to the provider failing, so the
+    sibling's cache miss is taken instead of redialing the same origin into
+    the same burst of resets, even when the organization's cache on the
+    failed rung is fully warm.
+    """
+    candidate = next_route_candidate(
+        health=DeploymentHealthRegistry(),
+        keys=_KEYS,
+        failure=_transport(),
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+        failover_mode=mode,
+        throttle_cache_threshold=0.0,
+        cached_fraction=1.0,
+    )
+    assert candidate == 1
+
+
+def test_a_transport_failure_with_no_sibling_redials_the_warm_rung() -> None:
+    """With every other rung already dispatched, the failed rung is redialed once."""
+    health = DeploymentHealthRegistry()
+    assert (
+        next_route_candidate(
+            health=health,
+            keys=_KEYS,
+            failure=_transport(),
+            current_depth=1,
+            attempt_counts=[1, 1],
+            total_attempts=2,
+            refusal_failover=False,
+        )
+        == 1
+    )
+    # The rung's own redial cap still ends the ladder.
+    assert (
+        next_route_candidate(
+            health=health,
+            keys=_KEYS,
+            failure=_transport(),
+            current_depth=1,
+            attempt_counts=[1, 2],
+            total_attempts=3,
+            refusal_failover=False,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("failure", (_transport(), _retryable()))
+def test_an_open_circuit_never_ends_a_request_whose_only_rung_it_is(
+    failure: GatewayFailure,
+) -> None:
+    """A one-rung route redials through its own open circuit rather than answering 502.
+
+    Once resets open a one-rung route's circuit on a worker, a brand-new
+    request is still force-admitted to the rung; a request whose first dial
+    reset gets the same last-resort and forced claims for its redial instead
+    of ending ``all_routes_failed`` after a single attempt.
+    """
+    keys = _KEYS[:1]
+    health = DeploymentHealthRegistry(failure_threshold=2, open_seconds=60.0)
+    health.failed(keys[0], failure)
+    health.failed(keys[0], failure)
+    assert health.claim(keys[0]) is False  # the circuit is open on this worker
+    assert health.claim_last_resort(keys[0]) is True  # another request holds the probe
+    candidate = next_route_candidate(
+        health=health,
+        keys=keys,
+        failure=failure,
+        current_depth=0,
+        attempt_counts=[1],
+        total_attempts=1,
+        refusal_failover=False,
+        failover_mode="maximize_cache",
+    )
+    assert candidate == 0
+
+
+def test_a_throttle_window_still_refuses_the_forced_redial() -> None:
+    """The provider's own stated backoff is never overridden by the forced claim."""
+    keys = _KEYS[:1]
+    health = DeploymentHealthRegistry()
+    throttled = GatewayFailure(
+        failure_class=GatewayFailureClass.THROTTLED,
+        safe_message="provider throttled the request",
+        retryable_same_deployment=True,
+        failover_eligible=True,
+        retry_after_seconds=30,
+    )
+    health.failed(keys[0], throttled)
+    candidate = next_route_candidate(
+        health=health,
+        keys=keys,
+        failure=throttled,
+        current_depth=0,
+        attempt_counts=[1],
+        total_attempts=1,
+        refusal_failover=False,
+    )
+    assert candidate is None
+
+
+def _context_window(limit: int | None) -> GatewayFailure:
+    """Build one provider context-window 400 as the data plane classifies it."""
+    return GatewayFailure(
+        failure_class=GatewayFailureClass.INVALID_REQUEST,
+        safe_message="This model's maximum context length is 16384 tokens.",
+        failover_eligible=True,
+        context_window_rejected=True,
+        context_window_limit_tokens=limit,
+    )
+
+
+@pytest.mark.parametrize(
+    ("limit", "windows", "expected"),
+    [
+        # A lane serving 16,384 tokens of a model both lanes advertise at
+        # 262,144: the wider lane takes it.
+        (16_384, (262_144, 262_144), 1),
+        # A sibling no wider than the stated window would refuse the same.
+        (16_384, (262_144, 16_384), None),
+        # A sibling the catalog states no window for is admitted, as at admission.
+        (16_384, (262_144, None), 1),
+        # No stated window: the failed rung's advertised window is the bar.
+        (None, (32_768, 32_768), None),
+        (None, (32_768, 131_072), 1),
+        # No window facts for the route at all: any untried rung.
+        (None, (None, None), 1),
+    ],
+)
+def test_a_context_window_rejection_advances_only_to_a_wider_rung(
+    limit: int | None, windows: tuple[int | None, ...], expected: int | None
+) -> None:
+    """The caller's 400 advances only to a rung whose window could fit the request."""
+    candidate = next_route_candidate(
+        health=DeploymentHealthRegistry(),
+        keys=_KEYS,
+        failure=_context_window(limit),
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+        failover_mode="maximize_cache",
+        context_windows=windows,
+    )
+    assert candidate == expected
+
+
+def test_a_context_window_rejection_never_redials_the_refusing_rung() -> None:
+    """A one-rung route surfaces the provider's 400; the same window refuses again."""
+    candidate = next_route_candidate(
+        health=DeploymentHealthRegistry(),
+        keys=_KEYS[:1],
+        failure=_context_window(16_384),
+        current_depth=0,
+        attempt_counts=[1],
+        total_attempts=1,
+        refusal_failover=False,
+        context_windows=(262_144,),
+    )
+    assert candidate is None
+
+
 def test_input_reservation_is_tokenized_once_per_request_object(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

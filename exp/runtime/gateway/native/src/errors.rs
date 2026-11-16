@@ -360,6 +360,13 @@ pub struct Failure {
     /// `GatewayHeaderTimeout`), read by the control plane's lane ejection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header_timeout: Option<HeaderTimeout>,
+    /// A provider context-window refusal: the caller's class, but the ladder
+    /// may take it once, to a wider rung (python `native_context_window`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub context_window_rejected: bool,
+    /// The window the rejecting provider stated, when its sentence names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_limit_tokens: Option<u32>,
 }
 
 /// Which bound ended a dial waiting for its provider's response headers.
@@ -400,6 +407,8 @@ impl Failure {
             encrypted_reasoning_rejected: false,
             tenant_origin: false,
             header_timeout: None,
+            context_window_rejected: false,
+            context_window_limit_tokens: None,
         }
     }
 

@@ -4,7 +4,10 @@ mod deadline;
 pub use deadline::{
     deadline_while_generating, stream_timeout_failure, DEADLINE_BEFORE_OUTPUT_MESSAGE,
 };
+mod collect;
 mod progress;
+pub use collect::collect_committed;
+pub(crate) use collect::collect_committed_observed;
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime};
@@ -23,7 +26,6 @@ use crate::metrics::METRICS;
 use crate::stop_sequences::StopSequenceGuard;
 use crate::tool_search::{ToolSearchWithholder, WithheldSearchCall};
 use crate::tool_serialization::ToolCallSerializer;
-use crate::waterfall::CommittedAttempt;
 
 /// Map collection failures to public errors, honoring aggregate-output bounds.
 pub fn collection_public_error(failure: &Failure) -> PublicError {
@@ -800,62 +802,6 @@ impl UpstreamRelay {
 impl Drop for UpstreamRelay {
     fn drop(&mut self) {
         self.close_transport();
-    }
-}
-
-/// Drain one non-streaming attempt, bounding output like the Python aggregation.
-pub async fn collect_committed(
-    committed: &mut CommittedAttempt,
-    deadline: Instant,
-    phase_timeout: Duration,
-    request_started: Instant,
-) -> Result<Vec<Event>, Failure> {
-    let mut events: Vec<Event> = Vec::new();
-    let mut retained_bytes = 0usize;
-    let mut lease = crate::retained::RetainedLease::default();
-    let mut retain = |events: &mut Vec<Event>, event: Event| -> Result<(), Failure> {
-        let bytes = event_retained_bytes(&event);
-        retained_bytes = retained_bytes.saturating_add(bytes);
-        if retained_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES {
-            return Err(Failure::new(
-                FailureClass::ProviderInternal,
-                OUTPUT_OVERFLOW_MESSAGE,
-            ));
-        }
-        if !lease.reserve(bytes) {
-            return Err(Failure::new(
-                FailureClass::Unavailable,
-                crate::retained::WORKER_RETENTION_EXHAUSTED_MESSAGE,
-            ));
-        }
-        events.push(event);
-        Ok(())
-    };
-    for event in committed.prefix.drain(..) {
-        retain(&mut events, event)?;
-    }
-    if events.last().is_some_and(Event::is_terminal) {
-        return Ok(events);
-    }
-    loop {
-        let next = committed
-            .relay
-            .next_event(deadline, phase_timeout, request_started)
-            .await;
-        if matches!(next, Err(_) | Ok(None) | Ok(Some(Event::Failed(_)))) {
-            committed.usage = committed.relay.usage_before_failure(committed.usage.take());
-        }
-        match next? {
-            Some(event) => {
-                track_event(&event, &mut committed.usage, &mut committed.tool_names);
-                let terminal = event.is_terminal();
-                retain(&mut events, event)?;
-                if terminal {
-                    return Ok(events);
-                }
-            }
-            None => return Err(ended_without_terminal()),
-        }
     }
 }
 

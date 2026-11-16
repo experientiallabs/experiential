@@ -359,3 +359,58 @@ def test_a_forced_pass_never_takes_a_fast_reserve() -> None:
     assert failure["failure_class"] == "throttled"
     assert registry.loads.fast_inflight(rung_load_key(reserve_lane)) == 0
     assert registry.loads.failover_inflight(rung_load_key(reserve_lane)) == 0
+
+
+# A provider context-window 400 exactly as the data plane files it
+# (`context_window.rs::mark`): the caller's class, failover-eligible once.
+_CONTEXT_WINDOW: JsonObject = {
+    "failure_class": "invalid_request",
+    "safe_message": "provider rejected the request",
+    "failover_eligible": True,
+    "context_window_rejected": True,
+    "context_window_limit_tokens": 16_384,
+}
+
+
+def _windowed(deployment: ExactModelDeployment, window: int) -> ExactModelDeployment:
+    """Return ``deployment`` advertising a ``window``-token context window."""
+    capabilities = ModelCapabilities(maximum_output_tokens=8_192, context_window_tokens=window)
+    return deployment.model_copy(update={"capabilities": capabilities})
+
+
+def test_a_context_window_spill_never_lands_on_a_rung_no_wider_than_the_refusal() -> None:
+    """The sideways spill after a shed walks only rungs whose window could fit."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    lane_a, lane_b = _refusing_pair()
+    lane_a = _windowed(lane_a, 262_144)
+    narrow = _windowed(_deployment("deployment-c", connection_sha256="e" * 64), 16_384)
+    wide = _windowed(_deployment("deployment-d", connection_sha256="f" * 64), 262_144)
+    _fill(registry, (lane_a,), 2, "occupied")
+    _admit(registry, (_windowed(lane_b, 262_144), lane_a, narrow, wide), request_id="window")
+    reserved = _fail_with(registry, "window", _CONTEXT_WINDOW)
+    # Depth 1 (wider) is full and sheds; the spill skips the narrow depth 2.
+    assert reserved["route_depth"] == 3
+
+
+def test_a_transport_failure_returns_to_its_rung_when_the_sibling_cannot_take_it() -> None:
+    """The sibling-first walk falls back to the failed rung's permitted redial."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    lane_a, lane_b = _refusing_pair()
+    _fill(registry, (lane_a,), 2, "occupied")
+    _admit(registry, (lane_b, lane_a), request_id="redial")
+    started = _start(registry, ordinal=0, request_id="redial")
+    assert started["route_depth"] == 0
+    _settle(
+        registry,
+        attempt_id=str(started["attempt_id"]),
+        outcome="failed",
+        finalize=False,
+        failure=_REFUSED,
+        request_id="redial",
+    )
+    # The full sibling sheds; the walk returns to the reset rung instead of
+    # forcing the sibling past its bound or ending the request.
+    reserved = _start(registry, ordinal=1, current_depth=0, failure=_REFUSED, request_id="redial")
+    assert reserved["route_depth"] == 0

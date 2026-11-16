@@ -342,15 +342,17 @@ def test_provider_client_error_relays_the_parameter(engine: _ServingEngine) -> N
 
 
 @pytest.mark.parametrize(
-    ("prompt", "expected_fragment"),
+    ("prompt", "expected_fragment", "dials"),
     [
-        ("unbilled", "incomplete or invalid response"),
-        ("short-count", "incomplete or invalid response"),
-        ("server-error", "had a server error"),
+        ("unbilled", "incomplete or invalid response", 1),
+        ("short-count", "incomplete or invalid response", 1),
+        # A 5xx is redialable: the one-rung route redials once, even when the
+        # earlier cases opened the rung's circuit on this worker.
+        ("server-error", "had a server error", 2),
     ],
 )
 def test_unbillable_or_failing_provider_answers_fail_closed(
-    engine: _ServingEngine, prompt: str, expected_fragment: str
+    engine: _ServingEngine, prompt: str, expected_fragment: str, dials: int
 ) -> None:
     """No usage, a missing image, or a 5xx never hands the caller an unaccounted image."""
     failed_before = _terminal_attempts(engine.base, "failed")
@@ -358,7 +360,7 @@ def test_unbillable_or_failing_provider_answers_fail_closed(
     assert response.status_code == 502, response.text
     assert response.json()["error"]["code"] == "all_routes_failed"
     assert expected_fragment in response.json()["error"]["message"]
-    assert _terminal_attempts(engine.base, "failed") == failed_before + 1
+    assert _terminal_attempts(engine.base, "failed") == failed_before + dials
 
 
 def _last_attempt(engine: _ServingEngine) -> tuple[object, ...]:

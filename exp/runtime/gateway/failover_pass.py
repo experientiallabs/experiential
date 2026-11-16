@@ -51,6 +51,7 @@ from exp.runtime.gateway.health import (
 )
 from exp.runtime.gateway.lane_ejection import DEAD_LANE_FAILURES
 from exp.runtime.gateway.lane_saturation import lane_saturated_failure
+from exp.runtime.gateway.native_context_window import route_context_windows, wider_windows
 from exp.runtime.gateway.native_execution import InflightRequest
 from exp.runtime.gateway.native_fallback_rules import route_fallback_rules, untried_depths
 from exp.runtime.gateway.rung_admission import RungShed
@@ -69,6 +70,12 @@ class FailoverPass:
             failure that earns a forced pass.
         forced: Depths this walk already tried to force past their bound.
         forcing: Whether the current candidate is a forced pass.
+        redial: The rung a transport failure left for its siblings
+            (``next_route_candidate`` tries them first) while its own redial is
+            still permitted: claimed once the sideways walk runs out, so a
+            sibling that sheds or is rejected never ends the request.
+        redial_forced: Whether that redial may take the forced claim (the
+            request's only dial failed).
     """
 
     untried: tuple[int, ...]
@@ -76,6 +83,8 @@ class FailoverPass:
     may_force: bool = False
     forced: set[int] = field(default_factory=set)
     forcing: bool = False
+    redial: int | None = None
+    redial_forced: bool = False
 
     @classmethod
     def begin(
@@ -103,13 +112,29 @@ class FailoverPass:
         )
         if not (failure.failover_eligible or refusal):
             return None
-        untried = untried_depths(
-            route_fallback_rules(entry.route), failure, entry.attempt_counts, current_depth
+        untried = wider_windows(
+            untried_depths(
+                route_fallback_rules(entry.route), failure, entry.attempt_counts, current_depth
+            ),
+            failure,
+            current_depth,
+            route_context_windows(entry.route),
+        )
+        policy = entry.attempt_policy
+        cap = policy.physical_route_cap
+        redial_permitted = (
+            failure.failure_class == GatewayFailureClass.TRANSPORT
+            and failure.retryable_same_deployment
+            and entry.ordinary_attempt_counts[current_depth]
+            < policy.maximum_same_deployment_attempts
+            and (cap is None or entry.attempt_counts[current_depth] < cap)
         )
         return cls(
             untried=untried,
             ladder=untried,
             may_force=failure.failure_class in DEAD_LANE_FAILURES,
+            redial=current_depth if redial_permitted else None,
+            redial_forced=entry.total_attempts <= 1,
         )
 
     def sideways(
@@ -135,7 +160,13 @@ class FailoverPass:
             self.forcing = False
             return None
         self.ladder = tuple(depth for depth in self.ladder if depth != candidate)
-        return claim_route_from(health, keys, 0, self.ladder) if self.ladder else None
+        claimed = claim_route_from(health, keys, 0, self.ladder) if self.ladder else None
+        if claimed is not None or self.redial is None or self.redial == candidate:
+            return claimed
+        redial, self.redial = self.redial, None
+        if self.redial_forced:
+            return claim_route_from(health, keys, 0, (redial,))
+        return redial if health.claim(keys[redial]) else None
 
     def forced_target(
         self,

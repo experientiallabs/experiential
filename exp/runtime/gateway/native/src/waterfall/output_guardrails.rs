@@ -7,6 +7,7 @@ use crate::tool_search::{messages_prelude_events, responses_prelude_events, Tool
 use crate::web_search::{web_search_prelude_events, WebSearchAdmission};
 
 /// Output policy presence and the protocol projection for gateway-generated content.
+#[derive(Clone, Copy)]
 pub struct OutputGuardrailContext<'a> {
     pub web_search: Option<&'a WebSearchAdmission>,
     pub responses: bool,

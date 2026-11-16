@@ -516,6 +516,13 @@ class GatewayFailure(ContractModel):
             class and message settle as they are; the caller-facing answer
             collapses to the data plane's opaque custom-endpoint error, so the
             gateway never replays it as a specific provider failure.
+        context_window_rejected: The provider refused the request as longer
+            than its own context window. The class stays the caller's
+            ``INVALID_REQUEST``, but a lane may serve less than the window the
+            model advertises, so the ladder may advance once, only to a rung
+            whose advertised window is larger (``native_context_window``).
+        context_window_limit_tokens: The window the rejecting provider's
+            sentence states, when it names one.
     """
 
     failure_class: GatewayFailureClass
@@ -549,6 +556,8 @@ class GatewayFailure(ContractModel):
     """Set only on a header-phase timeout: which bound expired (lane ejection
     counts only ``allowance``)."""
     tenant_origin: bool = False
+    context_window_rejected: bool = False
+    context_window_limit_tokens: int | None = Field(default=None, ge=1)
 
 
 def _validate_responses_probability_records(

@@ -69,3 +69,33 @@ limits and separate reservations. This health hint does not prove that the reque
 was unprocessed; unknown usage and its accounting hold remain unresolved. Ordinary
 transport failures, midstream failures and `REFUSED_STREAM` keep their existing
 health behavior.
+
+## Transport, buffered answers and context windows
+
+A `transport` failure (a reset or refused connection) is the path to the provider failing, not its
+answer, so it is never decided by cache stakes: under every failover mode it advances to an untried
+sibling before any redial of the failed rung, taking the cache miss, and redials that rung only when
+no sibling can take it. When a request's only dial failed and the only remaining way to an answer is a redial of that rung
+while this worker holds its circuit open, the redial is admitted through the last-resort and forced
+claims a fresh request's first dial would get (a provider-stated throttle window still refuses), so
+the circuit never ends a request after one dial; any later redial stays behind it.
+
+Commitment is the moment the caller could see the rung. A surface that assembles the whole answer
+before sending it (every non-streaming request, and a stream an output guardrail buffers) drains the
+committed attempt inside the waterfall (`WaterfallContext::buffered`, `waterfall/buffered.rs`): a
+`transport`, `timeout`, `provider_internal`, or `malformed_response` failure the classifier marked
+redialable or failover-eligible that breaks such an attempt mid-body settles it `failed` (its own
+attempt row, with whatever usage it reported) and takes the ladder like a pre-commit failure,
+because the caller has received nothing. A stream that already sent the caller a delta never
+restarts or splices another rung: it ends with the protocol's own terminal error (a Chat `error`
+data frame then `[DONE]`, Messages `event: error`, Responses `response.failed`), never a silently
+cut connection.
+
+A provider context-window refusal (`context_length_exceeded`, or a sentence such as vLLM's "maximum
+context length is N tokens") keeps the caller's `invalid_request` class and sentence, but a lane can
+serve less than the window the model advertises. The data plane files it with
+`context_window_rejected` (and the stated window in `context_window_limit_tokens`), never redials
+it, and keeps it failover-eligible once per request; the control plane advances only to an untried
+rung whose advertised window exceeds the stated one (else the failed rung's advertised window), or
+whose window the catalog does not state (`native_context_window.py`). With no such rung, or on a
+second refusal, the caller receives the provider's 400 unchanged.

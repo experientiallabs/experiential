@@ -733,11 +733,21 @@ async fn non_success_failure(
     let encrypted_reasoning = body
         .as_deref()
         .is_some_and(|body| rejected_encrypted_reasoning(dialect, body));
-    failure
+    // A context-window verdict keeps the caller's class and sentence, but a
+    // lane can serve less than the window the model advertises: the ladder
+    // may take it once, to a rung whose window is larger (`next_route_candidate`).
+    let context_window = body.as_deref().and_then(|body| {
+        crate::context_window::rejected_context_window(dialect, code.as_deref(), body)
+    });
+    let failure = failure
         .with_retry(false, lane_limitation)
         .with_rejected_parameter(parameter)
-        .with_provider_detail(detail)
-        .with_encrypted_reasoning_rejected(encrypted_reasoning)
+        .with_provider_detail(detail);
+    let failure = match context_window {
+        Some(limit) => crate::context_window::mark(failure, limit),
+        None => failure,
+    };
+    failure.with_encrypted_reasoning_rejected(encrypted_reasoning)
 }
 
 /// The ledger detail of one status-only classification.

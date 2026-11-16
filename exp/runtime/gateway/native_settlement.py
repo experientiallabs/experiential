@@ -196,6 +196,14 @@ def failure_from_boundary_payload(payload: object) -> GatewayFailure | None:
         refusal_reason=refusal_reason_from_payload(data.get("refusal_reason")),
         header_timeout=header_timeout_from_payload(data.get("header_timeout")),
         tenant_origin=data.get("tenant_origin") is True,
+        context_window_rejected=data.get("context_window_rejected") is True,
+        context_window_limit_tokens=(
+            context_limit
+            if isinstance(context_limit := data.get("context_window_limit_tokens"), int)
+            and not isinstance(context_limit, bool)
+            and context_limit >= 1
+            else None
+        ),
     )
 
 

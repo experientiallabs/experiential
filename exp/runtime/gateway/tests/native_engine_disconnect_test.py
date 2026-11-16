@@ -231,6 +231,22 @@ class _SseUpstream(BaseHTTPRequestHandler):
             if prompt.startswith(("quiet-", "hidden-", "anthro-", "beforeheaders-", "keyed-")):
                 _serve_quiet(self, prompt)
                 return
+            if prompt.startswith("reset-"):
+                # One delta, then a TCP reset mid-body ("stream decode
+                # failed: connection reset"). A ``reset-once-`` prompt
+                # resets only its first dial.
+                calls = _RESET_CALLS[prompt] = _RESET_CALLS.get(prompt, 0) + 1
+                if prompt.startswith("reset-once-") and calls > 1:
+                    self.wfile.write(_content_chunk("hello "))
+                    self.wfile.write(_content_chunk("world"))
+                    self.wfile.write(_TERMINAL_FRAMES)
+                    self.wfile.flush()
+                    return
+                self.wfile.write(_content_chunk("hello "))
+                self.wfile.flush()
+                time.sleep(0.2)
+                _reset_connection(self)
+                return
             if prompt == "slow-token":
                 for _ in range(10):
                     self.wfile.write(_content_chunk("tick "))
@@ -264,6 +280,17 @@ class _SseUpstream(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         """Suppress request logs so test output cannot retain payload context."""
         del format, args
+
+
+_RESET_CALLS: dict[str, int] = {}
+
+
+def _reset_connection(handler: BaseHTTPRequestHandler) -> None:
+    """Abort the provider socket with a TCP RST instead of a clean close."""
+    handler.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    handler.wfile.close()
+    handler.rfile.close()
+    handler.connection.close()
 
 
 _PROVIDER_OPENED: dict[str, threading.Event] = {}
@@ -1020,6 +1047,69 @@ def test_a_deadline_cut_stream_says_so_instead_of_ending_cleanly(
         assert "event: error" in response.text
         assert "event: message_stop" not in response.text
     assert elapsed < _REQUEST_TIMEOUT_SECONDS + 3
+
+
+@pytest.mark.parametrize("surface", ["chat", "messages"])
+def test_a_reset_after_the_first_delta_ends_the_stream_with_an_error_event(
+    engine: _ServingEngine, surface: str
+) -> None:
+    """A provider reset after output reached the caller is named, never a silent cut.
+
+    The delta the caller already holds cannot be taken back or spliced onto
+    another rung, so the stream ends with the protocol's own terminal error
+    (Chat: an ``error`` data frame then ``[DONE]``; Messages: ``event:
+    error``), which SDK clients surface instead of reading a clean ending.
+    """
+    prompt = f"reset-stream-{surface}"
+    body = json.loads(_chat_payload(prompt, stream=True))
+    path = "/v1/chat/completions"
+    if surface == "messages":
+        body["max_tokens"] = 128
+        path = "/v1/messages"
+    response = httpx.post(
+        f"{engine.base}{path}",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json=body,
+        timeout=_REQUEST_TIMEOUT_SECONDS + 10,
+    )
+    assert response.status_code == 200
+    assert "hello" in response.text
+    assert "transport" in response.text.lower() or "retry" in response.text.lower()
+    if surface == "chat":
+        assert '"error"' in response.text, response.text[-400:]
+        assert response.text.rstrip().endswith("data: [DONE]")
+    else:
+        assert "event: error" in response.text, response.text[-400:]
+        assert "event: message_stop" not in response.text
+    # Committed output is never re-dialed onto a second provider call.
+    assert _RESET_CALLS[prompt] == 1
+
+
+def test_a_non_streaming_answer_broken_mid_body_is_restarted_not_failed(
+    engine: _ServingEngine,
+) -> None:
+    """A reset the caller never saw (nothing sent yet) restarts the answer.
+
+    A non-streaming request assembles the whole answer before sending a byte,
+    so a provider reset mid-body is still the ladder's to take: the broken
+    attempt settles ``failed`` (its own attempt row) and the redial serves the
+    caller a normal 200 instead of a 502. On this one-rung route the redial is
+    admitted even when earlier resets opened the rung's circuit.
+    """
+    prompt = "reset-once-buffered"
+    failed_before = _terminal_attempts(engine, "failed")
+    completed_before = _terminal_attempts(engine, "completed")
+    response = httpx.post(
+        f"{engine.base}/v1/chat/completions",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        content=_chat_payload(prompt),
+        timeout=_REQUEST_TIMEOUT_SECONDS + 10,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["choices"][0]["message"]["content"] == "hello world"
+    assert _RESET_CALLS[prompt] == 2
+    assert _terminal_attempts(engine, "failed") == failed_before + 1
+    assert _terminal_attempts(engine, "completed") == completed_before + 1
 
 
 def test_heartbeat_keeps_original_provider_phase_timeout(engine: _ServingEngine) -> None:
