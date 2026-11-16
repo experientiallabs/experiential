@@ -519,11 +519,12 @@ def _persist_tinker_selection(
         models.setdefault(alias, desired_record)
         write_model_catalog(
             store.model_catalog_path,
-            ModelCatalog(
-                schema_version=current.schema_version,
-                connections=connections,
-                models=models,
-                roles=current.roles,
+            ModelCatalog.model_validate(
+                {
+                    **current.model_dump(),
+                    "connections": connections,
+                    "models": models,
+                }
             ),
         )
 

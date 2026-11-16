@@ -412,13 +412,16 @@ def _merge_provider_setup(
         world_model_reasoning_effort=setup.world_model_reasoning_effort,
         judge_reasoning_effort=setup.judge_reasoning_effort,
     )
-    catalog = ModelCatalog(
-        schema_version=(
-            existing.schema_version if existing is not None else MODEL_CATALOG_SCHEMA_VERSION
-        ),
-        connections=connections,
-        models=models,
-        roles=ModelRoles.model_validate(role_values),
+    catalog = ModelCatalog.model_validate(
+        {
+            **(existing.model_dump() if existing is not None else {}),
+            "schema_version": (
+                existing.schema_version if existing is not None else MODEL_CATALOG_SCHEMA_VERSION
+            ),
+            "connections": connections,
+            "models": models,
+            "roles": ModelRoles.model_validate(role_values),
+        }
     )
     embedder = catalog.models[catalog.roles.embedder or ""]
     if embedder.capabilities is None or not embedder.capabilities.supports_embeddings:

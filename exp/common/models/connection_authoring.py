@@ -114,14 +114,18 @@ def sync_provider_models(
                     f"model alias {alias!r} already differs; rerun with replacement"
                 )
             current_models[alias] = proposed
-        catalog = ModelCatalog(
-            schema_version=(
-                existing.schema_version if existing is not None else MODEL_CATALOG_SCHEMA_VERSION
-            ),
-            connections=current_connections,
-            models=current_models,
-            gateway_pools=existing.gateway_pools if existing is not None else {},
-            roles=existing.roles if existing is not None else ModelRoles(),
+        catalog = ModelCatalog.model_validate(
+            {
+                **(existing.model_dump() if existing is not None else {}),
+                "schema_version": (
+                    existing.schema_version
+                    if existing is not None
+                    else MODEL_CATALOG_SCHEMA_VERSION
+                ),
+                "connections": current_connections,
+                "models": current_models,
+                "roles": existing.roles if existing is not None else ModelRoles(),
+            }
         )
         previous_bytes = target.read_bytes() if on_commit is not None and target.exists() else None
         write_model_catalog(target, catalog)
