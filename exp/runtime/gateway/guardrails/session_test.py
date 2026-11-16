@@ -6,7 +6,7 @@ import asyncio
 import json
 import threading
 import time
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -1284,7 +1284,7 @@ def test_optional_block_record_waits_for_native_denial_acceptance(boundary: str)
                         action="error",
                         failure=capture_unavailable_failure().model_dump(mode="json"),
                     )
-                session._flush_native_rejection()
+                session._flush_input_rejection()
                 assert not blocks()
             assert session._native_rejection is None
             assert expiry.call_count == int(boundary == "policy")
@@ -1293,5 +1293,128 @@ def test_optional_block_record_waits_for_native_denial_acceptance(boundary: str)
             assert len(blocks()) == int(boundary in ("timely", "committed_then_closed"))
             assert expiry.call_count == int(boundary in ("policy", "publication"))
     finally:
+        session.cancel()
+        engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize("boundary", ["timely", "expired", "cancel_after_commit"])
+def test_later_input_block_records_its_own_committed_gate(boundary: str) -> None:
+    """A prior native allow cannot hide a later synchronous input turn's actual block."""
+    optional = _observer_policy().model_copy(
+        update={"mode": "enforce", "input_execution": "parallel", "fail_open": True}
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((optional,)),
+        client=DirectClassifierClient(
+            ClassifierRegistry(
+                {"criminal": ScriptedClassifier(input_verdict=ClassifierVerdict(flagged=True))}
+            )
+        ),
+        monotonic=time.monotonic,
+    )
+    session = _session(engine)
+    native = Mock()
+    native.decision_json.return_value = '{"action":"allow"}'
+    native.expired.return_value = False
+    native.elapsed_seconds.return_value = 0.251 if boundary == "expired" else 0.001
+    session.native_input = native
+    flush = session._flush_input_rejection
+
+    def cancel_after_commit(decision: JsonObject | None = None) -> None:
+        """Cross the deadline after the synchronous gate has retained its rejection."""
+        if boundary == "cancel_after_commit" and decision is not None:
+            assert session._input_failure is not None
+            native.elapsed_seconds.return_value = 0.251
+            session.cancel()
+        flush(decision)
+
+    try:
+        with (
+            patch.object(engine, "_record") as actions,
+            patch.object(engine, "record_input_expiry") as expiry,
+            patch.object(session, "_flush_input_rejection", side_effect=cancel_after_commit),
+        ):
+            if boundary == "expired":
+                assert session.inspect_input(_request("later turn")) == _request("later turn")
+            else:
+                with pytest.raises(GuardrailRejected):
+                    session.inspect_input(_request("later turn"))
+                assert session.input_decision()["action"] == "error"
+            recorded = [c for c in actions.call_args_list if c.args[2] is GuardrailAction.BLOCK]
+            assert len(recorded) == int(boundary != "expired")
+            assert expiry.call_count == int(boundary == "expired")
+            assert session._native_rejection is None
+            session.cancel()
+            assert len(
+                [c for c in actions.call_args_list if c.args[2] is GuardrailAction.BLOCK]
+            ) == int(boundary != "expired")
+    finally:
+        session.cancel()
+        engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize("cancel_active", [False, True])
+def test_later_fresh_subject_keeps_expiry_coverage_after_prepared_allow(
+    cancel_active: bool,
+) -> None:
+    """Completed preparation cannot hide later expiry, including cleanup during inspection."""
+    started, release = threading.Event(), threading.Event()
+
+    class Classifier(ScriptedClassifier):
+        """Allow preparation, then hold only the fresh synchronous subject."""
+
+        async def inspect_input(
+            self, *, request: GatewayRequest, check: GuardrailCheck
+        ) -> ClassifierVerdict:
+            """Expose the later subject's active lifetime without holding the event loop."""
+            if request.messages[-1].content == "later":
+                started.set()
+                while not release.is_set():
+                    await asyncio.sleep(0.001)
+            return await super().inspect_input(request=request, check=check)
+
+    optional = _observer_policy().model_copy(
+        update={"mode": "enforce", "input_execution": "parallel", "fail_open": True}
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((optional,)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": Classifier()})),
+        monotonic=time.monotonic,
+    )
+    session = _session(engine)
+    native = Mock()
+    native.decision_json.return_value = '{"action":"allow"}'
+    native.expired.return_value = False
+    native.elapsed_seconds.return_value = None
+    session.native_input = native
+    try:
+        session.prepare_dispatch((_request("prepared"),), overlap=True)
+        assert session._input is not None
+        session._input.result(timeout=1)
+        assert all(count == 0 for count in session._input_pending_checks.values())
+        with patch.object(engine, "record_input_expiry") as expiry:
+            if cancel_active:
+                native.elapsed_seconds.return_value = 0.001
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    later = executor.submit(session.inspect_input, _request("later"))
+                    try:
+                        assert started.wait(1)
+                        native.elapsed_seconds.return_value = 0.251
+                        session.cancel()
+                        session.cancel()
+                        assert expiry.call_count == 1
+                    finally:
+                        release.set()
+                    assert later.result(timeout=1) == _request("later")
+            else:
+                native.elapsed_seconds.return_value = 0.251
+                assert session.inspect_input(_request("later")) == _request("later")
+                assert session.inspect_input(_request("later")) == _request("later")
+            assert expiry.call_count == 1
+            assert expiry.call_args.args[0].policy_id == optional.policy_id
+            assert session._synchronous_inputs == 0
+            assert all(count == 0 for count in session._input_pending_checks.values())
+    finally:
+        release.set()
         session.cancel()
         engine.close(timeout_seconds=2)

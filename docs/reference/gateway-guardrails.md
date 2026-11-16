@@ -518,9 +518,11 @@ keep their authored check deadlines.
 
 The parallel wait starts when the gateway first needs the input decision to
 proceed, including the first committed provider content for buffered responses.
-Optional terminal actions are recorded as applied only after the native release
-commits the denial. A discarded late rejection contributes timeout coverage, not
-an applied block. Classification scores remain observations of the classifier.
+Optional terminal actions are recorded as applied only after their input gate
+commits the denial. The initial parallel release uses the native outcome; later
+synchronous turns use their own committed input result. A discarded late rejection
+contributes timeout coverage, not an applied block. Classification scores remain
+observations of the classifier.
 
 At zero additional wait, a denial already published to the native decision before
 the blocking boundary is retained. A result still awaiting publication is pending
