@@ -583,19 +583,7 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
                     None
                 };
                 let mut next_policy = ctx.policy;
-                // A transport failure advances to an untried sibling before
-                // any redial of this rung (`next_route_candidate`), so the
-                // same-rung backoff would only delay the sibling's dial.
-                let sibling_first = failure.failure_class == FailureClass::Transport
-                    && fallback_rules::successor_available(
-                        ctx.route,
-                        depth,
-                        &physical_counts,
-                        &failure,
-                        failure.failover_eligible,
-                    );
                 let retry_wait = if failure.retryable_same_deployment
-                    && !sibling_first
                     && fits
                     && counts[depth] < ctx.policy.maximum_same_deployment_attempts
                 {

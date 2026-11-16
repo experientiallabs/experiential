@@ -78,7 +78,7 @@ mod tests {
 
     #[test]
     fn a_context_window_verdict_names_the_window_the_lane_serves() {
-        // The live Greenference qwen3.5-9b 400 (vLLM), 2026-11-16.
+        // vLLM's context-length 400.
         let vllm = r#"{"object":"error","message":"This model's maximum context length is 16384 tokens. However, you requested 8192 output tokens and your prompt contains at least 8193 input tokens, for a total of at least 16385 tokens.","type":"BadRequestError","param":null,"code":400}"#;
         assert_eq!(
             rejected_context_window(Dialect::OpenAiCompatible, None, vllm),

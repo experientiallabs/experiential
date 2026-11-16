@@ -1,9 +1,7 @@
 //! A buffered surface restarts a committed attempt whose connection breaks
 //! mid-body: nothing reached the caller, so the ladder takes the failure and
-//! the answer comes from the next rung (production, 2026-11-16: bursts of
-//! "stream decode failed: connection reset" ended non-streaming requests
-//! that a sibling could have served). A streaming surface keeps the attempt
-//! the caller already saw.
+//! the answer comes from the next rung. A streaming surface keeps the
+//! attempt the caller already saw.
 
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
@@ -261,8 +259,8 @@ fn restartable_names_upstream_faults_and_never_gateway_or_caller_ones() {
     }
 }
 
-/// The live Greenference qwen3.5-9b verdict (vLLM), 2026-11-16: the lane
-/// serves 16,384 tokens of a model advertised at 262,144.
+/// A vLLM lane's verdict when it serves fewer tokens than the model
+/// advertises.
 const CONTEXT_WINDOW_BODY: &str = concat!(
     "{\"object\":\"error\",\"message\":\"This model's maximum context length is 16384 ",
     "tokens. However, you requested 8192 output tokens and your prompt contains at least ",
@@ -318,4 +316,29 @@ fn a_second_context_window_rejection_is_the_requests_answer() {
         let settles = story["settles"].as_array().expect("settles");
         assert_eq!(settles.last().expect("settle")["finalize"], true);
     });
+}
+
+#[test]
+fn work_the_provider_already_ran_is_never_restarted() {
+    // Client tool calls are text the caller executes: a restart repeats nothing.
+    assert!(!buffered::provider_executed(&Event::TextDelta("hi".into())));
+    let client_call = Event::ToolArgumentsDelta {
+        index: 0,
+        delta: "{}".into(),
+    };
+    assert!(!buffered::provider_executed(&client_call));
+    // A hosted MCP call or a server tool may already have had effects.
+    let hosted = Event::HostedToolItemStarted {
+        output_index: 0,
+        item_id: "mcp_1".into(),
+        item_type: "mcp_call".into(),
+        item: "{}".into(),
+    };
+    assert!(buffered::provider_executed(&hosted));
+    let server = Event::ServerToolUseStarted {
+        index: 0,
+        call_id: "srvtoolu_1".into(),
+        name: "web_fetch".into(),
+    };
+    assert!(buffered::provider_executed(&server));
 }

@@ -1271,11 +1271,10 @@ def test_a_transport_failure_takes_the_sibling_before_redialing_the_warm_rung(
 ) -> None:
     """A reset advances to an untried sibling under every mode, cache at stake or not.
 
-    Production, 2026-11-16: bursts of connection resets on Cloudflare-fronted
-    origins ended requests while the route still had rungs. A transport
-    failure is the path to the provider failing, so the sibling's cache miss
-    is taken instead of redialing the same origin into the same burst, even
-    when the organization's cache on the failed rung is fully warm.
+    A transport failure is the path to the provider failing, so the
+    sibling's cache miss is taken instead of redialing the same origin into
+    the same burst of resets, even when the organization's cache on the
+    failed rung is fully warm.
     """
     candidate = next_route_candidate(
         health=DeploymentHealthRegistry(),
@@ -1328,12 +1327,10 @@ def test_an_open_circuit_never_ends_a_request_whose_only_rung_it_is(
 ) -> None:
     """A one-rung route redials through its own open circuit rather than answering 502.
 
-    Production, 2026-11-16: gpt-6-luna and deepseek-v4.1-flash-uncensored each
-    served on one house rung. Two resets opened the rung's circuit on the
-    worker, after which every request whose first dial reset found its
-    redial refused by ``health.claim`` and ended ``all_routes_failed`` with
-    no second attempt, while a brand-new request was force-admitted to the
-    same rung. The redial now takes the same last-resort and forced claims.
+    Once resets open a one-rung route's circuit on a worker, a brand-new
+    request is still force-admitted to the rung; a request whose first dial
+    reset gets the same last-resort and forced claims for its redial instead
+    of ending ``all_routes_failed`` after a single attempt.
     """
     keys = _KEYS[:1]
     health = DeploymentHealthRegistry(failure_threshold=2, open_seconds=60.0)
@@ -1392,8 +1389,8 @@ def _context_window(limit: int | None) -> GatewayFailure:
 @pytest.mark.parametrize(
     ("limit", "windows", "expected"),
     [
-        # Production, 2026-11-16: a qwen3.5-9b lane served 16,384 tokens of a
-        # model both lanes advertise at 262,144; the wider lane takes it.
+        # A lane serving 16,384 tokens of a model both lanes advertise at
+        # 262,144: the wider lane takes it.
         (16_384, (262_144, 262_144), 1),
         # A sibling no wider than the stated window would refuse the same.
         (16_384, (262_144, 16_384), None),

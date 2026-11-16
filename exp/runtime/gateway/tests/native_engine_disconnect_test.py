@@ -232,9 +232,9 @@ class _SseUpstream(BaseHTTPRequestHandler):
                 _serve_quiet(self, prompt)
                 return
             if prompt.startswith("reset-"):
-                # One delta, then a TCP reset mid-body (the 2026-11-16
-                # "stream decode failed: connection reset" bursts). A
-                # ``reset-once-`` prompt resets only its first dial.
+                # One delta, then a TCP reset mid-body ("stream decode
+                # failed: connection reset"). A ``reset-once-`` prompt
+                # resets only its first dial.
                 calls = _RESET_CALLS[prompt] = _RESET_CALLS.get(prompt, 0) + 1
                 if prompt.startswith("reset-once-") and calls > 1:
                     self.wfile.write(_content_chunk("hello "))
