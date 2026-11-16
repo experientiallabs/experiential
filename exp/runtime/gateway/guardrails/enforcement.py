@@ -223,7 +223,7 @@ class GuardrailEngine:
                 ``None`` to record no scores.
             decision_current: Native optional release eligibility, or None for
                 the ordinary classifier deadline. Expired outcomes cannot act.
-            defer_rejection: Retain terminal action metadata until native release,
+            defer_rejection: Retain terminal action metadata until its input gate commits,
                 or None to record the ordinary synchronous decision immediately.
 
         Returns:
@@ -853,8 +853,8 @@ class GuardrailEngine:
             )
         return None
 
-    def record_native_rejection(self, record: ObservationRecord) -> None:
-        """Record one terminal action only after the native release commits its denial."""
+    def record_input_rejection(self, record: ObservationRecord) -> None:
+        """Record one terminal action after its input gate commits the denial."""
         assert record.check is not None
         self._decision(
             record.policy, record.check, record.check.action, record.outcome, record.latency_seconds
