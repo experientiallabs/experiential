@@ -974,3 +974,31 @@ def test_the_header_timeout_phase_crosses_both_boundaries_typed(
     assert settled is not None and settled.header_timeout is expected
     reserved = failure_from_boundary_payload(payload)
     assert reserved is not None and reserved.header_timeout is expected
+
+
+def test_boundary_payload_carries_a_context_window_rejection() -> None:
+    """The data plane's context-window verdict reaches the candidate choice intact."""
+    failure = failure_from_boundary_payload(
+        {
+            "failure_class": "invalid_request",
+            "safe_message": "provider rejected the request",
+            "failover_eligible": True,
+            "context_window_rejected": True,
+            "context_window_limit_tokens": 16_384,
+        }
+    )
+    assert failure is not None
+    assert failure.context_window_rejected is True
+    assert failure.context_window_limit_tokens == 16_384
+    # A malformed figure fails closed to "no stated window", never a raise.
+    for limit in (0, True, "16384", None):
+        parsed = failure_from_boundary_payload(
+            {
+                "failure_class": "invalid_request",
+                "safe_message": "provider rejected the request",
+                "context_window_rejected": True,
+                "context_window_limit_tokens": limit,
+            }
+        )
+        assert parsed is not None
+        assert parsed.context_window_limit_tokens is None

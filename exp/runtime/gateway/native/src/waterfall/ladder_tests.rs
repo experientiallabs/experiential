@@ -3,8 +3,7 @@
 //! advance, exhaustion `Retry-After`) on the real loop rather than on its parts.
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic::AtomicUsize, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pyo3::prelude::*;
@@ -399,7 +398,7 @@ pub(super) const SCHEDULE: ThrottleRedial = ThrottleRedial {
     max_delay_ms: 2_000,
 };
 
-const TEXT_FRAME: &str = "{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}";
+pub(super) const TEXT_FRAME: &str = "{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}";
 const THROTTLE_FRAME: &str = "{\"error\":{\"code\":\"rate_limit_exceeded\",\
                               \"message\":\"Rate limit reached\"}}";
 
@@ -496,6 +495,7 @@ impl Harness {
             output_token_cap: None,
             tool_search: None,
             output_guardrails: None,
+            buffered: &[],
         };
         let won = acquire_attempt(&context, &mut guard).await;
         (won, guard)

@@ -56,6 +56,7 @@ async fn run_budgeted(
         output_token_cap: None,
         tool_search: None,
         output_guardrails: None,
+        buffered: &[],
     };
     (acquire_attempt(&context, &mut guard).await, guard)
 }

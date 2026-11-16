@@ -387,6 +387,7 @@ async fn generate(
                 responses: false,
             },
         ),
+        buffered: &admission.buffered_depths(),
     };
     let mut won =
         acquire_guarded_attempt(&context, &mut guard, admission.guardrail_input_pending).await;

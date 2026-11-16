@@ -242,6 +242,7 @@ impl SearchHarness {
             output_token_cap: None,
             tool_search: Some(tool_search),
             output_guardrails: None,
+            buffered: &[],
         };
         let won = acquire_attempt(&context, &mut guard).await;
         (won, guard)

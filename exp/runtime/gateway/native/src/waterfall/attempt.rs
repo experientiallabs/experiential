@@ -406,6 +406,7 @@ pub(super) async fn run_attempt(
                         tool_search_dropped_after_output,
                         pace: None,
                         rate_limit_headers: caller_rate_limits,
+                        collection_failure: None,
                     }));
                 }
                 withheld_bytes += event_bytes;
@@ -437,6 +438,7 @@ pub(super) async fn run_attempt(
                     tool_search_dropped_after_output,
                     pace: None,
                     rate_limit_headers: caller_rate_limits,
+                    collection_failure: None,
                 }));
             }
             if !event.is_terminal() {

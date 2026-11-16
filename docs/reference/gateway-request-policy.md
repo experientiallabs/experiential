@@ -42,7 +42,10 @@ response = client.chat.completions.create(
   outer SDK operation with hidden redials.
 - These are ceilings. Health circuits, failure eligibility, spending limits,
   authorization, context limits, and request deadlines can stop earlier. A larger
-  retry ceiling cannot override any of them.
+  retry ceiling cannot override any of them. The one exception is the circuit
+  on a request's only remaining rung: its first redial there is admitted through
+  an open circuit, as a fresh request's first dial would be; later redials stay
+  behind it.
 - Every model HTTP dispatch has its own durable reservation and settlement,
   including a reasoning-repair successor. A refused dial's observed usage belongs
   to its own attempt. Unknown usage stays unknown. Provider-side hosted tools are

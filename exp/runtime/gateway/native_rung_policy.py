@@ -314,6 +314,10 @@ def failed_dispatch_candidate(
         maximum_same_deployment_attempts=entry.attempt_policy.maximum_same_deployment_attempts,
         physical_route_cap=entry.attempt_policy.physical_route_cap,
         physical_attempt_counts=entry.attempt_counts,
+        context_windows=tuple(
+            None if item.capabilities is None else item.capabilities.context_window_tokens
+            for item in route.deployments
+        ),
     )
     disposition = throttle_disposition(
         failure,

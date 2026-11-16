@@ -91,6 +91,11 @@ pub struct CommittedAttempt {
     pub pace: Option<f64>,
     /// See [`Served::rate_limit_headers`].
     pub rate_limit_headers: Vec<(String, String)>,
+    /// The failure the waterfall already met draining this attempt for a
+    /// buffered surface (`WaterfallContext::buffered`) when the ladder could
+    /// not restart it; `collect_committed` answers with it instead of reading
+    /// the closed relay.
+    pub collection_failure: Option<Failure>,
 }
 
 /// One attempt whose terminal was reached and settled before commitment.
@@ -254,6 +259,9 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
     // Whether this reservation re-dials the same depth after a tool-search
     // round; consumed by one `start_attempt`.
     let mut tool_search_round = false;
+    // A provider context-window rejection may advance the ladder once per
+    // request; a second one is the request's real answer.
+    let mut context_window_failover_spent = false;
     loop {
         let search_redial = std::mem::take(&mut tool_search_round);
         let repair_redial = std::mem::take(&mut reasoning_repair);
@@ -291,6 +299,8 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 // throttle ladder advertises it as `Retry-After`.
                 "retry_after_seconds": failure.retry_after_seconds,
                 "header_timeout": failure.header_timeout.map(|phase| phase.as_str()),
+                "context_window_rejected": failure.context_window_rejected,
+                "context_window_limit_tokens": failure.context_window_limit_tokens,
             }))),
         }));
         let started_text = match ctx.bridge.call("start_attempt", argument).await {
@@ -398,6 +408,15 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
             &tool_search_rounds,
         )
         .await;
+        // A buffered surface sends the caller nothing before the terminal, so
+        // a connection broken mid-body there is still the ladder's to take.
+        if ctx.buffered.get(depth).copied().unwrap_or(false) {
+            if let AttemptEnd::Committed(committed) = &mut end {
+                if let Some(restart) = buffered::drain(ctx, guard, committed, dial_wire).await {
+                    end = restart;
+                }
+            }
+        }
         // Every pre-commit failure of a tenant origin answers opaquely; the
         // relay marks the failures it yields after an open the same way.
         if let AttemptEnd::Ladder { failure, .. } | AttemptEnd::Repair { failure, .. } = &mut end {
@@ -526,6 +545,11 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 if opened {
                     guard.mark_opened();
                 }
+                let mut failure = failure;
+                if failure.context_window_rejected {
+                    failure.failover_eligible &= !context_window_failover_spent;
+                    context_window_failover_spent = true;
+                }
                 track_retry_after(&mut largest_retry_after, &failure);
                 let boundary = failure.clone().boundary();
                 // A pre-commit throttle on a rung worth waiting for is
@@ -544,7 +568,19 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                     None
                 };
                 let mut next_policy = ctx.policy;
+                // A transport failure advances to an untried sibling before
+                // any redial of this rung (`next_route_candidate`), so the
+                // same-rung backoff would only delay the sibling's dial.
+                let sibling_first = failure.failure_class == FailureClass::Transport
+                    && fallback_rules::successor_available(
+                        ctx.route,
+                        depth,
+                        &physical_counts,
+                        &failure,
+                        failure.failover_eligible,
+                    );
                 let retry_wait = if failure.retryable_same_deployment
+                    && !sibling_first
                     && fits
                     && counts[depth] < ctx.policy.maximum_same_deployment_attempts
                 {
@@ -681,6 +717,8 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
 mod attempt;
 use attempt::run_attempt;
 
+mod buffered;
+
 mod commit;
 pub(crate) use commit::is_semantic;
 mod fallback_rules;
@@ -707,6 +745,8 @@ use successor::throttle_backoff_delay;
 
 mod search_round;
 
+#[cfg(test)]
+mod buffered_ladder_tests;
 #[cfg(test)]
 mod ladder_tests;
 #[cfg(test)]

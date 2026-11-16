@@ -831,6 +831,9 @@ pub async fn collect_committed(
         events.push(event);
         Ok(())
     };
+    if let Some(failure) = committed.collection_failure.take() {
+        return Err(failure);
+    }
     for event in committed.prefix.drain(..) {
         retain(&mut events, event)?;
     }

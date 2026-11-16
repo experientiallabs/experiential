@@ -14,6 +14,7 @@ mod bridge;
 mod caller_copy;
 mod capture;
 mod codex_native_inversion;
+mod context_window;
 mod dialects;
 mod dispatch_capacity;
 mod encode;
