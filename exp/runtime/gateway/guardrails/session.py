@@ -28,6 +28,7 @@ from exp.runtime.gateway.guardrails.deterministic import (
     native_output_plan,
 )
 from exp.runtime.gateway.guardrails.input_wait import InputWait
+from exp.runtime.gateway.guardrails.recording import ObservationRecord
 from exp.runtime.gateway.guardrails.streaming import StreamSegment
 from exp.runtime.gateway.guardrails.subjects import ObservedSubjects
 
@@ -78,6 +79,7 @@ class GuardrailSession:
         _native_expiry_recorded: Whether the native expiry has entered decision observations.
         _input_pending_checks: Remaining authenticated subjects per optional policy/check.
         _input_outcomes_lock: Serializes check completion against native expiry observation.
+        _native_rejection: One content-free terminal record awaiting native publication.
     """
 
     engine: GuardrailEngine
@@ -100,6 +102,7 @@ class GuardrailSession:
         default_factory=dict, init=False, repr=False
     )
     _input_outcomes_lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _native_rejection: ObservationRecord | None = field(default=None, init=False, repr=False)
 
     def optional_input_wait_ms(self) -> int | None:
         """Authorize native expiry only when every enforcing input check is optional."""
@@ -116,9 +119,11 @@ class GuardrailSession:
         """Publish a completed verdict without renewing an expired native decision."""
         native = self.native_input
         assert native is not None
+        denied = False
         try:
             future.result()
         except GuardrailRejected as error:
+            denied = error.failure.failure_class is GatewayFailureClass.GUARDRAIL
             decision = {
                 "action": "error",
                 "failure": denied_input_failure(error.failure).model_dump(mode="json"),
@@ -127,7 +132,22 @@ class GuardrailSession:
             decision = {"action": "allow"}
         else:
             decision = {"action": "allow"}
-        native.publish(json.dumps(decision))
+        published = native.publish(json.dumps(decision))
+        with self._input_outcomes_lock:
+            record, self._native_rejection = self._native_rejection, None
+        if (
+            denied
+            and published
+            and not self._closed
+            and not native.expired()
+            and record is not None
+        ):
+            self.engine.record_native_rejection(record)
+
+    def _defer_native_rejection(self, record: ObservationRecord) -> None:
+        """Retain only the current terminal check, without request or response content."""
+        with self._input_outcomes_lock:
+            self._native_rejection = record
 
     @property
     def enforcing_policies(self) -> tuple[GuardrailPolicy, ...]:
@@ -209,6 +229,12 @@ class GuardrailSession:
                 self.engine.record_input_expiry(policy)
             return
         with self._input_outcomes_lock:
+            if (
+                expired
+                and self._native_rejection is not None
+                and self._native_rejection.policy.policy_id == policy.policy_id
+            ):
+                self._native_rejection = None
             remaining = tuple(
                 check
                 for check in policy.input_checks
@@ -262,6 +288,9 @@ class GuardrailSession:
                         (lambda: self._native_decision_current(policy))
                         if self.native_input is not None
                         else None
+                    ),
+                    defer_rejection=(
+                        self._defer_native_rejection if self.native_input is not None else None
                     ),
                 )
             )

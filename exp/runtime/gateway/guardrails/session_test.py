@@ -41,6 +41,7 @@ from exp.runtime.gateway.guardrails.contracts import (
 from exp.runtime.gateway.guardrails.deterministic import compile_native_detectors
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import validate_guardrail_engine
+from exp.runtime.gateway.guardrails.recording import ObservationRecord
 from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 from exp.runtime.gateway.guardrails.store_test import _authorization
@@ -1151,6 +1152,97 @@ def test_shorter_policy_rejection_crossing_native_deadline_keeps_later_check(
         assert record.call_count == int(expired)
         if expired:
             assert record.call_args.args[0].policy_id == shorter.policy_id
+    finally:
+        session.cancel()
+        engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize(
+    "boundary", ["timely", "policy", "publication", "closed", "not_published", "non_native"]
+)
+def test_optional_block_record_waits_for_native_denial_acceptance(boundary: str) -> None:
+    """Late policy results and native expiry cannot be logged as applied blocks."""
+    optional = _observer_policy().model_copy(
+        update={
+            "mode": "enforce",
+            "input_execution": "parallel",
+            "fail_open": True,
+            "input_max_wait_ms": 50 if boundary == "policy" else 250,
+        }
+    )
+    policies = (optional,)
+    if boundary == "policy":
+        policies += (
+            optional.model_copy(
+                update={
+                    "policy_id": "later",
+                    "input_max_wait_ms": 250,
+                    "checks": (optional.checks[0].model_copy(update={"adapter_id": "allow"}),),
+                }
+            ),
+        )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore(policies),
+        client=DirectClassifierClient(
+            ClassifierRegistry(
+                {
+                    "criminal": ScriptedClassifier(input_verdict=ClassifierVerdict(flagged=True)),
+                    "allow": ScriptedClassifier(),
+                }
+            )
+        ),
+        monotonic=time.monotonic,
+    )
+    session = _session(engine)
+    native = Mock()
+    native.expired.return_value = False
+    native.elapsed_seconds.return_value = 0.001
+    native.publish.return_value = True
+    session.native_input = None if boundary == "non_native" else native
+    defer = session._defer_native_rejection
+
+    def expire_after_record(record: ObservationRecord) -> None:
+        """Cross the smaller policy deadline after its terminal metadata is prepared."""
+        defer(record)
+        if boundary == "policy":
+            native.elapsed_seconds.return_value = 0.075
+
+    future: Future[None] = Future()
+    session._input = future
+    try:
+        with (
+            patch.object(session, "_defer_native_rejection", side_effect=expire_after_record),
+            patch.object(engine, "_record") as actions,
+            patch.object(engine, "record_input_expiry") as expiry,
+        ):
+            try:
+                asyncio.run(session._inspect_input(_request()))
+            except GuardrailRejected as error:
+                future.set_exception(error)
+            else:
+                future.set_result(None)
+
+            def blocks() -> list[object]:
+                """Select only applied terminal actions, excluding successful later checks."""
+                return [c for c in actions.call_args_list if c.args[2] is GuardrailAction.BLOCK]
+
+            if boundary == "non_native":
+                assert len(blocks()) == 1
+                return
+            assert not blocks(), "optional action must wait for the native decision"
+            if boundary == "publication":
+                native.expired.return_value = True
+                native.elapsed_seconds.return_value = 0.251
+            if boundary == "closed":
+                session.cancel()
+            elif boundary == "not_published":
+                native.publish.return_value = False
+            session._publish_native_input(future)
+            assert len(blocks()) == int(boundary == "timely")
+            assert session._native_rejection is None
+            assert expiry.call_count == int(boundary == "policy")
+            session.cancel()
+            assert expiry.call_count == int(boundary in ("policy", "publication"))
     finally:
         session.cancel()
         engine.close(timeout_seconds=2)
