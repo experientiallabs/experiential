@@ -5,6 +5,10 @@ from __future__ import annotations
 import json
 
 from exp.common.core.artifacts import JsonObject
+from exp.runtime.anthropic_protocol.gateway_reasoning import (
+    require_provider_signed_thinking,
+    strict_thinking_signatures,
+)
 from exp.runtime.anthropic_protocol.requests import decode_messages, decode_messages_count_tokens
 from exp.runtime.gateway.lone_surrogates import (
     LoneSurrogateRefusal,
@@ -56,6 +60,7 @@ def decode_native_body(
     client_request_id: str | None = None,
     anthropic_beta: str | None = None,
     model: str | None = None,
+    strict_thinking_signatures_header: str | None = None,
 ) -> DecodedGatewayRequest:
     """Decode one raw request body with the shared surface decoder.
 
@@ -73,6 +78,10 @@ def decode_native_body(
             tokens are retained for Anthropic dispatch.
         model: The alias named in the request path, on the Gemini surfaces
             (their body carries no model field).
+        strict_thinking_signatures_header: Optional raw
+            ``x-experiential-strict-thinking-signatures`` header value. On the
+            Messages surface, ``true`` refuses unsigned or gateway-issued
+            thinking history before dispatch; other surfaces ignore it.
 
     Returns:
         The public alias and canonical request.
@@ -84,6 +93,8 @@ def decode_native_body(
     payload, repairs = _load_repaired_body(body)
     try:
         if surface == "messages":
+            if strict_thinking_signatures(strict_thinking_signatures_header):
+                require_provider_signed_thinking(payload)
             decoded = decode_messages(payload, anthropic_beta=anthropic_beta)
         elif surface in {"generate_content", "stream_generate_content"}:
             decoded = decode_generate_content(

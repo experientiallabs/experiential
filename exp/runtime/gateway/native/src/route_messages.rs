@@ -31,7 +31,7 @@ use crate::reasoning_display::ReasoningOutput;
 use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::respond::{
     bearer_key, client_ip, complete_visible_refusal, escalation_error, json_response,
-    latin1_header_list, outward_event, price_stream_end, read_body, send_bounded,
+    latin1_header, latin1_header_list, outward_event, price_stream_end, read_body, send_bounded,
     settle_stream_end, sse_body_response, with_app_identity,
 };
 use crate::respond::{log_stream_exit, stream_delivery::Delivery};
@@ -133,6 +133,33 @@ pub(crate) async fn messages_count_tokens(
     }
 }
 
+/// Opt-in request header that makes the shared decoder refuse unsigned or
+/// gateway-issued thinking history before dispatch (Anthropic's own replay
+/// contract). Absent, the gateway keeps reading unsigned thinking as its own
+/// exposed plaintext.
+pub(crate) const STRICT_THINKING_SIGNATURES_HEADER: &str =
+    "x-experiential-strict-thinking-signatures";
+
+/// The `admit` callback argument for one Messages request.
+///
+/// The caller's anthropic-beta header joins admission so the shared decoder
+/// can retain allowlisted tokens (e.g. the 1M context window) for Anthropic
+/// dispatch and disclose the rest; the strict-signature opt-in rides as its
+/// raw value so the decoder alone owns its parsing and refusal.
+fn messages_admit_value(raw_key: &str, body_text: &str, headers: &HeaderMap) -> Value {
+    let mut admit_value = json!({
+        "raw_key": raw_key,
+        "body": body_text,
+        "surface": "messages",
+        "anthropic_beta": latin1_header_list(headers, "anthropic-beta"),
+        "strict_thinking_signatures": latin1_header(headers, STRICT_THINKING_SIGNATURES_HEADER),
+        "client_ip": client_ip(headers),
+        "capture_session_id": crate::capture::session_id(headers),
+    });
+    with_app_identity(&mut admit_value, headers);
+    admit_value
+}
+
 pub(crate) async fn messages(
     State(state): State<AppState>,
     request: axum::extract::Request,
@@ -164,20 +191,7 @@ pub(crate) async fn messages(
         Err(_) => return messages_error_response(&PublicError::invalid_json()),
     };
 
-    // The caller's anthropic-beta header joins admission so the shared
-    // decoder can retain allowlisted tokens (e.g. the 1M context window)
-    // for Anthropic dispatch and disclose the rest.
-    let anthropic_beta = latin1_header_list(&headers, "anthropic-beta");
-    let mut admit_value = json!({
-        "raw_key": raw_key,
-        "body": body_text,
-        "surface": "messages",
-        "anthropic_beta": anthropic_beta,
-        "client_ip": client_ip(&headers),
-        "capture_session_id": crate::capture::session_id(&headers),
-    });
-    with_app_identity(&mut admit_value, &headers);
-    let admit_argument = compact_json(&admit_value);
+    let admit_argument = compact_json(&messages_admit_value(&raw_key, &body_text, &headers));
     let admission_reply = match state.bridge.admit(admit_argument).await {
         Ok(text) => text,
         Err(error) => return messages_error_response(&error),
@@ -911,5 +925,27 @@ async fn emit_messages_failure(
         if !send_bounded(sender, deadline, Bytes::from(frame)).await {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admission_carries_the_raw_strict_signature_opt_in() {
+        let mut headers = HeaderMap::new();
+        headers.append(STRICT_THINKING_SIGNATURES_HEADER, "true".parse().unwrap());
+        headers.append("anthropic-beta", "context-1m-2025-08-07".parse().unwrap());
+        let value = messages_admit_value("key", "{}", &headers);
+        assert_eq!(value["strict_thinking_signatures"], json!("true"));
+        assert_eq!(value["anthropic_beta"], json!("context-1m-2025-08-07"));
+        assert_eq!(value["surface"], json!("messages"));
+    }
+
+    #[test]
+    fn admission_without_the_opt_in_sends_null() {
+        let value = messages_admit_value("key", "{}", &HeaderMap::new());
+        assert_eq!(value["strict_thinking_signatures"], Value::Null);
     }
 }

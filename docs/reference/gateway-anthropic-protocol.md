@@ -155,6 +155,40 @@ Completions for generation and counts the same Chat tool list on `count_tokens`.
 no Messages tool type, so the fold never reinterprets a valid Messages declaration, and an entry
 that is not exactly one of the two OpenAI shapes keeps its named 400.
 
+## Thinking signatures
+
+Anthropic signs every `thinking` block it issues and refuses a replayed block whose `signature`
+is missing or empty. By default the gateway reads such a block differently: an unsigned
+`thinking` block is history the gateway itself issued (a non-Anthropic rung's exposed reasoning,
+or a Bedrock lane that returns thinking without signatures), so it replays as plaintext reasoning
+on rungs that accept it and is dropped on the Anthropic wire, and the turn still succeeds. Signed
+blocks are always forwarded byte-exact, so a tampered signature already gets Anthropic's own 400.
+
+A caller that wants Anthropic's replay contract instead sends the opt-in request header
+`x-experiential-strict-thinking-signatures: true` on `POST /v1/messages`. The value is read
+case-insensitively; `false`, a blank value, or no header keeps the default, and any other value is
+refused on `param: x-experiential-strict-thinking-signatures`. With it set, the decoder refuses the
+request before routing, reservation, or dispatch, on every lane, when any message holds:
+
+- a `thinking` block whose `signature` is missing, `null`, or `""`
+  (`messages.N.content.M.signature`);
+- a `redacted_thinking` block whose `data` is missing, `null`, or `""`, or is a gateway-issued
+  reasoning carrier (`messages.N.content.M.data`).
+
+Gateway-issued blocks are refused too: the caller asked for provider-signed history only, so a
+strict caller cannot replay the unsigned thinking or sealed carriers a non-Anthropic rung returned.
+Opaque Anthropic `redacted_thinking` payloads pass unchanged, as do signed blocks. The refusal is
+HTTP 400 in the Anthropic error envelope:
+
+```json
+{"type": "error", "error": {"type": "invalid_request_error", "message": "thinking block signature is required: x-experiential-strict-thinking-signatures is true, so every thinking block must carry the non-empty signature its provider issued. Replay the block exactly as it was returned, or omit the header to accept unsigned thinking as gateway-issued plaintext. (param: messages.1.content.0.signature)"}}
+```
+
+Anthropic defines no request field or header for this check, so the opt-in is the gateway's own
+header and is never forwarded upstream. It applies to `/v1/messages` only: `count_tokens` is never
+dispatched, and Chat Completions and Responses replay reasoning through the gateway's own carriers
+rather than caller-visible Anthropic signatures, so the header has no effect there.
+
 ## Stream usage
 
 On the Messages stream, `message_start.message.usage` is a PRE-DISPATCH figure and

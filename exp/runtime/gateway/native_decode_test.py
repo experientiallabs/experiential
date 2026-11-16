@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from exp.runtime.gateway.contracts import GatewayApiSurface
+from exp.common.core.artifacts import JsonObject
+from exp.runtime.gateway.contracts import ExposedReasoningContentBlock, GatewayApiSurface
 from exp.runtime.gateway.native_decode import (
     NativeDecodeError,
     decode_native_body,
@@ -149,3 +152,89 @@ def test_an_escaped_backslash_spelling_a_nested_escape_is_still_repaired() -> No
     assert decoded.request.ignored_parameters == (
         "messages.tool_calls.function.arguments->replaced(lone_surrogate)",
     )
+
+
+def _thinking_history(thinking: JsonObject) -> str:
+    """Return a Messages body whose assistant turn replays one thinking block first."""
+    return json.dumps(
+        {
+            "model": "public-model",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": [thinking, {"type": "text", "text": "ok"}]},
+                {"role": "user", "content": "again"},
+            ],
+        }
+    )
+
+
+_UNSIGNED_SHAPES: tuple[tuple[str, JsonObject], ...] = (
+    ("missing", {"type": "thinking", "thinking": "plan"}),
+    ("null", {"type": "thinking", "thinking": "plan", "signature": None}),
+    ("empty", {"type": "thinking", "thinking": "plan", "signature": ""}),
+)
+
+
+@pytest.mark.parametrize(("shape", "block"), _UNSIGNED_SHAPES)
+def test_strict_signatures_refuse_an_unsigned_thinking_block_before_dispatch(
+    shape: str, block: JsonObject
+) -> None:
+    """With the opt-in, a stripped signature is Anthropic's 400, naming the block."""
+    with pytest.raises(NativeDecodeError) as raised:
+        decode_native_body(
+            _thinking_history(block),
+            surface="messages",
+            strict_thinking_signatures_header="true",
+        )
+    error = raised.value.error
+    assert error.status_code == 400, shape
+    assert error.detail.type == "invalid_request_error"
+    assert error.detail.param == "messages.1.content.0.signature"
+    assert "signature is required" in error.detail.message
+
+
+def test_strict_signatures_dispatch_a_signed_block_unchanged() -> None:
+    """A signed block decodes exactly as it does without the opt-in."""
+    body = _thinking_history({"type": "thinking", "thinking": "plan", "signature": "sig=="})
+    strict = decode_native_body(body, surface="messages", strict_thinking_signatures_header="TRUE")
+    default = decode_native_body(body, surface="messages")
+    assert strict == default
+    assert strict.request.messages[1].provider_anthropic_blocks == (
+        {"type": "thinking", "thinking": "plan", "signature": "sig=="},
+        {"type": "text", "text": "ok"},
+    )
+
+
+@pytest.mark.parametrize("header", [None, "false", " False ", ""])
+@pytest.mark.parametrize(("shape", "block"), _UNSIGNED_SHAPES)
+def test_without_the_opt_in_unsigned_thinking_stays_gateway_plaintext(
+    header: str | None, shape: str, block: JsonObject
+) -> None:
+    """Absent, blank, or false keeps the default: unsigned thinking is gateway-issued."""
+    decoded = decode_native_body(
+        _thinking_history(block),
+        surface="messages",
+        strict_thinking_signatures_header=header,
+    )
+    assistant = decoded.request.messages[1]
+    assert assistant.provider_anthropic_blocks is None, shape
+    assert assistant.provider_reasoning == (ExposedReasoningContentBlock(content="plan"),)
+
+
+def test_strict_signatures_reject_an_unreadable_header_value() -> None:
+    """A misspelled opt-in fails loudly instead of silently skipping the check."""
+    body = _thinking_history({"type": "thinking", "thinking": "plan", "signature": "sig=="})
+    with pytest.raises(NativeDecodeError) as raised:
+        decode_native_body(body, surface="messages", strict_thinking_signatures_header="yes")
+    assert raised.value.error.detail.param == "x-experiential-strict-thinking-signatures"
+
+
+def test_strict_signatures_ignore_other_surfaces() -> None:
+    """The opt-in is a Messages contract; Chat decodes as before."""
+    body: JsonObject = {
+        "model": "public-model",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    decoded = decode_native_body(json.dumps(body), strict_thinking_signatures_header="true")
+    assert decoded.request.messages[0].content == "hi"
