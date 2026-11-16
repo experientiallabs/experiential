@@ -471,8 +471,9 @@ def next_route_candidate(
     A provider context-window rejection advances once, only to a wider rung
     (``native_context_window``). A transport failure is never decided by cache
     stakes: it takes an untried sibling before any redial of the failed rung.
-    With no sibling left, a first redial through the rung's open circuit gets
-    the forced claim a fresh first dial would; later redials stay behind it.
+    When a request's only dial failed and no sibling can serve, its redial
+    through the rung's open circuit gets the forced claim a fresh first dial
+    would; any later redial stays behind the circuit.
 
     Args:
         health: Revision-isolated circuit and throttle registry.
@@ -569,10 +570,10 @@ def next_route_candidate(
     if candidate is None and same_redial:
         if health.claim(keys[current_depth]):
             candidate = current_depth
-        elif attempt_counts[current_depth] <= 1:
-            # Nothing else can serve and the circuit is open: load shedding, not
-            # a verdict. A fresh request would be force-admitted here, so a first
-            # redial is too; a provider-stated throttle window still refuses.
+        elif total_attempts <= 1:
+            # The request's one dial failed, nothing else can serve, and the
+            # circuit is open: load shedding, not a verdict. A fresh request would
+            # be force-admitted here, so this redial is too (a throttle refuses).
             candidate = claim_route_from(health, keys, 0, (current_depth,))
     return candidate
 

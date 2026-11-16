@@ -75,10 +75,10 @@ health behavior.
 A `transport` failure (a reset or refused connection) is the path to the provider failing, not its
 answer, so it is never decided by cache stakes: under every failover mode it advances to an untried
 sibling before any redial of the failed rung, taking the cache miss, and redials that rung only when
-no sibling can take it. When the only remaining way to an answer is a redial of a rung whose circuit
-this worker opened, the request's first redial is admitted through the last-resort and forced claims
-a fresh request's first dial would get (a provider-stated throttle window still refuses), so the
-circuit never ends a request after one dial; later redials stay behind it.
+no sibling can take it. When a request's only dial failed and the only remaining way to an answer is a redial of that rung
+while this worker holds its circuit open, the redial is admitted through the last-resort and forced
+claims a fresh request's first dial would get (a provider-stated throttle window still refuses), so
+the circuit never ends a request after one dial; any later redial stays behind it.
 
 Commitment is the moment the caller could see the rung. A surface that assembles the whole answer
 before sending it (every non-streaming request, and a stream an output guardrail buffers) drains the
