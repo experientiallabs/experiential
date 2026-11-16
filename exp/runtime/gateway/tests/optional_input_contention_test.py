@@ -104,10 +104,12 @@ def _serving_with_capture(
 
 
 @pytest.mark.parametrize(
-    "capture_mode", ["off", "on", "full", "hosted", "hosted-checkpoint-discard"]
+    ("capture_mode", "distinct_budgets"),
+    [(mode, False) for mode in ("off", "on", "full", "hosted", "hosted-checkpoint-discard")]
+    + [("off", True)],
 )
 def test_optional_release_survives_occupied_serving_pool_and_late_denial(
-    tmp_path: Path, capture_mode: str
+    tmp_path: Path, capture_mode: str, distinct_budgets: bool
 ) -> None:
     """Expiry releases while all serving workers remain blocked, then settles exactly once."""
     received, provider_release = threading.Event(), threading.Event()
@@ -125,7 +127,11 @@ def test_optional_release_survives_occupied_serving_pool_and_late_denial(
     )
     template.close()
     engine = GuardrailEngine(
-        store=MappingGuardrailStore((policy,)),
+        store=MappingGuardrailStore(
+            (policy.model_copy(update={"policy_id": "shorter", "input_max_wait_ms": 50}), policy)
+            if distinct_budgets
+            else (policy,)
+        ),
         client=DirectClassifierClient(ClassifierRegistry({"criminal": classifier})),
         monotonic=time.monotonic,
     )

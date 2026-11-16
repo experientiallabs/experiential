@@ -784,7 +784,7 @@ def test_optional_wait_deducts_native_callback_queue_time() -> None:
 
 @pytest.mark.parametrize("later_wait", [50, 250])
 def test_native_optional_eligibility_preserves_distinct_policy_budgets(later_wait: int) -> None:
-    """Only a uniform optional budget can replace the per-policy input timers."""
+    """Every optional-only chain retains its largest budget as a native ceiling."""
     optional = _observer_policy().model_copy(
         update={
             "mode": "enforce",
@@ -800,12 +800,13 @@ def test_native_optional_eligibility_preserves_distinct_policy_budgets(later_wai
         monotonic=time.monotonic,
     )
     try:
-        assert _session(engine).optional_input_wait_ms() == (50 if later_wait == 50 else None)
+        assert _session(engine).optional_input_wait_ms() == max(50, later_wait)
     finally:
         engine.close()
 
 
-def test_native_expiry_counts_only_unfinished_checks_once() -> None:
+@pytest.mark.parametrize("settle_without_poll", [False, True])
+def test_native_expiry_counts_only_unfinished_checks_once(settle_without_poll: bool) -> None:
     """A completed allow is coverage, while a stalled sibling expires exactly once."""
     classifier = _Classifier("allow")
     optional = _observer_policy().model_copy(
@@ -836,8 +837,13 @@ def test_native_expiry_counts_only_unfinished_checks_once() -> None:
             assert classifier.started.wait(1)
             native.expired.return_value = True
             native.elapsed_seconds.return_value = 0.251
-            assert session.input_decision()["action"] == "allow"
-            assert session.input_decision()["action"] == "allow"
+            if settle_without_poll:
+                native.close.side_effect = lambda: setattr(native.expired, "return_value", False)
+                session.cancel()
+                session.cancel()
+            else:
+                assert session.input_decision()["action"] == "allow"
+                assert session.input_decision()["action"] == "allow"
             # The inspection completion and native observation can race; the
             # same expired check remains one observation whichever arrives first.
             session._finish_input_check(optional, expired=True)
@@ -1001,4 +1007,88 @@ def test_optional_cancellation_cannot_quarantine_a_strict_shared_adapter() -> No
         assert not engine._inspects.quarantined_adapter_ids()
     finally:
         release.set()
+        engine.close(timeout_seconds=2)
+
+
+def test_distinct_native_budgets_expire_early_check_and_preserve_timely_later_block() -> None:
+    """A native boundary arriving during inspection leaves the later policy its own time."""
+    first, later = _Classifier("allow"), _Classifier("block")
+    optional = _observer_policy().model_copy(
+        update={
+            "mode": "enforce",
+            "input_execution": "parallel",
+            "fail_open": True,
+            "input_max_wait_ms": 50,
+        }
+    )
+    sibling = optional.model_copy(
+        update={
+            "policy_id": "later",
+            "input_max_wait_ms": 250,
+            "checks": (optional.checks[0].model_copy(update={"adapter_id": "later"}),),
+        }
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((optional, sibling)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": first, "later": later})),
+        monotonic=time.monotonic,
+    )
+    boundary: list[float] = []
+    native = Mock()
+    native.expired.return_value = False
+    native.elapsed_seconds.side_effect = lambda: (
+        None if not boundary else time.monotonic() - boundary[0]
+    )
+    session = _session(engine)
+    session.native_input = native
+    try:
+        with patch.object(engine, "record_input_expiry") as record:
+            session.prepare_dispatch((_request(),), overlap=True)
+            assert first.started.wait(1)
+            boundary.append(time.monotonic())
+            assert later.started.wait(0.2), "early optional check consumed the later budget"
+            assert first.cancelled.wait(0.1)
+            later.release.set()
+            assert session._input is not None
+            with pytest.raises(GuardrailRejected):
+                session._input.result(timeout=0.2)
+            assert time.monotonic() - boundary[0] < 0.25
+            assert record.call_count == 1
+            assert record.call_args.args[0].policy_id == optional.policy_id
+    finally:
+        first.release.set()
+        later.release.set()
+        session.cancel()
+        engine.close(timeout_seconds=2)
+
+
+def test_cancel_records_a_shorter_pending_policy_before_the_native_ceiling() -> None:
+    """Disconnect cannot erase a shorter policy's expired coverage behind a longer check."""
+    classifier = _Classifier("allow")
+    optional = _observer_policy().model_copy(
+        update={"mode": "enforce", "input_execution": "parallel", "fail_open": True}
+    )
+    shorter = optional.model_copy(update={"policy_id": "shorter", "input_max_wait_ms": 50})
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((optional, shorter)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": classifier})),
+        monotonic=time.monotonic,
+    )
+    native = Mock()
+    native.expired.return_value = False
+    native.elapsed_seconds.return_value = None
+    session = _session(engine)
+    session.native_input = native
+    try:
+        with patch.object(engine, "record_input_expiry") as record:
+            session.prepare_dispatch((_request(),), overlap=True)
+            assert classifier.started.wait(1)
+            native.elapsed_seconds.return_value = 0.1
+            session.cancel()
+            session.cancel()
+            assert record.call_count == 1
+            assert record.call_args.args[0].policy_id == shorter.policy_id
+    finally:
+        classifier.release.set()
+        session.cancel()
         engine.close(timeout_seconds=2)

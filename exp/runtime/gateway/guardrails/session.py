@@ -109,9 +109,8 @@ class GuardrailSession:
         ):
             return None
         budgets = {p.input_max_wait_ms for p in policies}
-        # Differing budgets need the existing per-policy timer so an expired
-        # early check cannot prevent a later check from using its longer budget.
-        return budgets.pop() if len(budgets) == 1 else None
+        # Keep smaller per-policy timers, with one independent native ceiling.
+        return max(budgets)
 
     def _publish_native_input(self, future: Future[None]) -> None:
         """Publish a completed verdict without renewing an expired native decision."""
@@ -223,9 +222,15 @@ class GuardrailSession:
         if expired and remaining:
             self.engine.record_input_expiry(policy.model_copy(update={"checks": remaining}))
 
-    def _native_decision_current(self) -> bool:
-        """Keep late classifier outcomes from being reported as applied decisions."""
-        return self.native_input is None or not self.native_input.expired()
+    def _native_decision_current(self, policy: GuardrailPolicy) -> bool:
+        """Keep outcomes after this policy's native boundary from being applied."""
+        native = self.native_input
+        if native is None:
+            return True
+        elapsed = native.elapsed_seconds()
+        return not native.expired() and (
+            elapsed is None or elapsed * 1000 < policy.input_max_wait_ms
+        )
 
     async def _enforce_input(
         self, policy: GuardrailPolicy, request: GatewayRequest
@@ -254,16 +259,24 @@ class GuardrailSession:
                     deadline_monotonic=self.deadline_monotonic,
                     request_id=self.request_id,
                     decision_current=(
-                        self._native_decision_current if self.native_input is not None else None
+                        (lambda: self._native_decision_current(policy))
+                        if self.native_input is not None
+                        else None
                     ),
                 )
             )
 
         if policy.input_execution != "parallel" or not policy.fail_open:
             return await inspect()
+        native_elapsed = None
         if self.native_input is not None:
+            distinct_budgets = (
+                len({p.input_max_wait_ms for p in self.enforcing_policies if p.input_checks}) > 1
+            )
+            if distinct_budgets:
+                native_elapsed = self.native_input.elapsed_seconds
             elapsed = self.native_input.elapsed_seconds()
-            if elapsed is None:
+            if elapsed is None and not distinct_budgets:
                 try:
                     result = await inspect()
                 except GuardrailRejected:
@@ -277,17 +290,20 @@ class GuardrailSession:
                         return result
                 self._finish_input_check(policy, expired=True)
                 return request
-            self._input_wait.begin(elapsed_seconds=elapsed)
+            if elapsed is not None:
+                self._input_wait.begin(elapsed_seconds=elapsed)
         result = await self._input_wait.run(
-            inspect, wait_ms=policy.input_max_wait_ms, deadline=self.deadline_monotonic
+            inspect,
+            wait_ms=policy.input_max_wait_ms,
+            deadline=self.deadline_monotonic,
+            native_elapsed=native_elapsed,
         )
         if result is None:
             self._finish_input_check(policy, expired=True)
             return request
-        self._finish_input_check(
-            policy, expired=self.native_input is not None and self.native_input.expired()
-        )
-        return result
+        expired = not self._native_decision_current(policy)
+        self._finish_input_check(policy, expired=expired)
+        return request if expired else result
 
     async def _inspect_input(self, request: GatewayRequest) -> GatewayRequest:
         """Require the final rewrite to preserve every preceding check's constraint."""
@@ -380,18 +396,31 @@ class GuardrailSession:
         """Whether native delivery must await this session's input decision."""
         return self._input is not None
 
+    def _record_native_expiry(self) -> None:
+        """Retain missing coverage before either a decision read or terminal cleanup."""
+        native = self.native_input
+        if native is None:
+            return
+        expired = native.expired()
+        elapsed = native.elapsed_seconds()
+        if expired and not self._native_expiry_recorded:
+            self._native_expiry_recorded = True
+            if self._input is not None:
+                self._input.cancel()
+        elif not expired and (self._input is None or self._input.done()):
+            return
+        for policy in self.enforcing_policies:
+            if policy.input_checks and (
+                expired or (elapsed is not None and elapsed * 1000 >= policy.input_max_wait_ms)
+            ):
+                self._finish_input_check(policy, expired=True)
+
     def input_decision(self) -> JsonObject:
         """Poll approval without tying up a bridge worker or renewing its deadline."""
         if self._input_failure is not None:
             return {"action": "error", "failure": self._input_failure.model_dump(mode="json")}
         if self.native_input is not None:
-            if self.native_input.expired() and not self._native_expiry_recorded:
-                self._native_expiry_recorded = True
-                if self._input is not None:
-                    self._input.cancel()
-                for policy in self.enforcing_policies:
-                    if policy.input_checks:
-                        self._finish_input_check(policy, expired=True)
+            self._record_native_expiry()
             decision = json.loads(self.native_input.decision_json())
             if decision["action"] == "closed":
                 return {
@@ -445,6 +474,7 @@ class GuardrailSession:
         """
         if failure is not None:
             self._input_failure = denied_input_failure(failure)
+        self._record_native_expiry()
         self._closed = True
         if self.native_input is not None:
             self.native_input.close()

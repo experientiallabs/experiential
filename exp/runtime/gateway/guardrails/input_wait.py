@@ -29,7 +29,12 @@ class InputWait:
                 self._boundary.set_result(time.monotonic() - elapsed_seconds)
 
     async def run[T](
-        self, inspect: Callable[[], Coroutine[object, object, T]], *, wait_ms: int, deadline: float
+        self,
+        inspect: Callable[[], Coroutine[object, object, T]],
+        *,
+        wait_ms: int,
+        deadline: float,
+        native_elapsed: Callable[[], float | None] | None = None,
     ) -> T | None:
         """Return a ready verdict or expire only this optional policy's wait.
 
@@ -37,15 +42,29 @@ class InputWait:
             inspect: Isolated inspection coroutine factory with its own capacity bound.
             wait_ms: Shared additional waiting allowance after the first blocking boundary.
             deadline: Existing request deadline, which never extends the grace.
+            native_elapsed: Native boundary clock for distinct optional policy budgets.
 
         Returns:
             The inspection result, or None when this policy's remaining wait is spent.
         """
         if self._boundary.done() and self._boundary.result() + wait_ms / 1000 <= time.monotonic():
             return None
+        if native_elapsed is not None and (elapsed := native_elapsed()) is not None:
+            self.begin(elapsed_seconds=elapsed)
         task = asyncio.create_task(inspect())
         boundary = asyncio.wrap_future(self._boundary)
         try:
+            # A distinct, smaller policy budget still expires before the native
+            # request-wide ceiling. Only this uncommon chain needs clock polling;
+            # the native ceiling never depends on this event loop being scheduled.
+            while native_elapsed is not None and not self._boundary.done() and not task.done():
+                if (elapsed := native_elapsed()) is not None:
+                    self.begin(elapsed_seconds=elapsed)
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                await asyncio.wait({task}, timeout=min(0.005, remaining))
             if not self._boundary.done():
                 await asyncio.wait(
                     {task, boundary},
