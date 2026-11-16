@@ -31,6 +31,7 @@ from exp.optimize.model.sft.training_contracts import (
 if TYPE_CHECKING:
     import tinker
     from tinker_cookbook.renderers import Message, Renderer
+    from tinker_cookbook.renderers import ToolCall as CookbookToolCall
 
 _MISSING_TINKER_EXTRA = (
     "Tinker SFT requires the optional sft dependencies; run `uv sync --extra sft` "
@@ -42,27 +43,12 @@ class TinkerSFTDependencyError(TinkerSFTError):
     """The concrete Tinker backend was requested without its optional local SDK dependencies."""
 
 
-class TinkerFunctionCall(TypedDict):
-    """The cookbook-compatible function payload of one complete assistant tool call."""
-
-    name: str
-    arguments: str
-
-
-class TinkerToolCall(TypedDict):
-    """The cookbook-compatible representation of one EXP assistant tool call."""
-
-    type: str
-    id: str
-    function: TinkerFunctionCall
-
-
 class TinkerConversationMessage(TypedDict):
     """One cookbook-compatible text, assistant-tool, or tool-result message."""
 
     role: str
     content: str
-    tool_calls: NotRequired[list[TinkerToolCall]]
+    tool_calls: NotRequired[list[CookbookToolCall]]
     tool_call_id: NotRequired[str]
     name: NotRequired[str]
 
@@ -190,13 +176,19 @@ class TinkerTrainerSession:
 
         rendered: list[TrainerDatum] = []
         for example in examples:
-            datum = conversation_to_datum(
-                cast("list[Message]", tinker_messages_from_example(example)),
-                self._renderer,
-                max_length=None,
-                train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE,
-                reduction="none",
-            )
+            try:
+                datum = conversation_to_datum(
+                    cast("list[Message]", tinker_messages_from_example(example)),
+                    self._renderer,
+                    max_length=None,
+                    train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE,
+                    reduction="none",
+                )
+            except Exception as exc:
+                raise TinkerSFTError(
+                    f"Tinker cookbook could not render example {example.example_id!r}; "
+                    "check the example's messages and configured renderer before retrying"
+                ) from exc
             datum = _truncate_context_only(
                 datum,
                 maximum_datum_tokens=self._spec.maximum_datum_tokens,
@@ -328,16 +320,17 @@ def _assistant_message(action: AssistantAction) -> TinkerConversationMessage:
     return message
 
 
-def _tool_call(call: ToolCall) -> TinkerToolCall:
+def _tool_call(call: ToolCall) -> CookbookToolCall:
     """Render one typed tool call through canonical JSON so argument bytes are deterministic."""
-    return {
-        "type": "function",
-        "id": call.call_id,
-        "function": {
-            "name": call.name,
-            "arguments": call.arguments_json(sort_keys=True, compact=True),
-        },
-    }
+    from tinker_cookbook.renderers import ToolCall as CookbookToolCall
+
+    return CookbookToolCall(
+        id=call.call_id,
+        function=CookbookToolCall.FunctionBody(
+            name=call.name,
+            arguments=call.arguments_json(sort_keys=True, compact=True),
+        ),
+    )
 
 
 def _named_metric(metrics: Mapping[str, float] | None, names: Sequence[str]) -> float | None:
