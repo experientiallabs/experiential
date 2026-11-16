@@ -91,6 +91,8 @@ pub(super) async fn drain(
             return None;
         }
     };
+    // The failed attempt keeps the upstream label the relay already parsed.
+    guard.record_upstream_provider(committed.relay.upstream_provider());
     committed.relay.close_transport();
     Some(AttemptEnd::Ladder {
         failure,

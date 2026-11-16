@@ -391,3 +391,26 @@ def test_a_context_window_spill_never_lands_on_a_rung_no_wider_than_the_refusal(
     reserved = _fail_with(registry, "window", _CONTEXT_WINDOW)
     # Depth 1 (wider) is full and sheds; the spill skips the narrow depth 2.
     assert reserved["route_depth"] == 3
+
+
+def test_a_transport_failure_returns_to_its_rung_when_the_sibling_cannot_take_it() -> None:
+    """The sibling-first walk falls back to the failed rung's permitted redial."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    lane_a, lane_b = _refusing_pair()
+    _fill(registry, (lane_a,), 2, "occupied")
+    _admit(registry, (lane_b, lane_a), request_id="redial")
+    started = _start(registry, ordinal=0, request_id="redial")
+    assert started["route_depth"] == 0
+    _settle(
+        registry,
+        attempt_id=str(started["attempt_id"]),
+        outcome="failed",
+        finalize=False,
+        failure=_REFUSED,
+        request_id="redial",
+    )
+    # The full sibling sheds; the walk returns to the reset rung instead of
+    # forcing the sibling past its bound or ending the request.
+    reserved = _start(registry, ordinal=1, current_depth=0, failure=_REFUSED, request_id="redial")
+    assert reserved["route_depth"] == 0
