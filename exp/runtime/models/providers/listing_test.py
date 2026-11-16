@@ -351,6 +351,17 @@ def test_openai_compatible_listing_preserves_unknowns_for_absent_or_invalid_fiel
     assert model.cache_write_cost_per_million_tokens_usd is None
 
 
+def test_listing_skips_an_oversized_model_identity() -> None:
+    """One unusable identity cannot discard valid models from the same response."""
+    transport = _transport(_ok({"data": [{"id": "gpt-good"}, {"id": "x" * 513}]}))
+
+    models = _lister(transport).list_models(
+        ProviderEndpoint(provider="openai", api_key="secret-key")
+    )
+
+    assert [model.model for model in models] == ["gpt-good"]
+
+
 def test_anthropic_listing_reads_identities_and_sends_version_header() -> None:
     """Anthropic entries without an identity are skipped and the version header is sent."""
     transport = _transport(
@@ -524,6 +535,36 @@ def test_openrouter_listing_reads_capabilities_limits_and_prices() -> None:
     assert model.cache_write_cost_per_million_tokens_usd is None
 
 
+def test_openrouter_listing_drops_nonfinite_limits_and_prices() -> None:
+    """Non-finite optional numbers stay unknown without losing the model."""
+    transport = _transport(
+        _ok(
+            {
+                "data": [
+                    {
+                        "id": "vendor/model",
+                        "context_length": float("inf"),
+                        "top_provider": {"max_completion_tokens": float("nan")},
+                        "pricing": {
+                            "prompt": "nan",
+                            "completion": "inf",
+                        },
+                    }
+                ]
+            }
+        )
+    )
+
+    model = _lister(transport).list_models(
+        ProviderEndpoint(provider="openrouter", api_key="secret-key")
+    )[0]
+
+    assert model.context_window_tokens is None
+    assert model.maximum_output_tokens is None
+    assert model.input_cost_per_million_tokens_usd is None
+    assert model.output_cost_per_million_tokens_usd is None
+
+
 def test_gemini_listing_follows_pages_and_drops_the_resource_prefix() -> None:
     """Gemini paginates its model resources and prefixes each identity with ``models/``."""
     transport = _transport(
@@ -574,6 +615,30 @@ def test_gemini_listing_follows_pages_and_drops_the_resource_prefix() -> None:
     assert models[1].supports_embeddings is True
     assert transport.requests[0].headers["x-goog-api-key"] == "secret-key"
     assert transport.requests[1].url.endswith("&pageToken=page-2")
+
+
+def test_gemini_listing_drops_nonfinite_token_limits() -> None:
+    """A malformed optional token limit cannot abort Gemini discovery."""
+    transport = _transport(
+        _ok(
+            {
+                "models": [
+                    {
+                        "name": "models/gemini-good",
+                        "inputTokenLimit": float("inf"),
+                        "outputTokenLimit": float("nan"),
+                    }
+                ]
+            }
+        )
+    )
+
+    model = _lister(transport).list_models(
+        ProviderEndpoint(provider="gemini", api_key="secret-key")
+    )[0]
+
+    assert model.context_window_tokens is None
+    assert model.maximum_output_tokens is None
 
 
 def test_gemini_listing_preserves_an_opaque_page_token() -> None:
