@@ -5,6 +5,7 @@ from __future__ import annotations
 from exp.common.core.artifacts import JsonObject, canonical_json_bytes
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.guardrails.contracts import ClassifierCoverageError
+from exp.runtime.gateway.reasoning_blocks import ExposedReasoningContentBlock
 
 
 def text_input_context(request: GatewayRequest) -> str:
@@ -13,10 +14,13 @@ def text_input_context(request: GatewayRequest) -> str:
     Message text, including the canonical folded tool-error prefix, and tool arguments
     are scanned separately by each adapter. Function
     definitions, examples, call/result identifiers, names and namespaces, the closed Messages
-    ``tool_use`` caller, schemas, and normalized search declarations are ordinary text too.
-    Opaque provider content, Responses caller objects, attachments, and provider-owned tools
-    or prompt configuration require a separately validated projection. Internal replay IDs,
-    cache hints, and inert telemetry are not prompt content.
+    ``tool_use`` caller, schemas, normalized search declarations, and caller-replayed
+    plaintext reasoning (Chat ``reasoning_content`` on assistant history) are ordinary text
+    too; reasoning is scanned but never rewritten. Gateway-recovered, sealed, encrypted or
+    provider-signed reasoning, opaque provider content, Responses caller objects,
+    attachments, and provider-owned tools or prompt configuration require a separately
+    validated projection. Internal replay IDs, cache hints, and inert telemetry are not
+    prompt content.
 
     Returns:
         Canonical text for the supported non-message context, or an empty string.
@@ -33,7 +37,10 @@ def text_input_context(request: GatewayRequest) -> str:
         or request.provider_server_tools
         or any(
             message.content_parts
-            or message.provider_reasoning
+            or any(
+                not isinstance(block, ExposedReasoningContentBlock)
+                for block in message.provider_reasoning
+            )
             or message.capture_only_reasoning
             or message.provider_native_item is not None
             or message.provider_anthropic_block is not None
@@ -101,6 +108,17 @@ def text_input_context(request: GatewayRequest) -> str:
             }
             for message in results
         ]
+    reasoning = [
+        block.content
+        for message in request.messages
+        for block in message.provider_reasoning
+        if isinstance(block, ExposedReasoningContentBlock) and block.content
+    ]
+    if reasoning:
+        # Plaintext the caller replays on its own assistant turns is input the
+        # provider reads; scan it as immutable context (a match cannot be
+        # redacted out of a replayed reasoning field without changing history).
+        context["reasoning"] = reasoning
     if request.tool_choice is not None:
         context["tool_choice"] = (
             request.tool_choice
