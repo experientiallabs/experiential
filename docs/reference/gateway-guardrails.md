@@ -518,6 +518,10 @@ keep their authored check deadlines.
 
 The parallel wait starts when the gateway first needs the input decision to
 proceed, including the first committed provider content for buffered responses.
+At zero additional wait, a denial already published to the native decision before
+the blocking boundary is retained. A result still awaiting publication is pending
+and fails open when that boundary arrives.
+
 For an optional-only input policy set, the native timer enforces the
 allowance without waiting for a Python status callback. The cap
 bounds optional inspection waiting; it does not waive strict checks, required
