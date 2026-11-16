@@ -7,6 +7,8 @@ import json
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol, cast
 
+from exp_gateway_native import OptionalInputDecision
+
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import BillingSource
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
@@ -29,8 +31,6 @@ from exp.runtime.gateway.native_capture import (
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 if TYPE_CHECKING:
-    from exp_gateway_native import OptionalInputDecision
-
     from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
     from exp.runtime.gateway.routing import GatewayRoute
@@ -316,8 +316,6 @@ def _prepare_native_optional_input(
     wait_ms = session.optional_input_wait_ms()
     if wait_ms is None:
         return False
-    from exp_gateway_native import OptionalInputDecision
-
     try:
         prepared = (
             None
