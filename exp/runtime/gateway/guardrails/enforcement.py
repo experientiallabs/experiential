@@ -211,6 +211,7 @@ class GuardrailEngine:
         deadline_monotonic: float,
         request_id: str | None = None,
         decision_current: Callable[[], bool] | None = None,
+        defer_rejection: Callable[[ObservationRecord], None] | None = None,
     ) -> GatewayRequest:
         """Run the input chain once and return the validated or transformed request.
 
@@ -222,6 +223,8 @@ class GuardrailEngine:
                 ``None`` to record no scores.
             decision_current: Native optional release eligibility, or None for
                 the ordinary classifier deadline. Expired outcomes cannot act.
+            defer_rejection: Retain terminal action metadata until native publication,
+                or None to record the ordinary synchronous decision immediately.
 
         Returns:
             The original request, or the last successful modification.
@@ -243,6 +246,7 @@ class GuardrailEngine:
             deadline_monotonic=deadline_monotonic,
             request_id=request_id,
             decision_current=decision_current,
+            defer_rejection=defer_rejection,
         )
 
     async def _inspect_input(
@@ -254,6 +258,7 @@ class GuardrailEngine:
         retention: ObservationLease | None = None,
         request_id: str | None = None,
         decision_current: Callable[[], bool] | None = None,
+        defer_rejection: Callable[[ObservationRecord], None] | None = None,
     ) -> GatewayRequest:
         """Evaluate the same bounded checks while granting actions only to enforcing policies."""
         self.input_invocations += 1
@@ -276,6 +281,7 @@ class GuardrailEngine:
                 retention=retention,
                 request_id=request_id,
                 decision_current=decision_current,
+                defer_rejection=defer_rejection,
             )
             if verdict is None or policy.mode == "observe":
                 continue
@@ -716,6 +722,7 @@ class GuardrailEngine:
         retention: ObservationLease | None = None,
         request_id: str | None = None,
         decision_current: Callable[[], bool] | None = None,
+        defer_rejection: Callable[[ObservationRecord], None] | None = None,
     ) -> ClassifierVerdict | None:
         """Invoke one adapter under the tighter of check timeout and request deadline.
 
@@ -792,7 +799,13 @@ class GuardrailEngine:
         if not verdict.flagged:
             self._decision(policy, check, GuardrailAction.ALLOW, outcome, elapsed)
             return None
-        self._decision(policy, check, check.action, outcome, elapsed)
+        if defer_rejection is not None and check.action in (
+            GuardrailAction.BLOCK,
+            GuardrailAction.ERROR,
+        ):
+            defer_rejection(ObservationRecord(policy, check, outcome, elapsed))
+        else:
+            self._decision(policy, check, check.action, outcome, elapsed)
         return verdict
 
     def _submit_classification(
@@ -839,6 +852,13 @@ class GuardrailEngine:
                 )
             )
         return None
+
+    def record_native_rejection(self, record: ObservationRecord) -> None:
+        """Record one terminal action only after the native authority accepts its denial."""
+        assert record.check is not None
+        self._decision(
+            record.policy, record.check, record.check.action, record.outcome, record.latency_seconds
+        )
 
     def record_input_expiry(self, policy: GuardrailPolicy) -> None:
         """Record skipped optional coverage without adding a serving-path write."""
