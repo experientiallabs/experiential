@@ -366,7 +366,7 @@ pub struct Failure {
     pub context_window_rejected: bool,
     /// The window the rejecting provider stated, when its sentence names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_window_limit_tokens: Option<u64>,
+    pub context_window_limit_tokens: Option<u32>,
 }
 
 /// Which bound ended a dial waiting for its provider's response headers.

@@ -34,7 +34,7 @@ pub(crate) fn rejected_context_window(
     dialect: Dialect,
     code: Option<&str>,
     body: &str,
-) -> Option<Option<u64>> {
+) -> Option<Option<u32>> {
     let message = parse_error_document(body)
         .and_then(|value| error_message_field(dialect, &value).map(str::to_ascii_lowercase));
     let named = message.as_deref().is_some_and(|message| {
@@ -50,7 +50,7 @@ pub(crate) fn rejected_context_window(
 
 /// The window a context-length sentence states ("maximum context length is
 /// 16384 tokens"), digits and thousands separators only.
-fn stated_context_window(message: &str) -> Option<u64> {
+fn stated_context_window(message: &str) -> Option<u32> {
     CONTEXT_WINDOW_LIMIT_PREFIXES.iter().find_map(|prefix| {
         let start = message.find(prefix)? + prefix.len();
         let digits: String = message[start..]
@@ -58,13 +58,13 @@ fn stated_context_window(message: &str) -> Option<u64> {
             .take_while(|c| c.is_ascii_digit() || *c == ',')
             .filter(char::is_ascii_digit)
             .collect();
-        digits.parse::<u64>().ok().filter(|limit| *limit > 0)
+        digits.parse::<u32>().ok().filter(|limit| *limit > 0)
     })
 }
 
 /// Mark `failure` as a context-window refusal: failover-eligible, never
 /// redialed (the same rung refuses the same request again).
-pub(crate) fn mark(mut failure: Failure, limit_tokens: Option<u64>) -> Failure {
+pub(crate) fn mark(mut failure: Failure, limit_tokens: Option<u32>) -> Failure {
     failure.context_window_rejected = true;
     failure.context_window_limit_tokens = limit_tokens;
     failure.failover_eligible = true;
