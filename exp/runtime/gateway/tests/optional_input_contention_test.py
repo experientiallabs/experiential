@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -172,8 +173,6 @@ def test_optional_release_survives_occupied_serving_pool_and_late_denial(
             """Grant hosted retention only after the real ledger settles the request."""
             result = super().settle(argument)
             if capture_mode.startswith("hosted"):
-                import json
-
                 assert collector is not None
                 collector.settle(json.loads(argument)["request_id"], True, True)
             return result
