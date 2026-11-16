@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 import pytest
 from pydantic import ValidationError
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayApiSurface,
@@ -828,6 +829,7 @@ def test_native_expiry_counts_only_unfinished_checks_once(settle_without_poll: b
         monotonic=time.monotonic,
     )
     native = Mock()
+    native.decision_json.return_value = '{"action":"pending"}'
     native.expired.return_value = False
     native.elapsed_seconds.return_value = None
     native.decision_json.return_value = '{"action":"allow"}'
@@ -880,6 +882,7 @@ def test_native_late_result_records_one_expiry_without_an_enforced_block(
         monotonic=time.monotonic,
     )
     native = Mock()
+    native.decision_json.return_value = '{"action":"pending"}'
     native.expired.return_value = False
     native.elapsed_seconds.return_value = 0.0 if boundary_started else None
     native.decision_json.return_value = '{"action":"allow"}'
@@ -932,6 +935,7 @@ def test_native_expiry_includes_later_authenticated_subject() -> None:
         monotonic=time.monotonic,
     )
     native = Mock()
+    native.decision_json.return_value = '{"action":"pending"}'
     native.expired.return_value = False
     native.elapsed_seconds.return_value = None
     native.decision_json.return_value = '{"action":"allow"}'
@@ -1037,6 +1041,7 @@ def test_distinct_native_budgets_expire_early_check_and_preserve_timely_later_bl
     )
     boundary: list[float] = []
     native = Mock()
+    native.decision_json.return_value = '{"action":"pending"}'
     native.expired.return_value = False
     native.elapsed_seconds.side_effect = lambda: (
         None if not boundary else time.monotonic() - boundary[0]
@@ -1077,6 +1082,7 @@ def test_cancel_records_a_shorter_pending_policy_before_the_native_ceiling() -> 
         monotonic=time.monotonic,
     )
     native = Mock()
+    native.decision_json.return_value = '{"action":"pending"}'
     native.expired.return_value = False
     native.elapsed_seconds.return_value = None
     session = _session(engine)
@@ -1124,6 +1130,7 @@ def test_shorter_policy_rejection_crossing_native_deadline_keeps_later_check(
     )
     session = _session(engine)
     native = Mock()
+    native.decision_json.return_value = '{"action":"pending"}'
     native.expired.return_value = False
     native.elapsed_seconds.return_value = 0.001
     session.native_input = native if native_present else None
@@ -1158,7 +1165,17 @@ def test_shorter_policy_rejection_crossing_native_deadline_keeps_later_check(
 
 
 @pytest.mark.parametrize(
-    "boundary", ["timely", "policy", "publication", "closed", "not_published", "non_native"]
+    "boundary",
+    [
+        "timely",
+        "policy",
+        "publication",
+        "closed",
+        "published_then_closed",
+        "committed_then_closed",
+        "capture_unavailable",
+        "non_native",
+    ],
 )
 def test_optional_block_record_waits_for_native_denial_acceptance(boundary: str) -> None:
     """Late policy results and native expiry cannot be logged as applied blocks."""
@@ -1195,9 +1212,19 @@ def test_optional_block_record_waits_for_native_denial_acceptance(boundary: str)
     )
     session = _session(engine)
     native = Mock()
+    native.decision_json.return_value = '{"action":"pending"}'
     native.expired.return_value = False
     native.elapsed_seconds.return_value = 0.001
     native.publish.return_value = True
+    released: JsonObject = {"action": "pending"}
+    native.decision_json.side_effect = lambda: json.dumps(released)
+
+    def close_release() -> None:
+        """Mirror native close: terminal releases remain immutable."""
+        if released["action"] == "pending":
+            released["action"] = "closed"
+
+    native.close.side_effect = close_release
     session.native_input = None if boundary == "non_native" else native
     defer = session._defer_native_rejection
 
@@ -1235,13 +1262,35 @@ def test_optional_block_record_waits_for_native_denial_acceptance(boundary: str)
                 native.elapsed_seconds.return_value = 0.251
             if boundary == "closed":
                 session.cancel()
-            elif boundary == "not_published":
-                native.publish.return_value = False
             session._publish_native_input(future)
-            assert len(blocks()) == int(boundary == "timely")
+            assert not blocks(), "publication is not a committed native release"
+            if boundary == "published_then_closed":
+                session.cancel()
+            if boundary in ("timely", "committed_then_closed"):
+                error = future.exception()
+                assert isinstance(error, GuardrailRejected)
+                released.update(action="error", failure=error.failure.model_dump(mode="json"))
+                if boundary == "timely":
+                    assert session.input_decision()["action"] == "error"
+                else:
+                    session.cancel()
+                assert len(blocks()) == 1
+            else:
+                released["action"] = (
+                    "closed" if boundary in ("closed", "published_then_closed") else "allow"
+                )
+                if boundary == "capture_unavailable":
+                    released.update(
+                        action="error",
+                        failure=capture_unavailable_failure().model_dump(mode="json"),
+                    )
+                session._flush_native_rejection()
+                assert not blocks()
             assert session._native_rejection is None
             assert expiry.call_count == int(boundary == "policy")
             session.cancel()
+            session.cancel()
+            assert len(blocks()) == int(boundary in ("timely", "committed_then_closed"))
             assert expiry.call_count == int(boundary in ("policy", "publication"))
     finally:
         session.cancel()
