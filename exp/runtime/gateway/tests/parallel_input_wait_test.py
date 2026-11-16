@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -27,6 +29,7 @@ from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.tests.guardrail_policy_integrity_test import _body, _provider
 from exp.runtime.gateway.tests.mandatory_guardrails_paths_test import _serving
 from exp.runtime.gateway.tests.native_waterfall_test import _content_chunk, _terminal_frames
+from exp.runtime.gateway.tests.optional_input_contention_test import _held_provider
 from exp.runtime.gateway.tests.parallel_input_guardrails_test import _Classifier, _engine
 
 
@@ -215,21 +218,32 @@ def test_optional_expiry_does_not_delay_or_skip_required_output_inspection(
         ),
         monotonic=time.monotonic,
     )
-    with _provider(
-        _content_chunk("safe-answer") + _terminal_frames(prompt_tokens=80, completion_tokens=5)
-    ) as (base, _received):
+    received, provider_release = threading.Event(), threading.Event()
+    with _held_provider(received, provider_release) as base:
         _, key = _configured_gateway(
             tmp_path, base_url=base, billing_source=BillingSource.HOST_MANAGED
         )
         components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"})
         control = NativeControlPlane(components, guardrails=engine)
         try:
-            with _serving(control) as url, httpx.Client() as client:
+            with (
+                _serving(control) as url,
+                httpx.Client() as client,
+                ThreadPoolExecutor(max_workers=1) as pool,
+            ):
                 path, body = _body("chat", False)
-                started = time.monotonic()
-                response = client.post(
-                    url + path, headers={"authorization": f"Bearer {key}"}, json=body, timeout=2
+                response_task = pool.submit(
+                    client.post,
+                    url + path,
+                    headers={"authorization": f"Bearer {key}"},
+                    json=body,
+                    timeout=2,
                 )
+                assert received.wait(2) and classifier.started.wait(2)
+                # Measure the boundary held by moderation, after mandatory admission.
+                started = time.monotonic()
+                provider_release.set()
+                response = response_task.result(timeout=0.65)
                 assert time.monotonic() - started < 0.65
                 assert classifier.started.is_set() and not classifier.release.is_set()
                 assert len(output_calls) == 1
