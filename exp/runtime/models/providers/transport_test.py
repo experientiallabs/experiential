@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ssl
+import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
@@ -25,6 +27,16 @@ from exp.runtime.models.providers.transport import (
 )
 
 _IMMEDIATE_RETRY = RetryPolicy(maximum_attempts=2, initial_delay_seconds=0, maximum_delay_seconds=0)
+
+
+class _DripStream(httpx.SyncByteStream):
+    """Yield a valid JSON body in chunks that outlive the request deadline."""
+
+    def __iter__(self) -> Iterator[bytes]:
+        """Yield each body chunk after a delay shorter than the HTTPX read timeout."""
+        for chunk in (b'{"data":', b" []", b"}"):
+            time.sleep(0.02)
+            yield chunk
 
 
 def test_provider_tls_uses_system_trust_with_verification_enabled(
@@ -87,6 +99,32 @@ def test_transport_names_network_failures_without_exposing_secrets(
         if certificate_error
         else ("ConnectError" in message)
     )
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+def test_httpx_transport_enforces_a_wall_clock_deadline(method: str) -> None:
+    """A response that keeps dripping bytes cannot extend one attempt indefinitely."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return a stream whose individual reads stay below the configured timeout."""
+        return httpx.Response(200, stream=_DripStream(), request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        transport = HttpxJsonTransport(client)
+        with pytest.raises(ProviderTransportError, match="provider request timed out"):
+            if method == "get":
+                transport.get(
+                    "https://provider.test/v1/models",
+                    headers={},
+                    timeout_seconds=0.03,
+                )
+            else:
+                transport.post(
+                    "https://provider.test/v1/embeddings",
+                    headers={},
+                    payload={"input": "fixture"},
+                    timeout_seconds=0.03,
+                )
 
 
 def test_get_json_returns_the_first_success_body_for_one_attempt() -> None:

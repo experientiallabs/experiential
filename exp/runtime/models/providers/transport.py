@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import random
@@ -377,13 +378,10 @@ class HttpxJsonTransport(JsonHttpTransport):
         Raises:
             ProviderTransportError: The request fails or the response is not a JSON object.
         """
-        try:
-            response = self._client.get(url, headers=dict(headers), timeout=timeout_seconds)
-        except httpx.TimeoutException as exc:
-            raise ProviderTransportError(transport_error_message(exc)) from exc
-        except httpx.TransportError as exc:
-            raise ProviderTransportError(transport_error_message(exc)) from exc
-        return _decoded_response(response, trusted_origin=self._trusted_admission_origin)
+        request = self._client.build_request(
+            "GET", url, headers=dict(headers), timeout=timeout_seconds
+        )
+        return self._send(request, timeout_seconds=timeout_seconds)
 
     def post(
         self,
@@ -407,18 +405,50 @@ class HttpxJsonTransport(JsonHttpTransport):
         Raises:
             ProviderTransportError: The request fails or the response is not a JSON object.
         """
+        request = self._client.build_request(
+            "POST",
+            url,
+            headers=dict(headers),
+            json=payload,
+            timeout=timeout_seconds,
+        )
+        return self._send(request, timeout_seconds=timeout_seconds)
+
+    def _send(self, request: httpx.Request, *, timeout_seconds: float) -> JsonHttpResponse:
+        """Send and decode one response inside an absolute attempt deadline.
+
+        Args:
+            request: Prepared request with HTTPX's per-operation timeout attached.
+            timeout_seconds: Maximum elapsed time allowed for the attempt.
+
+        Returns:
+            The status code and decoded JSON object.
+
+        Raises:
+            ProviderTransportError: The deadline expires or provider transport fails.
+        """
+        deadline = time.monotonic() + timeout_seconds
         try:
-            response = self._client.post(
-                url,
-                headers=dict(headers),
-                json=payload,
-                timeout=timeout_seconds,
-            )
+            response = self._client.send(request, stream=True)
+            try:
+                body = bytearray()
+                for chunk in response.iter_bytes():
+                    if time.monotonic() >= deadline:
+                        raise ProviderTransportError("provider request timed out")
+                    body.extend(chunk)
+                if time.monotonic() >= deadline:
+                    raise ProviderTransportError("provider request timed out")
+                return _decoded_response(
+                    response,
+                    body_bytes=bytes(body),
+                    trusted_origin=self._trusted_admission_origin,
+                )
+            finally:
+                response.close()
         except httpx.TimeoutException as exc:
             raise ProviderTransportError(transport_error_message(exc)) from exc
         except httpx.TransportError as exc:
             raise ProviderTransportError(transport_error_message(exc)) from exc
-        return _decoded_response(response, trusted_origin=self._trusted_admission_origin)
 
 
 def provider_ssl_context() -> ssl.SSLContext:
@@ -462,12 +492,16 @@ def transport_error_message(error: httpx.TransportError) -> str:
 
 
 def _decoded_response(
-    response: httpx.Response, *, trusted_origin: httpx.URL | None = None
+    response: httpx.Response,
+    *,
+    body_bytes: bytes | None = None,
+    trusted_origin: httpx.URL | None = None,
 ) -> JsonHttpResponse:
     """Decode one provider response body as a JSON object without revealing content.
 
     Args:
         response: Completed provider HTTP response.
+        body_bytes: Explicit streamed response bytes, or ``None`` for a buffered response.
         trusted_origin: Explicit authority for certified non-dispatch receipts, if configured.
 
     Returns:
@@ -479,7 +513,7 @@ def _decoded_response(
     retry_after = parse_retry_after(response.headers.get("Retry-After"))
     known_unbilled = certified_admission_refusal(response, trusted_origin)
     try:
-        body = response.json()
+        body = response.json() if body_bytes is None else json.loads(body_bytes)
     except ValueError as exc:
         raise ProviderTransportError(
             f"provider returned non-JSON HTTP {response.status_code}",
