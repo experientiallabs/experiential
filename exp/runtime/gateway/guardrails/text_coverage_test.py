@@ -41,6 +41,7 @@ from exp.runtime.gateway.reasoning_blocks import (
 from exp.runtime.gateway.tool_contracts import GatewayProviderNativeTool
 from exp.runtime.gateway.tool_search.contracts import GatewayToolSearch
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearch
+from exp.runtime.openai_protocol.requests import decode_chat
 
 UNSUPPORTED_TEXT_INPUTS = (
     "recovered_reasoning",
@@ -73,6 +74,7 @@ SUPPORTED_TEXT_CONTEXTS = (
     "tool_result_name",
     "tool_result_namespace",
     "tool_result_id",
+    "exposed_reasoning",
 )
 
 
@@ -285,9 +287,37 @@ def text_context_request(field: str, text: str) -> GatewayRequest:
                     provider_tool_namespace=text if field == "tool_result_namespace" else None,
                 ),
             )
+        case "exposed_reasoning":
+            data["surface"] = GatewayApiSurface.CHAT_COMPLETIONS
+            data["messages"] = (
+                GatewayMessage(
+                    role="assistant",
+                    tool_calls=(ToolCall(call_id="call-one", name="lookup", arguments={}),),
+                    provider_reasoning=(ExposedReasoningContentBlock(content=text),),
+                ),
+            )
         case _:
             raise AssertionError(f"unknown fixture {field}")
     return GatewayRequest.model_validate(data)
+
+
+def test_exposed_reasoning_beside_sealed_reasoning_still_fails_coverage() -> None:
+    """Only plaintext reasoning is projected; any opaque block keeps the turn uninspectable."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="assistant",
+                content="visible",
+                provider_reasoning=(
+                    ExposedReasoningContentBlock(content="plain"),
+                    SealedReasoningContentBlock(carrier="sealed", deployment_hint="fixture"),
+                ),
+            ),
+        ),
+    )
+    with pytest.raises(ClassifierCoverageError):
+        text_input_context(request)
 
 
 @pytest.mark.parametrize("field", UNSUPPORTED_TEXT_INPUTS)
@@ -412,3 +442,33 @@ def test_actual_observation_records_coverage_and_tool_errors_truthfully(
         assert enforced == []
     finally:
         engine.close(timeout_seconds=2)
+
+
+def test_decoded_chat_reasoning_content_replay_is_inspected_not_refused() -> None:
+    """A Chat tool loop replaying its own ``reasoning_content`` stays inspectable.
+
+    DeepSeek and GLM clients replay plaintext reasoning on every assistant tool-call
+    turn; refusing it as opaque failed every follow-up turn of such an agent.
+    """
+    decoded = decode_chat(
+        {
+            "model": "fixture",
+            "messages": [
+                {"role": "user", "content": "look it up"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "the key is sk-live-alice",
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-one", "content": "done"},
+            ],
+        }
+    )
+    assert "sk-live-alice" in text_input_context(decoded.request)
