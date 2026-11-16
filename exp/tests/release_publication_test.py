@@ -41,7 +41,7 @@ def _source_gate() -> str:
         ({"GITHUB_REF": "refs/tags/v0.7.243beta1"}, False),
         ({"GITHUB_REF": "refs/heads/candidate", "PUBLISH": "true"}, False),
         ({"GITHUB_REF": "refs/heads/candidate"}, True),
-        ({"NATIVE": "0.3.188", "CARGO": "0.3.188"}, True),
+        ({"NATIVE": "0.3.188", "CARGO": "0.3.188"}, False),
         (
             {"PROJECT": "0.7.243", "GITHUB_REF": "refs/tags/v0.7.243", "ON_MAIN": "true"},
             False,

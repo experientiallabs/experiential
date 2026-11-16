@@ -94,7 +94,7 @@ jobs:
               assert native_dependencies == [f"exp-gateway-native=={native['version']}"], 'flagship must pin its exact native companion'
               assert re.fullmatch(r'\d+\.\d+\.\d+(rc\d+)?', native['version'])
               assert re.sub(r'rc(\d+)$', r'-rc.\1', native['version']) == cargo['version']
-              assert prerelease or 'rc' not in native['version'], 'stable releases require stable native wheels'
+              assert prerelease == ('rc' in native['version']), 'flagship and native release stages must match'
           revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f'revision={revision}\npublish={str(publish).lower()}\n')
