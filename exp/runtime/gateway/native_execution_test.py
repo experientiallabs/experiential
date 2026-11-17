@@ -1468,3 +1468,45 @@ def test_input_reservation_is_tokenized_once_per_request_object(
     assert entry.reserved_input_tokens() < first
     assert entry.reserved_input_tokens() < first
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("failover_mode", "threshold", "wait", "expected"),
+    (
+        # A warm throttle with a short wait still surfaces under both rules...
+        ("maximize_cache", None, 30, None),
+        ("maximize_cache", 0.5, 60, None),
+        # ...and with no stated wait (the window is unknown, keep the cache).
+        ("maximize_cache", 0.5, None, None),
+        # A wait no cache outlives advances cold under both rules (a Claude
+        # plan's usage window, 2026-11-16: 3,722 s to 12,939 s).
+        ("maximize_cache", None, 3_722, 1),
+        ("maximize_cache", 0.5, 12_939, 1),
+        ("maximize_cache_affinity", 0.5, 61, 1),
+    ),
+)
+def test_a_throttle_waiting_past_the_cache_advances_even_when_warm(
+    failover_mode: FailoverMode,
+    threshold: float | None,
+    wait: int | None,
+    expected: int | None,
+) -> None:
+    """Surfacing keeps the warm cache only while the provider's wait is short."""
+    failure = _failover_only().model_copy(update={"retry_after_seconds": wait})
+    candidate = next_route_candidate(
+        health=DeploymentHealthRegistry(),
+        keys=_KEYS,
+        failure=failure,
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+        failover_mode=failover_mode,
+        throttle_cache_threshold=threshold,
+        cached_fraction=0.9,
+    )
+    assert candidate == expected
+    if threshold is not None:
+        assert throttle_disposition(
+            failure, throttle_cache_threshold=threshold, cached_fraction=0.9
+        ) == (THROTTLE_SURFACED_CACHE_PRESERVING if expected is None else THROTTLE_FAILOVER_COLD)

@@ -78,6 +78,10 @@ MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS = 2
 # first-byte stall must advance and is not a cache-preserving failure.
 _CACHE_PRESERVING_NO_FAILOVER_CLASSES = frozenset({GatewayFailureClass.THROTTLED})
 
+# A warm throttle surfaces only while the prompt cache outlives its Retry-After;
+# a plan's hours-long usage window (2026-11-16) advances cold instead.
+CACHE_PRESERVING_MAX_WAIT_SECONDS: Final[int] = 60
+
 ThrottleDisposition = Literal[
     "throttle_surfaced_cache_preserving", "throttle_failover_cold", "throttle_backoff"
 ]
@@ -127,7 +131,8 @@ def throttle_disposition(
         or failure.failure_class not in _CACHE_PRESERVING_NO_FAILOVER_CLASSES
     ):
         return None
-    if cached_fraction >= throttle_cache_threshold:
+    short_wait = (failure.retry_after_seconds or 0) <= CACHE_PRESERVING_MAX_WAIT_SECONDS
+    if cached_fraction >= throttle_cache_threshold and short_wait:
         return THROTTLE_SURFACED_CACHE_PRESERVING
     return THROTTLE_FAILOVER_COLD
 
@@ -553,7 +558,9 @@ def next_route_candidate(
         )
         if disposition == THROTTLE_SURFACED_CACHE_PRESERVING:
             return None
-        if disposition is None and failover_mode == "maximize_cache" and throttled:
+        warm_mode = disposition is None and failover_mode == "maximize_cache"
+        short_wait = (failure.retry_after_seconds or 0) <= CACHE_PRESERVING_MAX_WAIT_SECONDS
+        if warm_mode and throttled and short_wait:
             return None
     refusal_eligible = failure.failure_class == GatewayFailureClass.REFUSAL and refusal_failover
     rules = fallback_rules or (None,) * len(keys)
