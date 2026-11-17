@@ -255,7 +255,7 @@ with base64 data-URL media left out (large tool schemas still count). Release no
 first-byte allowance above 600 s no longer raises the budget past 600 s; raise
 `EXP_GATEWAY_PRE_FIRST_BYTE_MAX_SECONDS` (or set it to 0) for a lane that genuinely needs longer.
 Fast failures (refused, 5xx, transport) fail over at once as before; a header timeout fails over only
-while budget remains.
+while budget remains, and a dial with no rung left waits to the budget ([gateway-latency.md](gateway-latency.md)).
 
 **Dead-lane ejection.** Each worker ejects a dead lane on its own: three transport failures or
 provider 5xx (refused, 500, 502, 503, 504) on one lane within 10 s, or two header timeouts within
