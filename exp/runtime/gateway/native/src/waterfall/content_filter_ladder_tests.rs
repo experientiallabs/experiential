@@ -264,3 +264,63 @@ fn a_responses_stream_the_filter_cut_before_output_fails_over() {
         );
     });
 }
+
+#[test]
+fn a_typed_content_filter_code_under_403_fails_over_as_a_filter() {
+    block_on(async {
+        let harness = Harness::new();
+        let azure = spawn_rung(vec![Answer::Forbidden(concat!(
+            "{\"error\":{\"code\":\"content_filter\",",
+            "\"message\":\"The response was filtered due to the prompt triggering ",
+            "the content management policy.\"}}"
+        ))])
+        .await;
+        let sibling = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
+        let route = [
+            provider_wire("azure", &azure.url, "azure_openai"),
+            provider_wire("novita", &sibling.url, "openai"),
+        ];
+        let (won, guard) = harness.run(&route, None, Duration::from_secs(30)).await;
+        let won = finish(guard, won).await;
+        let Won::Committed(committed) = won else {
+            panic!("the 403 filter verdict fails over like any provider filter");
+        };
+        assert_eq!(committed.depth, 1);
+        drop(committed);
+        let story = harness.story().await;
+        let failure = &story["starts"][1]["failure"];
+        assert_eq!(failure["failure_class"], "refusal");
+        assert_eq!(failure["provider_content_filter"], true);
+    });
+}
+
+#[test]
+fn a_rule_rungs_own_opt_in_does_not_spend_the_one_shot_gate() {
+    block_on(async {
+        let harness = Harness::new();
+        harness
+            .configure(json!({"rules": [null, ["refusal:content_policy"], null]}))
+            .await;
+        let azure = spawn_rung(vec![Answer::Rejected(AZURE_FILTERED_BODY)]).await;
+        let opted = spawn_rung(vec![Answer::Rejected(AZURE_FILTERED_BODY)]).await;
+        let sibling = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
+        let route = [
+            provider_wire("azure-east", &azure.url, "azure_openai"),
+            DeploymentWire {
+                native_tool_translation: Default::default(),
+                failover_only_on: Some(vec!["refusal:content_policy".to_string()]),
+                ..provider_wire("azure-west", &opted.url, "azure_openai")
+            },
+            provider_wire("novita", &sibling.url, "openai"),
+        ];
+        let (won, guard) = harness.run(&route, None, Duration::from_secs(30)).await;
+        let won = finish(guard, won).await;
+        let Won::Committed(committed) = won else {
+            panic!("the other provider still takes the refusal after the rule rung's");
+        };
+        assert_eq!(committed.depth, 2);
+        drop(committed);
+        assert_eq!(opted.accepted.lock().expect("lock").len(), 1);
+        assert_eq!(sibling.accepted.lock().expect("lock").len(), 1);
+    });
+}

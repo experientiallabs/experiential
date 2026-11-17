@@ -166,6 +166,7 @@ impl Normalizer {
                 }
                 let delta = optional_text(&payload, "delta", "OpenAI refusal delta")?;
                 self.refusal_seen = true;
+                self.model_refusal_seen = true;
                 events.push(Event::ProviderRefusalDelta {
                     output_index,
                     item_id,
@@ -814,7 +815,7 @@ impl Normalizer {
                             Some(reason),
                             None,
                         ));
-                        events.push(Event::Failed(if self.refusal_seen {
+                        events.push(Event::Failed(if self.model_refusal_seen {
                             failure
                         } else {
                             crate::content_filter::mark(failure)

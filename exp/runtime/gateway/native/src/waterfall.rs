@@ -266,6 +266,9 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
     // A provider content-filter refusal may advance the ladder once per
     // request, to a rung of another provider; a second one is the answer.
     let mut content_filter_failover_spent = false;
+    // A promotion is spent only when it actually moved the request onto an
+    // unrestricted rung; a `failover_only_on` rung's own opt-in does not.
+    let mut content_filter_promotion_pending = false;
     // Once a buffered answer broke mid-body, the caller's first byte is no
     // longer a pre-commit matter: the shared pre-first-byte budget (often
     // spent by then) stops bounding the restart, and the request deadline
@@ -379,6 +382,9 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
                 .await;
             return Won::Failed(PublicError::internal());
         };
+        if std::mem::take(&mut content_filter_promotion_pending) {
+            content_filter_failover_spent = wire.failover_only_on.is_none();
+        }
         if !fallback_rules::dial_admitted(wire, current_depth, depth, last_failure.as_ref()) {
             // The control plane reserved a failover-only rung outside its
             // rules (a first dial, or a successor to a failure its set does
@@ -615,7 +621,7 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
                     && content_filter_failover
                 {
                     failure.failover_eligible = true;
-                    content_filter_failover_spent = true;
+                    content_filter_promotion_pending = true;
                 }
                 track_retry_after(&mut largest_retry_after, &failure);
                 let boundary = failure.clone().boundary();

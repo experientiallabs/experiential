@@ -519,6 +519,15 @@ async fn non_success_failure(
         return failure;
     }
     if status == 403 {
+        // A typed content-policy verdict under 403 (a filtered completion, or
+        // an envelope code such as `content_filter`) is the provider's filter,
+        // not a credential failure: it takes the content-filter rules.
+        if let Some(filter) = body
+            .as_deref()
+            .and_then(|body| content_policy_rejection(dialect, body, &[]))
+        {
+            return filter.with_rate_limit_facts(rate_limit.clone(), retry_after);
+        }
         // Google answers a blocked key (`API_KEY_SERVICE_BLOCKED`) under 403
         // with the same structured reason family as its 400 `API_KEY_INVALID`:
         // the credential verdict the decision ladder may fail over on.
@@ -764,6 +773,35 @@ async fn non_success_failure(
         None => failure,
     };
     failure.with_encrypted_reasoning_rejected(encrypted_reasoning)
+}
+
+/// A typed content-policy rejection in a 4xx body: a completion the
+/// provider's filter finished (`content_filtered_completion`), or an error
+/// envelope whose code is a content-policy code. Marked a provider filter.
+fn content_policy_rejection(
+    dialect: Dialect,
+    body: &str,
+    request_words: &[&str],
+) -> Option<Failure> {
+    if let Some(filtered) = content_filtered_completion(dialect, body) {
+        let reason =
+            crate::stream_errors::refusal_reason(Some(&filtered.code), filtered.message.as_deref());
+        let detail = filtered
+            .message
+            .as_deref()
+            .and_then(|message| sanitized_detail(message, request_words))
+            .or(Some(filtered.code));
+        return Some(
+            crate::content_filter::mark(Failure::refusal(reason)).with_provider_detail(detail),
+        );
+    }
+    let code = rejected_code(dialect, body);
+    if !crate::content_filter::is_content_policy_code(code.as_deref()) {
+        return None;
+    }
+    let reason = crate::stream_errors::refusal_reason(code.as_deref(), None);
+    let detail = rejected_detail(dialect, body, request_words);
+    Some(crate::content_filter::mark(Failure::refusal(reason)).with_provider_detail(detail))
 }
 
 /// The ledger detail of one status-only classification.

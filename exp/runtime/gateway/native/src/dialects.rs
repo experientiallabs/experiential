@@ -278,9 +278,11 @@ impl Normalizer {
         let encrypted_reasoning_rejected = dialect == "openai_responses"
             && crate::rejection_shapes::refuses_encrypted_reasoning(code, message);
         // A typed content-policy code (or the relayed Gemini verdict) is the
-        // provider's filter; a refusal read only from the sentence is not.
-        let typed_verdict = crate::content_filter::is_content_policy_code(code)
-            || crate::stream_errors::relayed_gemini_refusal(code, raw_message).is_some();
+        // provider's filter; a refusal read only from the sentence, or one
+        // ending a turn the model already refused in its own words, is not.
+        let typed_verdict = !self.model_refusal_seen
+            && (crate::content_filter::is_content_policy_code(code)
+                || crate::stream_errors::relayed_gemini_refusal(code, raw_message).is_some());
         let failure = crate::stream_errors::stream_failure(kind, detail)
             .with_encrypted_reasoning_rejected(encrypted_reasoning_rejected);
         if typed_verdict {

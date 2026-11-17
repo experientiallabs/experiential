@@ -446,3 +446,44 @@ fn a_filter_incomplete_terminal_marks_the_provider_filter_only_without_a_model_r
         assert_eq!(failure.provider_content_filter, !model_refused);
     }
 }
+
+/// A Responses `response.failed` with a content-policy code after the
+/// model's own refusal stays the model's refusal, never a provider filter.
+#[test]
+fn a_filter_failed_terminal_after_a_model_refusal_is_not_a_provider_filter() {
+    for model_refused in [false, true] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        let mut payloads = Vec::new();
+        if model_refused {
+            payloads.push(serde_json::json!({
+                "type": "response.output_item.added", "output_index": 0,
+                "item": {"id": "msg_1", "type": "message", "role": "assistant", "content": []},
+            }));
+            payloads.push(serde_json::json!({
+                "type": "response.refusal.delta", "output_index": 0, "item_id": "msg_1",
+                "content_index": 0, "delta": "I can't help with that.",
+            }));
+        }
+        payloads.push(serde_json::json!({
+            "type": "response.failed", "response": {"status": "failed", "error": {
+                "code": "content_filter", "message": "blocked by the content filter",
+            }},
+        }));
+        let mut events = Vec::new();
+        for payload in payloads {
+            events.extend(
+                normalizer
+                    .feed(&SseEvent {
+                        event: None,
+                        data: payload.to_string(),
+                    })
+                    .expect("frame normalizes"),
+            );
+        }
+        let Some(Event::Failed(failure)) = events.last() else {
+            panic!("the failed terminal is a refusal: {events:?}");
+        };
+        assert_eq!(failure.failure_class, crate::errors::FailureClass::Refusal);
+        assert_eq!(failure.provider_content_filter, !model_refused);
+    }
+}
