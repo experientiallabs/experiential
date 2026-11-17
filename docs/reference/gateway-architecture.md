@@ -595,6 +595,12 @@ size bounds apply as for top-level user attachments. A route with no image (or P
 all degrades the attachment to placeholder text, disclosed as `messages.content.tool_result.image->placeholder` (or `...document->placeholder`); a user-turn image degrades too, disclosed `messages.content.image->placeholder`:
 the latest turn (the user messages since the model last spoke) asks the model to tell the user (quoting `AuthorizationSnapshot.image_input_notice` when set), earlier turns get `[image not processed]`, and a request with no caller text at all stays refused.
 Degrades chain: clearing one capability can expose the next (an image, then a tool-result PDF), so admission re-checks after each and degrades again where allowed.
+Malformed, oversized, or unsupported inline images and PDFs in replayed history become
+disclosed text placeholders before protocol validation. Only the newest caller-input message
+after the last model output retains strict inline-media validation. A rejected attachment
+therefore becomes history when the user sends a follow-up, even if the failed request produced
+no assistant reply. Valid attachments remain intact; this recovery does not grant image access
+on a text-only route.
 Both OpenAI surfaces accept the Vercel AI SDK's camelCase `promptCacheKey` (sent verbatim by
 opencode and other `ai-sdk` coding clients) as an alias of `prompt_cache_key`: it is renamed
 before manifest validation and decodes exactly as the documented field. When both spellings

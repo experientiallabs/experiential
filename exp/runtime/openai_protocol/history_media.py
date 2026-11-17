@@ -12,10 +12,12 @@ omitted and why, and the substitution is disclosed in ``ignored_parameters``.
 The rule follows the tool-result image precedent in ``capability_policy``:
 media in a tool output (a tool screenshot, a PDF a tool read) is history the
 moment the tool returns it, so it degrades in every turn; media in any other
-message degrades everywhere except the LATEST turn (the user messages since
-the model last spoke). Those keep the fail-closed contract, since the caller can still resend it
-differently: an oversized part gets a typed 400 that states the limit, and an
-undecodable or unsupported one keeps the decoder's own typed rejection.
+message degrades everywhere except the newest caller-input message after
+the model last spoke. That message keeps the fail-closed contract: an
+oversized part gets a typed 400 that states the limit, and an undecodable or
+unsupported one keeps the decoder's own typed rejection. A later caller
+message makes the rejected attachment history even without an intervening
+assistant reply, so a text follow-up can recover the conversation.
 
 This module owns the shared rule (classification, placeholder text, the
 limit-stating error) and the Chat and Responses walkers; the Anthropic
@@ -367,31 +369,32 @@ def _user_input(item: JsonObject) -> bool:
 
 
 def latest_turn(items: list[JsonValue]) -> frozenset[int]:
-    """Return the indexes of the caller-input entries after the last model-output entry.
+    """Return the newest caller-input index after the last model-output entry, if any.
 
     Model output is an assistant message, a reasoning or function/custom tool
     call item, or any provider-authored hosted item (compaction and program
     items included).
 
-    The latest turn is everything the caller added since the model last
-    spoke, so consecutive user messages (an image, then its question) all
-    stay strict, exactly as the document-count pass reads the turn.
+    Only the newest caller-input message keeps strict inline-media validation.
+    Rejection produces no model output, so requiring an assistant reply before
+    an attachment becomes history would also reject every later text follow-up.
+    Servable attachments in earlier messages remain unchanged.
 
     Args:
         items: Raw conversation entries, in order.
 
     Returns:
-        The latest turn's user-entry indexes.
+        The newest caller-input index, or an empty set after model output.
     """
-    last_model = max(
-        (index for index, item in enumerate(items) if isinstance(item, dict) and _model_turn(item)),
-        default=-1,
-    )
-    return frozenset(
-        index
-        for index, item in enumerate(items)
-        if index > last_model and isinstance(item, dict) and _user_input(item)
-    )
+    for index in range(len(items) - 1, -1, -1):
+        item = items[index]
+        if not isinstance(item, dict):
+            continue
+        if _model_turn(item):
+            return frozenset()
+        if _user_input(item):
+            return frozenset({index})
+    return frozenset()
 
 
 def degrade_chat_media(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
