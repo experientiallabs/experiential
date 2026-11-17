@@ -6,10 +6,14 @@ from dataclasses import dataclass
 
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.anthropic_protocol.gateway_reasoning import (
     EMPTY_GATEWAY_BLOCK,
+    STRICT_THINKING_SIGNATURES_HEADER,
     gateway_reasoning_block,
     merge_exposed_reasoning,
+    require_provider_signed_thinking,
+    strict_thinking_signatures,
 )
 from exp.runtime.gateway.contracts import (
     ExposedReasoningContentBlock,
@@ -71,3 +75,62 @@ def test_exposed_slices_concatenate_in_place_and_other_blocks_keep_order() -> No
     half = ExposedReasoningContentBlock(content="x" * (4 * 1024 * 1024 + 1))
     with pytest.raises(OpenAIProtocolError, match="8,388,608"):
         merge_exposed_reasoning([half, half], "p")
+
+
+def test_strict_header_reads_true_false_and_absent() -> None:
+    """Only true opts in; false, blank and absent keep the default; anything else fails."""
+    assert strict_thinking_signatures("true") is True
+    assert strict_thinking_signatures(" TRUE ") is True
+    assert strict_thinking_signatures("false") is False
+    assert strict_thinking_signatures("") is False
+    assert strict_thinking_signatures(None) is False
+    with pytest.raises(OpenAIProtocolError) as raised:
+        strict_thinking_signatures("1")
+    assert raised.value.detail.param == STRICT_THINKING_SIGNATURES_HEADER
+
+
+def _assistant(*blocks: JsonObject) -> JsonObject:
+    """Return a body whose second turn is an assistant turn holding ``blocks``."""
+    return {
+        "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [{"type": "text", "text": "a"}, *blocks]},
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    ("block", "param", "message"),
+    [
+        ({"type": "thinking", "thinking": "x"}, "signature", "signature is required"),
+        ({"type": "thinking", "signature": None}, "signature", "signature is required"),
+        ({"type": "thinking", "signature": ""}, "signature", "signature is required"),
+        ({"type": "redacted_thinking"}, "data", "data is required"),
+        ({"type": "redacted_thinking", "data": ""}, "data", "data is required"),
+        ({"type": "redacted_thinking", "data": _CARRIER}, "data", "gateway-issued"),
+    ],
+)
+def test_strict_check_names_the_unsigned_or_gateway_issued_block(
+    block: JsonObject, param: str, message: str
+) -> None:
+    """Each refusal is a 400 invalid_request_error on the caller's own field path."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        require_provider_signed_thinking(_assistant(block))
+    assert raised.value.status_code == 400
+    assert raised.value.detail.type == "invalid_request_error"
+    assert raised.value.detail.param == f"messages.1.content.1.{param}"
+    assert message in raised.value.detail.message
+
+
+def test_strict_check_passes_provider_signed_history_and_foreign_shapes() -> None:
+    """Signed thinking and opaque redacted payloads pass; malformed shapes are left to wire
+    validation, which names them precisely."""
+    require_provider_signed_thinking(
+        _assistant(
+            {"type": "thinking", "thinking": "x", "signature": "sig=="},
+            {"type": "redacted_thinking", "data": "opaque=="},
+        )
+    )
+    require_provider_signed_thinking({"messages": "not a list"})
+    require_provider_signed_thinking({"messages": [{"role": "user", "content": "text"}, 3]})
+    require_provider_signed_thinking({"messages": [{"role": "assistant", "content": ["x"]}]})

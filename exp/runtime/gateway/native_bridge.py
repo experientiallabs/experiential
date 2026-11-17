@@ -308,14 +308,14 @@ class NativeControlPlane(
         """
         assert_not_internal_classification()
         data = json.loads(argument)
-        surface = str(data.get("surface", "chat"))
         decoded = self._decode_body(
             data["body"],
-            surface=surface,
+            surface=str(data.get("surface", "chat")),
             idempotency_key=optional_text(data.get("idempotency_key")),
             client_request_id=optional_text(data.get("client_request_id")),
             anthropic_beta=optional_text(data.get("anthropic_beta")),
             model=optional_text(data.get("model")),
+            strict_thinking_signatures=optional_text(data.get("strict_thinking_signatures")),
         )
         request = decoded.request
         deadline = time.monotonic() + self._request_timeout_seconds
