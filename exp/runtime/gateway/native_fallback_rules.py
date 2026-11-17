@@ -19,7 +19,7 @@ dialed (``fallback_reason = failover_only_on:<token>``).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 
 from exp.common.models.failover_tokens import REFUSAL_TOKEN, REFUSAL_TOKEN_PREFIX
 from exp.common.models.gateway_catalog import ExactModelDeployment
@@ -32,8 +32,8 @@ FallbackRules = tuple[frozenset[str] | None, ...]
 RungFamily = tuple[str, str, str, frozenset[str] | None]
 """One upstream offering: ``(provider, provider_model, billing_source, failover_only_on)``."""
 
-RungFamilies = tuple[RungFamily, ...]
-"""One entry per route depth: the rung family that depth dials (``route_rung_families``)."""
+RungFamilies = tuple[RungFamily | None, ...]
+"""One entry per route depth: its rung family, ``None`` for a depth never worth reserving for."""
 
 FALLBACK_REASON_PREFIX = "failover_only_on:"
 """Prefix of the ledger ``fallback_reason`` an attempt on a rule-matched rung records."""
@@ -143,22 +143,35 @@ def untried_depths(
     )
 
 
-def route_rung_families(route: GatewayRoute) -> RungFamilies:
+def route_rung_families(
+    route: GatewayRoute, denied_pools: Collection[str] = frozenset()
+) -> RungFamilies:
     """Return each depth's rung family.
 
     A family is one upstream offering on one kind of credential: the
     deployments of one lane differ only by connection and share a family,
     while a different provider or model, a customer's own credential, or a
     rung carrying its own ``failover_only_on`` set is a family of its own.
+
+    Args:
+        route: The admitted route.
+        denied_pools: Destination pools the request's budget already refused;
+            their depths are skipped by the accounting walk, so they get no
+            family and no attempt is reserved for them.
+
+    Returns:
+        One family per route depth, aligned with ``route.deployments``.
     """
     return tuple(
-        (
+        None
+        if denied_pools and route.snapshot.stage_for_depth(depth).pool_id in denied_pools
+        else (
             deployment.provider,
             deployment.provider_model,
             deployment.billing_source.value,
             rung_rules(deployment),
         )
-        for deployment in route.deployments
+        for depth, deployment in enumerate(route.deployments)
     )
 
 
@@ -182,7 +195,7 @@ def fresh_family_count(
         How many undialed families the remaining attempts must still reach.
     """
     dialed = {families[depth] for depth, count in enumerate(dispatched) if count > 0}
-    return len({families[depth] for depth in depths} - dialed)
+    return len({families[depth] for depth in depths} - dialed - {None})
 
 
 def reserve_fresh_families(
@@ -216,7 +229,7 @@ def reserve_fresh_families(
     if fresh_family_count(depths, families, dispatched) < remaining_attempts:
         return depths
     dialed = {families[depth] for depth, count in enumerate(dispatched) if count > 0}
-    fresh = tuple(depth for depth in depths if families[depth] not in dialed)
+    fresh = tuple(depth for depth in depths if families[depth] not in dialed | {None})
     return fresh + tuple(depth for depth in depths if depth not in fresh)
 
 

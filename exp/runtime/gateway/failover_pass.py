@@ -126,7 +126,7 @@ class FailoverPass:
                 current_depth,
                 route_context_windows(entry.route),
             ),
-            route_rung_families(entry.route),
+            route_rung_families(entry.route, entry.denied_destination_pools),
             entry.attempt_counts,
             entry.attempt_policy.maximum_total_attempts - entry.total_attempts,
         )

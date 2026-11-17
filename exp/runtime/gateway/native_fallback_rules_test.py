@@ -30,6 +30,7 @@ from exp.runtime.gateway.native_fallback_rules import (
     eligible_depths,
     eligible_ladder,
     failure_token,
+    fresh_family_count,
     matched_token,
     require_unrestricted_rung,
     reserve_fresh_families,
@@ -348,3 +349,11 @@ def test_rung_family_index_names_the_first_depth_of_each_family() -> None:
     nxt = _deployment("next").model_copy(update={"provider": "anthropic"})
     route = _route(*lane, nxt)
     assert [rung_family_index(route, item) for item in (*lane, nxt)] == [0, 0, 0, 3]
+
+
+def test_a_family_the_budget_denied_is_never_reserved_for() -> None:
+    """A depth with no family (its pool refused this request) neither holds nor leads."""
+    families = (_ANTHROPIC,) * 8 + (None,)
+    dispatched = (1, 1, 1, 1, 1, 1, 1, 0, 0)
+    assert fresh_family_count((7, 8), families, dispatched) == 0
+    assert reserve_fresh_families((7, 8), families, dispatched, 1) == (7, 8)

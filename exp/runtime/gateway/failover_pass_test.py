@@ -513,11 +513,11 @@ def test_scheduled_throttle_redials_leave_the_last_attempt_for_the_next_rung() -
 def test_a_rung_whose_every_connection_throttles_continues_to_the_next_rung(
     redial_authored: bool,
 ) -> None:
-    """Production, 2026-11-15: eight throttled connections must not spend the whole budget.
+    """Eight throttled connections of one rung leave the last attempt for the next rung.
 
     Rung 0 is one lane behind eight connections and rung 1 a second provider.
-    Every connection answered a 429; the eight-attempt cap was spent on rung 0
-    and the caller got the 429. The last attempt now goes to rung 1.
+    When every connection answers a 429, rung 0 takes seven attempts and the
+    eighth, the last under the cap, goes to rung 1.
     """
     ledger = _RecordingLedger()
     registry = NativeAttemptAccounting(ledger)

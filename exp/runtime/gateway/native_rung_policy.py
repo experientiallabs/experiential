@@ -316,7 +316,7 @@ def failed_dispatch_candidate(
         physical_route_cap=entry.attempt_policy.physical_route_cap,
         physical_attempt_counts=entry.attempt_counts,
         context_windows=route_context_windows(route),
-        rung_families=route_rung_families(route),
+        rung_families=route_rung_families(route, entry.denied_destination_pools),
     )
     disposition = throttle_disposition(
         failure,
