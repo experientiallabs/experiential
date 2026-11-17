@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import pytest
 from jsonschema import ValidationError
 
 from exp.common.evaluations.reconstruction import EvaluationReferences, mechanical_checks
@@ -9,7 +10,9 @@ from exp.common.models import AssistantAction, ModelClient, ModelRequest, ModelR
 from exp.common.rollouts import StopReason
 from exp.common.tasks import TaskCase
 from exp.runtime.agents import AgentEpisode
+from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.environments import EnvironmentSession
+from exp.runtime.sessions.store import SessionStore
 from exp.simulation.actor import run_actor_workflow
 from exp.simulation.world_model.durable_test import NOW, setup
 
@@ -154,3 +157,134 @@ def test_caught_execution_failure_cannot_be_reported_as_completed(tmp_path: Path
     assert result.error_type is not None
     assert result.evidence.stop_reason == "actor_failure"
     assert result.evidence.steps[0].status == "failure"
+
+
+def test_malformed_simulator_proposal_is_not_an_actor_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An accepted actor action with malformed simulator output retains the true owner."""
+    session, project, _, _ = setup(tmp_path)
+    initial = session.state
+    malformed = {"observations": [], "effect": "not-an-object"}
+    monkeypatch.setattr(session, "_complete", lambda body, identity: malformed)
+    result = run_actor_workflow(
+        session,
+        _task(),
+        agent=_Actor((ToolCall(call_id="valid", name="append", arguments={"item": "a"}),)),
+        model=_UnusedModel(),
+        artifacts=project.artifacts,
+        clock=lambda: NOW,
+        code_revision="fixture",
+    )
+    assert result.evidence.stop_reason == "simulator_failure"
+    assert result.error_type is not None
+    assert len(result.evidence.steps) == 1
+    assert result.evidence.steps[0].status == "failure"
+    assert result.evidence.steps[0].reply is None
+    assert session.state == initial and session.transitions == ()
+    assert (
+        SessionStore(tmp_path / "world.sqlite", clock=lambda: NOW).proposal("world", "actor-step-0")
+        == malformed
+    )
+
+
+def test_dispatched_simulator_failure_is_an_unknown_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider error after dispatch saves no proposal and is not blamed on the actor."""
+    session, project, _, _ = setup(tmp_path)
+    initial = session.state
+
+    def timeout(body: object, identity: object) -> object:
+        """Fail after the simulator call was dispatched, as a read timeout does."""
+        raise TimeoutError("simulator read timed out")
+
+    monkeypatch.setattr(session, "_complete", timeout)
+    result = run_actor_workflow(
+        session,
+        _task(),
+        agent=_Actor((ToolCall(call_id="valid", name="append", arguments={"item": "a"}),)),
+        model=_UnusedModel(),
+        artifacts=project.artifacts,
+        clock=lambda: NOW,
+        code_revision="fixture",
+    )
+    assert result.evidence.stop_reason == "simulator_outcome_unknown"
+    assert result.error_type == "TimeoutError"
+    assert not session.has_recorded_proposal("actor-step-0")
+    assert session.state == initial and session.transitions == ()
+
+
+def test_unknown_reask_is_not_masked_by_an_earlier_rejected_proposal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saved refused proposal does not decide the outcome of the re-ask that timed out."""
+    session, project, _, _ = setup(tmp_path)
+    replies: list[object] = [{"observations": [], "effect": "not-an-object"}]
+
+    def refused_then_timeout(body: object, identity: object) -> object:
+        """Return one refused proposal, then fail the re-ask after dispatch."""
+        if replies:
+            return replies.pop()
+        raise TimeoutError("simulator read timed out")
+
+    monkeypatch.setattr(session, "_complete", refused_then_timeout)
+    monkeypatch.setattr(
+        session, "_policy", session._policy.model_copy(update={"maximum_reasks": 1})
+    )
+    result = run_actor_workflow(
+        session,
+        _task(),
+        agent=_Actor((ToolCall(call_id="valid", name="append", arguments={"item": "a"}),)),
+        model=_UnusedModel(),
+        artifacts=project.artifacts,
+        clock=lambda: NOW,
+        code_revision="fixture",
+    )
+    assert session.has_recorded_proposal("actor-step-0")
+    assert result.evidence.stop_reason == "simulator_outcome_unknown"
+    assert result.error_type == "TimeoutError"
+
+
+def test_actor_provider_failure_is_not_a_simulator_failure(tmp_path: Path) -> None:
+    """A failed actor call reaches no simulator operation and stays actor-attributed."""
+    session, project, _, _ = setup(tmp_path)
+    initial = session.state
+    result = run_actor_workflow(
+        session,
+        _task(),
+        agent=ChatAgentRuntime(maximum_model_calls=1),
+        model=_UnusedModel(),
+        artifacts=project.artifacts,
+        clock=lambda: NOW,
+        code_revision="fixture",
+    )
+    assert result.evidence.stop_reason == "actor_failure"
+    assert result.error_type == "AssertionError"
+    assert result.evidence.steps == ()
+    assert session.state == initial and session.transitions == ()
+
+
+def test_session_operation_budget_is_not_an_actor_failure(tmp_path: Path) -> None:
+    """A refused extra tool operation retains the harness limit and prior commits."""
+    session, project, requests, _ = setup(tmp_path)
+    calls = tuple(
+        ToolCall(call_id=f"call-{i}", name="append", arguments={"item": str(i)}) for i in range(31)
+    )
+    result = run_actor_workflow(
+        session,
+        _task(),
+        agent=_Actor(calls),
+        model=_UnusedModel(),
+        artifacts=project.artifacts,
+        clock=lambda: NOW,
+        code_revision="fixture",
+    )
+    assert result.error_type == "ProviderBudgetExhaustedError"
+    assert result.evidence.stop_reason == "simulator_budget_exhausted"
+    assert len(requests) == len(session.transitions) == 30
+    refused = result.evidence.steps[-1]
+    assert refused.status == "failure"
+    assert refused.before == refused.after == session.state
+    assert refused.reply is None
+    assert len(result.evidence.steps) == 31

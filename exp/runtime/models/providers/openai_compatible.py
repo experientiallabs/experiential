@@ -21,6 +21,7 @@ from exp.common.models import (
     ModelSnapshot,
     RawEmbedding,
     RawEmbeddingBatch,
+    ReasoningEffort,
     ToolCall,
     Usage,
 )
@@ -30,9 +31,7 @@ from exp.common.models.usage_observability import (
 )
 from exp.common.traces.ingest.json_strict import reject_duplicate_json_keys
 from exp.runtime.gateway.images_contracts import ImagesRequest
-from exp.runtime.models.providers.async_transport import (
-    AsyncJsonHttpTransport,
-)
+from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from exp.runtime.models.providers.base import (
     DEFAULT_RETRY_POLICY,
     DEFAULT_TIMEOUT_SECONDS,
@@ -390,7 +389,8 @@ def openai_compatible_response(
         output = AssistantAction(content=content, tool_calls=tool_calls)
     except ValueError as exc:
         raise ProviderRetryableResponseError(
-            "OpenAI-compatible response has neither text nor a complete tool call"
+            "OpenAI-compatible response has neither text nor a complete tool call",
+            hit_length_limit=choice.get("finish_reason") == "length",
         ) from exc
     return ModelResponse.completed(
         output=output,
@@ -498,6 +498,8 @@ def openai_embedding_response_raw(payload: JsonObject, *, expected_count: int) -
 class OpenAIEmbeddingMixin(ProviderHttpClient):
     """Adds the shared OpenAI-wire embeddings endpoint to one HTTP provider client."""
 
+    supports_idempotency_key: ClassVar[bool] = True
+
     def _embedding_model_id(self) -> str:
         """Return the model id placed on the embeddings wire.
 
@@ -587,7 +589,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         supports_frequency_penalty: bool = False,
         supports_presence_penalty: bool = False,
         supports_reasoning: bool = False,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
         chat_max_tokens_field: ChatMaxTokensField | None = None,
         sampling_requires_reasoning_none: bool = False,
         reasoning_output_exposed: bool = False,
@@ -619,6 +621,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             transport=transport,
             retry_policy=retry_policy,
             timeout_seconds=timeout_seconds,
+            reasoning_effort=reasoning_effort,
         )
         self._supports_temperature = supports_temperature
         self._supports_top_p = supports_temperature if supports_top_p is None else supports_top_p
@@ -627,7 +630,6 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         self._supports_frequency_penalty = supports_frequency_penalty
         self._supports_presence_penalty = supports_presence_penalty
         self._supports_reasoning = supports_reasoning
-        self._reasoning_effort = reasoning_effort
         self._token_limit_key: ChatMaxTokensField = chat_max_tokens_field or self.token_limit_key
         self._sampling_requires_reasoning_none = sampling_requires_reasoning_none
         self._reasoning_output_exposed = reasoning_output_exposed

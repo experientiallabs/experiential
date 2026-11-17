@@ -27,12 +27,14 @@ from exp.common.models import (
     ModelRequest,
     ModelRoles,
     ModelSnapshot,
+    ToolChoice,
     Usage,
 )
 from exp.common.models.catalog import GatewayDeploymentMetadata, GatewayTokenPrices
 from exp.common.models.gateway_catalog import normalize_gateway_catalog
 from exp.common.models.pricing import completion_cost_reservation
 from exp.common.models.token_cost_test import prices
+from exp.common.tasks import ToolSchema
 from exp.runtime.gateway.execution_resolution import _resolved_wire_profile
 from exp.runtime.models.credentials import (
     CredentialResolution,
@@ -66,7 +68,11 @@ from exp.runtime.models.providers.transport import (
 )
 from exp.runtime.models.providers.typesafe import TYPESAFE_BASE_URL, TypeSafeClient
 from exp.runtime.models.providers.vertex import VertexTokenProvider
-from exp.runtime.models.registry import CatalogRoleName, ModelConnectionError, RuntimeModelCatalog
+from exp.runtime.models.registry import (
+    CatalogRoleName,
+    ModelConnectionError,
+    RuntimeModelCatalog,
+)
 
 _DEFAULT_CAPABILITIES = ModelCapabilities(
     supports_tools=True,
@@ -1069,9 +1075,11 @@ def test_claude_plan_connection_needs_the_operator_app_and_then_signs_each_dispa
         models={
             "claude": ModelRecord(
                 connection="claude-plan",
-                model="claude-sonnet-5",
+                model="claude-sonnet-5-5",
                 billing_source=BillingSource.CUSTOMER_MANAGED,
-                capabilities=_DEFAULT_CAPABILITIES,
+                capabilities=_DEFAULT_CAPABILITIES.model_copy(
+                    update={"supports_forced_tool_choice": False}
+                ),
             )
         },
         roles=ModelRoles(candidates=("claude",), incumbent="claude"),
@@ -1117,6 +1125,14 @@ def test_claude_plan_connection_needs_the_operator_app_and_then_signs_each_dispa
     assert resolved.client.sign_gateway_dispatch(url=profile.url, body="{}") == {
         "Authorization": "Bearer injected"
     }
+    steered = resolved.client._build_request(
+        ModelRequest(
+            messages=(ModelMessage(role="user", content="Propose."),),
+            tools=(ToolSchema(name="submit", description="Submit.", input_schema={}),),
+            tool_choice="required",
+        )
+    )
+    assert steered["tool_choice"] == {"type": "auto", "disable_parallel_tool_use": True}
     assert built == ["claude-plan:anthropic"]
 
 
@@ -1250,3 +1266,91 @@ def test_azure_responses_surface_dispatches_over_the_native_responses_wire(
     assert "Authorization" not in profile.headers
     assert profile.forwards_prompt_cache_key is True
     assert profile.forwards_prompt_cache_ttl is False
+
+
+def test_transport_wrapper_preserves_original_resolver_and_credentials() -> None:
+    """Admission cloning changes only fresh transport construction, including injected auth."""
+    inner = ScriptedJsonTransport()
+    runtime = RuntimeModelCatalog(
+        _catalog(), environment={"FIXTURE_API_KEY": "fixture-key"}, transport_factory=lambda: inner
+    )
+    seen: list[object] = []
+
+    def wrapper(transport: object) -> ScriptedJsonTransport:
+        seen.append(transport)
+        assert transport is inner
+        return inner
+
+    clone = runtime.with_transport_wrapper(wrapper)
+    before = runtime.resolve("fixture-model")
+    assert not seen
+    after = clone.resolve("fixture-model")
+    assert seen == [inner]
+    assert before.snapshot == after.snapshot
+    assert before.credential_receipt == after.credential_receipt
+    runtime.resolve("fixture-model")
+    assert seen == [inner]
+
+
+@pytest.mark.parametrize(
+    ("provider", "base_url", "model"),
+    [
+        ("anthropic", None, "claude-sonnet-5-5"),
+        ("azure", "https://fixture.services.ai.azure.com", "claude-sonnet-5-5"),
+        (
+            "vertex",
+            "https://aiplatform.googleapis.com/v1/projects/test/locations/global",
+            "publishers/anthropic/models/claude-sonnet-5-5",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("declared", "wire"),
+    [
+        (True, {"type": "tool", "name": "submit_proposal"}),
+        (False, {"type": "auto", "disable_parallel_tool_use": True}),
+    ],
+)
+def test_catalog_forced_tool_choice_declaration_reaches_every_anthropic_client(
+    provider: str,
+    base_url: str | None,
+    model: str,
+    declared: bool | None,
+    wire: dict[str, object],
+) -> None:
+    """Direct, Foundry and Vertex Claude all send what the catalog declares, by capability."""
+    catalog = _catalog(
+        provider=provider,
+        base_url=base_url,
+        api_version="2024-10-21" if provider == "azure" else None,
+        capabilities=_DEFAULT_CAPABILITIES.model_copy(
+            update={"supports_forced_tool_choice": declared}
+        ),
+    )
+    catalog.models["fixture-model"] = catalog.models["fixture-model"].model_copy(
+        update={"model": model}
+    )
+    runtime = RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+        vertex_token_provider_factory=lambda credentials_json: lambda: "fixture-bearer",
+    )
+    client = runtime.resolve("fixture-model").client
+    assert isinstance(client, ProviderHttpClient)
+
+    payload = client._build_request(
+        ModelRequest(
+            messages=(ModelMessage(role="user", content="Propose."),),
+            tools=(
+                ToolSchema(
+                    name="submit_proposal",
+                    description="Submit the proposal.",
+                    input_schema={"type": "object"},
+                ),
+            ),
+            tool_choice=ToolChoice(name="submit_proposal"),
+        )
+    )
+
+    assert payload["tool_choice"] == wire

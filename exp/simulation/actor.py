@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from datetime import datetime
+from typing import Literal
 
 from exp.common.core.artifacts import ArtifactEnvelope, ContractModel, JsonObject
 from exp.common.evaluations.reconstruction import WorkflowEvidence, WorkflowStep
@@ -10,6 +11,7 @@ from exp.common.project import ArtifactStore
 from exp.common.tasks import TaskCase
 from exp.runtime.agents import AgentEpisode, AgentRuntime
 from exp.runtime.environments import Observation
+from exp.runtime.sessions.errors import ProviderBudgetExhaustedError
 from exp.simulation.world_model.durable import DurableWorldModelSession
 
 
@@ -34,20 +36,37 @@ class _RecordingEnvironment:
         """Bind a fresh session and accumulate only actually emitted actions."""
         self._session = session
         self._steps: list[WorkflowStep] = []
-        self._failed = False
+        self._failure_reason: (
+            Literal[
+                "actor_failure",
+                "simulator_failure",
+                "simulator_outcome_unknown",
+                "simulator_budget_exhausted",
+            ]
+            | None
+        ) = None
 
     def execute(self, action: ToolCall) -> Observation:
         """Capture one tool consequence through the existing guarded commit path."""
-        if self._failed:
+        if self._failure_reason is not None:
             raise RuntimeError("actor environment stopped after an execution failure")
         index = len(self._steps)
         before = self._session.state
         public_action: JsonObject = {"name": action.name, "arguments": action.arguments}
+        operation_id = f"actor-step-{index}"
         try:
             # Provider call IDs may repeat across turns; logical operations are episode slots.
-            observation = self._session.step((action,), operation_id=f"actor-step-{index}")[0]
+            observation = self._session.step((action,), operation_id=operation_id)[0]
         except Exception as error:  # noqa: BLE001 - failures remain evaluation evidence.
-            self._failed = True
+            self._failure_reason = (
+                "simulator_budget_exhausted"
+                if isinstance(error, ProviderBudgetExhaustedError)
+                else "simulator_outcome_unknown"
+                if self._session.outcome_unknown(operation_id)
+                else "simulator_failure"
+                if self._session.has_recorded_proposal(operation_id)
+                else "actor_failure"
+            )
             self._steps.append(
                 WorkflowStep(
                     step=index,
@@ -139,7 +158,9 @@ def run_actor_workflow(
             "final_answer": episode.final_action.model_dump(mode="json")
             if episode is not None and episode.final_action is not None
             else None,
-            "stop_reason": "actor_failure"
+            "stop_reason": environment._failure_reason
+            if environment._failure_reason is not None
+            else "actor_failure"
             if error_type is not None
             else episode.stop_reason.value
             if episode is not None

@@ -12,13 +12,16 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
+from exp.common.core.artifacts import Sha256, sha256_json
 from exp.common.models import AssistantAction, NumericMeasurement, ToolCall
 from exp.optimize.model.sft.contracts import (
     AssistantActionEvent,
+    ContinuationExampleSource,
     SFTExample,
     SFTMessage,
     ToolEvent,
 )
+from exp.optimize.model.sft.tail_sft import LossDatum, TargetLoss
 from exp.optimize.model.sft.training_contracts import (
     TinkerSFTError,
     TinkerSFTSpec,
@@ -182,21 +185,47 @@ class TinkerTrainerSession:
 
         Raises:
             TinkerSFTError: Rendering omitted cross-entropy inputs, removed the complete target,
-                or left the target with no supervised tokens.
+                discarded continuation context, or left the target with no supervised tokens.
         """
         _require_tinker_dependencies()
-        from tinker_cookbook.renderers import TrainOnWhat
+        from tinker_cookbook.renderers import ToolSpec, TrainOnWhat
         from tinker_cookbook.supervised.data import conversation_to_datum
 
         rendered: list[TrainerDatum] = []
         for example in examples:
+            messages = cast("list[Message]", tinker_messages_from_example(example))
+            if example.tools:
+                tools: list[ToolSpec] = [
+                    {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.input_schema,
+                    }
+                    for tool in example.tools
+                ]
+                system_prompt = ""
+                if messages and messages[0]["role"] == "system":
+                    system_prompt = str(messages.pop(0)["content"])
+                messages = (
+                    self._renderer.create_conversation_prefix_with_tools(tools, system_prompt)
+                    + messages
+                )
             datum = conversation_to_datum(
-                cast("list[Message]", tinker_messages_from_example(example)),
+                messages,
                 self._renderer,
                 max_length=None,
                 train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE,
                 reduction="none",
             )
+            if (
+                isinstance(example.source, ContinuationExampleSource)
+                and self._spec.maximum_datum_tokens is not None
+                and len(datum.model_input.to_ints()) >= self._spec.maximum_datum_tokens
+            ):
+                raise TinkerSFTError(
+                    f"maximum_datum_tokens cannot retain the complete continuation context "
+                    f"and target for {example.example_id}; raise the token ceiling"
+                )
             datum = _truncate_context_only(
                 datum,
                 maximum_datum_tokens=self._spec.maximum_datum_tokens,
@@ -234,8 +263,9 @@ class TinkerTrainerSession:
             learning_rate: Frozen Adam learning rate for the current batch.
 
         Returns:
-            Only backend-reported loss and gradient metrics.  Tinker exposes no per-step monetary
-            meter on this API, so cost remains absent rather than estimated.
+            Backend-reported loss and gradient metrics. Cost is a conservative estimate from
+            the explicitly configured token price and input ceiling, never observed billing.
+            Without those settings cost remains unknown.
 
         Raises:
             TinkerSFTError: A datum did not originate from this concrete renderer.
@@ -243,17 +273,89 @@ class TinkerTrainerSession:
         _require_tinker_dependencies()
         import tinker
 
+        if not datums:
+            raise TinkerSFTError("cannot dispatch an optimizer update without target examples")
         tinker_datums: list[tinker.Datum] = []
         for datum in datums:
             if not isinstance(datum, TinkerSFTDatum):
                 raise TinkerSFTError("Tinker trainer received a datum from another backend")
             tinker_datums.append(datum.datum)
+        if self._spec.tail_sft is not None:
+            total = sum(datum.supervised_token_count for datum in datums)
+            tinker_datums = [
+                tinker.Datum(
+                    model_input=datum.model_input,
+                    loss_fn_inputs={
+                        **datum.loss_fn_inputs,
+                        "weights": tinker.TensorData(
+                            data=[
+                                float(weight) / total
+                                for weight in datum.loss_fn_inputs["weights"].data
+                            ],
+                            dtype=datum.loss_fn_inputs["weights"].dtype,
+                            shape=datum.loss_fn_inputs["weights"].shape,
+                        ),
+                    },
+                )
+                for datum in tinker_datums
+            ]
         forward_backward = self._client.forward_backward(tinker_datums, "cross_entropy").result()
         optimizer = self._client.optim_step(tinker.AdamParams(learning_rate=learning_rate)).result()
         return TrainerBatchResult(
             loss=_named_metric(forward_backward.metrics, ("loss", "total_loss")),
             gradient_norm=_named_metric(optimizer.metrics, ("grad_norm", "gradient_norm")),
+            cost_usd=conservative_training_step_cost(self._spec, batch_example_count=len(datums)),
         )
+
+    def datum_identity(self, datum: LossDatum) -> Sha256:
+        """Hash exact rendered tokens and target mask for initialization/current alignment."""
+        if not isinstance(datum, TinkerSFTDatum):
+            raise TinkerSFTError("Tinker scorer received a datum from another backend")
+        return sha256_json(
+            {
+                "model_input": datum.datum.model_input.to_ints(),
+                "weights": list(datum.datum.loss_fn_inputs["weights"].data),
+                "target_tokens": list(datum.datum.loss_fn_inputs["target_tokens"].data),
+            }
+        )
+
+    def score_batch(self, datums: Sequence[LossDatum]) -> tuple[TargetLoss, ...]:
+        """Read target-token log probabilities without computing gradients or updating weights."""
+        wire = []
+        for datum in datums:
+            if not isinstance(datum, TinkerSFTDatum):
+                raise TinkerSFTError("Tinker scorer received a datum from another backend")
+            wire.append(datum.datum)
+        output = self._client.forward(wire, "cross_entropy").result()
+        if len(output.loss_fn_outputs) != len(datums):
+            raise TinkerSFTError("Tinker scorer returned a different batch size")
+        rows = []
+        for datum, item, result in zip(datums, wire, output.loss_fn_outputs, strict=True):
+            probabilities = result["logprobs"].data
+            weights = item.loss_fn_inputs["weights"].data
+            if len(probabilities) != len(weights) or any(
+                weight not in (0, 1) for weight in weights
+            ):
+                raise TinkerSFTError("TailSFT requires aligned binary assistant-only masks")
+            if sum(weights) != datum.supervised_token_count:
+                raise TinkerSFTError("TailSFT supervised token count differs from its mask")
+            loss = (
+                -sum(
+                    float(logp)
+                    for logp, weight in zip(probabilities, weights, strict=True)
+                    if weight
+                )
+                / datum.supervised_token_count
+            )
+            rows.append(
+                TargetLoss(
+                    example_id=datum.example_id,
+                    datum_sha256=self.datum_identity(datum),
+                    target_tokens=datum.supervised_token_count,
+                    mean_loss=loss,
+                )
+            )
+        return tuple(rows)
 
     def save_state(self, checkpoint_name: str) -> str:
         """Persist one non-overwriting managed optimizer state.
@@ -296,9 +398,11 @@ def tinker_messages_from_example(example: SFTExample) -> list[TinkerConversation
     Raises:
         TinkerSFTError: The frozen context contains an unsupported event type.
     """
-    messages: list[TinkerConversationMessage] = [
-        {"role": "system", "content": f"Task:\n{example.task}"}
-    ]
+    messages: list[TinkerConversationMessage] = (
+        []
+        if isinstance(example.source, ContinuationExampleSource)
+        else [{"role": "system", "content": f"Task:\n{example.task}"}]
+    )
     for event in example.history:
         if isinstance(event, SFTMessage):
             role = "user" if event.role == "observation" else event.role

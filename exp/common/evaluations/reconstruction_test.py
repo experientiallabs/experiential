@@ -565,3 +565,119 @@ def test_difference_paths_are_unambiguous_and_sorted_numerically() -> None:
     ]
     container = next(row for row in rows if row["path"] == "x")
     assert container["actual"] == {"y": None} and not container["actual_missing"]
+
+
+def test_evaluation_binds_actual_completion_profile_and_refuses_changed_replay(
+    tmp_path: Path,
+) -> None:
+    """Changing output mode must not replay a differently configured judge under one identity."""
+    project = ProjectStore(tmp_path, "profile")
+    project.initialize(ProjectConfig(project_id="profile"))
+    judge = default_judge("fixture")
+
+    class Completion:
+        """Return explicit unavailable ratings with a registered fixture profile.
+
+        Attributes:
+            model_identity: Configured fixture model used for completion.
+            completion_profile_sha256: Serving settings supplied by the completion owner.
+            calls: Number of invoked fixture completions.
+        """
+
+        model_identity: str = "fixture"
+        completion_profile_sha256: str = "7" * 64
+        calls: int = 0
+
+        def __call__(self, body: JsonObject, identity: str) -> JsonObject:
+            """Return only declared rubric keys; no provider or native environment is used."""
+            self.calls += 1
+            return {
+                "axes": [
+                    {
+                        "dimension_id": axis.dimension_id,
+                        "status": "unassessable",
+                        "score": None,
+                        "rationale": "Fixture",
+                        "evidence_refs": [],
+                        "critical_flags": [],
+                    }
+                    for axis in judge.definition.dimensions
+                ]
+            }
+
+    complete = Completion()
+    result = evaluate(
+        evidence(),
+        references(),
+        judge=judge,
+        complete=complete,
+        artifacts=project.artifacts,
+        artifact_id="profile-check",
+        clock=lambda: NOW,
+        code_revision="fixture",
+    )
+    assert result.judge_completion_sha256 == "7" * 64
+    complete.completion_profile_sha256 = "8" * 64
+    with pytest.raises(ValueError, match="saved evaluation identity"):
+        evaluate(
+            evidence(),
+            references(),
+            judge=judge,
+            complete=complete,
+            artifacts=project.artifacts,
+            artifact_id="profile-check",
+            clock=lambda: NOW,
+            code_revision="fixture",
+        )
+    assert complete.calls == 1
+    complete.completion_profile_sha256 = "7" * 64
+    complete.model_identity = "another-model"
+    with pytest.raises(ValueError, match="judge model differs"):
+        evaluate(
+            evidence(),
+            references(),
+            judge=judge,
+            complete=complete,
+            artifacts=project.artifacts,
+            artifact_id="wrong-model",
+            clock=lambda: NOW,
+            code_revision="fixture",
+        )
+    assert complete.calls == 1
+    assert not project.artifacts.exists("wrong-model-intent")
+
+
+def test_private_execution_receipts_are_bound_but_never_sent_to_the_judge(tmp_path: Path) -> None:
+    """Rule-use telemetry cannot bias the independent grade or consume its prompt allowance."""
+    import json
+
+    from exp.common.evaluations.reconstruction import JudgeNotRun
+
+    project = ProjectStore(tmp_path, "audit")
+    base = evidence()
+    value = base.model_copy(update={"audit_metadata": {"marker": "PRIVATE-CLAIM-RECEIPT"}})
+    calls = []
+
+    def judge(body: JsonObject, identity: str) -> JsonObject:
+        """Inspect the actual dispatched body while buying no provider inference."""
+        del identity
+        calls.append(body)
+        assert "PRIVATE-CLAIM-RECEIPT" not in json.dumps(body)
+        assert "audit_metadata" not in json.dumps(body)
+        raise JudgeNotRun("No inference needed for the information-boundary test")
+
+    report = evaluate(
+        value,
+        references(),
+        judge=default_judge("fixture"),
+        complete=judge,
+        artifacts=project.artifacts,
+        artifact_id="audit-report",
+        clock=lambda: NOW,
+        code_revision="test",
+    )
+    assert len(calls) == 1 and report.evidence_sha256 == sha256_json(value)
+    assert report.evidence_sha256 != sha256_json(base)
+    saved = project.artifacts.read_bytes("audit-report-intent", "evidence.json")
+    assert b"PRIVATE-CLAIM-RECEIPT" in saved
+    assert "audit_metadata" not in base.model_dump(mode="json")

@@ -41,6 +41,7 @@ from exp.runtime.environments import (
     EnvironmentSession,
     LocalProcessEnvironmentRuntime,
 )
+from exp.runtime.environments.containment.host import host_containment
 from exp.runtime.models import ResolvedModel
 from exp.simulation import (
     PairedSimulationCell,
@@ -71,6 +72,7 @@ _LOCK_AT = datetime(2026, 8, 12, 11, tzinfo=UTC)
 _EVIDENCE_AT = datetime(2026, 8, 12, 12, tzinfo=UTC)
 _COMPARISON_AT = datetime(2026, 8, 12, 13, tzinfo=UTC)
 _REPORT_AT = datetime(2026, 8, 12, 14, tzinfo=UTC)
+_LOCAL_REFUSAL = host_containment().report.refusal
 _ENVIRONMENT_SHA256 = "e" * 64
 
 
@@ -121,8 +123,8 @@ class _CountingEnvironmentRuntime:
 
 
 @pytest.mark.skipif(
-    sys.platform != "darwin",
-    reason="the bounded LocalProcessEnvironmentRuntime is intentionally Darwin-only",
+    _LOCAL_REFUSAL is not None,
+    reason=f"this host refuses local process containment: {_LOCAL_REFUSAL}",
 )
 def test_w16_actual_text_and_local_process_comparison_preserves_failure_denominator(
     tmp_path: Path,
@@ -153,6 +155,7 @@ def test_w16_actual_text_and_local_process_comparison_preserves_failure_denomina
         revision,
         fit_rag_input=fit_rag_input,
         grounded_world_model_input=grounded_world_model_input,
+        lock_input=lock_input,
     )
     sandbox_spec = _spec(
         sandbox_plan,
@@ -160,6 +163,7 @@ def test_w16_actual_text_and_local_process_comparison_preserves_failure_denomina
         task_input,
         SimulationMode.SANDBOX,
         revision,
+        lock_input=lock_input,
     )
     candidate_snapshot = text_plan.candidate_snapshots[0].model
     candidate_text = _ScriptedClient(
@@ -469,6 +473,7 @@ def _spec(
     *,
     fit_rag_input: ArtifactInput | None = None,
     grounded_world_model_input: ArtifactInput | None = None,
+    lock_input: ArtifactInput | None = None,
 ) -> SimulationSpec:
     """Return one executable specification without pre-persisting outputs.
 
@@ -480,6 +485,7 @@ def _spec(
         revision: Exact source revision bound to created artifacts.
         fit_rag_input: Exact persisted fit-only RAG pointer for world-model mode.
         grounded_world_model_input: Exact persisted grounded runtime pointer.
+        lock_input: Policy lock the specification cites, proving it was planned after it.
 
     Returns:
         Finite specification bound to the selected plan and task set.
@@ -493,6 +499,7 @@ def _spec(
             plan_input,
             task_input,
             *((rag_input, grounded_input) if mode is SimulationMode.WORLD_MODEL else ()),
+            *(() if lock_input is None else (lock_input,)),
         ),
         code_revision=revision,
         simulation_id=f"w16-{mode.value}-simulation",

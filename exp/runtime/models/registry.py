@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Callable, Mapping
+from copy import copy
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from threading import TIMEOUT_MAX
@@ -33,6 +34,7 @@ from exp.runtime.models.credentials import (
     read_connection_credential,
 )
 from exp.runtime.models.preflight import CapabilityRequirement, preflight_capabilities
+from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.anthropic import ANTHROPIC_BASE_URL, AnthropicClient
 from exp.runtime.models.providers.anthropic_subscription import (
     AnthropicOAuthApp,
@@ -52,6 +54,7 @@ from exp.runtime.models.providers.azure import (
     bind_azure_api_key,
     resolve_azure_api_surface,
 )
+from exp.runtime.models.providers.backpressure import ProviderRoute
 from exp.runtime.models.providers.base import DEFAULT_TIMEOUT_SECONDS
 from exp.runtime.models.providers.bedrock import (
     BedrockClient,
@@ -418,13 +421,14 @@ class RuntimeModelCatalog:
                     model=snapshot,
                     api_key=api_key,
                     base_url=connection.base_url,
-                    transport=self._transport_factory(),
+                    transport=self._bound_transport(connection.provider, alias),
                     token_provider=token_provider,
                     supports_temperature=capabilities.supports_temperature,
                     supports_top_p=_supports_top_p(capabilities),
                     supports_top_k=_supports_flag(capabilities, "supports_top_k"),
                     supports_reasoning=capabilities.supports_reasoning,
                     reasoning_effort=capabilities.reasoning_effort,
+                    supports_forced_tool_choice=capabilities.supports_forced_tool_choice,
                 )
                 return ResolvedModel(
                     alias,
@@ -442,7 +446,7 @@ class RuntimeModelCatalog:
                     model=snapshot,
                     api_key=api_key,
                     base_url=connection.base_url,
-                    transport=self._transport_factory(),
+                    transport=self._bound_transport(connection.provider, alias),
                     timeout_seconds=self._http_timeout_seconds,
                     token_provider=token_provider,
                     supports_temperature=capabilities.supports_temperature,
@@ -472,7 +476,7 @@ class RuntimeModelCatalog:
                 model=snapshot,
                 api_key=api_key,
                 base_url=connection.base_url,
-                transport=self._transport_factory(),
+                transport=self._bound_transport(connection.provider, alias),
                 timeout_seconds=self._http_timeout_seconds,
                 token_provider=token_provider,
                 supports_temperature=capabilities.supports_temperature,
@@ -500,7 +504,7 @@ class RuntimeModelCatalog:
                 model=snapshot,
                 api_key=api_key,
                 base_url=connection.base_url or OPENAI_BASE_URL,
-                transport=self._transport_factory(),
+                transport=self._bound_transport(connection.provider, alias),
                 timeout_seconds=self._http_timeout_seconds,
                 supports_temperature=capabilities.supports_temperature,
                 supports_top_p=_supports_top_p(capabilities),
@@ -558,7 +562,7 @@ class RuntimeModelCatalog:
                     base_url=azure_anthropic_base_url(connection.base_url),
                     authorization_bearer=True,
                     serves_advisor_tool=False,
-                    transport=self._transport_factory(),
+                    transport=self._bound_transport(connection.provider, alias),
                     timeout_seconds=self._http_timeout_seconds,
                     supports_temperature=capabilities.supports_temperature,
                     supports_top_p=_supports_top_p(capabilities),
@@ -572,6 +576,7 @@ class RuntimeModelCatalog:
                     ),
                     supports_reasoning=capabilities.supports_reasoning,
                     reasoning_effort=capabilities.reasoning_effort,
+                    supports_forced_tool_choice=capabilities.supports_forced_tool_choice,
                 )
                 return ResolvedModel(
                     alias,
@@ -587,7 +592,7 @@ class RuntimeModelCatalog:
                     endpoint=connection.base_url,
                     api_key=api_key,
                     api_version=api_version,
-                    transport=self._transport_factory(),
+                    transport=self._bound_transport(connection.provider, alias),
                     timeout_seconds=self._http_timeout_seconds,
                     supports_temperature=capabilities.supports_temperature,
                     supports_top_p=_supports_top_p(capabilities),
@@ -615,7 +620,7 @@ class RuntimeModelCatalog:
                 api_key=api_key,
                 api_version=api_version,
                 api_surface=api_surface,
-                transport=self._transport_factory(),
+                transport=self._bound_transport(connection.provider, alias),
                 timeout_seconds=self._http_timeout_seconds,
                 supports_temperature=capabilities.supports_temperature,
                 supports_top_p=_supports_top_p(capabilities),
@@ -667,7 +672,7 @@ class RuntimeModelCatalog:
             raise ModelConnectionError(
                 f"OpenAI-compatible alias {alias!r} needs connection.base_url"
             )
-        transport = self._transport_factory()
+        transport = self._bound_transport(provider, alias)
         endpoint = urlsplit(base_url)
         if (
             self._transport_factory is HttpxAsyncJsonTransport
@@ -701,6 +706,8 @@ class RuntimeModelCatalog:
                     "supports_presence_penalty": _supports_flag(
                         capabilities, "supports_presence_penalty"
                     ),
+                    "supports_reasoning": capabilities.supports_reasoning,
+                    "reasoning_effort": capabilities.reasoning_effort,
                 }
             )
         if provider in {"openrouter", "openai-compatible"}:
@@ -709,13 +716,6 @@ class RuntimeModelCatalog:
             # Audio only: no sampling or reasoning facts apply, but the
             # configured dispatch timeout does.
             http_kwargs["timeout_seconds"] = self._http_timeout_seconds
-        if provider in {"anthropic", "gemini", "openrouter", "openai-compatible"}:
-            http_kwargs.update(
-                {
-                    "supports_reasoning": capabilities.supports_reasoning,
-                    "reasoning_effort": capabilities.reasoning_effort,
-                }
-            )
         if provider in {"openrouter", "openai-compatible"}:
             http_kwargs["sampling_requires_reasoning_none"] = (
                 capabilities.sampling_requires_reasoning_none
@@ -731,6 +731,7 @@ class RuntimeModelCatalog:
             )
         if provider == "anthropic":
             http_kwargs["inference_geo"] = connection.inference_geo
+            http_kwargs["supports_forced_tool_choice"] = capabilities.supports_forced_tool_choice
         http_client = factory(**http_kwargs)
         embedding_client = (
             http_client
@@ -747,6 +748,18 @@ class RuntimeModelCatalog:
             served_model_id=record.served_model_id,
             credential_receipt=credential.receipt,
         )
+
+    def _bound_transport(self, provider: str, alias: str) -> ProviderTransport:
+        """Build one client's transport, scoping an admitted transport to its provider and alias.
+
+        Host-wide admission limits and circuit breakers are keyed by these scopes, so every
+        client the registry builds on an :class:`AdmittedJsonTransport` paces under its own
+        provider's breaker and its alias's in-flight limit.
+        """
+        transport = self._transport_factory()
+        if isinstance(transport, AdmittedJsonTransport):
+            return transport.for_route(ProviderRoute(provider=provider, alias=alias))
+        return transport
 
     def _anthropic_app(self) -> AnthropicOAuthApp:
         """Return the operator's Anthropic OAuth app.
@@ -804,7 +817,7 @@ class RuntimeModelCatalog:
                 client = ChatGptSubscriptionClient(
                     model=snapshot,
                     tokens=tokens,
-                    transport=self._transport_factory(),
+                    transport=self._bound_transport(connection.provider, alias),
                     timeout_seconds=self._http_timeout_seconds,
                     supports_temperature=capabilities.supports_temperature,
                     supports_top_p=_supports_top_p(capabilities),
@@ -817,13 +830,14 @@ class RuntimeModelCatalog:
                     model=snapshot,
                     tokens=tokens,
                     app=self._anthropic_app(),
-                    transport=self._transport_factory(),
+                    transport=self._bound_transport(connection.provider, alias),
                     timeout_seconds=self._http_timeout_seconds,
                     supports_temperature=capabilities.supports_temperature,
                     supports_top_p=_supports_top_p(capabilities),
                     supports_top_k=_supports_flag(capabilities, "supports_top_k"),
                     supports_reasoning=capabilities.supports_reasoning,
                     reasoning_effort=capabilities.reasoning_effort,
+                    supports_forced_tool_choice=capabilities.supports_forced_tool_choice,
                 )
             case None:
                 raise ModelConnectionError(f"connection {connection_id!r} is not a plan sign-in")
@@ -878,6 +892,14 @@ class RuntimeModelCatalog:
         if role == "candidate":
             return roles.candidate_reasoning_efforts.get(alias)
         return None
+
+    def with_transport_wrapper(
+        self, wrapper: Callable[[ProviderTransport], ProviderTransport]
+    ) -> RuntimeModelCatalog:
+        """Wrap fresh transports without changing credentials, catalog or client factories."""
+        result = copy(self)
+        result._transport_factory = lambda: wrapper(self._transport_factory())
+        return result
 
     def with_catalog(self, catalog: ModelCatalog) -> RuntimeModelCatalog:
         """Return an equivalent resolver over updated local catalog metadata.

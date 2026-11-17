@@ -13,6 +13,7 @@ from exp.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    ReasoningEffort,
     ToolCall,
     Usage,
 )
@@ -123,7 +124,7 @@ class GeminiClient(ProviderHttpClient):
         supports_frequency_penalty: bool = False,
         supports_presence_penalty: bool = False,
         supports_reasoning: bool = False,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         """Create a Gemini client with explicit generation capability gates."""
         super().__init__(
@@ -133,6 +134,7 @@ class GeminiClient(ProviderHttpClient):
             transport=transport,
             retry_policy=retry_policy,
             timeout_seconds=timeout_seconds,
+            reasoning_effort=reasoning_effort,
         )
         self._supports_temperature = supports_temperature
         self._supports_top_p = supports_top_p
@@ -141,7 +143,6 @@ class GeminiClient(ProviderHttpClient):
         self._supports_frequency_penalty = supports_frequency_penalty
         self._supports_presence_penalty = supports_presence_penalty
         self._supports_reasoning = supports_reasoning
-        self._reasoning_effort = reasoning_effort
 
     def _headers(self) -> dict[str, str]:
         """Build native Gemini headers using the goog API key scheme."""

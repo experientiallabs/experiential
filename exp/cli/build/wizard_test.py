@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from io import StringIO
 from pathlib import Path
@@ -23,6 +23,7 @@ from exp.cli.gateway.compatibility import ProjectGatewayCompatibility
 from exp.cli.providers.setup_test import _FakeLister
 from exp.cli.shared.picker_test import ScriptedConsole
 from exp.common.config.settings import set_maximum_command_cost_usd
+from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
     BillingSource,
     ConnectionConfig,
@@ -54,6 +55,9 @@ from exp.optimize.router.automatic.service_test import (
     _ProviderState,
 )
 from exp.runtime.models import CatalogRoleName, ResolvedModel, RuntimeModelCatalog
+from exp.runtime.models.credentials import CredentialResolution
+from exp.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
+from exp.runtime.models.registry import ProviderTransport
 from exp.simulation.build import ProjectBuild
 
 _RUNNER = CliRunner()
@@ -155,6 +159,31 @@ class _WizardCompletionClient:
         return _CompletionClient(protocol_alias, self._model, self._state).complete(request)
 
 
+class _WizardEmbeddingTransport(JsonHttpTransport):
+    """Serve fixture vectors through the actual admitted embedding wire."""
+
+    def __init__(self, state: _ProviderState) -> None:
+        self._state = state
+
+    def post(
+        self, url: str, *, headers: Mapping[str, str], payload: JsonObject, timeout_seconds: float
+    ) -> JsonHttpResponse:
+        assert url.endswith("/embeddings")
+        texts = payload["input"]
+        assert isinstance(texts, list) and all(isinstance(text, str) for text in texts)
+        vectors = _EmbeddingClient(self._state).embed(cast(list[str], texts))
+        return JsonHttpResponse(
+            200,
+            {
+                "data": [
+                    {"index": i, "embedding": list(vector.values)}
+                    for i, vector in enumerate(vectors)
+                ],
+                "usage": {"prompt_tokens": 1, "total_tokens": 1},
+            },
+        )
+
+
 class _WizardRuntimeCatalog:
     """Resolve recommended aliases through deterministic local provider clients."""
 
@@ -217,6 +246,21 @@ class _WizardRuntimeCatalog:
         """
         return self.resolve(alias, role=role)
 
+    def with_transport_wrapper(
+        self, wrapper: Callable[[ProviderTransport], ProviderTransport]
+    ) -> RuntimeModelCatalog:
+        """Exercise real provider framing and admission around a deterministic fixture wire."""
+        environment = {
+            connection.api_key_env: "fixture-only"
+            for connection in self._catalog.connections.values()
+            if connection.api_key_env is not None
+        }
+        return RuntimeModelCatalog(
+            self._catalog,
+            environment=environment,
+            transport_factory=lambda: _WizardEmbeddingTransport(self._state),
+        ).with_transport_wrapper(wrapper)
+
     def with_catalog(self, catalog: ModelCatalog) -> _WizardRuntimeCatalog:
         """Return an equivalent resolver over a candidate-inclusive catalog.
 
@@ -251,6 +295,10 @@ def _install_integrated_runtime(
         """Return a deterministic runtime while accepting static-planner options."""
         return _WizardRuntimeCatalog(catalog, state)
 
+    monkeypatch.setattr(
+        "exp.runtime.models.registry.read_connection_credential",
+        lambda *_args, **_kwargs: CredentialResolution("fixture-only", "stored"),
+    )
     monkeypatch.setattr("exp.cli.providers.setup.HttpProviderModelLister", lambda: lister)
     monkeypatch.setattr("exp.cli.build.app.RuntimeModelCatalog", factory)
     monkeypatch.setattr(wizard, "RuntimeModelCatalog", factory)
@@ -290,6 +338,7 @@ def _catalog() -> ModelCatalog:
     )
     embedding = ModelCapabilities(
         supports_embeddings=True,
+        context_window_tokens=128_000,
         input_cost_per_million_tokens_usd=0.1,
     )
     return ModelCatalog(
@@ -423,6 +472,13 @@ def test_default_build_prepares_saved_scenarios_without_rollouts(
         for artifact_id in store.artifacts.list_ids()
     }
     assert "grounded-world-model" in artifact_types
+    physical_intents = [
+        artifact_id
+        for artifact_id in store.artifacts.list_ids(artifact_type="provider-physical-attempt")
+        if artifact_id.endswith("-intent")
+    ]
+    assert len(physical_intents) == len(state.embedding_calls)
+    assert physical_intents
     assert "router-policy" not in artifact_types
 
 
@@ -738,6 +794,7 @@ def test_explicit_router_selection_builds_and_composes_provisional_router(
             reconciled_expired_requests=0,
             reconciled_unknown_attempts=0,
             request_timeout_seconds=120.0,
+            close=lambda **_kwargs: None,
         )
 
     def _serve(
@@ -1072,6 +1129,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
         maximum_build_cost_usd: float,
         provider_spend_authorized: bool,
         trace_import_id: str | None = None,
+        trace_source: str | None = None,
         progress: build_command.ProgressHook | None = None,
     ) -> build_command.GroundedBuildCompletion:
         """Record both adapters using the shared typed execution seam.
@@ -1087,6 +1145,8 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
             estimate: Conservative embedding estimate.
             maximum_build_cost_usd: Strict embedding ceiling.
             provider_spend_authorized: Whether paid embedding work is authorized.
+            trace_import_id: Stored corpus selected with the build, forwarded unchanged.
+            trace_source: Declared format of that corpus, forwarded unchanged.
             progress: Optional stage observer forwarded unchanged.
 
         Returns:
@@ -1105,6 +1165,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
             maximum_build_cost_usd=maximum_build_cost_usd,
             provider_spend_authorized=provider_spend_authorized,
             trace_import_id=trace_import_id,
+            trace_source=trace_source,
             progress=progress,
         )
 
@@ -1581,6 +1642,10 @@ def test_completed_replay_confirms_models_without_paid_provider_work(
     catalog = _catalog()
     write_model_catalog(tmp_path / "models.toml", catalog)
     lister = _FakeLister()
+    monkeypatch.setattr(
+        "exp.runtime.models.registry.read_connection_credential",
+        lambda *_args, **_kwargs: CredentialResolution("fixture-only", "stored"),
+    )
     monkeypatch.setattr("exp.cli.providers.setup.HttpProviderModelLister", lambda: lister)
     monkeypatch.setattr(wizard, "_wizard_cost_plan", unexpected)
     monkeypatch.setattr(wizard, "_completed_build_plan", lambda *_args, **_kwargs: _plan(catalog))

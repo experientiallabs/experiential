@@ -6,6 +6,7 @@ import pytest
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.known_models import _ANTHROPIC_MODELS
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -14,6 +15,7 @@ from exp.runtime.gateway.contracts import (
     GatewayToolDefinition,
 )
 from exp.runtime.models.providers.anthropic_tool_compat import (
+    _ANTHROPIC_FORCED_TOOL_CHOICE_REJECTING_RELEASES,
     anthropic_input_schema,
     anthropic_input_schema_reshaping,
     anthropic_rejects_assistant_prefill,
@@ -546,3 +548,13 @@ def test_a_root_without_type_gains_object_and_everything_else_is_verbatim() -> N
     }
     assert anthropic_input_schema_reshaping(nested) is None
     assert anthropic_input_schema(nested) is nested
+
+
+def test_forced_tool_choice_releases_match_the_maintained_model_records() -> None:
+    """This name list and the catalog's maintained declarations name the same releases."""
+    declared = {
+        model_id
+        for model_id, known in _ANTHROPIC_MODELS.items()
+        if known.supports_forced_tool_choice is False
+    }
+    assert declared == set(_ANTHROPIC_FORCED_TOOL_CHOICE_REJECTING_RELEASES)

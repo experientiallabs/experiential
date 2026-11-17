@@ -22,7 +22,14 @@ from exp.common.judging.definition import JudgeDefinition
 from exp.common.judging.display import render_rubric_table
 from exp.common.judging.interface import Judge
 from exp.common.judging.judgment import DimensionJudgment, Judgment
-from exp.common.judging.labels import HumanLabelSet, HumanScore, HumanScoreHistory, HumanScoreReview
+from exp.common.judging.labels import (
+    HumanLabelSet,
+    HumanScore,
+    HumanScoreHistory,
+    HumanScoreReview,
+    ReviewedTarget,
+    ReviewerJudgment,
+)
 from exp.common.judging.lineage import (
     RouterLineageAssignment,
     RouterLineageSplit,
@@ -75,6 +82,8 @@ __all__ = [
     "HumanScore",
     "HumanScoreHistory",
     "HumanScoreReview",
+    "ReviewedTarget",
+    "ReviewerJudgment",
     "InsufficientCalibrationRiskAcceptance",
     "Judge",
     "JudgeDefinition",

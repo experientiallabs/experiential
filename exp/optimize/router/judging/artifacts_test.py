@@ -14,10 +14,11 @@ from exp.common.judging.provenance import read_artifact_json
 from exp.common.models import ModelSnapshot
 from exp.common.rollouts import RolloutArtifact
 from exp.common.traces import Trace
-from exp.optimize.router.judging.artifacts import write_production_rollout
+from exp.optimize.router.judging.artifacts import load_build_review, write_production_rollout
 from exp.optimize.router.judging.contracts import ManualJudgeError
 from exp.optimize.router.judging.service import prepare_manual_judge_calibration
 from exp.optimize.router.judging.service_test import _built_store, _model, _setup
+from exp.simulation.build import _build_review_id
 
 _TIME = datetime(2026, 8, 13, tzinfo=UTC)
 _DIGEST = "b" * 64
@@ -173,3 +174,19 @@ def test_production_evidence_replays_across_package_revisions_without_rewriting(
     with patch("exp.optimize.router.judging.artifacts._rollout_span", return_value=changed):
         with pytest.raises(ManualJudgeError, match="conflicts"):
             write_production_rollout(store, setup, task, trace, _TIME, "new-package")
+
+
+def test_a_build_grouped_under_an_earlier_descriptor_version_refuses_with_the_remedy(
+    tmp_path: Path,
+) -> None:
+    """Judging never reuses a build whose lineages this version would group differently."""
+    store = _built_store(tmp_path)
+    review = store.read_review()
+    assert isinstance(review, dict) and isinstance(review["build_review"], dict)
+    binding = {**review["build_review"], "descriptor_embedder": "hashing-descriptor-v1"}
+    binding.pop("readiness_id")
+    earlier = {**binding, "readiness_id": _build_review_id(binding)}
+    store.write_review({**review, "build_review": earlier})
+
+    with pytest.raises(ManualJudgeError, match="under hashing-descriptor-v1.*run exp build"):
+        load_build_review(store)

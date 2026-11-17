@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, Literal
 from uuid import uuid4
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.models import (
     ChatMaxTokensField,
     ModelRequest,
@@ -20,6 +20,7 @@ from exp.common.models import (
     ModelSnapshot,
     ReasoningEffort,
 )
+from exp.runtime.models.call_evidence import intent_idempotency_key
 from exp.runtime.models.credentials import DispatchCredentialReceipt
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
@@ -29,6 +30,19 @@ from exp.runtime.models.providers.async_transport import (
     post_json_async,
     run_then_close_pooled_client,
     run_with_retry_async,
+)
+from exp.runtime.models.providers.attempt_timeouts import (
+    COMPLETION_SECONDS_PER_OUTPUT_TOKEN as COMPLETION_SECONDS_PER_OUTPUT_TOKEN,
+)
+from exp.runtime.models.providers.attempt_timeouts import (
+    MAXIMUM_COMPLETION_TIMEOUT_SECONDS as MAXIMUM_COMPLETION_TIMEOUT_SECONDS,
+)
+from exp.runtime.models.providers.attempt_timeouts import (
+    completion_deadline_seconds,
+    request_timeout_seconds,
+)
+from exp.runtime.models.providers.attempt_timeouts import (
+    completion_timeout_seconds as completion_timeout_seconds,
 )
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
@@ -41,8 +55,10 @@ from exp.runtime.models.providers.transport import (
     RetryClassification,
     RetryPolicy,
     classify_retry,
+    classify_unrepeatable_retry,
     is_unbilled_attempt,
     propagate_request_attempt_evidence,
+    public_error_code,
 )
 
 if TYPE_CHECKING:
@@ -61,32 +77,6 @@ ReasoningWireFormat = Literal[
     "gemini_thinking",
 ]
 """Provider-wire representation for one normalized reasoning-effort control."""
-
-COMPLETION_SECONDS_PER_OUTPUT_TOKEN = 0.03
-"""Per-token completion allowance, a conservative approximately 33 tokens per second."""
-
-MAXIMUM_COMPLETION_TIMEOUT_SECONDS = 600.0
-"""Hard ceiling for a derived completion-attempt timeout."""
-
-
-def completion_timeout_seconds(
-    configured_timeout_seconds: float,
-    maximum_output_tokens: int | None,
-) -> float:
-    """Derive one bounded completion timeout from the requested output budget.
-
-    Args:
-        configured_timeout_seconds: Positive per-attempt floor configured on the client.
-        maximum_output_tokens: Requested output ceiling, or ``None`` for the provider default.
-
-    Returns:
-        A finite timeout between the configured floor and scaled ceiling.
-    """
-    if maximum_output_tokens is None:
-        return configured_timeout_seconds
-    scaled = maximum_output_tokens * COMPLETION_SECONDS_PER_OUTPUT_TOKEN
-    return max(configured_timeout_seconds, min(scaled, MAXIMUM_COMPLETION_TIMEOUT_SECONDS))
-
 
 SERVICE_TIER_DIALECTS = frozenset({"openai_responses", "openai_compatible"})
 """Wire dialects with a request field that preserves the caller's service tier.
@@ -558,9 +548,22 @@ class GatewayWireProfile:
 
 
 class ProviderHttpClient(abc.ABC):
-    """One explicit provider connection sharing validation, headers, and the completion flow."""
+    """One explicit provider connection sharing validation, headers, and the completion flow.
+
+    The client's catalog-pinned reasoning effort, passed as ``reasoning_effort``, is the effort
+    a request sends when it names none. The same effective effort scales each completion
+    attempt's timeout, so a subclass never derives timeouts from a separately kept effort.
+    """
 
     default_headers: ClassVar[Mapping[str, str]] = {}
+    # Whether this wire defines ``Idempotency-Key``. True only on the OpenAI-family wire
+    # (OpenAI, Azure, OpenAI-compatible, OpenRouter), where the header is the protocol's
+    # convention and Experiential's own gateway replays by it: a request made under a recorded
+    # canonical intent there carries a key derived from that intent, so a resend after an
+    # ambiguous failure reuses it. The Anthropic Messages and Gemini protocols define no
+    # idempotency header; their per-call key is a fresh identity no endpoint deduplicates, and
+    # an ambiguous outcome there is resolved only by never redrawing it.
+    supports_idempotency_key: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -571,6 +574,7 @@ class ProviderHttpClient(abc.ABC):
         transport: AsyncJsonHttpTransport | JsonHttpTransport | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         """Create a client with a single explicit endpoint and credential.
 
@@ -581,7 +585,10 @@ class ProviderHttpClient(abc.ABC):
             transport: Optional deterministic transport used by tests.
             retry_policy: Bounded same-endpoint retry policy.
             timeout_seconds: Per-attempt timeout floor. Completion calls scale above it from the
-                requested maximum output tokens, while non-completion routes use it exactly.
+                request's size, output budget and reasoning effort, while non-completion routes
+                use it exactly.
+            reasoning_effort: Catalog-pinned effort sent when a request names none, or ``None``
+                to leave the provider default.
         """
         if not api_key:
             raise ValueError(f"{type(self).__name__} requires a non-empty API key")
@@ -593,6 +600,26 @@ class ProviderHttpClient(abc.ABC):
         self._transport = as_async_transport(transport)
         self._retry_policy = retry_policy
         self._timeout_seconds = timeout_seconds
+        self._reasoning_effort = reasoning_effort
+
+    def _completion_timeout_seconds(self, request: ModelRequest) -> float:
+        """Per-attempt completion timeout for ``request`` under this client's effective effort."""
+        return request_timeout_seconds(
+            self._timeout_seconds, request, default_reasoning_effort=self._reasoning_effort
+        )
+
+    def _completion_deadline_seconds(self, request: ModelRequest) -> float:
+        """Request-wide deadline that leaves every allowed attempt its whole completion timeout.
+
+        Args:
+            request: The complete typed request whose size, output budget and effort apply.
+
+        Returns:
+            The bounded deadline in seconds, retries and their waits included.
+        """
+        return completion_deadline_seconds(
+            self._completion_timeout_seconds(request), self._retry_policy
+        )
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Complete one non-streaming request through the provider's completion route.
@@ -600,8 +627,8 @@ class ProviderHttpClient(abc.ABC):
         A completed response that decodes to no usable output, such as a reasoning model
         spending its whole output budget without visible text, is dispatched again under the
         client's bounded retry policy before the last error surfaces to the caller. The request's
-        output budget scales both the default request deadline and each transport-attempt ceiling,
-        while an injected request-wide deadline remains authoritative.
+        size, output budget and reasoning effort scale each transport-attempt ceiling, and the
+        default request deadline leaves every allowed attempt that whole ceiling.
 
         Args:
             request: Visible messages, tool schemas, and sampling controls to send.
@@ -609,11 +636,10 @@ class ProviderHttpClient(abc.ABC):
         Returns:
             The typed non-streaming model response with observed request economics.
         """
-        completion_timeout = completion_timeout_seconds(
-            self._timeout_seconds,
-            request.maximum_output_tokens,
+        return _run_sync(
+            self.complete_async(request),
+            timeout_seconds=self._completion_deadline_seconds(request),
         )
-        return _run_sync(self.complete_async(request), timeout_seconds=completion_timeout)
 
     async def complete_async(
         self,
@@ -626,6 +652,8 @@ class ProviderHttpClient(abc.ABC):
 
         Transport failures and completed empty-output responses share one retry policy instead of
         multiplying nested retry counts. The same idempotency identity is sent on every safe retry.
+        Without an injected deadline, every attempt the retry policy allows gets its whole
+        request-derived timeout instead of the remainder of a single attempt's allowance.
 
         Args:
             request: Visible messages, tool schemas, and sampling controls to send.
@@ -635,11 +663,10 @@ class ProviderHttpClient(abc.ABC):
         Returns:
             The typed completed response with observed request economics.
         """
-        completion_timeout = completion_timeout_seconds(
-            self._timeout_seconds,
-            request.maximum_output_tokens,
+        completion_timeout = self._completion_timeout_seconds(request)
+        request_deadline = deadline or RequestDeadline.after(
+            completion_deadline_seconds(completion_timeout, self._retry_policy)
         )
-        request_deadline = deadline or RequestDeadline.after(completion_timeout)
         payload = self._build_request(request)
         path = self._request_path(self._completion_path())
         url = f"{self._base_url}/{path}"
@@ -648,7 +675,9 @@ class ProviderHttpClient(abc.ABC):
             for name, value in self._headers().items()
             if name.lower() != "idempotency-key"
         }
-        request_headers["Idempotency-Key"] = idempotency_key or f"exp-{uuid4().hex}"
+        request_headers["Idempotency-Key"] = (
+            idempotency_key or self._intent_idempotency_key(url, payload) or f"exp-{uuid4().hex}"
+        )
 
         attempts = 0
         unbilled_attempts = 0
@@ -670,21 +699,13 @@ class ProviderHttpClient(abc.ABC):
                 raise
             if not 200 <= response.status_code < 300:
                 unbilled_attempts += int(response.known_unbilled)
-                error = response.body.get("error")
-                if (
-                    idempotency_key is None
-                    and response.status_code == 409
-                    and isinstance(error, dict)
-                    and error.get("code") == "idempotency_replay_unavailable"
-                ):
-                    # The gateway confirms this completed operation cannot be replayed. A new
-                    # client-owned attempt gets a new key and remains inside the retry allowance.
-                    request_headers["Idempotency-Key"] = f"exp-{uuid4().hex}"
                 raise ProviderTransportError(
                     f"provider returned HTTP {response.status_code}",
                     status_code=response.status_code,
                     retry_after_seconds=response.retry_after_seconds,
                     known_unbilled=response.known_unbilled,
+                    error_code=public_error_code(response.body),
+                    request_sha256=sha256_json(payload),
                 )
             try:
                 return self._parse_response(
@@ -697,8 +718,12 @@ class ProviderHttpClient(abc.ABC):
                 raise ProviderTruncatedResponseError(
                     str(error), response_body=deepcopy(response.body)
                 ) from error
-            except ProviderRetryableResponseError:
-                if idempotency_key is None:
+            except ProviderRetryableResponseError as error:
+                if error.hit_length_limit:
+                    # A definite allowance stop is one returned model outcome, not QoS.
+                    # Keep its body for durable rejection without inventing an assistant action.
+                    error.response_body = deepcopy(response.body)
+                elif idempotency_key is None:
                     # Replaying a cached, completed empty response cannot produce usable output.
                     request_headers["Idempotency-Key"] = f"exp-{uuid4().hex}"
                 raise
@@ -708,7 +733,9 @@ class ProviderHttpClient(abc.ABC):
             policy=self._retry_policy,
             deadline=request_deadline,
             attempt_timeout_seconds=completion_timeout,
-            classify=_classify_complete_retry,
+            classify=_classify_complete_retry
+            if self.supports_idempotency_key
+            else _classify_unrepeatable_complete_retry,
         )
         return result.model_copy(
             update={
@@ -729,6 +756,10 @@ class ProviderHttpClient(abc.ABC):
                 implementation, so the gateway cannot serve its routes.
         """
         raise ProviderCapabilityError(capability="native_data_plane")
+
+    def _intent_idempotency_key(self, url: str, payload: JsonObject) -> str | None:
+        """Return the current intent's stable key on a wire that defines the header, else None."""
+        return intent_idempotency_key(url, payload) if self.supports_idempotency_key else None
 
     def _headers(self) -> dict[str, str]:
         """Build the authenticated JSON headers sent with every request."""
@@ -765,15 +796,19 @@ class ProviderHttpClient(abc.ABC):
             The first successful decoded provider body.
         """
         request_deadline = deadline or RequestDeadline.after(self._timeout_seconds)
+        url = f"{self._base_url}/{self._request_path(path)}"
         return await post_json_async(
             self._transport,
-            f"{self._base_url}/{self._request_path(path)}",
+            url,
             headers=self._headers(),
             payload=payload,
             deadline=request_deadline,
             retry_policy=self._retry_policy,
-            idempotency_key=idempotency_key,
+            idempotency_key=idempotency_key or self._intent_idempotency_key(url, payload),
             attempt_timeout_seconds=self._timeout_seconds,
+            classify=classify_retry
+            if self.supports_idempotency_key
+            else classify_unrepeatable_retry,
         )
 
     def _request_path(self, path: str) -> str:
@@ -810,8 +845,30 @@ def _classify_complete_retry(exception: Exception) -> RetryClassification:
         A stable retry decision and concise reason.
     """
     if isinstance(exception, ProviderRetryableResponseError):
+        if exception.hit_length_limit:
+            return RetryClassification(retryable=False, reason="output_budget_exhausted")
         return RetryClassification(retryable=True, reason="empty_completed_output")
     return classify_retry(exception)
+
+
+def _classify_unrepeatable_complete_retry(exception: Exception) -> RetryClassification:
+    """Classify failures on a wire without an idempotency contract.
+
+    An empty output without a length stop may be retried. A known output-allowance stop is
+    terminal; any unproven transport or HTTP failure may have executed and is never resent
+    (see `classify_unrepeatable_retry`).
+
+    Args:
+        exception: Error raised by one post-and-parse attempt.
+
+    Returns:
+        A stable retry decision and concise reason.
+    """
+    if isinstance(exception, ProviderRetryableResponseError):
+        if exception.hit_length_limit:
+            return RetryClassification(retryable=False, reason="output_budget_exhausted")
+        return RetryClassification(retryable=True, reason="empty_completed_output")
+    return classify_unrepeatable_retry(exception)
 
 
 def _run_sync[ResultT](

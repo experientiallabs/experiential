@@ -14,6 +14,7 @@ from exp.simulation.world_model.experience_memory import (
     MemoryVersion,
     forget_summary,
     memory_head,
+    memory_version_id,
     memory_view,
     publish_trajectory,
     retired_lines,
@@ -230,3 +231,52 @@ def test_crash_between_forget_and_rebuild_recovers_exactly_once(tmp_path: Path) 
     again = Compressor()
     assert memory.maintain(again) == [] and again.calls == []
     assert "WRONG-CLAIM" not in memory.view(v3, budget=2)
+
+
+def test_a_forget_needs_a_built_summary_one_reason_and_binds_its_provenance(
+    tmp_path: Path,
+) -> None:
+    """Nothing unbuilt is forgotten; the record names the head and the exact generation."""
+    memory = Memory(tmp_path)
+    memory.learn("alpha", "[unresolved] alpha claim")
+    v2 = memory.learn("beta", "[unresolved] beta claim")
+    with pytest.raises(ValueError, match="no built summary"):
+        forget_summary(
+            memory.store, LINEAGE, (0, 2), reason="stale", created_at=NOW, code_revision="x"
+        )
+    memory.maintain(Compressor())
+    dry = forget_summary(
+        memory.store,
+        LINEAGE,
+        (0, 2),
+        reason="stale",
+        created_at=NOW,
+        code_revision="x",
+        dry_run=True,
+    )
+    assert not memory.store.exists(dry) and not memory.store.list_ids(artifact_type="memory-forget")
+    record = forget_summary(
+        memory.store, LINEAGE, (0, 2), reason="stale", created_at=NOW, code_revision="x"
+    )
+    assert record == dry
+    saved = json.loads(memory.store.read_bytes(record, "forget.json"))
+    assert saved == {
+        "lineage": LINEAGE,
+        "base_version": v2.version,
+        "lo": 0,
+        "hi": 2,
+        "generation": 0,
+        "reason": "stale",
+    }
+    inputs = {row.artifact_id for row in memory.store.read(record).manifest.inputs}
+    assert inputs == {memory_version_id(LINEAGE, v2.version), summary_id(LINEAGE, 0, 2)}
+    with pytest.raises(ValueError, match="for another reason: 'stale'"):
+        forget_summary(
+            memory.store, LINEAGE, (0, 2), reason="different", created_at=NOW, code_revision="x"
+        )
+    v3 = memory.learn("gamma", "[unresolved] gamma claim")
+    assert v3.forgotten == ("0-2", "0-4")
+    with pytest.raises(ValueError, match="generation 1"):
+        forget_summary(
+            memory.store, LINEAGE, (0, 2), reason="again", created_at=NOW, code_revision="x"
+        )

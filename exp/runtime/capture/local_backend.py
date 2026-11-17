@@ -17,7 +17,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from xml.parsers.expat import ExpatError
 
-from filelock import FileLock, Timeout
+from filelock import Timeout
+
+from exp.common.core.locks import CoordinationLock
 
 if sys.platform == "win32":
     pwd = None
@@ -56,7 +58,7 @@ def capture_instance() -> Iterator[None]:
     """
     try:
         path = _foreground_lock_path()
-        lock = FileLock(path, timeout=0, mode=0o600)
+        lock = CoordinationLock(path, timeout=0, mode=0o600)
         lock.acquire()
     except Timeout as exc:
         raise RuntimeError(

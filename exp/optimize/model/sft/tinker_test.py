@@ -12,6 +12,7 @@ from exp.common.core.artifacts import ArtifactInput
 from exp.common.models import AssistantAction, ToolCall
 from exp.optimize.model.sft.contracts import (
     AssistantActionEvent,
+    ContinuationExampleSource,
     SFTExample,
     SFTMessage,
     ToolEvent,
@@ -238,7 +239,7 @@ def test_datum_fixture_is_shifted_cross_entropy_with_only_target_tokens_and_weig
     session = TinkerTrainerSession(
         client=cast("tinker.TrainingClient", client),
         renderer=cast("Renderer", renderer),
-        spec=_spec(),
+        spec=_spec().model_copy(update={"training_usd_per_million_tokens": 5}),
     )
 
     (datum,) = session.render_examples((_example(),))
@@ -254,6 +255,9 @@ def test_datum_fixture_is_shifted_cross_entropy_with_only_target_tokens_and_weig
 
     result = session.train_batch((datum,), learning_rate=0.02)
 
+    assert result.cost_usd is not None
+    assert result.cost_usd.provenance == "estimated"
+    assert result.cost_usd.value == 5 * 32 / 1_000_000
     assert result.loss == 1.25
     assert result.gradient_norm == 0.75
     assert client.forward_backward_calls[0][1] == "cross_entropy"
@@ -369,3 +373,88 @@ def test_datum_limit_rejects_instead_of_truncating_the_two_token_target() -> Non
 
     with pytest.raises(TinkerSFTError, match="complete supervised target"):
         session.render_examples((_example(),))
+
+
+def test_tail_scoring_masks_context_and_normalizes_survivor_token_weights() -> None:
+    """Extreme context likelihood cannot affect filtering or the token-averaged update."""
+    tinker = pytest.importorskip("tinker")
+    from exp.optimize.model.sft.tail_sft import TailSFTPolicy
+
+    class Client(_TrainingClient):
+        """Expose exact target log probabilities without performing a backward pass."""
+
+        def forward(
+            self, data: Sequence[tinker.Datum], loss_fn: str
+        ) -> _Future[tinker.ForwardBackwardOutput]:
+            """Return deliberately extreme context and hand-computable target log probabilities."""
+            return _Future(
+                tinker.ForwardBackwardOutput(
+                    loss_fn_output_type=loss_fn,
+                    loss_fn_outputs=[
+                        {
+                            "logprobs": tinker.TensorData(
+                                data=[-1000.0, -2.0, -4.0], dtype="float32", shape=[3]
+                            )
+                        }
+                        for _ in data
+                    ],
+                    metrics={},
+                )
+            )
+
+    client = Client()
+    session = TinkerTrainerSession(
+        client=cast("tinker.TrainingClient", client),
+        renderer=cast("Renderer", _DatumRenderer()),
+        spec=_spec().model_copy(
+            update={
+                "tail_sft": TailSFTPolicy(
+                    reference=ArtifactInput(artifact_id="initial-losses", sha256=_DIGEST),
+                    drop_fraction=0.5,
+                )
+            }
+        ),
+    )
+    datums = session.render_examples(
+        (_example(), _example().model_copy(update={"example_id": "second"}))
+    )
+    first_datum = datums[0]
+    assert isinstance(first_datum, TinkerSFTDatum)
+    initial_weights = list(first_datum.datum.loss_fn_inputs["weights"].data)
+    scores = session.score_batch(datums)
+    assert [row.mean_loss for row in scores] == [3.0, 3.0]
+    assert client.optim_steps == [] and client.forward_backward_calls == []
+    session.train_batch(datums, learning_rate=0.02)
+    updated = client.forward_backward_calls[0][0]
+    assert updated[0].loss_fn_inputs["weights"].data == [0.0, 0.25, 0.25]
+    assert updated[1].loss_fn_inputs["weights"].data == [0.0, 0.25, 0.25]
+    assert first_datum.datum.loss_fn_inputs["weights"].data == initial_weights
+
+
+@pytest.mark.parametrize("maximum_tokens", [3, 4])
+def test_continuation_rendering_never_discards_checkpoint_context(maximum_tokens: int) -> None:
+    """A small training ceiling cannot silently change the context of a witnessed target."""
+    pytest.importorskip("tinker")
+    reference = ArtifactInput(artifact_id="saved-study", sha256=_DIGEST)
+    example = _example().model_copy(
+        update={
+            "source": ContinuationExampleSource(
+                study=reference, branch=0, acceptance_evidence=reference
+            )
+        }
+    )
+    client = _TrainingClient()
+    session = TinkerTrainerSession(
+        client=cast("tinker.TrainingClient", client),
+        renderer=cast("Renderer", _DatumRenderer()),
+        spec=_spec().model_copy(update={"maximum_datum_tokens": maximum_tokens}),
+    )
+    if maximum_tokens == 3:
+        with pytest.raises(TinkerSFTError, match="complete continuation context"):
+            session.render_examples((example,))
+    else:
+        (datum,) = session.render_examples((example,))
+        assert isinstance(datum, TinkerSFTDatum)
+        assert datum.datum.model_input.to_ints() == [10, 11, 12]
+        assert datum.datum.loss_fn_inputs["weights"].data == [0.0, 1.0, 1.0]
+    assert not client.forward_backward_calls and not client.optim_steps

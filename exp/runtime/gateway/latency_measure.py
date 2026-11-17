@@ -481,12 +481,68 @@ def configure_gateway(root: Path, *, provider_base_url: str) -> str:
     return issued.raw_key
 
 
+class GatewayProcess:
+    """Own one gateway subprocess and its sole stdout reader through bounded shutdown."""
+
+    def __init__(self, process: subprocess.Popen[str]) -> None:
+        """Take ownership of the child and start its sole output reader.
+
+        Args:
+            process: Gateway child with a captured stdout pipe, released on startup failure.
+        """
+        self.process = process
+        self.lines: list[str] = []
+        self._reader_error: Exception | None = None
+        self._reader: threading.Thread | None = None
+        try:
+            self._reader = threading.Thread(target=self._drain, daemon=True)
+            self._reader.start()
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def output_thread(self) -> threading.Thread:
+        """Return the successfully constructed output reader for lifecycle inspection."""
+        if self._reader is None:
+            raise RuntimeError("gateway output reader was not constructed")
+        return self._reader
+
+    def _drain(self) -> None:
+        """Retain reader failures for the lifecycle owner to report at shutdown."""
+        try:
+            _pump_process_output(self.process, self.lines)
+        except Exception as error:  # noqa: BLE001 - close reports the owned reader failure.
+            self._reader_error = error
+
+    def close(self) -> None:
+        """Stop the process, join its sole reader, then close the pipe without racing it."""
+        try:
+            if self.process.poll() is None:
+                self.process.send_signal(signal.SIGINT)
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+        finally:
+            if self._reader is not None:
+                if self._reader.ident is not None:
+                    self._reader.join(timeout=5)
+                if self._reader.is_alive():
+                    raise RuntimeError("gateway output reader did not stop after process shutdown")
+            if self.process.stdout is not None:
+                self.process.stdout.close()
+        if self._reader_error is not None:
+            raise RuntimeError("gateway output reader failed") from self._reader_error
+
+
 def start_gateway_process(
     *,
     root: Path,
     port: int,
     credential: str,
-) -> subprocess.Popen[str]:
+) -> GatewayProcess:
     """Launch the product gateway on loopback and wait until it is ready.
 
     Args:
@@ -528,40 +584,24 @@ def start_gateway_process(
         text=True,
         env=env,
     )
-    lines: list[str] = []
-    pump = threading.Thread(
-        target=_pump_process_output,
-        args=(process, lines),
-        daemon=True,
-    )
-    pump.start()
+    owner = GatewayProcess(process)
     try:
         wait_for_http_ok(
             f"http://127.0.0.1:{port}/health/ready",
             process=process,
-            lines=lines,
+            lines=owner.lines,
             timeout_s=GATEWAY_START_TIMEOUT_S,
             label="gateway",
         )
-    except Exception:
-        stop_gateway_process(process)
+    except BaseException:
+        stop_gateway_process(owner)
         raise
-    return process
+    return owner
 
 
-def stop_gateway_process(process: subprocess.Popen[str]) -> None:
-    """Signal the gateway and wait for a bounded exit.
-
-    Args:
-        process: Live or already terminated gateway process.
-    """
-    if process.poll() is None:
-        process.send_signal(signal.SIGINT)
-    try:
-        process.communicate(timeout=10)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.communicate(timeout=5)
+def stop_gateway_process(process: GatewayProcess) -> None:
+    """Close the subprocess and sole output reader owned by this latency measurement."""
+    process.close()
 
 
 def _pump_process_output(process: subprocess.Popen[str], lines: list[str]) -> None:

@@ -10,10 +10,9 @@ from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
-from filelock import FileLock, Timeout
-
 from exp.common.config import ARTIFACT_DIR
 from exp.common.core.artifacts import sha256_json
+from exp.common.core.locks import CoordinationLock, Timeout
 from exp.common.models import (
     SNAPSHOT_SCHEMA_VERSION,
     CatalogSnapshotUnitError,
@@ -230,7 +229,7 @@ def gateway_instance_lock(root: Path, *, port: int) -> Iterator[None]:
     """
     state_dir = root / "gateway"
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    lock = FileLock(state_dir / "run.lock", timeout=0, mode=0o600)
+    lock = CoordinationLock(state_dir / "run.lock", timeout=0, mode=0o600)
     try:
         lock.acquire()
     except Timeout:

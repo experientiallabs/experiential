@@ -6,7 +6,6 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
-from exp.cli.build.learning import resolve_memory_recall
 from exp.common.models import (
     BillingSource,
     ConnectionConfig,
@@ -15,6 +14,7 @@ from exp.common.models import (
     ModelRecord,
 )
 from exp.common.models.catalog_roles import ModelRoles
+from exp.optimize.evaluation.learning.recall import resolve_memory_recall
 
 
 @pytest.mark.parametrize(

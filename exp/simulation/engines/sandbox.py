@@ -40,6 +40,7 @@ from exp.common.rollouts import (
 from exp.common.tasks import LoadedTaskSet, load_task_set
 from exp.runtime.agents import AgentEpisode, AgentRuntime
 from exp.runtime.environments import EnvironmentRuntime
+from exp.runtime.environments.interface import ContainedEnvironmentRuntime
 from exp.simulation.engines.clock import timestamp, utc_now
 from exp.simulation.engines.sandbox_bindings import (
     SANDBOX_SIMULATOR_ID,
@@ -96,7 +97,9 @@ class SandboxSimulator:
         task_set_input: Exact persisted task-set manifest identity.
         candidates: Resolved candidate clients keyed by plan alias.
         agent_factory: Creates a fresh customer agent runtime for every episode.
-        environment_runtime: Simulator-owned executable environment factory.
+        environment_runtime: Simulator-owned executable environment factory. A runtime that
+            reports host containment has its level checked against
+            ``sandbox.required_containment`` and recorded in every cell binding.
         environment_cost: Proven environment cost ceiling and observability capability.
         environment_id: Stable environment identity expected in sandbox settings.
         environment_sha256: Exact environment plan or image digest expected in settings.
@@ -141,6 +144,11 @@ class SandboxSimulator:
         self._candidates = dict(candidates)
         self._agent_factory = agent_factory
         self._environment_runtime = environment_runtime
+        self._environment_containment = (
+            environment_runtime.containment.level
+            if isinstance(environment_runtime, ContainedEnvironmentRuntime)
+            else None
+        )
         self._environment_cost = environment_cost or EnvironmentCostBinding()
         self._environment_id = environment_id
         self._environment_sha256 = environment_sha256
@@ -257,6 +265,20 @@ class SandboxSimulator:
             raise SandboxSimulationError(
                 "sandbox environment identity does not match the configured runtime"
             )
+        level = self._environment_containment
+        missing = (
+            settings.required_containment
+            if level is None
+            else level.missing(settings.required_containment)
+        )
+        if missing:
+            raise SandboxSimulationError(
+                "sandbox environment does not enforce required containment: "
+                + ", ".join(missing)
+                + "; run on a host whose environment runtime reports them (see "
+                "docs/reference/local-process-containment.md) or remove them from "
+                "sandbox.required_containment"
+            )
         plan_cells = {cell.cell_id: cell for cell in self._plan.cells}
         expected_candidates = {
             snapshot.alias: snapshot.model for snapshot in self._plan.candidate_snapshots
@@ -349,6 +371,7 @@ class SandboxSimulator:
                 task=self._tasks[cell.task_id],
                 candidate=self._candidates[cell.candidate_alias],
                 environment_cost=self._environment_cost,
+                environment_containment=self._environment_containment,
             )
             for cell in cells
         }

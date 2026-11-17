@@ -105,6 +105,10 @@ class VendorObservation:
         source_parent_span_id: Vendor parent span key, when the export declares one.
         request_text: User-visible request text carried by this record.
         input_messages: Declared input messages retained as canonical GenAI evidence.
+        input_history_prefix: Input declared as this many leading messages of the trace's shared
+            ``message_history`` instead of inline; exclusive with ``input_messages``.
+        message_history: The trace's shared conversation history. At most one observation of a
+            trace declares it, so the history is held and serialized once, not per step.
         completion_text: Assistant-visible output text for a model or agent record.
         tool_calls: Tool calls requested by a model record.
         tool_name: Executed tool name for a tool-result record.
@@ -129,6 +133,8 @@ class VendorObservation:
     source_parent_span_id: str | None = None
     request_text: str | None = None
     input_messages: JsonValue | None = None
+    input_history_prefix: int | None = None
+    message_history: tuple[JsonObject, ...] = ()
     completion_text: str | None = None
     tool_calls: tuple[VendorToolCall, ...] = ()
     tool_name: str | None = None
@@ -141,6 +147,13 @@ class VendorObservation:
     declared_attributes: JsonObject = field(default_factory=dict)
     extensions: JsonObject = field(default_factory=dict)
     synthetic_time: bool = False
+
+    def __post_init__(self) -> None:
+        """Reject an input declared both inline and as a history prefix."""
+        if self.input_messages is not None and self.input_history_prefix is not None:
+            raise VendorTraceFormatError(
+                "an observation declares its input inline or as a history prefix, not both"
+            )
 
 
 def declared_tool_calls(output: JsonValue | None) -> tuple[VendorToolCall, ...]:

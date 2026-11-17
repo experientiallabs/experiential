@@ -20,6 +20,7 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
 )
+from exp.runtime.gateway.guardrails.bounded import start_on_native_loop
 from exp.runtime.gateway.guardrails.classifiers import (
     ClassifierRegistry,
     KeywordClassifier,
@@ -50,6 +51,12 @@ from exp.runtime.gateway.guardrails.subjects import observation_subject_bytes
 from exp.runtime.gateway.native_capture import capture_unavailable_failure
 from exp.runtime.gateway.tests.parallel_input_guardrails_test import _Classifier, _engine
 from exp.runtime.gateway.tool_contracts import GatewayProviderNativeTool
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _ready_observation_scheduler() -> None:
+    """Test admitted observations on a ready loop; cold admission is covered separately."""
+    start_on_native_loop(asyncio.sleep(0)).result(timeout=2)
 
 
 def _request(text: str = "fixture") -> GatewayRequest:

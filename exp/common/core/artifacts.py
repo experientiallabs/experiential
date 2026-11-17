@@ -51,6 +51,7 @@ _SECRET_VALUE_RULES = (
     ("xox", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
     ("bearer", re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b", re.IGNORECASE)),
 )
+_IGNORE_CASE_FLAG = int(re.IGNORECASE)
 _SECRET_ENVIRONMENT_NAME_PATTERN = re.compile(
     r"\b(?:[A-Z][A-Z0-9]*_)*(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|REFRESH_TOKEN|SECRET|"
     r"CREDENTIAL)(?:_[A-Z0-9]+)*\b"
@@ -122,9 +123,16 @@ class StructuredFailure(ContractModel):
 
 
 class SourceIdentity(ContractModel):
-    """Identifies immutable source evidence without storing its raw payload."""
+    """Identifies immutable source evidence without storing its raw payload.
 
-    kind: Literal["file", "otlp", "production", "simulation", "manual", "generated"]
+    Attributes:
+        kind: Provenance class. ``native-world`` marks replies executed by a native-owned
+            executable world backend; ``simulation`` marks replies a simulated owner produced.
+        source_id: Durable source label.
+        sha256: Digest of the exact source content, when known.
+    """
+
+    kind: Literal["file", "otlp", "production", "native-world", "simulation", "manual", "generated"]
     source_id: str = Field(min_length=1, max_length=512)
     sha256: Sha256 | None = None
 
@@ -464,7 +472,7 @@ def redact_secret_json(value: JsonValue) -> tuple[JsonValue, int]:
 def _has_secret_value(value: str) -> bool:
     """Skip a regex scan only when its mandatory literal prefix is absent."""
     for prefix, pattern in _SECRET_VALUE_RULES:
-        text = value.lower() if pattern.flags & re.IGNORECASE else value
+        text = value.lower() if pattern.flags & _IGNORE_CASE_FLAG else value
         if prefix in text and pattern.search(value):
             return True
     return False
@@ -489,3 +497,18 @@ def _assert_json_value_secret_free(value: JsonValue, *, path: str) -> None:
             raise SecretBoundaryError(
                 f"immutable artifacts cannot contain a secret-like value at {path}"
             )
+
+
+def strict_equal(actual: JsonValue, expected: JsonValue) -> bool:
+    """Compare exact JSON types, preserving booleans and numeric representations."""
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(actual, dict) and isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            strict_equal(actual[k], expected[k]) for k in actual
+        )
+    if isinstance(actual, list) and isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            strict_equal(a, b) for a, b in zip(actual, expected, strict=True)
+        )
+    return actual == expected

@@ -16,6 +16,7 @@ from websockets.sync.client import connect
 
 from exp.common.models import BillingSource, GatewayTokenPrices
 from exp.runtime.gateway.contracts import GatewayFailureClass, GatewayRequest
+from exp.runtime.gateway.guardrails import bounded
 from exp.runtime.gateway.guardrails.bounded import BoundedInspect
 from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry, ScriptedClassifier
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
@@ -46,6 +47,12 @@ from exp.runtime.gateway.tests.guardrail_policy_integrity_test import _body, _pr
 from exp.runtime.gateway.tests.mandatory_guardrails_paths_test import _serving
 from exp.runtime.gateway.tests.native_tool_search_test import _TOOLS_CHAT, _configure, _Provider
 from exp.runtime.gateway.tests.native_waterfall_test import _content_chunk, _terminal_frames
+
+
+@pytest.fixture(autouse=True)
+def _ready_observation_scheduler() -> None:
+    """Require accepted observation work; cold-start refusal has separate scheduler tests."""
+    bounded._NATIVE_RUNNER.loop()
 
 
 class _Classifier(ScriptedClassifier):

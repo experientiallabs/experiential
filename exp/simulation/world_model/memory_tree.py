@@ -175,6 +175,35 @@ def fit_line(text: str) -> str:
     return cut + "..."
 
 
+def fit_rule_line(
+    authority: Literal["unresolved rule", "checked hypothesis"],
+    cue: str,
+    claim: str,
+    detail: str = "",
+) -> str:
+    """Keep both condition and claim in a bounded recall preview, never a complete rule.
+
+    Short rules retain their full text. Overflow shares the available UTF-8 budget between
+    cue and claim, donating unused space to the longer part. The explicit preview marker
+    requires the linked record for complete scope, uncertainty and supersession details.
+    """
+    cue, claim, detail = (re.sub(r"\s+", " ", value).strip() for value in (cue, claim, detail))
+    full = f"[{authority}] when {cue}: {claim}" + (f" {detail}" if detail else "")
+    if len(full.encode()) <= LINE_BYTES:
+        return full
+    prefix = f"[{authority}] [preview; read record] when "
+    budget = LINE_BYTES - len(prefix.encode()) - 2
+    cue_budget = min(len(cue.encode()), max(budget // 2, budget - len(claim.encode())))
+
+    def preview(value: str, limit: int) -> str:
+        """Truncate only at UTF-8 boundaries and mark omitted content explicitly."""
+        if len(value.encode()) <= limit:
+            return value
+        return value.encode()[: limit - 3].decode(errors="ignore").rstrip() + "..."
+
+    return f"{prefix}{preview(cue, cue_budget)}: {preview(claim, budget - cue_budget)}"
+
+
 def line_id(lineage: str, index: int) -> str:
     """Only identity line ``index`` of ``lineage`` may occupy."""
     return stable_id("memory-line", {"lineage": lineage, "index": index})
