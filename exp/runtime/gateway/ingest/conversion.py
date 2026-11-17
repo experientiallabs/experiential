@@ -86,10 +86,14 @@ def _conversation(
     if not isinstance(raw_request, dict):
         raise ValueError("effective request is required")
     request = GatewayRequest.model_validate(raw_request)
-    messages = _request_messages(request, context.get("provider_context"))
+    messages = request_messages(request, context.get("provider_context"))
     lineage, missing_parent = _restore_linked_reasoning(messages, experience, by_response_id)
     output_message_start = len(messages)
-    messages.extend(_output_messages(experience))
+    messages.extend(
+        output_messages(
+            experience.protocol, experience.response, experience.request.get("exp_capture_output")
+        )
+    )
     tool_names: dict[str, str] = {}
     for message in messages:
         calls = message.get("tool_calls")
@@ -194,7 +198,10 @@ def _linked_output_turns(experience: CapturedExchange) -> list[JsonObject]:
     turns: list[JsonObject] = []
     current: JsonObject | None = None
     has_message = False
-    for output in _output_messages(experience):
+    outputs = output_messages(
+        experience.protocol, experience.response, experience.request.get("exp_capture_output")
+    )
+    for output in outputs:
         if _empty_reasoning_item(output):
             continue
         if output.get("role") != "assistant" or output.get("provider_native_item") is not None:
@@ -252,16 +259,35 @@ def _visible_turn(message: JsonObject) -> JsonObject:
     }
 
 
-def _output_messages(experience: CapturedExchange) -> list[JsonObject]:
-    """Normalize public completed output, without asserting agent task success."""
-    if experience.protocol == "responses":
-        output = experience.response.get("output")
+def output_messages(
+    protocol: CaptureProtocol, response: JsonObject, capture_output: JsonValue = None
+) -> list[JsonObject]:
+    """Normalize one completed public response into messages, without asserting task success.
+
+    Responses output items and Messages content blocks decode through the request decoders,
+    so they come back in canonical gateway message form. A Chat response returns its single
+    choice message exactly as the provider sent it.
+
+    Args:
+        protocol: Public surface that produced the response.
+        response: Complete response body.
+        capture_output: Captured output evidence (exact tool arguments and permitted
+            reasoning), or None when it was not retained.
+
+    Returns:
+        The response messages in output order.
+
+    Raises:
+        ValueError: The response has no observed output or is not one complete turn.
+    """
+    if protocol == "responses":
+        output = response.get("output")
         if not isinstance(output, list) or not output:
             raise ValueError("response has no observed output")
         decoded = decode_responses({"model": "captured", "input": output})
-        messages = _request_messages(decoded.request, provider_replay_authority(decoded.request))
-    elif experience.protocol == "messages":
-        content = experience.response.get("content")
+        messages = request_messages(decoded.request, provider_replay_authority(decoded.request))
+    elif protocol == "messages":
+        content = response.get("content")
         if not isinstance(content, list) or not content:
             raise ValueError("message has no observed output")
         decoded = decode_messages(
@@ -271,10 +297,10 @@ def _output_messages(experience: CapturedExchange) -> list[JsonObject]:
                 "messages": [{"role": "assistant", "content": content}],
             }
         )
-        messages = _request_messages(decoded.request, provider_replay_authority(decoded.request))
+        messages = request_messages(decoded.request, provider_replay_authority(decoded.request))
     else:
-        messages = _chat_output(experience)
-    output = experience.request.get("exp_capture_output")
+        messages = _chat_output(response)
+    output = capture_output
     if isinstance(output, dict):
         _restore_output_tools(messages, output)
         reasoning = output.get("provider_reasoning")
@@ -321,9 +347,9 @@ def _restore_output_tools(messages: list[JsonObject], output: JsonObject) -> Non
                     function["arguments"] = captured["raw_arguments"]
 
 
-def _chat_output(experience: CapturedExchange) -> list[JsonObject]:
+def _chat_output(response: JsonObject) -> list[JsonObject]:
     """Read exactly one complete public Chat assistant turn."""
-    choices = experience.response.get("choices")
+    choices = response.get("choices")
     if not isinstance(choices, list) or len(choices) != 1:
         raise ValueError("capture needs exactly one observed choice")
     choice = choices[0]
@@ -332,11 +358,39 @@ def _chat_output(experience: CapturedExchange) -> list[JsonObject]:
     return [choice["message"]]
 
 
-def _request_messages(request: GatewayRequest, provider: JsonValue) -> list[JsonObject]:
-    """Restore serialization-excluded reasoning, tool failures, and raw arguments."""
-    messages: list[JsonObject] = [
-        message.model_dump(mode="json", exclude_none=True) for message in request.messages
-    ]
+def request_messages(request: GatewayRequest, provider: JsonValue) -> list[JsonObject]:
+    """Dump canonical request messages, restoring capture-only evidence the dump excludes.
+
+    Args:
+        request: Effective gateway request.
+        provider: Captured provider context with replay entries, or None.
+
+    Returns:
+        One JSON message per request message, with reasoning, tool failures and exact raw
+        tool arguments restored from the provider context.
+
+    Raises:
+        ValueError: The provider context does not match the request messages.
+    """
+    return restore_provider_context(
+        [message.model_dump(mode="json", exclude_none=True) for message in request.messages],
+        provider,
+    )
+
+
+def restore_provider_context(messages: list[JsonObject], provider: JsonValue) -> list[JsonObject]:
+    """Restore captured reasoning, tool failures and raw arguments onto dumped messages.
+
+    Args:
+        messages: Canonical message dumps, updated in place.
+        provider: Captured provider context with replay entries, or None.
+
+    Returns:
+        The same list, with replay evidence merged into its messages and tool calls.
+
+    Raises:
+        ValueError: The provider context does not match the messages.
+    """
     replay = provider.get("provider_replay") if isinstance(provider, dict) else None
     if isinstance(replay, list):
         for entry in replay:
