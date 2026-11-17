@@ -3053,7 +3053,7 @@ def test_deployment_priced_for_service_tier_overrides_only_for_a_carried_tier() 
         GatewayTokenPrices,
     )
     from exp.common.models.gateway_catalog import ExactModelDeployment
-    from exp.runtime.gateway.native_execution import deployment_priced_for_service_tier
+    from exp.runtime.gateway.native_attempt_pricing import deployment_priced_for_service_tier
 
     deployment = ExactModelDeployment(
         deployment_id="d1",

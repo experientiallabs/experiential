@@ -48,19 +48,32 @@ pub(crate) fn successor_possible(
 /// The wait before re-dialing a throttled rung, or `None` when the ladder
 /// should advance instead: the pool authors no schedule, the rung's redial
 /// budget on this request is spent (or zero), the failure is not a throttle,
-/// the total cap is reached, or the schedule itself declines (`Retry-After`
-/// beyond the ceiling, or no room under the deadline).
+/// the total cap is reached, the attempts left are reserved for undialed rung
+/// families (`fallback_rules::fresh_family_reserved`), or the schedule itself
+/// declines (`Retry-After` beyond the ceiling, or no room under the deadline).
 pub(super) fn throttle_backoff_delay(
     ctx: &WaterfallContext<'_>,
     wire: &DeploymentWire,
     failure: &Failure,
     throttle_redials_at_depth: u32,
     total_attempts: u32,
+    depth: usize,
+    dispatched: &[u32],
 ) -> Option<Duration> {
     let schedule = wire.throttle_redial.or(ctx.policy.throttle_redial)?;
+    let maximum = ctx.policy.maximum_total_attempts.min(8);
     if wire.throttle_redial_budget == 0
         || failure.failure_class != FailureClass::Throttled
-        || total_attempts >= ctx.policy.maximum_total_attempts
+        || total_attempts >= maximum
+        // The attempts left are all needed for undialed families: the
+        // control plane would refuse the redial, so never wait for it.
+        || fallback_rules::fresh_family_reserved(
+            ctx.route,
+            depth,
+            dispatched,
+            failure,
+            maximum - total_attempts,
+        )
     {
         return None;
     }

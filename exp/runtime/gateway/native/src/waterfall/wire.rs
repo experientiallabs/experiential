@@ -167,6 +167,14 @@ pub struct DeploymentWire {
     /// widening (the same convention as the other per-rung flags here).
     #[serde(default)]
     pub capture_logprobs: bool,
+    /// This rung's family within the route: the route index of the first
+    /// deployment dialing the same upstream offering on the same kind of
+    /// credential (`native_fallback_rules.route_rung_families`). A throttle
+    /// redial waits only while the attempts left can still reach every
+    /// undialed family (`fallback_rules::fresh_family_reserved`). Absent on
+    /// older admissions, which never reserve.
+    #[serde(default)]
+    pub rung_family: Option<u32>,
 }
 
 /// The frozen retry-policy facts returned by admission.

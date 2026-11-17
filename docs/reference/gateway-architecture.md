@@ -300,7 +300,7 @@ mode's fixed rule under every mode: the throttle surfaces exactly when the reque
 organization's observed cached-token fraction on the throttled rung (the worker's EWMA of its
 settled `cached_input_tokens / input_tokens` there) is at or above the threshold, else fails over
 cold, disclosed on the cold attempt as `throttle_failover_cold` with the throttled rung as its
-`preferred_deployment_id`.
+`preferred_deployment_id`. A route often lists one rung as several deployments, one per connection of the same upstream offering (`provider`, `provider_model`), ahead of the next rung. Every failover keeps enough of the request's attempt budget to reach each untried offering: once the attempts left (this one included) are no more than the offerings with an untried deployment that the request has not dialed, those offerings' deployments are claimed first, in route order, and the dialed offering's remaining connections follow as the spill. A lane of eight connections ahead of a second provider therefore spends seven attempts on the lane and the eighth on the next rung when every connection answers 429, instead of returning the 429 with that rung never dialed. The eligible set never changes (`failover_only_on`, budget and account refusals still apply), only its order when the budget is tight.
 
 A pool may additionally author a `throttle_redial` schedule (`max_attempts`, `base_delay_ms`,
 `max_delay_ms`). With it, a throttle is never returned while any way to serve the request
