@@ -48,6 +48,13 @@ export interface RunSpec {
   eventsUrl?: string | null;
   /** True when this sandbox was just rebuilt from storage. */
   restored: boolean;
+  /**
+   * Standing instructions for the whole conversation (a setup guide, for example), or null or
+   * absent for none. The runner puts them in their own section of the system prompt on every run,
+   * so they hold on every turn and survive compaction; they never enter the transcript. The host
+   * sends them with every run of the conversation.
+   */
+  instructions?: string | null;
 }
 
 export type TodoStatus = "pending" | "in_progress" | "completed";

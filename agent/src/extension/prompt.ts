@@ -26,6 +26,18 @@ export interface PromptSections {
   sections: Record<string, string>;
 }
 
+/** The section holding a conversation's standing instructions (RunSpec.instructions). */
+export const CONVERSATION_SECTION_NAME = "conversation";
+
+/**
+ * Add a conversation's standing instructions as their own system prompt section. Nothing is added
+ * for empty instructions.
+ */
+export function addConversationSection(options: PromptSections, instructions: string | null | undefined): void {
+  const text = instructions?.trim() ?? "";
+  if (text !== "") options.sections[CONVERSATION_SECTION_NAME] = text;
+}
+
 /** Add the cowork section to Pi's structured system prompt options. */
 export function addCoworkSection(options: PromptSections): void {
   options.sections[COWORK_SECTION_NAME] = COWORK_SECTION;

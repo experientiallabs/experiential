@@ -30,6 +30,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { AskUserDetails } from "../extension/ask-user.js";
 import { createExpCodeExtension } from "../extension/index.js";
+import { addConversationSection } from "../extension/prompt.js";
 import { resolveSkillsDir } from "../extension/skills.js";
 import { normalizeTodos } from "../extension/todo.js";
 import { createWebFetchTool } from "../extension/web-fetch.js";
@@ -242,6 +243,9 @@ export async function runOnce(options: RunnerOptions): Promise<RunEndStatus> {
     if (spec.reasoningEffort !== null) extra.reasoning_effort = spec.reasoningEffort;
     if (reasons) extra.include_reasoning = true;
     if (Object.keys(extra).length > 0) pi.on("before_provider_request", (event) => ({ ...(event.payload as Record<string, unknown>), ...extra }));
+    // The conversation's standing instructions: a system prompt section on every run, never a
+    // message, so they hold across turns and compaction.
+    if (spec.instructions) pi.on("before_agent_start", (event) => addConversationSection(event.systemPromptOptions, spec.instructions));
   };
   const resourceLoader = new DefaultResourceLoader({
     cwd: options.workDir,
