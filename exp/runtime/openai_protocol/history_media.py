@@ -357,14 +357,16 @@ def _model_turn(item: JsonObject) -> bool:
 
 
 def _user_input(item: JsonObject) -> bool:
-    """Whether one history entry is caller input: a user message or an unpaired output.
+    """Whether an entry is caller input, including native agent and compaction requests.
 
     A ``function_call_output`` without a ``call_id`` answers no call; the
     decoder carries it as user input (a thread message or notification), so
     its media is the caller's current input, not historical tool data.
     """
-    return item.get("role") == "user" or (
-        item.get("type") == "function_call_output" and item.get("call_id") is None
+    return (
+        item.get("role") == "user"
+        or item.get("type") in {"agent_message", "compaction_trigger"}
+        or (item.get("type") == "function_call_output" and item.get("call_id") is None)
     )
 
 
@@ -401,7 +403,7 @@ def degrade_chat_media(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]
     """Replace unservable inline media in a Chat Completions history.
 
     Tool messages degrade in every position; every other message degrades
-    except the latest turn's user messages. The payload is never mutated.
+    except the newest caller-input message. The payload is never mutated.
 
     Args:
         payload: Parsed Chat Completions body, before strict wire validation.
@@ -449,9 +451,9 @@ def degrade_chat_media(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]
 def degrade_responses_media(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
     """Replace unservable inline media in a Responses input history.
 
+    Message and ``agent_message`` items degrade except the newest caller input.
     ``function_call_output`` parts degrade in every position except an
-    unpaired output in the latest turn; message items degrade except the
-    latest turn's user messages. The payload is never mutated.
+    unpaired output that is the newest caller input. The payload is never mutated.
 
     Args:
         payload: Parsed Responses body, before strict wire validation.
@@ -483,7 +485,7 @@ def degrade_responses_media(payload: JsonObject) -> tuple[JsonObject, tuple[str,
                 "input.function_call_output.output",
                 index in latest,
             )
-        elif "role" in item_object:
+        elif "role" in item_object or item_object.get("type") == "agent_message":
             assistant = item_object.get("role") == "assistant"
             field, text_type, position, is_latest = (
                 "content",

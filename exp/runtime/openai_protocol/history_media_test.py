@@ -321,6 +321,50 @@ def test_text_followup_recovers_after_an_image_rejection_without_an_assistant_re
     assert request.ignored_parameters == (f"{field}.content.image->placeholder({reason})",)
 
 
+@pytest.mark.parametrize("agent_image", [False, True], ids=["user-image", "agent-image"])
+@pytest.mark.parametrize("compaction", [False, True], ids=["agent-followup", "compaction-followup"])
+def test_native_user_input_recovers_after_an_image_rejection(
+    agent_image: bool, compaction: bool
+) -> None:
+    """Native user inputs advance history, and agent media obeys the same size limit."""
+    content: list[object] = [{"type": "input_image", "image_url": _OVERSIZED_URL}]
+    rejected: JsonObject = (
+        {
+            "type": "agent_message",
+            "author": "/root/worker",
+            "recipient": "/root",
+            "content": content,
+        }
+        if agent_image
+        else {"role": "user", "content": content}
+    )
+    with pytest.raises(OpenAIProtocolError):
+        decode_responses({"model": "coding", "input": [rejected]})
+    newest: JsonObject = (
+        {"type": "compaction_trigger"}
+        if compaction
+        else {
+            "type": "agent_message",
+            "author": "/root/worker",
+            "recipient": "/root",
+            "content": [{"type": "input_text", "text": "Continue without the image."}],
+        }
+    )
+    payload: JsonObject = {"model": "coding", "input": [rejected, newest]}
+    original = copy.deepcopy(payload)
+    request = decode_responses(payload).request
+    assert payload == original
+    if agent_image:
+        assert request.messages[0].provider_native_item == {
+            **rejected,
+            "content": [{"type": "input_text", "text": placeholder_text("image", "oversized")}],
+        }
+    else:
+        assert request.messages[0].content == placeholder_text("image", "oversized")
+    assert request.messages[-1].provider_native_item == newest
+    assert request.ignored_parameters == ("input.content.image->placeholder(oversized)",)
+
+
 def test_an_unchanged_history_is_returned_without_copies() -> None:
     """A servable history allocates no rebuilt lists: the same payload object comes back."""
     payload = _chat_body(_chat_tool_history(_chat_image(_PNG_URL)))
