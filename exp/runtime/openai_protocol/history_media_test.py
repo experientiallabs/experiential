@@ -323,11 +323,24 @@ def test_text_followup_recovers_after_an_image_rejection_without_an_assistant_re
 
 @pytest.mark.parametrize("agent_image", [False, True], ids=["user-image", "agent-image"])
 @pytest.mark.parametrize("compaction", [False, True], ids=["agent-followup", "compaction-followup"])
+@pytest.mark.parametrize(
+    "cache_markers",
+    [
+        {},
+        {"cache_control": {"type": "ephemeral"}},
+        {"prompt_cache_breakpoint": {"mode": "explicit"}},
+        {
+            "cache_control": {"type": "ephemeral"},
+            "prompt_cache_breakpoint": {"mode": "explicit"},
+        },
+    ],
+    ids=["no-cache-marker", "cache-control", "prompt-cache-breakpoint", "both-cache-markers"],
+)
 def test_native_user_input_recovers_after_an_image_rejection(
-    agent_image: bool, compaction: bool
+    agent_image: bool, compaction: bool, cache_markers: JsonObject
 ) -> None:
     """Native user inputs advance history, and agent media obeys the same size limit."""
-    content: list[object] = [{"type": "input_image", "image_url": _OVERSIZED_URL}]
+    content: list[object] = [{"type": "input_image", "image_url": _OVERSIZED_URL, **cache_markers}]
     rejected: JsonObject = (
         {
             "type": "agent_message",
@@ -362,7 +375,12 @@ def test_native_user_input_recovers_after_an_image_rejection(
     else:
         assert request.messages[0].content == placeholder_text("image", "oversized")
     assert request.messages[-1].provider_native_item == newest
-    assert request.ignored_parameters == ("input.content.image->placeholder(oversized)",)
+    expected = ["input.content.image->placeholder(oversized)"]
+    if "cache_control" in cache_markers:
+        expected.append("input.0.content.0.cache_control->dropped(unsupported_item)")
+    if agent_image and "prompt_cache_breakpoint" in cache_markers:
+        expected.append("input.0.content.0.prompt_cache_breakpoint->dropped(unsupported_item)")
+    assert request.ignored_parameters == tuple(expected)
 
 
 def test_an_unchanged_history_is_returned_without_copies() -> None:

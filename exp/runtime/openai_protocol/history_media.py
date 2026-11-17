@@ -297,6 +297,7 @@ def _degrade_parts(
     latest: bool,
     position: str,
     disclosures: dict[str, None],
+    cache_keys: tuple[str, ...] = OPENAI_CACHE_KEYS,
 ) -> list[JsonValue] | None:
     """Degrade the unservable media in one ordered part list.
 
@@ -307,6 +308,7 @@ def _degrade_parts(
         latest: Whether the list is a user message of the latest turn.
         position: Disclosure position class (``messages.content`` or a tool output).
         disclosures: Ordered disclosure set, extended in place.
+        cache_keys: Cache markers supported on the replacement text part.
 
     Returns:
         The rebuilt list, or ``None`` when nothing was replaced.
@@ -329,8 +331,14 @@ def _degrade_parts(
             continue
         if rebuilt is None:
             rebuilt = list(parts)
-        rebuilt[index] = placeholder_part(text_type, kind, reason, cast(JsonObject, part))
+        part_object = cast(JsonObject, part)
+        rebuilt[index] = placeholder_part(
+            text_type, kind, reason, part_object, cache_keys=cache_keys
+        )
         disclosures[f"{position}.{kind}->placeholder({reason})"] = None
+        for key in OPENAI_CACHE_KEYS:
+            if key in part_object and key not in cache_keys:
+                disclosures[f"{param}.{index}.{key}->dropped(unsupported_item)"] = None
     return rebuilt
 
 
@@ -505,6 +513,9 @@ def degrade_responses_media(payload: JsonObject) -> tuple[JsonObject, tuple[str,
             latest=is_latest,
             position=position,
             disclosures=disclosures,
+            # Responses text has no cache_control field. The breakpoint pass
+            # extracts prompt_cache_breakpoint before strict wire validation.
+            cache_keys=("prompt_cache_breakpoint",),
         )
         if parts is not None:
             if rebuilt is None:
