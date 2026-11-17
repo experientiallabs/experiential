@@ -1,4 +1,4 @@
 # Native gateway fixes remain unreleased until a reviewed package-version bump.
 # The package workflow refuses publication while this marker exists.
-experiential = "0.7.249"
-exp-gateway-native = "0.3.192"
+experiential = "0.7.250"
+exp-gateway-native = "0.3.193"
