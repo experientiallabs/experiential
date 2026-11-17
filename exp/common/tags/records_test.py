@@ -124,7 +124,7 @@ def test_summarize_takes_per_tag_max_and_min() -> None:
     summary = summarize(record)
     assert summary == TagSummary(
         bank_id=DEFAULT_TAG_BANK.bank_id,
-        bank_version=1,
+        bank_version=DEFAULT_TAG_BANK.version,
         bank_digest=DEFAULT_TAG_BANK.digest,
         turn_max=(0.7, 0.9, 1.0),
         turn_min=(0.2, 0.4, 0.0),

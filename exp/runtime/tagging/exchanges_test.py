@@ -256,6 +256,7 @@ def test_local_chat_capture_keeps_tools_images_and_tool_results() -> None:
     (window,) = turn_windows(exchange)
     assert window.text.splitlines() == [
         "[task] Find record A [image]",
+        "[... 2 earlier messages not shown ...]",
         "[tool_result lookup] not found",
         "[assistant] Record A is missing.",
         '[tool_call lookup] {"id":"B"}',
@@ -624,6 +625,7 @@ def test_custom_tools_native_declarations_and_results_stay_readable() -> None:
     assert [tool.name for tool in exchange.tools] == ["files.read", "apply_patch", "web_search"]
     (window,) = turn_windows(exchange)
     assert window.text.splitlines()[1:] == [
+        "[... 2 earlier messages not shown ...]",
         "[tool_result apply_patch] Patch failed: file not found",
         "[tool_call apply_patch] *** retry",
         "[assistant] [image]",
@@ -720,7 +722,7 @@ def test_native_results_server_errors_namespaces_and_server_tools_are_read() -> 
     }
     exchange = exchange_from_captured(_experience("responses", request, body))
     assert exchange.messages[1].tool_calls[0].function.name == "files.read"
-    assert turn_windows(exchange)[0].text.splitlines()[1] == "[tool_result files.read] data"
+    assert "[tool_result files.read] data" in turn_windows(exchange)[0].text.splitlines()
     shell = _native_message(
         "tool",
         {

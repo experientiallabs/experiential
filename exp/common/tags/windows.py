@@ -366,9 +366,11 @@ def turn_windows(
 ) -> tuple[TagWindow, ...]:
     """Split the exchange's new slice into overlapping windows.
 
-    Windows break only between messages. Each starts with the ``[task]`` header and repeats up
-    to ``overlap_chars`` of the previous window's trailing messages, while always adding at
-    least one message the previous window did not show.
+    Windows break only between messages. Each starts with the ``[task]`` header, then a note
+    counting the earlier messages it does not show when the conversation has any, so success
+    claims and corrections can rest on earlier work. It repeats up to ``overlap_chars`` of the
+    previous window's trailing messages, while always adding at least one message the previous
+    window did not show.
 
     Args:
         exchange: The exchange.
@@ -380,6 +382,9 @@ def turn_windows(
     budget = budget or TagWindowBudget()
     start = turn_start(exchange)
     header = _task_header(exchange, budget.header_chars)
+    earlier = start - leading_instructions(exchange.messages)
+    if earlier:
+        header += f"\n[... {earlier} earlier message{'s' if earlier > 1 else ''} not shown ...]"
     body = budget.window_chars - len(header) - 1
     blocks = [clip_text(block, body) for block in _render_all(exchange.all_messages(), start)]
     windows: list[TagWindow] = []

@@ -172,6 +172,7 @@ def test_turn_slice_starts_after_the_last_assistant_message() -> None:
     )
     assert window.text.splitlines() == [
         "[task] Fix the failing date parser test",
+        "[... 2 earlier messages not shown ...]",
         "[tool_result bash] " + "0" * 40,
         "[assistant] All tests pass now.",
     ]
@@ -238,7 +239,7 @@ def test_one_oversized_message_keeps_head_and_tail() -> None:
 
 
 def test_task_header_is_clipped_to_its_budget() -> None:
-    """A long first request is shortened in every turn header."""
+    """A long first request is shortened in every turn header, before the earlier-messages note."""
     exchange = TagExchange(
         exchange_id="req",
         messages=(
@@ -249,9 +250,10 @@ def test_task_header_is_clipped_to_its_budget() -> None:
         response=(TagMessage(role="assistant", content="done"),),
     )
     (window,) = turn_windows(exchange, SMALL)
-    header = window.text.split("\n[user] next")[0]
+    header, rest = window.text.split("\n[... 2 earlier messages not shown ...]\n")
     assert len(header) <= SMALL.header_chars
     assert header.startswith("[task] RRR")
+    assert rest == "[user] next\n[assistant] done"
 
 
 def test_budget_validation_and_token_sizing() -> None:
