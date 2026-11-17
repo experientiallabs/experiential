@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 #[path = "google_cache.rs"]
 mod google_cache;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_attempt(
     ctx: &WaterfallContext<'_>,
     guard: &mut AttemptGuard,
@@ -30,6 +31,7 @@ pub(super) async fn run_attempt(
     repaired: &mut Option<Value>,
     reactive_repair: bool,
     search_rounds: &[ToolSearchRound],
+    sole_rung: bool,
 ) -> AttemptEnd {
     let Some(dialect) = Dialect::from_str(&wire.dialect) else {
         // Admission validated every dialect; reaching here is wire drift.
@@ -103,27 +105,42 @@ pub(super) async fn run_attempt(
     // was a no-op: 251 of 251 header timeouts on lanes carrying 90 s and
     // 120 s allowances cut at exactly 60 s (production, 2026-09-16).
     let phase_timeout = Duration::from_secs_f64(wire.timeout_seconds.max(0.001));
-    let first_byte_allowance_for = || {
-        first_byte_allowance(
-            wire,
-            ctx.time_to_first_byte,
-            ctx.time_to_first_byte_slope_seconds_per_million_input_tokens,
-            ctx.approximate_input_tokens,
-        )
+    // Per dial: the instant the rung's own first-byte allowance expires
+    // (capped at the shared budget), and the first-byte and first-token
+    // deadlines the dial actually waits for. The per-rung allowances exist to
+    // trigger failover; when no other rung could take a timeout from this
+    // dial (`sole_rung`), cutting the wait would end the request with nowhere
+    // to go, so the dial waits out the request's whole pre-first-byte budget
+    // instead (production, 2026-11-17: a one-lane Gemini route cut at its
+    // 15 s allowance while the provider answered at 16-20 s).
+    let dial_bounds = || {
+        let now = Instant::now();
+        let allowance = ctx.capped(
+            now + first_byte_allowance(
+                wire,
+                ctx.time_to_first_byte,
+                ctx.time_to_first_byte_slope_seconds_per_million_input_tokens,
+                ctx.approximate_input_tokens,
+            ),
+        );
+        if sole_rung {
+            let budget = ctx.pre_commit_deadline();
+            return (allowance, budget, budget);
+        }
+        // The first-token bound the relay enforces once the headers are in:
+        // its own base (thinking models on a chat wire stream nothing for a
+        // minute and more), the same input slope, absolute from the same dial.
+        let first_token = ctx.capped(
+            now + first_token_allowance(
+                wire,
+                ctx.time_to_first_token,
+                ctx.time_to_first_byte_slope_seconds_per_million_input_tokens,
+                ctx.approximate_input_tokens,
+            ),
+        );
+        (allowance, allowance, first_token)
     };
-    let mut first_byte_deadline = ctx.capped(Instant::now() + first_byte_allowance_for());
-    // The first-token bound the relay enforces once the headers are in: its
-    // own base (thinking models on a chat wire stream nothing for a minute
-    // and more), the same input slope, absolute from the same dial.
-    let first_token_allowance_for = || {
-        first_token_allowance(
-            wire,
-            ctx.time_to_first_token,
-            ctx.time_to_first_byte_slope_seconds_per_million_input_tokens,
-            ctx.approximate_input_tokens,
-        )
-    };
-    let mut first_token_deadline = ctx.capped(Instant::now() + first_token_allowance_for());
+    let (mut allowance_deadline, mut first_byte_deadline, mut first_token_deadline) = dial_bounds();
     // What is already known repairs the first dial: the payload this request
     // stripped on an earlier dial of the rung, else the payloads this worker
     // remembers the caller's provider refusing.
@@ -184,8 +201,11 @@ pub(super) async fn run_attempt(
         {
             inject = false;
             refusal_unconfirmed = true;
-            first_byte_deadline = ctx.capped(Instant::now() + first_byte_allowance_for());
-            first_token_deadline = ctx.capped(Instant::now() + first_token_allowance_for());
+            (
+                allowance_deadline,
+                first_byte_deadline,
+                first_token_deadline,
+            ) = dial_bounds();
             continue 'dial;
         }
         let response = match opened {
@@ -206,7 +226,10 @@ pub(super) async fn run_attempt(
                     };
                 }
                 return AttemptEnd::Ladder {
-                    failure: customer_owned(attribute_header_timeout(ctx, failure), wire),
+                    failure: customer_owned(
+                        attribute_header_timeout(ctx, failure, allowance_deadline),
+                        wire,
+                    ),
                     refusal_eligible: false,
                     exhaustion_flush: Vec::new(),
                     usage: None,
@@ -312,10 +335,11 @@ pub(super) async fn run_attempt(
                         inject = false;
                         refusal_unconfirmed = true;
                         guard.forget_discarded_dial();
-                        first_byte_deadline =
-                            ctx.capped(Instant::now() + first_byte_allowance_for());
-                        first_token_deadline =
-                            ctx.capped(Instant::now() + first_token_allowance_for());
+                        (
+                            allowance_deadline,
+                            first_byte_deadline,
+                            first_token_deadline,
+                        ) = dial_bounds();
                         continue 'dial;
                     }
                     return AttemptEnd::Ladder {
@@ -456,10 +480,11 @@ pub(super) async fn run_attempt(
                         inject = false;
                         refusal_unconfirmed = true;
                         guard.forget_discarded_dial();
-                        first_byte_deadline =
-                            ctx.capped(Instant::now() + first_byte_allowance_for());
-                        first_token_deadline =
-                            ctx.capped(Instant::now() + first_token_allowance_for());
+                        (
+                            allowance_deadline,
+                            first_byte_deadline,
+                            first_token_deadline,
+                        ) = dial_bounds();
                         continue 'dial;
                     }
                     usage = relay.usage_before_failure(usage);

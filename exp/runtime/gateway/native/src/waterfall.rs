@@ -412,6 +412,20 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
         // A rung a tool-search round rebuilt dials its rebuilt wire; the
         // route's own entry still answers every policy question above.
         let dial_wire = search_wires[depth].as_ref().unwrap_or(wire);
+        // Whether a timeout of this dial would leave the ladder anywhere to
+        // go; when it would not, the dial waits out the request's budget
+        // rather than its own allowance (`run_attempt`).
+        let sole_rung = !successor_possible(
+            ctx.policy,
+            ctx.route,
+            ctx.deadline,
+            total_attempts,
+            counts[depth],
+            depth,
+            &physical_counts,
+            &crate::relay::first_byte_timeout_failure(),
+            false,
+        );
         let mut end = run_attempt(
             ctx,
             guard,
@@ -420,6 +434,7 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
             &mut repaired[depth],
             repair_redial,
             &tool_search_rounds,
+            sole_rung,
         )
         .await;
         // A buffered surface sends the caller nothing before the terminal, so

@@ -393,12 +393,20 @@ pub(crate) fn pre_first_byte_budget(
 /// budget cut the wait and the timeout is no strike against the lane: a
 /// healthy fallback dialed after a hung lead gets only the reserve, and must
 /// not be ejected for running out of someone else's time.
+///
+/// `allowance_deadline` is when the rung's own allowance expired (capped at
+/// the shared budget). A sole rung waits past it to the budget
+/// (`run_attempt`), and a timeout there is still the lane's strike whenever
+/// its own allowance ran out first, exactly as when the wait was cut at it.
 pub(crate) fn attribute_header_timeout(
     ctx: &WaterfallContext<'_>,
     mut failure: Failure,
+    allowance_deadline: Instant,
 ) -> Failure {
+    let budget = ctx.pre_commit_deadline();
     if failure.header_timeout == Some(HeaderTimeout::Allowance)
-        && crate::relay::remaining(ctx.pre_commit_deadline()).is_zero()
+        && crate::relay::remaining(budget).is_zero()
+        && allowance_deadline >= budget
     {
         failure.header_timeout = Some(HeaderTimeout::Budget);
     }

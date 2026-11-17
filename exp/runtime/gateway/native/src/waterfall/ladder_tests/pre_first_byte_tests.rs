@@ -178,3 +178,90 @@ fn only_a_lane_that_spent_its_own_allowance_takes_the_header_timeout_strike() {
         );
     });
 }
+
+/// Production, 2026-11-17 (scaled down): a model with one live lane whose
+/// first byte drifted past the lane's allowance. With no rung to fail over
+/// to, the allowance must not end the request: the dial waits out the
+/// request's pre-first-byte budget and serves.
+#[test]
+fn a_sole_rung_waits_past_its_allowance_for_a_late_first_byte() {
+    block_on(async {
+        let harness = Harness::new();
+        let route = [wire(
+            "only",
+            &spawn_slow_header_rung(Duration::from_millis(2_500)).await,
+            0,
+        )];
+        let started = Instant::now();
+        let (won, guard) = run_budgeted(&harness, &route, Some(Duration::from_secs(5))).await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("a sole rung answering inside the budget must serve");
+        };
+        assert_eq!(committed.depth, 0);
+        assert!(
+            started.elapsed() >= Duration::from_millis(2_400),
+            "{:?}",
+            started.elapsed()
+        );
+        let story = harness.story().await;
+        assert_eq!(
+            story["starts"].as_array().map(Vec::len),
+            Some(1),
+            "one dial, no redial: {story}"
+        );
+    });
+}
+
+/// With an untried sibling, the allowance still triggers failover: the slow
+/// lead is abandoned at its 2 s allowance and the backup serves.
+#[test]
+fn a_rung_with_a_sibling_still_fails_over_at_its_allowance() {
+    block_on(async {
+        let harness = Harness::new();
+        let route = [
+            wire(
+                "lead",
+                &spawn_slow_header_rung(Duration::from_secs(4)).await,
+                0,
+            ),
+            wire("backup", &spawn_slow_header_rung(Duration::ZERO).await, 0),
+        ];
+        let started = Instant::now();
+        let (won, guard) = run_budgeted(&harness, &route, Some(Duration::from_secs(8))).await;
+        let elapsed = started.elapsed();
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("the backup must serve after the lead's allowance");
+        };
+        assert_eq!(committed.depth, 1);
+        assert!(elapsed >= Duration::from_millis(1_900), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(3_500), "{elapsed:?}");
+        let story = harness.story().await;
+        let settles = story["settles"].as_array().expect("settles");
+        assert_eq!(settles[0]["failure"]["header_timeout"], json!("allowance"));
+    });
+}
+
+/// A sole rung that is still silent when the budget runs out ends the
+/// request with the retryable timeout at the budget, and the lane still
+/// takes the header-timeout strike because its own allowance ran out first.
+#[test]
+fn a_sole_rung_silent_past_the_budget_still_times_out() {
+    block_on(async {
+        let harness = Harness::new();
+        let route = [wire("only", &spawn_stalled_rung().await, 0)];
+        let started = Instant::now();
+        let (won, guard) = run_budgeted(&harness, &route, Some(Duration::from_secs(4))).await;
+        let elapsed = started.elapsed();
+        let Won::Failed(error) = finish(guard, won).await else {
+            panic!("a stalled sole rung must fail at the budget");
+        };
+        assert!(elapsed >= Duration::from_millis(3_900), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(4_900), "{elapsed:?}");
+        assert_eq!(error.status_code, 503);
+        assert_eq!(error.code, "deadline_exceeded");
+        let story = harness.story().await;
+        let settles = story["settles"].as_array().expect("settles");
+        assert_eq!(settles.len(), 1, "{settles:?}");
+        assert_eq!(settles[0]["failure"]["header_timeout"], json!("allowance"));
+    });
+}

@@ -124,6 +124,16 @@ lane's medians sat above two minutes. A stall past the allowance is
 `first_byte_timeout_failure()`: class `timeout`, failover-eligible, never redialed on the
 stalled lane, so the ladder advances before anything has reached the caller.
 
+Both allowances exist to trigger failover. A dial with nowhere to fail over to (no untried rung
+that could take a timeout, or no attempt left under the request's cap) does not stop at them: it
+waits for its headers and first token until the request's pre-first-byte budget (or the request
+deadline, whichever is nearer), so a sole lane that answers late still serves. A sole lane still
+silent at the budget ends with the same retryable timeout as before, and its header timeout is
+still the lane's strike (`header_timeout: allowance`) because its own allowance ran out first.
+Reference case, 2026-11-17: a model with one live Gemini lane had its first byte drift to 2-18 s
+and about 100 requests per 35 minutes ended at the 15 s header allowance while the 90 s budget had
+room and the provider would have answered at 16-20 s.
+
 ## Generation progress and commitment
 
 After genuine generation begins, the connection's existing `timeout_seconds` bounds the idle
