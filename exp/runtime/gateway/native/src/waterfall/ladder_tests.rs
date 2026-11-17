@@ -15,11 +15,10 @@ use crate::bridge::Bridge;
 use crate::throttle_backoff::ThrottleRedial;
 use crate::upstream::build_client;
 
-/// A control plane that mirrors the python candidate policy for one two-rung
-/// route: a `throttle_backoff` reservation redials the same depth while the
-/// per-rung redial cap allows, a failover-eligible failure advances, and
-/// anything else exhausts with the failure echoed back. Every call is
-/// recorded so the test can read the ledger story.
+/// A control plane mirroring the python candidate policy for one two-rung route:
+/// a `throttle_backoff` reservation redials the same depth while the per-rung
+/// redial cap allows, a failover-eligible failure advances, and anything else
+/// exhausts with the failure echoed back, every call recorded for the test.
 const PLANE_SOURCE: &std::ffi::CStr = cr#"
 import json
 import threading

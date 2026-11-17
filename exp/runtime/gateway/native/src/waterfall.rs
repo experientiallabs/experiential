@@ -585,8 +585,23 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
                     None
                 };
                 let mut next_policy = ctx.policy;
+                // Every attempt left is owed to an undialed rung family: the
+                // control plane dials that family before any redial, so the
+                // redial's backoff is never slept (a redial it still falls
+                // back to, when that family cannot be claimed, goes at once).
+                let reserved = fallback_rules::fresh_family_reserved(
+                    ctx.route,
+                    depth,
+                    &physical_counts,
+                    &failure,
+                    ctx.policy
+                        .maximum_total_attempts
+                        .min(8)
+                        .saturating_sub(total_attempts),
+                );
                 let retry_wait = if failure.retryable_same_deployment
                     && fits
+                    && !reserved
                     && counts[depth] < ctx.policy.maximum_same_deployment_attempts
                 {
                     ctx.policy.backoff.map(|backoff| {
