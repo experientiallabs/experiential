@@ -23,8 +23,17 @@ from collections.abc import Sequence
 from typing import Final
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.contracts import GatewayProviderNativeTool, GatewayRequest
-from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
+from exp.runtime.gateway.contracts import (
+    GatewayProviderNativeTool,
+    GatewayRequest,
+    GatewayToolDefinition,
+)
+from exp.runtime.gateway.tool_contracts import (
+    GatewayAllowedToolsChoice,
+    GatewayCustomToolChoice,
+    GatewayNamedToolChoice,
+)
+from exp.runtime.gateway.tool_search.contracts import RESPONSES_TOOL_SEARCH_TYPES
 from exp.runtime.gateway.web_search.plan import RESPONSES_WEB_SEARCH_TOOL_TYPES
 from exp.runtime.models.providers.allowed_tools import entry_names_declaration
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -55,11 +64,13 @@ def _may_call_hosted(
         declares_search: Whether a stripped hosted web-search declaration remains.
 
     Returns:
-        False when ``tool_choice`` is ``none`` or an allowed-tools selector names
-        no hosted tool, so no built-in call can happen; True otherwise.
+        False when ``tool_choice`` is ``none``, forces one caller tool, or is an
+        allowed-tools selector naming no hosted tool, so no built-in call can
+        happen; True otherwise.
     """
     choice = request.tool_choice
-    if choice == "none":
+    if choice == "none" or isinstance(choice, GatewayNamedToolChoice | GatewayCustomToolChoice):
+        # Nothing, or one named caller tool, may be called: never a hosted one.
         return False
     if isinstance(choice, GatewayAllowedToolsChoice):
         if declares_search and any(
@@ -154,6 +165,16 @@ def shape_tool_call_budget(
         if disclosure not in ignored:
             ignored.append(disclosure)
     provider_updates["provider_native_tools"] = kept
+    if any(entry.tool.get("type") in RESPONSES_TOOL_SEARCH_TYPES for entry in hosted):
+        # Without the provider's search a deferred function is unreachable, so
+        # every tool loads directly (as the gateway's own planner does).
+        provider_updates["tool_search"] = None
+        tools = provider_updates.get("tools", request.tools)
+        provider_updates["tools"] = tuple(
+            tool.model_copy(update={"defer_loading": None})
+            for tool in (tools if isinstance(tools, tuple) else ())
+            if isinstance(tool, GatewayToolDefinition)
+        )
     choice = provider_updates.get("tool_choice", request.tool_choice)
     serviceable = bool(kept or request.tools)
     if isinstance(choice, GatewayAllowedToolsChoice):

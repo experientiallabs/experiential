@@ -11,7 +11,8 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
-from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice, GatewayNamedToolChoice
+from exp.runtime.gateway.tool_search.contracts import GatewayToolSearch
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearch
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderParameterError
@@ -107,6 +108,8 @@ def test_a_choice_that_excludes_every_hosted_tool_needs_no_provider_cap() -> Non
         mode="auto", provider_entries=({"type": "custom", "name": "exec"},)
     )
     assert _shape(_request(2, tool_choice=custom_only), _PLAN) == ({"max_tool_calls": None}, [])
+    forced = GatewayNamedToolChoice(name="f")
+    assert _shape(_request(2, tool_choice=forced), _PLAN) == ({"max_tool_calls": None}, [])
     search_allowed = GatewayAllowedToolsChoice(
         mode="auto", provider_entries=({"type": "web_search"},)
     )
@@ -150,3 +153,29 @@ def test_a_spent_budget_narrows_or_clears_the_tool_choice() -> None:
     assert TOOL_CHOICE_CLEARED in ignored
     updates, _ = _shape(_request(0, tool_choice="required"), _NATIVE)
     assert "tool_choice" not in updates
+
+
+def test_a_spent_budget_withholding_native_tool_search_loads_deferred_tools() -> None:
+    """Without the provider's search a deferred function would be unreachable."""
+    request = _request(
+        0,
+        tools=(GatewayToolDefinition(name="f", parameters={"type": "object"}, defer_loading=True),),
+        provider_native_tools=(GatewayProviderNativeTool(index=1, tool={"type": "tool_search"}),),
+        tool_search=GatewayToolSearch(declared_as="responses_tool", tool_type="tool_search"),
+    )
+    updates, ignored = _shape(request, _NATIVE)
+    assert updates["tool_search"] is None
+    # The provider body carries every function loaded and no deferral marker.
+    payload = openai_responses_stream_payload(
+        "gpt-6-luna", request.model_copy(update=updates), supports_temperature=False
+    )
+    tools_on_wire = payload["tools"]
+    assert isinstance(tools_on_wire, list)
+    assert [tool.get("name") for tool in tools_on_wire if isinstance(tool, dict)] == ["f"]
+    assert all(isinstance(tool, dict) and "defer_loading" not in tool for tool in tools_on_wire)
+    assert ignored == ["tools.tool_search->dropped(max_tool_calls)"]
+    tools = updates["tools"]
+    assert isinstance(tools, tuple)
+    assert [tool.defer_loading for tool in tools if isinstance(tool, GatewayToolDefinition)] == [
+        None
+    ]
