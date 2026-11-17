@@ -807,10 +807,18 @@ impl Normalizer {
                     if reason == "max_output_tokens" {
                         events.push(Event::Incomplete);
                     } else if reason == "content_filter" || reason == "safety" {
-                        // The incomplete reason IS the category token.
-                        events.push(Event::Failed(Failure::refusal(
-                            crate::stream_errors::refusal_reason(Some(reason), None),
-                        )));
+                        // The incomplete reason IS the category token. With no
+                        // refusal of the model's own, the provider's filter
+                        // cut the turn; a model refusal stays as it was.
+                        let failure = Failure::refusal(crate::stream_errors::refusal_reason(
+                            Some(reason),
+                            None,
+                        ));
+                        events.push(Event::Failed(if self.refusal_seen {
+                            failure
+                        } else {
+                            crate::content_filter::mark(failure)
+                        }));
                     } else {
                         // The undocumented reason is the only diagnostic this
                         // terminal carries; it rides as the bounded detail.

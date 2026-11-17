@@ -99,3 +99,36 @@ it, and keeps it failover-eligible once per request; the control plane advances 
 rung whose advertised window exceeds the stated one (else the failed rung's advertised window), or
 whose window the catalog does not state (`native_context_window.py`). With no such rung, or on a
 second refusal, the caller receives the provider's 400 unchanged.
+
+## Provider content filters
+
+A provider's own content filter (Azure's content management system, an account-side moderation
+layer) can refuse a request, or the output it would have returned, that another provider serving the
+same model applies no filter to. The data plane files such a verdict as a `refusal` with
+`refusal_reason = content_policy` and `provider_content_filter` (`content_filter.rs`) when it comes
+from the provider's typed rejection: a 4xx whose completion body finished `content_filter`
+(Azure Foundry's `content_filter_results` verdict), a 4xx error envelope whose code is a
+content-policy code (directly or relayed inside a decode-failure 400), the relayed Gemini
+`PROHIBITED_CONTENT` 403, an in-stream error event carrying a content-policy code, a Chat stream
+closed with a `content_filter`/`safety` finish, a Responses stream ending `incomplete` for
+`content_filter`/`safety`, or a Bedrock `content_filtered`/`guardrail_intervened` stop. It is never
+set for the model declining in its own words (a Chat `refusal` delta, a refusal stop reason), for a
+refusal read only from a sentence, for a cyber, CBRN, recitation or data-inspection verdict, or for
+the gateway's own `guardrail` class. Settlement carries the flag, so the failed attempt row tells
+the provider's filter from the model's refusal.
+
+Such a refusal is never redialed, and the waterfall makes it failover-eligible once per request,
+only when an untried unrestricted rung of a different provider exists and only while nothing reached
+the caller: before commit, or while a buffered surface (non-streaming, or a guardrail-buffered stream)
+drains a committed attempt. The empty refusal marker an OpenAI-compatible filter finish emits is held
+uncommitted while some rung may still take the refusal (the one-shot gate, a `failover_only_on` rung
+naming it, or the alias revision's refusal failover). Only a content-policy CODE marks a filter: a
+generic `refusal` code whose category comes from the sentence does not. The control plane then admits only an untried rung whose provider
+differs from the refusing rung's (`native_content_filter.py`); another deployment of the same provider
+would apply the same filter. The refused dial keeps its own failed attempt row, and the served attempt
+is recorded at its own route depth like any failover, taking the cache miss. With no such rung, on a
+second filter refusal, or once a live stream sent the caller a delta, the caller receives the refusal
+exactly as before. An alias revision that opted into refusal failover keeps its own unrestricted walk,
+and a `failover_only_on` rung that names `refusal` or `refusal:content_policy` keeps taking such a
+refusal on its own opt-in, as it did before this rule (the one-shot gate governs only unrestricted rungs).
+The walk never leaves the request's route, so it never changes the model.

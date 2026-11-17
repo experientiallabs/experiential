@@ -578,7 +578,7 @@ async fn non_success_failure(
             Some((reason, detail))
         });
         if let Some((reason, detail)) = refusal {
-            return Failure::refusal(reason)
+            return crate::content_filter::mark(Failure::refusal(reason))
                 .with_provider_detail(detail)
                 .with_rate_limit_facts(rate_limit.clone(), retry_after);
         }
@@ -619,10 +619,11 @@ async fn non_success_failure(
         .collect();
     // A 4xx whose body is a COMPLETION finished `content_filter` (Azure
     // Foundry's DeepSeek lanes answer their output filter this way, with
-    // no error envelope at all) is the model's verdict on the content:
-    // file and answer it as a refusal, the blocked label kept ledger-only,
-    // never as a request-shape error and never a failover (the next rung
-    // refuses the same content or, worse, serves it).
+    // no error envelope at all) is the provider's content filter refusing
+    // the content: file and answer it as a refusal, the blocked label kept
+    // ledger-only, never as a request-shape error. A content-policy verdict
+    // is the provider's own filter, so the waterfall may take it once to a
+    // rung of another provider before the caller sees it (`content_filter`).
     if let Some(filtered) = body
         .as_deref()
         .and_then(|body| content_filtered_completion(dialect, body))
@@ -634,7 +635,7 @@ async fn non_success_failure(
             .as_deref()
             .and_then(|message| sanitized_detail(message, &request_words))
             .or(Some(filtered.code));
-        return Failure::refusal(reason)
+        return crate::content_filter::mark(Failure::refusal(reason))
             .with_provider_detail(detail)
             .with_rate_limit_facts(rate_limit.clone(), retry_after);
     }
@@ -677,8 +678,15 @@ async fn non_success_failure(
             ) {
                 let ledger_detail =
                     sanitized.map(|text| format!("{}: {text}", status_detail(status)));
-                return crate::stream_errors::stream_failure(kind, ledger_detail)
-                    .with_rate_limit_facts(rate_limit.clone(), retry_after);
+                let failure = crate::stream_errors::stream_failure(kind, ledger_detail);
+                // A relayed content-policy CODE is the upstream provider's filter.
+                let failure =
+                    if crate::content_filter::is_content_policy_code(upstream_code.as_deref()) {
+                        crate::content_filter::mark(failure)
+                    } else {
+                        failure
+                    };
+                return failure.with_rate_limit_facts(rate_limit.clone(), retry_after);
             }
             (upstream_code, sanitized)
         }
@@ -710,7 +718,15 @@ async fn non_success_failure(
     // sentence saying "blocked by" could be about a firewall or a limit.
     if crate::stream_errors::is_refusal_code(code.as_deref()) {
         let reason = crate::stream_errors::refusal_reason(code.as_deref(), None);
-        return Failure::refusal(reason)
+        // Only a content-policy code is the provider's filter; a generic
+        // `refusal` or a cyber or CBRN verdict keeps its own ladder rules.
+        let failure = Failure::refusal(reason);
+        let failure = if crate::content_filter::is_content_policy_code(code.as_deref()) {
+            crate::content_filter::mark(failure)
+        } else {
+            failure
+        };
+        return failure
             .with_provider_detail(detail)
             .with_rate_limit_facts(rate_limit.clone(), retry_after);
     }

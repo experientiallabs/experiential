@@ -73,6 +73,26 @@ async fn run_buffered_with_budget(
     buffered: &[bool],
     budget: Option<Instant>,
 ) -> (Won, AttemptGuard) {
+    run_buffered_full(harness, route, buffered, budget, POLICY).await
+}
+
+/// [`run_buffered`] under `policy`.
+async fn run_buffered_with_policy(
+    harness: &Harness,
+    route: &[DeploymentWire],
+    buffered: &[bool],
+    policy: RoutePolicy,
+) -> (Won, AttemptGuard) {
+    run_buffered_full(harness, route, buffered, None, policy).await
+}
+
+async fn run_buffered_full(
+    harness: &Harness,
+    route: &[DeploymentWire],
+    buffered: &[bool],
+    budget: Option<Instant>,
+    policy: RoutePolicy,
+) -> (Won, AttemptGuard) {
     let mut guard = AttemptGuard::new(
         harness.bridge.clone(),
         Arc::new(AtomicUsize::new(0)),
@@ -87,7 +107,7 @@ async fn run_buffered_with_budget(
         raw_key: "key",
         caller_scope: None,
         route,
-        policy: POLICY,
+        policy,
         deadline: Instant::now() + Duration::from_secs(30),
         time_to_first_byte: Duration::from_secs(5),
         time_to_first_byte_slope_seconds_per_million_input_tokens: 0.0,
@@ -239,14 +259,14 @@ fn a_streaming_surface_keeps_the_attempt_the_caller_already_saw() {
 fn restartable_names_upstream_faults_and_never_gateway_or_caller_ones() {
     let transport =
         Failure::new(FailureClass::Transport, "provider transport failed").with_retry(true, true);
-    assert!(buffered::restartable(&transport));
+    assert!(buffered::restartable(&transport, false));
     let stalled = Failure::new(FailureClass::Timeout, "provider stalled").with_retry(false, true);
-    assert!(buffered::restartable(&stalled));
+    assert!(buffered::restartable(&stalled, false));
     // Unflagged: the classifier said neither redial nor fail over.
-    assert!(!buffered::restartable(&Failure::new(
-        FailureClass::Transport,
-        "provider transport failed",
-    )));
+    assert!(!buffered::restartable(
+        &Failure::new(FailureClass::Transport, "provider transport failed"),
+        false,
+    ));
     for class in [
         FailureClass::Internal,
         FailureClass::Unavailable,
@@ -255,8 +275,17 @@ fn restartable_names_upstream_faults_and_never_gateway_or_caller_ones() {
         FailureClass::Throttled,
     ] {
         let failure = Failure::new(class, "classified").with_retry(true, true);
-        assert!(!buffered::restartable(&failure), "{class:?}");
+        assert!(!buffered::restartable(&failure, true), "{class:?}");
     }
+    // A provider content filter restarts only while another provider may
+    // take it; the model's own refusal never does.
+    let filtered = crate::content_filter::mark(Failure::refusal(
+        crate::errors::RefusalReason::ContentPolicy,
+    ));
+    assert!(buffered::restartable(&filtered, true));
+    assert!(!buffered::restartable(&filtered, false));
+    let declined = Failure::refusal(crate::errors::RefusalReason::Unspecified);
+    assert!(!buffered::restartable(&declined, true));
 }
 
 /// A vLLM lane's verdict when it serves fewer tokens than the model
@@ -341,4 +370,100 @@ fn work_the_provider_already_ran_is_never_restarted() {
         name: "web_fetch".into(),
     };
     assert!(buffered::provider_executed(&server));
+}
+
+/// A rung of `provider`.
+fn provider_wire(deployment_id: &str, url: &str, provider: &str) -> DeploymentWire {
+    DeploymentWire {
+        native_tool_translation: Default::default(),
+        provider: provider.to_string(),
+        ..wire(deployment_id, url, 0)
+    }
+}
+
+#[test]
+fn a_buffered_answer_the_providers_filter_cut_restarts_on_another_provider() {
+    use super::content_filter_ladder_tests::FILTER_FINISH_FRAME;
+    block_on(async {
+        let harness = Harness::new();
+        let azure = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME, FILTER_FINISH_FRAME])]).await;
+        let sibling = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
+        let route = [
+            provider_wire("azure", &azure.url, "azure_openai"),
+            provider_wire("novita", &sibling.url, "openai"),
+        ];
+        let (won, guard) = run_buffered(&harness, &route, &[true, true]).await;
+        let Won::Committed(committed) = &won else {
+            panic!("the caller saw nothing: the sibling serves the buffered answer");
+        };
+        assert_eq!(committed.depth, 1);
+        assert!(committed.prefix.last().is_some_and(Event::is_terminal));
+        assert!(!committed
+            .prefix
+            .iter()
+            .any(|event| matches!(event, Event::Failed(_))));
+        finish(guard, won).await;
+        let story = harness.story().await;
+        let settles = story["settles"].as_array().expect("settles");
+        assert_eq!(settles[0]["outcome"], "failed");
+        assert_eq!(settles[0]["finalize"], false);
+        assert_eq!(settles[0]["failure"]["failure_class"], "refusal");
+        assert_eq!(settles[1]["outcome"], "completed");
+    });
+}
+
+#[test]
+fn a_buffered_filter_cut_with_no_other_provider_keeps_the_surfaces_answer() {
+    use super::content_filter_ladder_tests::FILTER_FINISH_FRAME;
+    block_on(async {
+        let harness = Harness::new();
+        let azure = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME, FILTER_FINISH_FRAME])]).await;
+        let other_azure = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
+        let route = [
+            provider_wire("azure-east", &azure.url, "azure_openai"),
+            provider_wire("azure-west", &other_azure.url, "azure_openai"),
+        ];
+        let (won, _guard) = run_buffered(&harness, &route, &[true, true]).await;
+        let Won::Committed(committed) = &won else {
+            panic!("the drained attempt stays the winner");
+        };
+        assert_eq!(committed.depth, 0);
+        assert!(matches!(
+            committed.prefix.last(),
+            Some(Event::Failed(failure)) if failure.failure_class == FailureClass::Refusal
+        ));
+        assert!(other_azure.accepted.lock().expect("lock").is_empty());
+    });
+}
+
+#[test]
+fn a_buffered_filter_cut_restarts_under_the_aliass_refusal_failover() {
+    use super::content_filter_ladder_tests::FILTER_FINISH_FRAME;
+    block_on(async {
+        let harness = Harness::new();
+        harness
+            .configure(serde_json::json!({"refusal_failover": true}))
+            .await;
+        let azure = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME, FILTER_FINISH_FRAME])]).await;
+        let other_azure = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
+        let route = [
+            provider_wire("azure-east", &azure.url, "azure_openai"),
+            provider_wire("azure-west", &other_azure.url, "azure_openai"),
+        ];
+        let (won, guard) = run_buffered_with_policy(
+            &harness,
+            &route,
+            &[true, true],
+            RoutePolicy {
+                refusal_failover: true,
+                ..POLICY
+            },
+        )
+        .await;
+        let Won::Committed(committed) = &won else {
+            panic!("the opted-in alias restarts the cut answer on any rung");
+        };
+        assert_eq!(committed.depth, 1);
+        finish(guard, won).await;
+    });
 }

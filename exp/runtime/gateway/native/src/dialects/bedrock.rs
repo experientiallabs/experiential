@@ -283,9 +283,11 @@ impl Normalizer {
             "end_turn" | "stop_sequence" | "tool_use" => Event::Completed,
             "max_tokens" | "model_context_window_exceeded" => Event::Incomplete,
             // The Bedrock stop reason names the content verdict.
-            "content_filtered" | "guardrail_intervened" => Event::Failed(Failure::refusal(
-                crate::stream_errors::refusal_reason(Some(reason), None),
-            )),
+            "content_filtered" | "guardrail_intervened" => {
+                Event::Failed(crate::content_filter::mark(Failure::refusal(
+                    crate::stream_errors::refusal_reason(Some(reason), None),
+                )))
+            }
             _ => Event::Failed(Failure::new(
                 FailureClass::ProviderInternal,
                 "provider ended the stream unexpectedly",

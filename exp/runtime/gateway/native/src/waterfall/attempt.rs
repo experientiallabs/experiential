@@ -32,6 +32,7 @@ pub(super) async fn run_attempt(
     reactive_repair: bool,
     search_rounds: &[ToolSearchRound],
     sole_rung: bool,
+    content_filter_failover: bool,
 ) -> AttemptEnd {
     let Some(dialect) = Dialect::from_str(&wire.dialect) else {
         // Admission validated every dialect; reaching here is wire drift.
@@ -368,8 +369,18 @@ pub(super) async fn run_attempt(
                 relay.private_progress();
                 continue;
             }
+            // The empty refusal marker an OpenAI-compatible filter finish
+            // (`content_filter`/`safety`) emits ahead of its refusal terminal
+            // is not the model's output: while a rung may still take that
+            // refusal, it waits uncommitted so the ladder can
+            // (`content_filter`). Other dialects' empty markers (Anthropic's
+            // refusal stop) commit as before.
+            let filter_marker = content_filter_failover
+                && dialect == Dialect::OpenAiCompatible
+                && matches!(&event, Event::RefusalDelta(text) if text.is_empty());
             if matches!(event, Event::GeminiThoughtPart(_))
                 || crate::logprobs::withhold_before_commit(&event, refusal_failover)
+                || filter_marker
             {
                 // Gemini thought evidence is already charged to the normalizer's
                 // retained-output and worker budgets; an image model signs each

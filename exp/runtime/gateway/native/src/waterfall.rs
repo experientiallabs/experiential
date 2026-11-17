@@ -32,7 +32,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::encode::compact_json;
-use crate::errors::{Failure, FailureClass, PublicError};
+use crate::errors::{Failure, FailureClass, PublicError, RefusalReason};
 use crate::events::{Event, Usage};
 use crate::metrics::METRICS;
 use crate::relay::{collection_public_error, remaining, UpstreamRelay};
@@ -263,6 +263,9 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
     // A provider context-window rejection may advance the ladder once per
     // request; a second one is the request's real answer.
     let mut context_window_failover_spent = false;
+    // A provider content-filter refusal may advance the ladder once per
+    // request, to a rung of another provider; a second one is the answer.
+    let mut content_filter_failover_spent = false;
     // Once a buffered answer broke mid-body, the caller's first byte is no
     // longer a pre-commit matter: the shared pre-first-byte budget (often
     // spent by then) stops bounding the restart, and the request deadline
@@ -315,6 +318,7 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
                 "header_timeout": failure.header_timeout.map(|phase| phase.as_str()),
                 "context_window_rejected": failure.context_window_rejected,
                 "context_window_limit_tokens": failure.context_window_limit_tokens,
+                "provider_content_filter": failure.provider_content_filter,
             }))),
         }));
         let started_text = match ctx.bridge.call("start_attempt", argument).await {
@@ -426,6 +430,22 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
             &crate::relay::first_byte_timeout_failure(),
             false,
         );
+        // Whether a provider content-filter refusal on this dial may still
+        // advance: once per request, to an untried rung of another provider.
+        let content_filter_failover = !content_filter_failover_spent
+            && fallback_rules::content_filter_successor(ctx.route, depth, &physical_counts);
+        // Whether some rung may take that refusal at all: the one-shot gate,
+        // a `failover_only_on` rung that names it (its own opt-in), or the
+        // alias's refusal failover. While one may, the refusal waits
+        // uncommitted for the ladder.
+        let filter_refusal_successor = content_filter_failover
+            || fallback_rules::successor_available(
+                ctx.route,
+                depth,
+                &physical_counts,
+                &crate::content_filter::mark(Failure::refusal(RefusalReason::ContentPolicy)),
+                ctx.policy.refusal_failover,
+            );
         let mut end = run_attempt(
             ctx,
             guard,
@@ -435,13 +455,17 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
             repair_redial,
             &tool_search_rounds,
             sole_rung,
+            filter_refusal_successor,
         )
         .await;
         // A buffered surface sends the caller nothing before the terminal, so
         // a connection broken mid-body there is still the ladder's to take.
         if ctx.buffered.get(depth).copied().unwrap_or(false) {
             if let AttemptEnd::Committed(committed) = &mut end {
-                if let Some(restart) = buffered::drain(ctx, guard, committed, dial_wire).await {
+                if let Some(restart) =
+                    buffered::drain(ctx, guard, committed, dial_wire, filter_refusal_successor)
+                        .await
+                {
                     end = restart;
                     restarted_after_commit = true;
                 }
@@ -579,6 +603,19 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
                 if failure.context_window_rejected {
                     failure.failover_eligible &= !context_window_failover_spent;
                     context_window_failover_spent = true;
+                }
+                // The provider's own filter refused content nothing has shown
+                // the caller yet: another provider serving the same model may
+                // apply none, so the ladder takes it once (the cache miss is
+                // the price), never to a rung of the same provider. A
+                // `failover_only_on` rung naming the refusal keeps its own
+                // operator opt-in, independent of this one-shot gate.
+                if failure.provider_content_filter
+                    && !failure.failover_eligible
+                    && content_filter_failover
+                {
+                    failure.failover_eligible = true;
+                    content_filter_failover_spent = true;
                 }
                 track_retry_after(&mut largest_retry_after, &failure);
                 let boundary = failure.clone().boundary();
@@ -786,6 +823,8 @@ mod search_round;
 
 #[cfg(test)]
 mod buffered_ladder_tests;
+#[cfg(test)]
+mod content_filter_ladder_tests;
 #[cfg(test)]
 mod ladder_tests;
 #[cfg(test)]

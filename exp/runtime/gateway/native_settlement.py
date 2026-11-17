@@ -204,6 +204,7 @@ def failure_from_boundary_payload(payload: object) -> GatewayFailure | None:
             and context_limit >= 1
             else None
         ),
+        provider_content_filter=data.get("provider_content_filter") is True,
     )
 
 
@@ -424,6 +425,7 @@ def terminal_from_settlement(
             refusal_reason=refusal_reason_from_payload(failure_payload.get("refusal_reason")),
             header_timeout=header_timeout_from_payload(failure_payload.get("header_timeout")),
             tenant_origin=failure_payload.get("tenant_origin") is True,
+            provider_content_filter=failure_payload.get("provider_content_filter") is True,
         )
         if (
             failure.failure_class == GatewayFailureClass.THROTTLED

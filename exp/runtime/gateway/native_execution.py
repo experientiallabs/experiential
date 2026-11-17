@@ -41,6 +41,7 @@ from exp.runtime.gateway.health import (
 )
 from exp.runtime.gateway.model_plan import project_stage_selection
 from exp.runtime.gateway.native_capture import PendingCapture
+from exp.runtime.gateway.native_content_filter import other_providers
 from exp.runtime.gateway.native_context_window import wider_windows
 from exp.runtime.gateway.native_dead_rungs import ADMISSION_DEAD_ERRORS, DeadRung, dead_rung
 from exp.runtime.gateway.native_fallback_rules import (
@@ -412,6 +413,7 @@ def next_route_candidate(
     physical_attempt_counts: list[int] | None = None,
     context_windows: Sequence[int | None] = (),
     rung_families: RungFamilies = (),
+    providers: Sequence[str] = (),
 ) -> int | None:
     """Choose a safe retry or later exact deployment without changing logical model.
 
@@ -502,6 +504,7 @@ def next_route_candidate(
             Read only for a provider context-window rejection.
         rung_families: Each depth's family; a tight budget reaches an undialed
             one before any redial or sibling (``reserve_fresh_families``).
+        providers: Each depth's provider, for a content-filter refusal (``native_content_filter``).
 
     Returns:
         The claimed route index, or ``None`` when the ladder is exhausted.
@@ -511,18 +514,13 @@ def next_route_candidate(
     physical_counts = physical_attempt_counts or attempt_counts
     refusal_eligible = failure.failure_class == GatewayFailureClass.REFUSAL and refusal_failover
     remaining_attempts = maximum_total_attempts - total_attempts
-    depths = wider_windows(
-        untried_depths(
-            fallback_rules or (None,) * len(keys),
-            failure,
-            physical_counts,
-            current_depth,
-            unrestricted=failure.failover_eligible or refusal_eligible,
-        ),
-        failure,
-        current_depth,
-        context_windows,
+    rules = fallback_rules or (None,) * len(keys)
+    unrestricted = failure.failover_eligible or refusal_eligible
+    depths = untried_depths(
+        rules, failure, physical_counts, current_depth, unrestricted=unrestricted
     )
+    depths = wider_windows(depths, failure, current_depth, context_windows)
+    depths = other_providers(depths, failure, current_depth, providers, refusal_failover, rules)
     # A redial spends an attempt on a family already dialed, so it waits while
     # the attempts left are all needed to reach the undialed ones; those come
     # first in the ladder (``reserve_fresh_families``).

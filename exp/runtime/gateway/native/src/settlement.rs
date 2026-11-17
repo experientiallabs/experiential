@@ -151,6 +151,11 @@ fn settle_argument(
             if let Some(phase) = failure.header_timeout {
                 wire["header_timeout"] = json!(phase.as_str());
             }
+            // A provider content-filter refusal, so the attempt row tells it
+            // apart from the model's own content-policy refusal.
+            if failure.provider_content_filter {
+                wire["provider_content_filter"] = json!(true);
+            }
             // A customer-addressed origin's failure: health keeps no nameable
             // cause for it, so a later refusal cannot replay it.
             failure.with_wire_origin(wire)

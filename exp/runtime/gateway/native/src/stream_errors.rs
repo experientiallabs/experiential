@@ -67,7 +67,7 @@ const CBRN_CODES: &[&str] = &[
     "biosecurity",
     "biosecurity_policy",
 ];
-const CONTENT_POLICY_CODES: &[&str] = &[
+pub(crate) const CONTENT_POLICY_CODES: &[&str] = &[
     "content_filter",
     "content_filtered",
     "content_policy_violation",

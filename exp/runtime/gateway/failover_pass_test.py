@@ -611,3 +611,49 @@ def test_a_last_attempt_ordered_past_an_ejected_next_rung_discloses_the_ejection
     assert [row["route_depth"] for row in ledger.started] == list(range(8))
     assert ledger.started[-1]["dispatch_reason"] == "lane_ejected"
     assert ledger.started[-1]["preferred_deployment_id"] == "openrouter-c-0"
+
+
+# A provider's content-filter refusal as the data plane promotes it
+# (`content_filter.rs`): a refusal, failover-eligible once, never redialed.
+_CONTENT_FILTER: JsonObject = {
+    "failure_class": "refusal",
+    "safe_message": "provider refused the request: content policy",
+    "refusal_reason": "content_policy",
+    "failover_eligible": True,
+    "provider_content_filter": True,
+}
+
+
+def _served_by(deployment: ExactModelDeployment, provider: str) -> ExactModelDeployment:
+    """Return ``deployment`` served by ``provider``."""
+    return deployment.model_copy(update={"provider": provider})
+
+
+def test_a_content_filter_refusal_skips_a_rung_of_the_same_provider() -> None:
+    """The next untried rung of another provider takes it; a second Azure lane does not."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    azure_east = _served_by(_deployment("deployment-a", connection_sha256="b" * 64), "azure_openai")
+    azure_west = _served_by(_deployment("deployment-b", connection_sha256="c" * 64), "azure_openai")
+    novita = _deployment("deployment-c", connection_sha256="e" * 64)
+    _admit(registry, (azure_east, azure_west, novita), request_id="filtered")
+    reserved = _fail_with(registry, "filtered", _CONTENT_FILTER)
+    assert reserved["route_depth"] == 2
+    assert ledger.started[-1]["deployment_id"] == "deployment-c"
+
+
+def test_a_content_filter_spill_never_lands_on_a_rung_of_the_same_provider() -> None:
+    """The sideways spill after a shed walks only rungs of another provider."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    lane_a, lane_b = _refusing_pair()
+    azure = _served_by(lane_b, "azure_openai")
+    other_azure = _served_by(
+        _deployment("deployment-c", connection_sha256="e" * 64), "azure_openai"
+    )
+    free = _deployment("deployment-d", connection_sha256="f" * 64)
+    _fill(registry, (lane_a,), 2, "occupied")
+    _admit(registry, (azure, lane_a, other_azure, free), request_id="spill")
+    reserved = _fail_with(registry, "spill", _CONTENT_FILTER)
+    # Depth 1 (another provider) is full and sheds; the spill skips Azure at 2.
+    assert reserved["route_depth"] == 3
