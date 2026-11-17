@@ -249,7 +249,7 @@ def test_output_guardrail_preserves_long_tool_id(length: int) -> None:
     assert GuardrailCompletion(tool_calls=(call,)).tool_calls[0].call_id == "x" * length
 
 
-@pytest.mark.parametrize("wait_ms", [-1, 251])
+@pytest.mark.parametrize("wait_ms", [-1, 5001])
 def test_optional_parallel_wait_cannot_exceed_the_budget(wait_ms: int) -> None:
     """An authored policy cannot disable the response ceiling with an invalid allowance."""
     with pytest.raises(ValueError):
@@ -282,3 +282,17 @@ def test_fail_open_cannot_skip_output_or_rewrite_checks(
             fail_open=True,
             checks=(_check("input", stage=stage, action=action),),
         )
+
+
+@pytest.mark.parametrize("wait_ms", [0, 250, 500, 5000])
+def test_parallel_wait_accepts_configured_bounded_allowance(wait_ms: int) -> None:
+    """An authored policy accepts a configurable bounded response allowance."""
+    policy = GuardrailPolicy(
+        policy_id="optional-input",
+        protected=True,
+        fail_open=True,
+        input_execution="parallel",
+        input_max_wait_ms=wait_ms,
+        checks=(_check("input"),),
+    )
+    assert policy.input_max_wait_ms == wait_ms

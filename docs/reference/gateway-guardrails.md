@@ -143,7 +143,7 @@ without registering or spilling content, then registered through the existing
 collector after approval or expiry. Capture failure still withholds output and
 waives the customer charge. Strict or mixed input policies retain required approval.
 Optional policies with differing budgets retain their per-policy timers under a
-native ceiling equal to the largest budget (at most 250 ms), so an
+native ceiling equal to the largest budget (at most 5000 ms), so an
 expired earlier check cannot prevent a later check from using its remaining time.
 Required output inspection consumes the released input decision and never rejoins
 an expired optional classification task.
@@ -508,8 +508,8 @@ unsupported, malformed, and timed-out classifier results then leave the request
 unchanged. A timely flagged result still applies the authored action. Other
 policies keep their existing uncertainty behavior.
 
-For `input_execution="parallel"`, `input_max_wait_ms` is between 0 and 250
-(default 250). Generation and inspection overlap. The first serving-path or mandatory predispatch boundary blocked on moderation
+For `input_execution="parallel"`, `input_max_wait_ms` is between 0 and 5000 ms
+(default 250 ms). Generation and inspection overlap. The check's `timeout_ms` separately bounds the entire classifier call, including this overlap; increasing the response allowance does not extend the classifier timeout. The first serving-path or mandatory predispatch boundary blocked on moderation
 starts one request-wide wait budget. Later tool
 contexts share the remaining budget and cannot renew it. Expiry records missing
 coverage through the bounded observation recorder. It cannot waive strict sibling

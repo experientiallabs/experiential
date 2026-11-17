@@ -197,7 +197,8 @@ impl PyOptionalInputDecision {
         collector: Option<PyRef<'_, CaptureCollector>>,
         capture_json: Option<&[u8]>,
     ) -> PyResult<Self> {
-        if request_id.is_empty() || wait_ms > 250 || collector.is_some() != capture_json.is_some() {
+        if request_id.is_empty() || wait_ms > 5000 || collector.is_some() != capture_json.is_some()
+        {
             return Err(PyValueError::new_err(
                 "invalid optional input release contract",
             ));
