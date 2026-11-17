@@ -162,6 +162,12 @@ def route_rung_families(route: GatewayRoute) -> RungFamilies:
     )
 
 
+def rung_family_index(route: GatewayRoute, deployment: ExactModelDeployment) -> int:
+    """Name ``deployment``'s family on the wire: the first route depth sharing it."""
+    families = route_rung_families(route)
+    return families.index(families[route.snapshot.deployment_ids.index(deployment.deployment_id)])
+
+
 def fresh_family_count(
     depths: Sequence[int], families: RungFamilies, dispatched: Sequence[int]
 ) -> int:

@@ -36,6 +36,7 @@ from exp.runtime.gateway.native_fallback_rules import (
     route_fallback_rules,
     route_rung_families,
     rule_fallback_reason,
+    rung_family_index,
     untried_depths,
 )
 from exp.runtime.gateway.routing import GatewayRoute
@@ -334,3 +335,16 @@ def test_a_tight_budget_keeps_a_matched_rule_key_ahead_of_a_later_fresh_rung() -
     families = route_rung_families(route)
     dispatched = (1,) * 7 + (0, 0)
     assert reserve_fresh_families((7, 8), families, dispatched, 1) == (7, 8)
+
+
+def test_rung_family_index_names_the_first_depth_of_each_family() -> None:
+    """The wire carries each family as the route depth of its first deployment."""
+    lane = tuple(
+        _deployment(f"lane-{index}").model_copy(
+            update={"billing_source": BillingSource.HOST_MANAGED}
+        )
+        for index in range(3)
+    )
+    nxt = _deployment("next").model_copy(update={"provider": "anthropic"})
+    route = _route(*lane, nxt)
+    assert [rung_family_index(route, item) for item in (*lane, nxt)] == [0, 0, 0, 3]

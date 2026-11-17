@@ -48,6 +48,7 @@ from exp.runtime.gateway.native_fallback_rules import (
     RungFamilies,
     fresh_family_count,
     reserve_fresh_families,
+    rung_family_index,
     untried_depths,
 )
 from exp.runtime.gateway.native_responses import ContinuationContext
@@ -499,9 +500,8 @@ def next_route_candidate(
         context_windows: Each depth's advertised context window (``None``
             when the catalog states none); empty when unknown for the route.
             Read only for a provider context-window rejection.
-        rung_families: Each depth's family (``route_rung_families``); when
-            given, a tight attempt budget reaches an undialed family before
-            a redial or a sibling of a dialed one (``reserve_fresh_families``).
+        rung_families: Each depth's family; a tight budget reaches an undialed
+            one before any redial or sibling (``reserve_fresh_families``).
 
     Returns:
         The claimed route index, or ``None`` when the ladder is exhausted.
@@ -967,6 +967,7 @@ def deployment_wire_entry(
         ),
         "zdr_constrained": zdr_constrained,
         "capture_logprobs": capture_logprobs,
+        "rung_family": rung_family_index(route, deployment),  # throttle redial reserve
     }
 
 

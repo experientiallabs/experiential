@@ -578,6 +578,8 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
                         &failure,
                         throttle_redials[depth],
                         total_attempts,
+                        depth,
+                        &physical_counts,
                     )
                 } else {
                     None

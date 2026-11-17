@@ -322,6 +322,7 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         failover_only_on: None,
         zdr_constrained: false,
         capture_logprobs: false,
+        rung_family: None,
     }
 }
 

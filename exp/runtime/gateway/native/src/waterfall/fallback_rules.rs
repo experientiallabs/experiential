@@ -18,6 +18,8 @@
 //! rung downstream, and whether the depth the control plane answered honors
 //! the rules, failing the request closed when it does not.
 
+use std::collections::HashSet;
+
 use super::wire::DeploymentWire;
 use crate::errors::{Failure, FailureClass, RefusalReason};
 
@@ -127,6 +129,43 @@ pub(crate) fn successor_available(
     })
 }
 
+/// Whether the attempts left must all go to rung families this request has
+/// not dialed yet, so a redial of the failed rung must not spend one (nor
+/// wait a backoff for it). Mirrors the control plane's
+/// `native_fallback_rules.fresh_family_count`: the families with an untried
+/// eligible deployment and no dispatch in this request, compared with
+/// `remaining_attempts` (the next attempt included). A route whose wires
+/// carry no family never reserves.
+pub(crate) fn fresh_family_reserved(
+    route: &[DeploymentWire],
+    depth: usize,
+    dispatched: &[u32],
+    failure: &Failure,
+    remaining_attempts: u32,
+) -> bool {
+    let dialed: HashSet<u32> = route
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| dispatched.get(*index).is_some_and(|count| *count > 0))
+        .filter_map(|(_, wire)| wire.rung_family)
+        .collect();
+    let fresh: HashSet<u32> = route
+        .iter()
+        .enumerate()
+        .filter(|(index, wire)| {
+            untried(dispatched, depth, *index)
+                && match rung_eligibility(wire, failure) {
+                    RungEligibility::Unrestricted => failure.failover_eligible,
+                    RungEligibility::Matched => true,
+                    RungEligibility::Excluded => false,
+                }
+        })
+        .filter_map(|(_, wire)| wire.rung_family)
+        .filter(|family| !dialed.contains(family))
+        .collect();
+    !fresh.is_empty() && fresh.len() as u32 >= remaining_attempts
+}
+
 /// Whether the rung at `depth` should withhold refusal DELTAS for a rule rung
 /// downstream even though the alias revision did not opt into refusal
 /// failover. Refusal text carries no bounded reason, so only a later rung
@@ -206,6 +245,7 @@ mod tests {
             failover_only_on: tokens.map(|set| set.iter().map(|t| t.to_string()).collect()),
             zdr_constrained: false,
             capture_logprobs: false,
+            rung_family: None,
         }
     }
 
@@ -402,5 +442,44 @@ mod tests {
         assert!(dial_admitted(&plain, Some(0), 1, Some(&throttled())));
         // A same-depth redial on a rule rung is that rung's own business.
         assert!(dial_admitted(&rule, Some(1), 1, Some(&throttled())));
+    }
+
+    /// Eight connections of one family, then a second family, all tagged.
+    fn lane_then_next(families: bool) -> Vec<DeploymentWire> {
+        (0..9)
+            .map(|index| DeploymentWire {
+                rung_family: families.then_some(if index < 8 { 0 } else { 8 }),
+                ..rung(None)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_last_attempts_are_reserved_for_an_undialed_family() {
+        let route = lane_then_next(true);
+        let seven = [1, 1, 1, 1, 1, 1, 1, 0, 0];
+        // One attempt left and the next family untried: no redial, no wait.
+        assert!(fresh_family_reserved(&route, 6, &seven, &throttled(), 1));
+        // Two left: a redial still leaves the next family its attempt.
+        assert!(!fresh_family_reserved(&route, 6, &seven, &throttled(), 2));
+        // The next family already dialed: nothing to reserve for.
+        let dialed = [1, 1, 1, 1, 1, 1, 1, 0, 1];
+        assert!(!fresh_family_reserved(&route, 6, &dialed, &throttled(), 1));
+        // Wires without families (an older admission) never reserve.
+        assert!(!fresh_family_reserved(
+            &lane_then_next(false),
+            6,
+            &seven,
+            &throttled(),
+            1
+        ));
+    }
+
+    #[test]
+    fn a_rule_rung_the_failure_does_not_match_is_not_reserved_for() {
+        let mut route = lane_then_next(true);
+        route[8].failover_only_on = Some(vec!["refusal:cyber_policy".to_string()]);
+        let seven = [1, 1, 1, 1, 1, 1, 1, 0, 0];
+        assert!(!fresh_family_reserved(&route, 6, &seven, &throttled(), 1));
     }
 }
