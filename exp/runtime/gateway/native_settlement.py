@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from exp.common.core.artifacts import JsonObject, stable_id
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayEvent,
@@ -76,11 +77,27 @@ def exhausted_attempt_payload(failure: GatewayFailure, *, known_unbilled: bool =
     return json.dumps(result, separators=(",", ":"))
 
 
-def budget_quota_failure() -> GatewayFailure:
-    """Return the sanitized quota failure after no route can reserve its cost."""
+# The gateway's own monthly hard limits, named by the scope that refused. A
+# rejection that carries its ledger's ``public_message`` answers that instead.
+_BUDGET_SCOPE_MESSAGES: dict[BudgetScopeKind, str] = {
+    BudgetScopeKind.TEAM: "your team's monthly gateway budget is used up",
+    BudgetScopeKind.IDENTITY: "your monthly gateway budget for this caller is used up",
+    BudgetScopeKind.POOL: "the monthly gateway budget for this model is used up",
+    BudgetScopeKind.DEPLOYMENT: "every route for this model has used up its monthly gateway budget",
+}
+
+
+def budget_quota_failure(rejection: BudgetReservationRejected) -> GatewayFailure:
+    """Return the sanitized quota failure for a reservation a hard limit refused.
+
+    The ledger's ``public_message`` when it gave one (it knows the real gate:
+    credits, a key cap, a plan allowance), else the sentence naming which of
+    the gateway's monthly budgets refused. The ledger's ``reason`` is never
+    used: it may name internal pool or deployment identifiers.
+    """
     return GatewayFailure(
         failure_class=GatewayFailureClass.QUOTA_EXCEEDED,
-        safe_message="monthly gateway allocation is exhausted",
+        safe_message=rejection.public_message or _BUDGET_SCOPE_MESSAGES[rejection.scope_kind],
     )
 
 
@@ -870,10 +887,18 @@ def optional_text(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def budget_quota_protocol_error() -> OpenAIProtocolError:
-    """Return the public quota error for an exhausted monthly allocation."""
-    failure = GatewayFailure(
-        failure_class=GatewayFailureClass.QUOTA_EXCEEDED,
-        safe_message="monthly gateway allocation is exhausted",
-    )
-    return public_failure_error(failure)
+def budget_quota_protocol_error(rejection: BudgetReservationRejected) -> OpenAIProtocolError:
+    """Return the public quota error for a reservation a hard limit refused.
+
+    A ledger's ``public_message`` is rendered verbatim: it states its own
+    remedy, and the monthly reset suffix and month-end ``Retry-After`` belong
+    only to the gateway's own monthly budgets.
+    """
+    if rejection.public_message is not None:
+        return OpenAIProtocolError(
+            status_code=429,
+            code="insufficient_quota",
+            message=rejection.public_message,
+            error_type="insufficient_quota",
+        )
+    return public_failure_error(budget_quota_failure(rejection))

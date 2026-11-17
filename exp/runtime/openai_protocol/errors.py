@@ -268,7 +268,7 @@ def public_failure_error(
         retry_after_seconds = max(1, math.ceil((reset - moment).total_seconds()))
         boundary = reset.isoformat().replace("+00:00", "Z")
         message = (
-            f"{message}. The allocation resets at {boundary}; retry after that time "
+            f"{message}. It resets at {boundary}; retry after that time "
             "or ask the gateway operator to raise the monthly budget."
         )
     # A refusal names its bounded category to the caller; an unnamed one is
