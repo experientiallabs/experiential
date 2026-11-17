@@ -229,6 +229,26 @@ describe("runner", () => {
     for (const skill of ["docx", "xlsx", "pptx", "pdf", "charts", "data-analysis"]) expect(system).toContain(`<name>${skill}</name>`);
   });
 
+  it("holds the conversation's instructions in the system prompt of every run, never in a user or assistant message", async () => {
+    writeSpec({ instructions: "Ask one question at a time." });
+    await run([{ text: "One." }]);
+    writeSpec({ prompt: "and again", instructions: "Ask one question at a time." });
+    await run([{ text: "Two." }]);
+    const messages = gateway.completions().at(-1)!.messages as { role: string; content: unknown }[];
+    expect(JSON.stringify(messages[0])).toContain("<conversation>");
+    expect(JSON.stringify(messages[0])).toContain("Ask one question at a time.");
+    // Only the system prompt carries them: no user, assistant or tool message repeats them, and
+    // the model sees them exactly once.
+    expect(messages.filter((message) => message.role !== "system").some((message) => JSON.stringify(message.content).includes("Ask one question at a time."))).toBe(false);
+    expect(JSON.stringify(messages).split("Ask one question at a time.").length - 1).toBe(1);
+  });
+
+  it("adds no conversation section when a run carries no instructions", async () => {
+    writeSpec();
+    await run([{ text: "ok" }]);
+    expect(JSON.stringify((gateway.completions()[0]?.messages as { content: unknown }[])[0])).not.toContain("<conversation>");
+  });
+
   it("sends the chosen reasoning effort on every model call", async () => {
     writeSpec({ reasoningEffort: "low" });
     await run([{ text: "ok" }]);
