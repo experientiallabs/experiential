@@ -140,7 +140,7 @@ as `@experiential-labs/exp-code/protocol`):
 
 | File | Direction | Contents |
 |---|---|---|
-| `runs/<runId>/run.json` | in | The `RunSpec`: model, prompt, attachments, gateway URL, turn and time limits, callback and event-push URLs, and optional `instructions` (the conversation's standing instructions, which the runner puts in a `conversation` section of the system prompt on every run, so they hold on every turn and survive compaction). |
+| `runs/<runId>/run.json` | in | The `RunSpec`: model, prompt, attachments, gateway URL, turn and time limits, callback and event-push URLs. |
 | `runs/<runId>/events.jsonl` | out | One `RunEvent` per line, `seq` from 1, append-only: `run_start`, `user_message`, `text`, `thinking`, `tool_start`, `tool_update`, `tool_end`, `todo`, `question`, `turn`, `files`, `error`, `run_end`. |
 | `runs/<runId>/inbox.jsonl` | in | `{"type":"steer","text":...}` or `{"type":"stop"}`, each with an optional `requestId`; a repeated `requestId` is ignored. |
 | `runs/<runId>/status.json` | out | `RunStatus` with a heartbeat every 5 seconds. |

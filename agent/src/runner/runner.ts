@@ -244,7 +244,7 @@ export async function runOnce(options: RunnerOptions): Promise<RunEndStatus> {
     if (reasons) extra.include_reasoning = true;
     if (Object.keys(extra).length > 0) pi.on("before_provider_request", (event) => ({ ...(event.payload as Record<string, unknown>), ...extra }));
     // The conversation's standing instructions: a system prompt section on every run, never a
-    // message, so they hold across turns and compaction.
+    // user or assistant message, so they hold across turns and compaction.
     if (spec.instructions) pi.on("before_agent_start", (event) => addConversationSection(event.systemPromptOptions, spec.instructions));
   };
   const resourceLoader = new DefaultResourceLoader({

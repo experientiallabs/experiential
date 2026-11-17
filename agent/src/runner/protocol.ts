@@ -51,8 +51,9 @@ export interface RunSpec {
   /**
    * Standing instructions for the whole conversation (a setup guide, for example), or null or
    * absent for none. The runner puts them in their own section of the system prompt on every run,
-   * so they hold on every turn and survive compaction; they never enter the transcript. The host
-   * sends them with every run of the conversation.
+   * so they hold on every turn and survive compaction. They are system prompt, never a user or
+   * assistant message (Pi records system prompt sections in the session file like any other
+   * section). The host sends them with every run of the conversation.
    */
   instructions?: string | null;
 }
