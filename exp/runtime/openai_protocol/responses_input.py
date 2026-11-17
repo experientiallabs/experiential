@@ -21,17 +21,15 @@ from exp.runtime.openai_protocol.custom_tool_wire import (
 )
 from exp.runtime.openai_protocol.errors import invalid_field
 from exp.runtime.openai_protocol.responses_input_items import (
+    HOSTED_TOOL_ITEM_TYPES_TOOL,
     AgentMessageItem,
     CompactionTriggerItem,
     ConfigurationUpdateItem,
     ContextCompactionItem,
+    HostedToolItemEcho,
     ItemReferenceItem,
 )
-from exp.runtime.openai_protocol.wire_models import (
-    HOSTED_TOOL_ITEM_TYPES_TOOL,
-    _AdditionalToolsItem,
-    _HostedToolItemEcho,
-)
+from exp.runtime.openai_protocol.wire_models import _AdditionalToolsItem
 
 NativeInputRole = Literal["developer", "user", "assistant", "tool"]
 """The canonical role a verbatim-carried input item holds its place under."""
@@ -40,7 +38,7 @@ NATIVE_INPUT_ITEMS = (
     _AdditionalToolsItem,
     CustomToolCallItem,
     CustomToolCallOutputItem,
-    _HostedToolItemEcho,
+    HostedToolItemEcho,
     AgentMessageItem,
     CompactionTriggerItem,
     ContextCompactionItem,
@@ -58,7 +56,7 @@ def native_input_role(
     item: _AdditionalToolsItem
     | CustomToolCallItem
     | CustomToolCallOutputItem
-    | _HostedToolItemEcho
+    | HostedToolItemEcho
     | AgentMessageItem
     | CompactionTriggerItem
     | ContextCompactionItem
@@ -80,7 +78,7 @@ def native_input_role(
         The canonical role the carried item holds its place under.
     """
     match item:
-        case _HostedToolItemEcho():
+        case HostedToolItemEcho():
             return "tool" if item.type in HOSTED_TOOL_ITEM_TYPES_TOOL else "assistant"
         case CustomToolCallItem() | ContextCompactionItem() | ItemReferenceItem():
             return "assistant"

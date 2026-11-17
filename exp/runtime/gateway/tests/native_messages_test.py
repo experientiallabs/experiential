@@ -3596,6 +3596,8 @@ def test_responses_max_tool_calls_reaches_the_native_responses_provider(
     )
     assert response.status_code == 200, response.text
     assert "x-experiential-ignored-parameters" not in response.json()
+    # The accepted cap is reflected on the response object, as OpenAI does.
+    assert response.json()["max_tool_calls"] == 2
     with _ResponsesUpstream.payloads_lock:
         dispatched = _ResponsesUpstream.payloads[before:]
     assert len(dispatched) == 1
@@ -3618,6 +3620,7 @@ def test_responses_max_tool_calls_is_gateway_enforced_on_a_compatible_provider(
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "completed"
     assert "x-experiential-ignored-parameters" not in response.json()
+    assert response.json()["max_tool_calls"] == 1
     with _SseUpstream.payloads_lock:
         dispatched = _SseUpstream.payloads[before:]
     assert len(dispatched) == 1

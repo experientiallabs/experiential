@@ -199,6 +199,26 @@ def test_responses_sse_exposes_ignored_compatibility_parameters() -> None:
     assert response["x-experiential-ignored-parameters"] == ["reasoning.summary"]
 
 
+def test_responses_sse_reflects_the_tool_call_budget_only_when_sent() -> None:
+    """The caller's ``max_tool_calls`` appears on the response object, like OpenAI's."""
+
+    def envelope(budget: int | None) -> JsonObject:
+        """Encode the start frame for one request and return its response object."""
+        request = GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(GatewayMessage(role="user", content="weather"),),
+            stream=True,
+            max_tool_calls=budget,
+        )
+        encoder = ResponsesSseEncoder(
+            request_id="request-budget", model="coding", created_at=123, request=request
+        )
+        return cast(JsonObject, _responses_payload(encoder.start()[0])["response"])
+
+    assert envelope(3)["max_tool_calls"] == 3
+    assert "max_tool_calls" not in envelope(None)
+
+
 def test_responses_sse_preserves_reasoning_summary_items() -> None:
     """Reasoning summary deltas become official streaming and terminal output items."""
     request = GatewayRequest(

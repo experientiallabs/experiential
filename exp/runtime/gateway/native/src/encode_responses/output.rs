@@ -92,6 +92,12 @@ impl ResponsesSseEncoder {
                 Value::Null
             },
         });
+        if let Some(limit) = self.envelope.max_tool_calls {
+            response
+                .as_object_mut()
+                .expect("response envelope is an object")
+                .insert("max_tool_calls".to_string(), json!(limit));
+        }
         if !self.envelope.ignored_parameters.is_empty() {
             response
                 .as_object_mut()

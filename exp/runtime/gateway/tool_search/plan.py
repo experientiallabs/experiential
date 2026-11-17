@@ -14,8 +14,9 @@
   rebuilt dispatch per round (:mod:`exp.runtime.gateway.tool_search.round`).
 * A declaration with no deferred tools has nothing to search: the carriers
   are stripped and the drop is disclosed.
-* A Responses ``max_tool_calls`` budget caps the gateway's search rounds (each
-  round is one built-in tool call). A budget the gateway's web search already
+* A Responses ``max_tool_calls`` budget bounds the gateway's searches: each
+  search call is one built-in tool call, so the rounds are capped by it and a
+  round's parallel calls past it are answered as not run. A budget the gateway's web search already
   spent leaves no round: the search is dropped with disclosure and every tool
   loads directly, as on any wire without deferred loading.
 """
@@ -54,6 +55,17 @@ class ToolSearchState:
     Mutable on purpose: each round moves matched tools from ``deferred`` into
     ``loaded`` and advances ``rounds_done``; the rebuilt dispatch reads the
     current partition.
+
+    Attributes:
+        search: The caller's declaration (``max_rounds`` already capped by the budget).
+        tool_name: Name of the gateway's search function tool.
+        loaded: Tools the provider receives directly.
+        deferred: The searchable corpus not yet loaded.
+        rounds_done: Completed search rounds.
+        rounds: The rendered facts of every executed search, in order.
+        call_budget: Searches the Responses ``max_tool_calls`` budget still
+            allows (each search is one built-in call), or ``None`` without a
+            budget. Calls past it are answered as not run and never executed.
     """
 
     search: GatewayToolSearch
@@ -62,12 +74,12 @@ class ToolSearchState:
     deferred: list[GatewayToolDefinition]
     rounds_done: int = 0
     rounds: list[JsonObject] = field(default_factory=list)
-    """The rendered facts of every completed round, in order."""
+    call_budget: int | None = None
 
     @property
     def exhausted(self) -> bool:
-        """Whether the model has spent its search rounds."""
-        return self.rounds_done >= self.search.max_rounds
+        """Whether the model has spent its search rounds or its built-in call budget."""
+        return self.rounds_done >= self.search.max_rounds or self.call_budget == 0
 
     def gateway_tool(self) -> GatewayToolDefinition:
         """The function tool the model calls to search the deferred corpus."""
@@ -219,7 +231,9 @@ def plan_tool_search(request: GatewayRequest, dialects: Sequence[str]) -> ToolSe
         updates["tool_choice"] = choice.model_copy(
             update={"names": (*(tool.name for tool in loaded), tool_name)}
         )
-    state = ToolSearchState(search=search, tool_name=tool_name, loaded=loaded, deferred=deferred)
+    state = ToolSearchState(
+        search=search, tool_name=tool_name, loaded=loaded, deferred=deferred, call_budget=budget
+    )
     stripped = strip_search_carriers(request)
     dispatch = stripped.model_copy(update={"tools": state.dispatch_tools(), **updates})
     admission: JsonObject = {

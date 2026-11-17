@@ -661,9 +661,7 @@ def decode_responses(
         if developer_index is not None:
             developer_messages_param = f"input.{developer_index}.role"
     return DecodedGatewayRequest(
-        alias=alias,
-        request=canonical,
-        developer_messages_param=developer_messages_param,
+        alias=alias, request=canonical, developer_messages_param=developer_messages_param
     )
 
 

@@ -121,3 +121,25 @@ def test_last_round_removes_the_search_tool() -> None:
     assert outcome.exhausted
     assert "tool_search" not in [tool.name for tool in outcome.request.tools]
     assert outcome.rounds[0]["matched"] == []
+
+
+def test_parallel_searches_past_the_tool_call_budget_are_answered_but_never_run() -> None:
+    """``max_tool_calls`` counts each search call, so one round cannot overspend it."""
+    plan = _planned()
+    assert plan.state is not None
+    plan.state.call_budget = 1
+    calls = [
+        WithheldSearchCall("c1", "tool_search", '{"query":"weather"}'),
+        WithheldSearchCall("c2", "tool_search", '{"query":"flight"}'),
+    ]
+    outcome = perform_round(plan.request, plan.state, calls)
+    # Only the first search ran (and is rendered); the second is answered as not run.
+    assert [entry["call_id"] for entry in outcome.rounds] == ["c1"]
+    assert plan.state.call_budget == 0
+    assert outcome.exhausted
+    assert "book_flight" not in [tool.name for tool in plan.state.loaded]
+    results = [message for message in outcome.request.messages if message.role == "tool"]
+    assert [message.tool_call_id for message in results] == ["c1", "c2"]
+    assert json.loads(results[1].content or "{}")["error"].startswith("max_tool_calls reached")
+    # The search tool is withdrawn once the budget is spent.
+    assert "tool_search" not in [tool.name for tool in outcome.request.tools]

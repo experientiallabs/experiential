@@ -564,4 +564,6 @@ def responses_envelope(request: GatewayRequest) -> JsonObject:
         "max_output_tokens": request.maximum_output_tokens,
         "previous_response_id": request.previous_response_id,
         "include_encrypted_reasoning": request.include_encrypted_reasoning,
+        # Reflected only when the caller sent it, like ``reasoning.context``.
+        **({} if request.max_tool_calls is None else {"max_tool_calls": request.max_tool_calls}),
     }
