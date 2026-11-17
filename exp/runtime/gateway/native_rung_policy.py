@@ -39,6 +39,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.fleet_lanes import FleetLane, FleetUsage
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.lane_saturation import failover_overflow_cap, priority_overflow_ceiling
+from exp.runtime.gateway.native_content_filter import route_providers
 from exp.runtime.gateway.native_context_window import route_context_windows
 from exp.runtime.gateway.native_execution import (
     THROTTLE_BACKOFF,
@@ -317,6 +318,7 @@ def failed_dispatch_candidate(
         physical_attempt_counts=entry.attempt_counts,
         context_windows=route_context_windows(route),
         rung_families=route_rung_families(route, entry.denied_destination_pools),
+        providers=route_providers(route),
     )
     disposition = throttle_disposition(
         failure,

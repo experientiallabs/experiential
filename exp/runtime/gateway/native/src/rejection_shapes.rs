@@ -490,10 +490,10 @@ pub struct FilteredCompletion {
 /// The envelope readers see no error there, so 438 such refusals in 48h
 /// settled as the generic request-shape 400 with no detail. The finish reason
 /// is the authoritative verdict: a `content_filter`/`safety` finish on the
-/// first choice is the model's answer to the content, never a request-shape
-/// error, and the nested code names the category. Only the OpenAI-compatible
-/// chat wire is read; other dialects state their verdicts in their own
-/// envelopes.
+/// first choice is the provider's content filter refusing the content, never
+/// a request-shape error, and the nested code names the category. Only the
+/// OpenAI-compatible chat wire is read; other dialects state their verdicts
+/// in their own envelopes.
 ///
 /// A STREAMING request gets the same verdict as an SSE body under the 4xx
 /// (live 2026-10-17, 29 events in five hours): `data: {"object":

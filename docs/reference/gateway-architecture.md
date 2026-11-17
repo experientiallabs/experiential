@@ -222,7 +222,7 @@ applies the same rule after commitment, when every committed event was one it ca
 Provider-internal retry layers are disabled so every
 possible billable dispatch is visible to the gateway ledger.
 See [graceful connection retirement](gateway-failover-rules.md#graceful-connection-retirement) for the health-only HTTP/2 hint.
-Transport failures, buffered answers broken mid-body, and context-window refusals: [failover rules](gateway-failover-rules.md#transport-buffered-answers-and-context-windows).
+Transport failures, buffered answers broken mid-body, and context-window refusals: [failover rules](gateway-failover-rules.md#transport-buffered-answers-and-context-windows); provider content-filter refusals: [failover rules](gateway-failover-rules.md#provider-content-filters).
 
 **Which rung a failover reaches.** A pre-commit failover-eligible failure advances to the first
 claimable rung this request has NOT dispatched yet, in route order, so a rung skipped earlier (shed

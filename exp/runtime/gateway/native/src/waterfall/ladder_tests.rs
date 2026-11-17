@@ -43,7 +43,7 @@ class Plane:
     def configure(self, argument):
         data = json.loads(argument)
         with self.lock:
-            self.rules = data.get("rules", self.rules)
+            self.rules = data.get("rules", self.rules); self.counts = [0] * len(self.rules)
             self.first_depth = data.get("first_depth")
             self.refusal_failover = data.get("refusal_failover", self.refusal_failover)
         return "{}"
@@ -888,7 +888,7 @@ fn gemini_relay_refusal_http_and_sse_stop_the_default_ladder_and_settle_once() {
                     "refusal_reason": "content_policy",
                     "provider_detail": detail,
                     "customer_owned": false,
-                    "retry_after_seconds": null,
+                    "retry_after_seconds": null, "provider_content_filter": true,
                 }),
             );
         });

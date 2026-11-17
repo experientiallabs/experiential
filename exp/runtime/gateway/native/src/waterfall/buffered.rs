@@ -22,17 +22,22 @@ use crate::settlement::AttemptGuard;
 
 /// Whether a failure met while draining a buffered attempt may restart it on
 /// the ladder: an upstream connection, stall or provider-side fault the data
-/// plane classified as redialable or failover-eligible. Caller-owned, content
-/// and gateway-internal failures (an output overflow, an exhausted retention
-/// budget) keep the surface's own answer.
-pub(super) fn restartable(failure: &Failure) -> bool {
-    matches!(
+/// plane classified as redialable or failover-eligible, or a provider
+/// content-filter refusal when `content_filter_failover` (the waterfall's
+/// verdict that another provider's rung may still take one). Caller-owned,
+/// model-content and gateway-internal failures (an output overflow, an
+/// exhausted retention budget) keep the surface's own answer.
+pub(super) fn restartable(failure: &Failure, content_filter_failover: bool) -> bool {
+    let broken = matches!(
         failure.failure_class,
         FailureClass::Transport
             | FailureClass::Timeout
             | FailureClass::ProviderInternal
             | FailureClass::MalformedResponse
-    ) && (failure.failover_eligible || failure.retryable_same_deployment)
+    ) && (failure.failover_eligible || failure.retryable_same_deployment);
+    // The provider's own content filter cut an answer the caller has not
+    // received, and another provider's rung may still take it.
+    broken || (failure.provider_content_filter && content_filter_failover)
 }
 
 /// Whether `event` reports a tool the provider itself executes, whose
@@ -50,7 +55,8 @@ pub(super) fn provider_executed(event: &Event) -> bool {
     )
 }
 
-/// Drain `committed` for a buffered surface. `None` keeps the attempt as the
+/// Drain `committed` for a buffered surface (`content_filter_failover` as
+/// for [`restartable`]). `None` keeps the attempt as the
 /// winner: either its whole answer now sits in `prefix` (terminal last), or
 /// a failure the ladder must not restart is parked in `collection_failure`
 /// for the surface to answer exactly as before. `Some` is the ladder end the
@@ -60,6 +66,7 @@ pub(super) async fn drain(
     guard: &mut AttemptGuard,
     committed: &mut CommittedAttempt,
     wire: &DeploymentWire,
+    content_filter_failover: bool,
 ) -> Option<AttemptEnd> {
     let phase_timeout = Duration::from_secs_f64(wire.timeout_seconds.max(0.001));
     let mut provider_ran_tool = false;
@@ -75,7 +82,9 @@ pub(super) async fn drain(
     let failure = match collected {
         Ok(mut events) => match events.last() {
             // A provider-declared mid-body failure the caller has not seen.
-            Some(Event::Failed(failure)) if restartable(failure) && !provider_ran_tool => {
+            Some(Event::Failed(failure))
+                if restartable(failure, content_filter_failover) && !provider_ran_tool =>
+            {
                 let failure = failure.clone();
                 events.clear();
                 failure
@@ -85,7 +94,9 @@ pub(super) async fn drain(
                 return None;
             }
         },
-        Err(failure) if restartable(&failure) && !provider_ran_tool => failure,
+        Err(failure) if restartable(&failure, content_filter_failover) && !provider_ran_tool => {
+            failure
+        }
         Err(failure) => {
             committed.collection_failure = Some(failure);
             return None;
@@ -94,9 +105,12 @@ pub(super) async fn drain(
     // The failed attempt keeps the upstream label the relay already parsed.
     guard.record_upstream_provider(committed.relay.upstream_provider());
     committed.relay.close_transport();
+    // A filter cut restarts under the alias's own refusal failover too.
+    let refusal_eligible =
+        failure.failure_class == FailureClass::Refusal && ctx.policy.refusal_failover;
     Some(AttemptEnd::Ladder {
         failure,
-        refusal_eligible: false,
+        refusal_eligible,
         exhaustion_flush: Vec::new(),
         usage: committed.usage.take(),
         tool_names: std::mem::take(&mut committed.tool_names),

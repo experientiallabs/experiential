@@ -103,6 +103,25 @@ pub(crate) fn untried(dispatched: &[u32], depth: usize, index: usize) -> bool {
     index != depth && dispatched.get(index).is_none_or(|count| *count == 0)
 }
 
+/// Whether a provider content-filter refusal at `depth` may advance: some
+/// unrestricted rung this request has not dispatched is served by a provider
+/// other than the refusing rung's. The control plane re-checks with health
+/// and capacity state and may still answer exhaustion.
+pub(crate) fn content_filter_successor(
+    route: &[DeploymentWire],
+    depth: usize,
+    dispatched: &[u32],
+) -> bool {
+    let Some(refusing) = route.get(depth) else {
+        return false;
+    };
+    route.iter().enumerate().any(|(index, wire)| {
+        untried(dispatched, depth, index)
+            && wire.failover_only_on.is_none()
+            && wire.provider != refusing.provider
+    })
+}
+
 /// Whether some untried rung may take `failure`: an unrestricted rung when
 /// `unrestricted_advance` (the route policy's own verdict on the failure)
 /// holds, or any rung whose set names the failure. Untried includes a rung

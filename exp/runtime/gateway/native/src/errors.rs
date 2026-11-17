@@ -367,6 +367,11 @@ pub struct Failure {
     /// The window the rejecting provider stated, when its sentence names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_limit_tokens: Option<u32>,
+    /// A provider's own content filter (not the model declining) refused the
+    /// request or its output: the waterfall may take it once to an untried
+    /// rung of another provider (`content_filter.rs`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub provider_content_filter: bool,
 }
 
 /// Which bound ended a dial waiting for its provider's response headers.
@@ -409,6 +414,7 @@ impl Failure {
             header_timeout: None,
             context_window_rejected: false,
             context_window_limit_tokens: None,
+            provider_content_filter: false,
         }
     }
 

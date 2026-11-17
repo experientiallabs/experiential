@@ -181,6 +181,7 @@ impl Normalizer {
                     }
                     Some("refusal") => {
                         self.refusal_seen = true;
+                        self.model_refusal_seen = true;
                         events.push(Event::RefusalDelta(optional_text(
                             block,
                             "refusal",
@@ -256,6 +257,7 @@ impl Normalizer {
                     }
                     Some("refusal_delta") => {
                         self.refusal_seen = true;
+                        self.model_refusal_seen = true;
                         events.push(Event::RefusalDelta(optional_text(
                             delta,
                             "refusal",

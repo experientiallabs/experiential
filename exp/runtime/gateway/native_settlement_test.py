@@ -1002,3 +1002,36 @@ def test_boundary_payload_carries_a_context_window_rejection() -> None:
         )
         assert parsed is not None
         assert parsed.context_window_limit_tokens is None
+
+
+def test_boundary_payload_carries_a_provider_content_filter() -> None:
+    """The data plane's content-filter verdict reaches the candidate choice intact."""
+    payload = {
+        "failure_class": "refusal",
+        "safe_message": "provider refused the request: content policy",
+        "failover_eligible": True,
+        "provider_content_filter": True,
+    }
+    failure = failure_from_boundary_payload(payload)
+    assert failure is not None and failure.provider_content_filter is True
+    # Anything but a literal true fails closed to "not a provider filter".
+    for flag in (1, "true", None):
+        parsed = failure_from_boundary_payload({**payload, "provider_content_filter": flag})
+        assert parsed is not None and parsed.provider_content_filter is False
+
+
+def test_terminal_from_settlement_carries_the_provider_content_filter() -> None:
+    """The settled attempt row tells the provider's filter from the model's refusal."""
+    for flag, expected in ((True, True), (None, False)):
+        payload: dict[str, object] = {
+            "failure_class": "refusal",
+            "safe_message": "provider refused the request: content policy",
+            "refusal_reason": "content_policy",
+        }
+        if flag is not None:
+            payload["provider_content_filter"] = flag
+        _terminal, failure = terminal_from_settlement(
+            {"outcome": "failed", "usage": None, "tool_names": [], "failure": payload}
+        )
+        assert failure is not None
+        assert failure.provider_content_filter is expected
