@@ -165,6 +165,7 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
         and request.provider_preferences is None
         and request.web_search is None
         and request.tool_search is None
+        and request.max_tool_calls is None
     ):
         return None
     envelope: JsonObject = {
@@ -217,6 +218,9 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
     if request.tool_search is not None:
         # Deferred-tool discovery changes what the model can see and call.
         envelope["tool_search"] = request.tool_search.model_dump(mode="json")
+    if request.max_tool_calls is not None:
+        # A built-in tool-call budget changes what the response may do.
+        envelope["max_tool_calls"] = request.max_tool_calls
     if retained_tools:
         envelope["tools"] = retained_tools
     if request.provider_beta_tokens:

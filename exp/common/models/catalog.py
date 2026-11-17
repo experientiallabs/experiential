@@ -453,9 +453,8 @@ class GatewayDeploymentCapabilities(ContractModel):
         supports_tool_call_limit: Whether a caller's Responses ``max_tool_calls`` limit can be
             preserved.
 
-            False means the capability is not declared. The public Responses surface currently
-            refuses the field, so no authored catalog should set this until a route honors the
-            cap.
+            Not consulted for routing: every route honors the cap (native Responses routes
+            forward it, other routes run their built-in tools in the gateway, which enforces it).
         supports_structured_text: Whether schema-constrained text output is supported.
         supports_stop_sequences: Whether caller-specified stop sequences are supported.
         supports_image_input: Whether the wire and model accept images; else images are refused.

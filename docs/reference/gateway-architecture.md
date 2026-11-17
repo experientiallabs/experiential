@@ -399,7 +399,7 @@ which the dispatch also adds whenever `thinking.display` is `updates`, since the
 `anthropic-beta.<token>` disclosure, never a rejection and never a blind forward. On the Responses surface, `client_metadata` and `text.verbosity` forward on native rungs
 and drop with disclosure elsewhere. Chat `verbosity` accepts `low`, `medium`, or `high` as the
 same hint: forwarded as `text.verbosity` on native Responses routes and omitted with a
-`verbosity` disclosure on other routes. Invalid values remain named parameter errors.
+`verbosity` disclosure on other routes. Invalid values remain named parameter errors. Responses `max_tool_calls` (a positive integer; null reads as absent) forwards on all-native Responses routes (capped at OpenRouter's own maximum of 30) and is enforced by the gateway elsewhere, where only the gateway runs built-in tools: its one web search counts against the budget and tool-search rounds are capped by the remainder (none left drops the search with a `tool_search->dropped(max_tool_calls)` disclosure). Chat defines no such field.
 Codex-native input items (`additional_tools` tool namespaces,
 `custom_tool_call`/`custom_tool_call_output` freeform history) and non-function top-level tool
 declarations (`custom` freeform-grammar tools, `namespace` tool trees, `web_search`,

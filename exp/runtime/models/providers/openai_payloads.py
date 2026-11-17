@@ -121,6 +121,7 @@ def openai_responses_stream_payload(
     omits_output_token_limit: bool = False,
     requests_reasoning_summary: bool = False,
     forwards_web_search_sources: bool = True,
+    max_tool_calls_ceiling: int | None = None,
 ) -> JsonObject:
     """Translate one canonical request to native streaming Responses JSON.
 
@@ -140,6 +141,9 @@ def openai_responses_stream_payload(
             ``web_search_call.action.sources`` include selector. OpenRouter's
             Responses endpoint relays OpenAI's web search but refuses the
             selector ("Invalid Responses API request"), so it is left off there.
+        max_tool_calls_ceiling: The origin's own ``max_tool_calls`` maximum, or
+            ``None``. A larger caller budget is sent as the ceiling, which the
+            origin enforces anyway, so the effective limit is unchanged.
         forwards_prompt_cache_options: Whether this origin carries
             ``prompt_cache_options.mode`` and ``prompt_cache_breakpoint``. A
             marked instruction then rides an input item, since top-level
@@ -248,6 +252,13 @@ def openai_responses_stream_payload(
     add_openai_tools(payload, request, responses=True)
     if request.parallel_tool_calls is not None:
         payload["parallel_tool_calls"] = request.parallel_tool_calls
+    if request.max_tool_calls is not None:
+        # The provider runs its hosted tools on this wire and enforces the cap.
+        payload["max_tool_calls"] = (
+            request.max_tool_calls
+            if max_tool_calls_ceiling is None
+            else min(request.max_tool_calls, max_tool_calls_ceiling)
+        )
     if request.client_metadata is not None:
         # Opaque client telemetry, forwarded verbatim (standard Responses
         # surface: accepted live with a plain API key, 2026-08-29).

@@ -436,6 +436,19 @@ def responses_origin_refuses_web_search_sources(profile: GatewayWireProfile) -> 
     )
 
 
+OPENROUTER_RESPONSES_MAX_TOOL_CALLS = 30
+"""OpenRouter's Responses ``max_tool_calls`` default and maximum (its OpenAPI
+``ResponsesRequest`` schema, read 2026-11-16)."""
+
+
+def responses_origin_tool_call_ceiling(profile: GatewayWireProfile) -> int | None:
+    """Return a native Responses origin's own ``max_tool_calls`` maximum, if any."""
+    host = (urlsplit(profile.url).hostname or "").lower()
+    if profile.dialect == "openai_responses" and host == "openrouter.ai":
+        return OPENROUTER_RESPONSES_MAX_TOOL_CALLS
+    return None
+
+
 def reasoning_off_via_chat_template(profile: GatewayWireProfile) -> bool:
     """Return whether this origin turns thinking off only through ``chat_template_kwargs``.
 
@@ -728,6 +741,7 @@ def dialect_stream_payload(
             omits_output_token_limit=profile.omits_output_token_limit,
             requests_reasoning_summary=not profile.billing_customer_managed,
             forwards_web_search_sources=not responses_origin_refuses_web_search_sources(profile),
+            max_tool_calls_ceiling=responses_origin_tool_call_ceiling(profile),
         )
     if profile.dialect == "anthropic_messages":
         payload = anthropic_messages_stream_payload(

@@ -968,6 +968,8 @@ class _ResponsesRequest(_WireModel):
     tools: tuple[_ResponseTool | NativeResponseTool, ...] = ()
     tool_choice: JsonValue = None
     parallel_tool_calls: bool | None = None
+    # Built-in (provider- or gateway-run) tool calls per response; null reads as absent.
+    max_tool_calls: StrictInt | None = Field(default=None, ge=1)
     max_output_tokens: int | None = Field(default=None, gt=0)
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)

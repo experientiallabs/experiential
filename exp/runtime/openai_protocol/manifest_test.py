@@ -84,7 +84,9 @@ def test_manifests_classify_explicit_exclusions() -> None:
     assert responses["top_p"] == CompatibilityDisposition.SUPPORTED
     assert responses["top_k"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert responses["top_logprobs"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
-    assert responses["max_tool_calls"] == CompatibilityDisposition.UNSUPPORTED
+    assert responses["max_tool_calls"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
+    # OpenAI defines the built-in tool-call budget on Responses only.
+    assert "max_tool_calls" not in chat
     # Hints that cannot change a correct answer are removed with disclosure.
     for hint in ("prompt_cache_retention", "seed"):
         assert chat[hint] == CompatibilityDisposition.IGNORED

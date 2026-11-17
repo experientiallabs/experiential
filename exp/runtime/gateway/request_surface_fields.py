@@ -24,6 +24,7 @@ def require_no_responses_only_fields(request: GatewayRequest) -> None:
         "include_web_search_sources": request.include_web_search_sources,
         "include_encrypted_reasoning": request.include_encrypted_reasoning,
         "reasoning_context": request.reasoning_context is not None,
+        "max_tool_calls": request.max_tool_calls is not None,
     }
     for name, set_here in present.items():
         if set_here:

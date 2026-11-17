@@ -584,20 +584,18 @@ class GatewayRequest(ContractModel):
     reasoning_context: Literal["auto", "current_turn", "all_turns"] | None = Field(
         default=None, exclude=True
     )
-    """Caller ``reasoning.context`` selector from the Responses surface.
-
-    Controls whether the model re-renders prior turns' reasoning. Forwarded
-    verbatim to native Responses rungs. Excluded from model serialization so
-    context-free request digests stay byte-identical to pre-field traffic; a
-    present value joins replay identity through
-    :func:`canonical_request_sha256`.
-    """
+    """Caller ``reasoning.context`` selector from the Responses surface, forwarded verbatim
+    to native Responses rungs. Excluded from serialization so context-free digests stay
+    byte-identical to pre-field traffic; a present value joins replay identity."""
     text_verbosity: Literal["low", "medium", "high"] | None = None
     """Caller output-length hint: Responses ``text.verbosity`` or Chat ``verbosity``.
 
     One canonical carrier for both spellings; the surface decides which public
     path a drop disclosure names.
     """
+    max_tool_calls: int | None = Field(default=None, ge=0, exclude=True)
+    """Responses built-in tool-call budget left after gateway-run calls (0 = spent); joins
+    replay identity. Native Responses routes forward it; elsewhere the search planners obey."""
     client_metadata: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller ``client_metadata`` from the Responses surface.
 

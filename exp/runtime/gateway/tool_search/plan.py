@@ -14,6 +14,10 @@
   rebuilt dispatch per round (:mod:`exp.runtime.gateway.tool_search.round`).
 * A declaration with no deferred tools has nothing to search: the carriers
   are stripped and the drop is disclosed.
+* A Responses ``max_tool_calls`` budget caps the gateway's search rounds (each
+  round is one built-in tool call). A budget the gateway's web search already
+  spent leaves no round: the search is dropped with disclosure and every tool
+  loads directly, as on any wire without deferred loading.
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ from exp.runtime.gateway.tool_search.contracts import (
 )
 
 DROPPED_NO_DEFERRED: Final = "tool_search->dropped(no_deferred_tools)"
+DROPPED_TOOL_CALL_BUDGET: Final = "tool_search->dropped(max_tool_calls)"
 TOOL_CHOICE_CLEARED: Final = "tool_choice->cleared(no_serviceable_tool)"
 
 
@@ -195,6 +200,16 @@ def plan_tool_search(request: GatewayRequest, dialects: Sequence[str]) -> ToolSe
             None,
             None,
         )
+    budget = request.max_tool_calls
+    if budget is not None and budget < 1:
+        every = tuple(tool.model_copy(update={"defer_loading": None}) for tool in request.tools)
+        return ToolSearchPlan(
+            _disclosed(request, DROPPED_TOOL_CALL_BUDGET).model_copy(update={"tools": every}),
+            None,
+            None,
+        )
+    if budget is not None and budget < search.max_rounds:
+        search = search.model_copy(update={"max_rounds": budget})
     tool_name = gateway_tool_search_name(tool.name for tool in request.tools)
     updates: dict[str, object] = {}
     if isinstance(choice, GatewayAllowedToolsChoice):

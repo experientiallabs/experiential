@@ -581,6 +581,11 @@ def route_generation_parameter_requests(
     if request.text_verbosity is not None and not native_only:
         chat = request.surface == GatewayApiSurface.CHAT_COMPLETIONS
         ignore("text_verbosity", "verbosity" if chat else "text.verbosity")
+    # Off an all-native route no provider receives a hosted tool (they are
+    # translated or gateway-run), so the budget is honored by the gateway's
+    # search planners and not sent; honored, so not disclosed.
+    if request.max_tool_calls is not None and not native_only:
+        provider_updates["max_tool_calls"] = None
 
     # A tool-call cache hint is honored only on the Anthropic wire; any other
     # rung silently cannot cache, so the omission is disclosed, never a
