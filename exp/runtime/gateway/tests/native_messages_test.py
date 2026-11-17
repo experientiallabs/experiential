@@ -3577,3 +3577,76 @@ def test_incapable_numeric_budget_never_reaches_upstream(
     assert response.json()["error"]["param"] == "thinking_budget"
     with _SseUpstream.payloads_lock:
         assert _SseUpstream.payloads == []
+
+
+def test_responses_max_tool_calls_reaches_the_native_responses_provider(
+    responses_engine: _ServingEngine,
+) -> None:
+    """Serve the built-in tool-call budget and forward it on the native Responses wire.
+
+    Production 2026-11-16: the field was refused pre-admission as unsupported.
+    """
+    with _ResponsesUpstream.payloads_lock:
+        before = len(_ResponsesUpstream.payloads)
+    response = httpx.post(
+        f"{responses_engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {responses_engine.raw_key}"},
+        json={
+            "model": "responses",
+            "input": "count-only",
+            "tools": [{"type": "web_search"}],
+            "max_tool_calls": 2,
+        },
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert "x-experiential-ignored-parameters" not in response.json()
+    # The accepted cap is reflected on the response object, as OpenAI does.
+    assert response.json()["max_tool_calls"] == 2
+    with _ResponsesUpstream.payloads_lock:
+        dispatched = _ResponsesUpstream.payloads[before:]
+    assert len(dispatched) == 1
+    assert dispatched[0]["max_tool_calls"] == 2
+
+
+def test_responses_max_tool_calls_is_gateway_enforced_on_a_compatible_provider(
+    engine: _ServingEngine,
+) -> None:
+    """Off the native wire no provider runs a hosted tool, so the budget is honored
+    by the gateway: served, never sent, and nothing disclosed."""
+    with _SseUpstream.payloads_lock:
+        before = len(_SseUpstream.payloads)
+    response = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "input": "hello", "max_tool_calls": 1},
+        timeout=30.0,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "completed"
+    assert "x-experiential-ignored-parameters" not in response.json()
+    assert response.json()["max_tool_calls"] == 1
+    with _SseUpstream.payloads_lock:
+        dispatched = _SseUpstream.payloads[before:]
+    assert len(dispatched) == 1
+    assert "max_tool_calls" not in dispatched[0]
+
+
+@pytest.mark.parametrize("value", (-1, "2"))
+def test_invalid_responses_max_tool_calls_is_rejected_before_provider_dispatch(
+    engine: _ServingEngine, value: JsonValue
+) -> None:
+    """A budget that is not a non-negative integer is a named client error, never an attempt."""
+    with _SseUpstream.payloads_lock:
+        before = len(_SseUpstream.payloads)
+    response = httpx.post(
+        f"{engine.base}/v1/responses",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json={"model": "coding", "input": "hello", "max_tool_calls": value},
+        timeout=30.0,
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "max_tool_calls"
+    assert response.json()["error"]["code"] == "invalid_parameter"
+    with _SseUpstream.payloads_lock:
+        assert len(_SseUpstream.payloads) == before

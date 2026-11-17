@@ -6683,3 +6683,70 @@ def test_a_compaction_trigger_before_the_last_item_is_refused_at_its_type() -> N
         )
 
     assert refused.value.detail.param == "input.1.type"
+
+
+def test_responses_decoder_admits_the_built_in_tool_call_budget() -> None:
+    """``max_tool_calls`` decodes onto the request and joins replay identity.
+
+    Production 2026-11-16: a client began sending it and every such request was
+    refused pre-admission as an unsupported parameter.
+    """
+    base: JsonObject = {"model": "gpt-6-luna", "input": "hi"}
+    decoded = decode_responses({**base, "max_tool_calls": 3}).request
+    assert decoded.max_tool_calls == 3
+    assert decoded.ignored_parameters == ()
+    # OpenAI documents the field as nullable: null reads as absent.
+    unset = decode_responses({**base, "max_tool_calls": None}).request
+    assert unset.max_tool_calls is None
+    assert canonical_request_sha256(unset) == canonical_request_sha256(
+        decode_responses(base).request
+    )
+    # The budget changes what a response may do, so it joins replay identity.
+    other = decode_responses({**base, "max_tool_calls": 4}).request
+    assert (
+        len(
+            {
+                canonical_request_sha256(decoded),
+                canonical_request_sha256(other),
+                canonical_request_sha256(unset),
+            }
+        )
+        == 3
+    )
+
+
+def test_responses_decoder_admits_a_zero_tool_call_budget() -> None:
+    """Zero is OpenAI's own spelling for "no built-in calls" (its SDK tests send it)."""
+    request = decode_responses({"model": "gpt-6-luna", "input": "hi", "max_tool_calls": 0})
+    assert request.request.max_tool_calls == 0
+
+
+@pytest.mark.parametrize("value", (-1, 2**31, 1.5, "3", True, [1]))
+def test_responses_decoder_refuses_a_non_integer_or_negative_tool_call_budget(
+    value: JsonValue,
+) -> None:
+    """Only a non-negative integer is a budget; anything else is a named invalid parameter."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_responses({"model": "gpt-6-luna", "input": "hi", "max_tool_calls": value})
+    assert captured.value.detail.code == "invalid_parameter"
+    assert captured.value.detail.param == "max_tool_calls"
+
+
+def test_chat_still_refuses_the_responses_only_tool_call_budget() -> None:
+    """Chat Completions defines no ``max_tool_calls``; it stays an exact-param refusal."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "gpt-6-luna",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tool_calls": 3,
+            }
+        )
+    assert captured.value.detail.code == "unsupported_parameter"
+    assert captured.value.detail.param == "max_tool_calls"
+    with pytest.raises(ValueError, match="max_tool_calls is valid only for Responses"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=(GatewayMessage(role="user", content="hi"),),
+            max_tool_calls=3,
+        )

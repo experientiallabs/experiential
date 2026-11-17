@@ -118,6 +118,7 @@ from exp.runtime.models.providers.thinking_budget import (
     thinking_budget_value,
     thinking_budget_wire_field,
 )
+from exp.runtime.models.providers.tool_call_budget import shape_tool_call_budget
 from exp.runtime.models.providers.tool_references import disclose_client_tool_search
 from exp.runtime.models.providers.tool_turn_order import disclose_tool_turn_text_fold
 
@@ -581,6 +582,7 @@ def route_generation_parameter_requests(
     if request.text_verbosity is not None and not native_only:
         chat = request.surface == GatewayApiSurface.CHAT_COMPLETIONS
         ignore("text_verbosity", "verbosity" if chat else "text.verbosity")
+    shape_tool_call_budget(profiles, request, provider_updates=provider_updates, ignored=ignored)
 
     # A tool-call cache hint is honored only on the Anthropic wire; any other
     # rung silently cannot cache, so the omission is disclosed, never a

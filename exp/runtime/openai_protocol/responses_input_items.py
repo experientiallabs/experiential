@@ -21,6 +21,8 @@ because its meaning belongs to the provider that issued or interprets it:
   position in history.
 - ``item_reference``: a stored item named by id (``openai-python`` 3.0
   ``ItemReference``), which the AI SDK and LiteLLM send for stored reasoning.
+- hosted-tool echoes (``web_search_call``, ``mcp_call``, ...): provider-run tool
+  items replayed as history (``HostedToolItemEcho``).
 
 The strict wire union in ``wire_models`` includes every model here, so none
 of them falls into the message branch (which would read it as a message
@@ -225,3 +227,80 @@ SDK_UNKNOWN_INPUT_ITEM_TYPES = frozenset(
 ``agent_message`` is in the SDK's beta Responses types only, and the other
 two are Codex-recorded backend items; the strict models above own them, so
 the official-schema probe does not see them (``official_responses_probe``)."""
+
+
+HOSTED_TOOL_ITEM_TYPES_ASSISTANT = frozenset(
+    {
+        "web_search_call",
+        "file_search_call",
+        "code_interpreter_call",
+        "computer_call",
+        "image_generation_call",
+        "local_shell_call",
+        "shell_call",
+        "apply_patch_call",
+        "mcp_call",
+        "mcp_list_tools",
+        "mcp_approval_request",
+        "tool_search_call",
+        "tool_search_output",
+        "program",
+        "program_output",
+        "compaction",
+    }
+)
+"""Provider-authored hosted-tool and opaque conversation output items."""
+
+HOSTED_TOOL_ITEM_TYPES_TOOL = frozenset(
+    {
+        "computer_call_output",
+        "local_shell_call_output",
+        "shell_call_output",
+        "apply_patch_call_output",
+        "mcp_approval_response",
+    }
+)
+"""Caller-authored results answering a hosted or locally executed call."""
+
+
+class HostedToolItemEcho(BaseModel):
+    """One hosted-tool Responses item echoed as input history.
+
+    Hosted tools (web search, MCP, code interpreter, ...) execute at the
+    provider, whose item vocabulary exists on no other wire, so validation is
+    deliberately shallow (mirroring ``_AdditionalToolsItem``) and the raw
+    caller item forwards byte-for-byte on native Responses rungs only; every
+    other rung rejects it by name. The type set is the documented output-item
+    union beyond the typed models in ``wire_models`` (openai-python 3.x, 2026-09-04).
+
+    Attributes:
+        type: Required hosted-tool item discriminator from the documented set.
+        id: Optional provider item id, 1 to 256 characters when present.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal[
+        "web_search_call",
+        "file_search_call",
+        "code_interpreter_call",
+        "computer_call",
+        "computer_call_output",
+        "image_generation_call",
+        "local_shell_call",
+        "local_shell_call_output",
+        "shell_call",
+        "shell_call_output",
+        "apply_patch_call",
+        "apply_patch_call_output",
+        "mcp_call",
+        "mcp_list_tools",
+        "mcp_approval_request",
+        "mcp_approval_response",
+        "tool_search_call",
+        "tool_search_output",
+        "program",
+        "program_output",
+        "compaction",
+    ]
+    id: str | None = Field(default=None, min_length=1, max_length=256)

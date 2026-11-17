@@ -23,6 +23,7 @@ from exp.runtime.gateway.web_search.plan import (
     DROPPED_FAILED,
     DROPPED_NO_QUERY,
     DROPPED_NOT_ALLOWED,
+    DROPPED_TOOL_CALL_BUDGET,
     DROPPED_TOOL_LOOP,
     DROPPED_UNAVAILABLE,
     TOOL_CHOICE_CLEARED,
@@ -406,3 +407,37 @@ def test_per_request_spellings_still_search_once_on_a_tool_result_turn() -> None
         )
         assert backend.queries == ["What is the latest Rust release?"]
         assert plan.admission is not None and plan.admission["requests"] == 1
+
+
+def test_a_gateway_search_spends_one_call_of_the_responses_tool_budget() -> None:
+    """The gateway's one search is a built-in tool call; the remainder rides on."""
+    request = _request(
+        GatewayApiSurface.RESPONSES, search=GatewayWebSearch(declared_as="model_suffix")
+    ).model_copy(update={"max_tool_calls": 2})
+    plan = plan_web_search(
+        request,
+        ["openai_compatible"],
+        StaticWebSearchBackend(_HITS),
+        deadline_monotonic=_deadline(),
+    )
+    assert plan.admission is not None
+    # The caller's cap is kept (the response reflects it); the spend is counted beside it.
+    assert plan.request.max_tool_calls == 2
+    assert plan.request.gateway_tool_calls == 1
+    # A search the gateway did not run spends nothing.
+    dropped = plan_web_search(request, ["openai_compatible"], None, deadline_monotonic=_deadline())
+    assert dropped.admission is None
+    assert dropped.request.gateway_tool_calls == 0
+
+
+def test_a_zero_tool_call_budget_forbids_the_gateway_search() -> None:
+    """``max_tool_calls: 0`` allows no built-in call, so the gateway never searches."""
+    backend = StaticWebSearchBackend(_HITS)
+    request = _request(
+        GatewayApiSurface.RESPONSES, search=GatewayWebSearch(declared_as="model_suffix")
+    ).model_copy(update={"max_tool_calls": 0})
+    plan = plan_web_search(request, ["openai_compatible"], backend, deadline_monotonic=_deadline())
+    assert plan.admission is None
+    assert backend.queries == []
+    assert DROPPED_TOOL_CALL_BUDGET in plan.request.ignored_parameters
+    assert plan.request.gateway_tool_calls == 0

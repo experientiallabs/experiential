@@ -567,6 +567,7 @@ def decode_responses(
             tool_search=responses_tool_search(native_tools),
             tool_choice=responses_tool_choice(request.tool_choice, native_tools=native_tools),
             parallel_tool_calls=request.parallel_tool_calls,
+            max_tool_calls=request.max_tool_calls,
             structured_text=responses_structured_text(request.text),
             json_object_output=responses_json_object_output(request.text),
             ignored_parameters=(
@@ -660,9 +661,7 @@ def decode_responses(
         if developer_index is not None:
             developer_messages_param = f"input.{developer_index}.role"
     return DecodedGatewayRequest(
-        alias=alias,
-        request=canonical,
-        developer_messages_param=developer_messages_param,
+        alias=alias, request=canonical, developer_messages_param=developer_messages_param
     )
 
 

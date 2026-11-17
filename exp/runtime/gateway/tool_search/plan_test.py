@@ -14,6 +14,7 @@ from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
 from exp.runtime.gateway.tool_search.contracts import GatewayToolSearch
 from exp.runtime.gateway.tool_search.plan import (
     DROPPED_NO_DEFERRED,
+    DROPPED_TOOL_CALL_BUDGET,
     TOOL_CHOICE_CLEARED,
     natively_served,
     plan_tool_search,
@@ -174,3 +175,39 @@ def test_gateway_search_corpus_holds_only_allowed_tools() -> None:
         mode="required", names=("loaded", "tool_search")
     )
     assert plan.state.loaded == [plan.request.tools[0]]
+
+
+def _responses_search_request(max_tool_calls: int | None) -> GatewayRequest:
+    return GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        tools=(_tool("loaded"), _tool("deferred", deferred=True)),
+        provider_native_tools=(GatewayProviderNativeTool(index=2, tool={"type": "tool_search"}),),
+        tool_search=GatewayToolSearch(declared_as="responses_tool", tool_type="tool_search"),
+        max_tool_calls=max_tool_calls,
+    )
+
+
+def test_the_responses_tool_call_budget_caps_gateway_search_rounds() -> None:
+    """Each gateway search round is one built-in call, so the budget bounds the rounds."""
+    plan = plan_tool_search(_responses_search_request(2), ["openai_compatible"])
+    assert plan.state is not None and plan.admission is not None
+    assert plan.state.search.max_rounds == 2
+    assert plan.admission["max_rounds"] == 2
+    plan.state.rounds_done = 2
+    assert plan.state.exhausted
+    assert [tool.name for tool in plan.state.dispatch_tools()] == ["loaded"]
+    # A budget above the default leaves the default; no budget changes nothing.
+    for budget in (None, 50):
+        roomy = plan_tool_search(_responses_search_request(budget), ["openai_compatible"])
+        assert roomy.state is not None and roomy.state.search.max_rounds == 3
+
+
+def test_a_spent_tool_call_budget_drops_the_search_and_loads_every_tool() -> None:
+    """With no call left (the gateway's web search took it) no search round can run."""
+    plan = plan_tool_search(_responses_search_request(0), ["openai_compatible"])
+    assert plan.state is None and plan.admission is None
+    assert DROPPED_TOOL_CALL_BUDGET in plan.request.ignored_parameters
+    assert [tool.name for tool in plan.request.tools] == ["loaded", "deferred"]
+    assert all(tool.defer_loading is None for tool in plan.request.tools)
+    assert plan.request.provider_native_tools == ()

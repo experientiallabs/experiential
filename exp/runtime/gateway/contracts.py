@@ -467,6 +467,9 @@ class GatewayRequest(ContractModel):
         gateway: Optional request routing/retry policy; excluded from provider serialization.
         zdr_requested: ``provider: {"zdr": true}`` (default false), tightening only: the host
             applies its require_zdr filter, 403 when no rung qualifies. Part of identity.
+        max_tool_calls: The caller's Responses built-in tool-call budget (0 allows none);
+            excluded, joins replay identity when present, reflected on the response.
+        gateway_tool_calls: Built-in calls the gateway itself already ran against that budget.
     """
 
     surface: GatewayApiSurface
@@ -584,20 +587,17 @@ class GatewayRequest(ContractModel):
     reasoning_context: Literal["auto", "current_turn", "all_turns"] | None = Field(
         default=None, exclude=True
     )
-    """Caller ``reasoning.context`` selector from the Responses surface.
-
-    Controls whether the model re-renders prior turns' reasoning. Forwarded
-    verbatim to native Responses rungs. Excluded from model serialization so
-    context-free request digests stay byte-identical to pre-field traffic; a
-    present value joins replay identity through
-    :func:`canonical_request_sha256`.
-    """
+    """Caller ``reasoning.context`` selector from the Responses surface, forwarded verbatim
+    to native Responses rungs. Excluded from serialization so context-free digests stay
+    byte-identical to pre-field traffic; a present value joins replay identity."""
     text_verbosity: Literal["low", "medium", "high"] | None = None
     """Caller output-length hint: Responses ``text.verbosity`` or Chat ``verbosity``.
 
     One canonical carrier for both spellings; the surface decides which public
     path a drop disclosure names.
     """
+    max_tool_calls: int | None = Field(default=None, ge=0, le=2_147_483_647, exclude=True)
+    gateway_tool_calls: int = Field(default=0, ge=0, exclude=True)
     client_metadata: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller ``client_metadata`` from the Responses surface.
 

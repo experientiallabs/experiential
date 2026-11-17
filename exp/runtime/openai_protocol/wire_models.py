@@ -860,79 +860,6 @@ class _AdditionalToolsItem(_WireModel):
     tools: tuple[JsonValue, ...]
 
 
-HOSTED_TOOL_ITEM_TYPES_ASSISTANT = frozenset(
-    {
-        "web_search_call",
-        "file_search_call",
-        "code_interpreter_call",
-        "computer_call",
-        "image_generation_call",
-        "local_shell_call",
-        "shell_call",
-        "apply_patch_call",
-        "mcp_call",
-        "mcp_list_tools",
-        "mcp_approval_request",
-        "tool_search_call",
-        "tool_search_output",
-        "program",
-        "program_output",
-        "compaction",
-    }
-)
-"""Provider-authored hosted-tool and opaque conversation output items."""
-
-HOSTED_TOOL_ITEM_TYPES_TOOL = frozenset(
-    {
-        "computer_call_output",
-        "local_shell_call_output",
-        "shell_call_output",
-        "apply_patch_call_output",
-        "mcp_approval_response",
-    }
-)
-"""Caller-authored results answering a hosted or locally executed call."""
-
-
-class _HostedToolItemEcho(BaseModel):
-    """One hosted-tool Responses item echoed as input history.
-
-    Hosted tools (web search, MCP, code interpreter, ...) execute at the
-    provider, whose item vocabulary exists on no other wire, so validation is
-    deliberately shallow (mirroring ``_AdditionalToolsItem``) and the raw
-    caller item forwards byte-for-byte on native Responses rungs only; every
-    other rung rejects it by name. The type set is the documented output-item
-    union beyond the typed models above (openai-python 3.x, 2026-09-04).
-    """
-
-    model_config = ConfigDict(extra="allow")
-
-    type: Literal[
-        "web_search_call",
-        "file_search_call",
-        "code_interpreter_call",
-        "computer_call",
-        "computer_call_output",
-        "image_generation_call",
-        "local_shell_call",
-        "local_shell_call_output",
-        "shell_call",
-        "shell_call_output",
-        "apply_patch_call",
-        "apply_patch_call_output",
-        "mcp_call",
-        "mcp_list_tools",
-        "mcp_approval_request",
-        "mcp_approval_response",
-        "tool_search_call",
-        "tool_search_output",
-        "program",
-        "program_output",
-        "compaction",
-    ]
-    id: str | None = Field(default=None, min_length=1, max_length=256)
-
-
 _ResponsesOutputItem = Annotated[
     _ResponseFunctionCall
     | _ResponseFunctionOutput
@@ -940,7 +867,7 @@ _ResponsesOutputItem = Annotated[
     | _AdditionalToolsItem
     | _CustomToolCall
     | _CustomToolCallOutput
-    | _HostedToolItemEcho
+    | _extra_items.HostedToolItemEcho
     | _extra_items.AgentMessageItem
     | _extra_items.CompactionTriggerItem
     | _extra_items.ContextCompactionItem
@@ -957,6 +884,8 @@ class _ResponsesRequest(_WireModel):
     Attributes:
         top_logprobs: Optional strict integer from zero through twenty for alternative tokens.
         truncation: Optional context policy, accepted only as disabled; no input is dropped.
+        max_tool_calls: Optional strict non-negative integer bounding built-in (provider- or
+            gateway-run) tool calls per response (0 allows none, at most 2**31 - 1); null is absent.
     """
 
     model: str = Field(min_length=1, max_length=256)
@@ -968,6 +897,7 @@ class _ResponsesRequest(_WireModel):
     tools: tuple[_ResponseTool | NativeResponseTool, ...] = ()
     tool_choice: JsonValue = None
     parallel_tool_calls: bool | None = None
+    max_tool_calls: StrictInt | None = Field(default=None, ge=0, le=2_147_483_647)
     max_output_tokens: int | None = Field(default=None, gt=0)
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)

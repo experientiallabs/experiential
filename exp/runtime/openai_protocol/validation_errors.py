@@ -16,8 +16,8 @@ from pydantic import ValidationError
 from pydantic_core import ErrorDetails
 
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field
-from exp.runtime.openai_protocol.responses_input_items import EXTRA_INPUT_ITEM_TYPES
-from exp.runtime.openai_protocol.wire_models import (
+from exp.runtime.openai_protocol.responses_input_items import (
+    EXTRA_INPUT_ITEM_TYPES,
     HOSTED_TOOL_ITEM_TYPES_ASSISTANT,
     HOSTED_TOOL_ITEM_TYPES_TOOL,
 )

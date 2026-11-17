@@ -29,6 +29,26 @@ fn ignored_generation_controls_are_disclosed_by_responses_encoder() {
 }
 
 #[test]
+fn caller_tool_call_budget_is_reflected_only_when_sent() {
+    let envelope = ResponsesEnvelope {
+        max_tool_calls: Some(3),
+        ..ResponsesEnvelope::default()
+    };
+    let mut encoder =
+        ResponsesSseEncoder::new("request-1", "coding", 1_700_000_000, envelope.clone());
+    assert!(encoder.start().expect("starts")[0].contains("\"max_tool_calls\":3"));
+    let body = |envelope| {
+        completed_responses_body("request-1", "coding", 1, envelope, &[Event::Completed])
+            .expect("completed body must encode")
+            .body
+    };
+    assert_eq!(body(envelope)["max_tool_calls"], json!(3));
+    assert!(body(ResponsesEnvelope::default())
+        .get("max_tool_calls")
+        .is_none());
+}
+
+#[test]
 fn thinking_deltas_project_onto_reasoning_summary_parts() {
     let mut encoder = ResponsesSseEncoder::new(
         "request-1",

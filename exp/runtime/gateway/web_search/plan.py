@@ -64,6 +64,8 @@ RESPONSES_WEB_SEARCH_TOOL_TYPES: Final = frozenset(
 DROPPED_UNAVAILABLE: Final = "web_search->dropped(search_unavailable)"
 DROPPED_FAILED: Final = "web_search->dropped(search_failed)"
 DROPPED_NO_QUERY: Final = "web_search->dropped(no_query)"
+DROPPED_TOOL_CALL_BUDGET: Final = "web_search->dropped(max_tool_calls)"
+"""A Responses ``max_tool_calls`` of zero forbids the gateway's search (a built-in call)."""
 TOOL_CHOICE_CLEARED: Final = "tool_choice->cleared(no_serviceable_tool)"
 DROPPED_NOT_ALLOWED: Final = "web_search->dropped(not_in_allowed_tools)"
 DROPPED_TOOL_LOOP: Final = "web_search->dropped(tool_loop)"
@@ -362,6 +364,8 @@ def plan_web_search(
         return _disclosed(request, DROPPED_NOT_ALLOWED)
     if search.declared_as in _TOOL_DECLARATIONS and answers_tool_call(request):
         return _disclosed(request, DROPPED_TOOL_LOOP)
+    if request.max_tool_calls == 0:
+        return _disclosed(request, DROPPED_TOOL_CALL_BUDGET)
     if backend is None:
         return _disclosed(request, DROPPED_UNAVAILABLE)
     query = derive_query(request)
@@ -397,6 +401,11 @@ def plan_web_search(
     injected = inject_results(
         strip_search_carriers(request), instruction_text(search, query, results)
     )
+    if injected.max_tool_calls is not None:
+        # This search is one built-in tool call against the caller's budget.
+        injected = injected.model_copy(
+            update={"gateway_tool_calls": injected.gateway_tool_calls + 1}
+        )
     admission: JsonObject = {
         "query": query,
         "requests": 1,

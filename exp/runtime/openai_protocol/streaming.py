@@ -822,6 +822,9 @@ class ResponsesSseEncoder:
                 else None
             ),
         }
+        if self.request.max_tool_calls is not None:
+            # Reflected only when sent, so budget-free bodies keep their goldens.
+            payload["max_tool_calls"] = self.request.max_tool_calls
         if self.request.ignored_parameters:
             payload["x-experiential-ignored-parameters"] = list(self.request.ignored_parameters)
         return payload

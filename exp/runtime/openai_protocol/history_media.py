@@ -40,7 +40,7 @@ from exp.common.models.content import (
     MAXIMUM_IMAGE_BYTES,
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field
-from exp.runtime.openai_protocol.wire_models import HOSTED_TOOL_ITEM_TYPES_ASSISTANT
+from exp.runtime.openai_protocol.responses_input_items import HOSTED_TOOL_ITEM_TYPES_ASSISTANT
 
 MediaKind = Literal["image", "document"]
 """Media kinds whose inline bytes this pass inspects."""

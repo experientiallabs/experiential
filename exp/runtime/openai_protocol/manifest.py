@@ -235,9 +235,13 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         # honored and ``true`` is disclosed as ignored
         # (``client_field_repairs.accept_responses_stream_options``).
         _field("stream_options", CompatibilityDisposition.SUPPORTED),
-        # The Responses tool-call cap is refused until a route can honor it.
-        # ``tool_call_limit`` is the catalog vocabulary for that decision.
-        _field("max_tool_calls", CompatibilityDisposition.UNSUPPORTED, "tool_call_limit"),
+        # The built-in tool-call budget: forwarded on all-native Responses
+        # routes (the provider runs its hosted tools), enforced by the gateway's
+        # own web-search and tool-search planners on every other route, where
+        # no provider receives a hosted tool. Never dropped, so no disclosure.
+        _field(
+            "max_tool_calls", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "tool_call_limit"
+        ),
         _field("metadata", CompatibilityDisposition.METADATA_ONLY),
         # End-user attribution / cache hints (OpenAI spec), same handling as the
         # Chat surface: accepted and recorded gateway-side, never forwarded.

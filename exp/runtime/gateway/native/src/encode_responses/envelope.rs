@@ -42,6 +42,10 @@ pub struct ResponsesEnvelope {
     pub max_output_tokens: Value,
     #[serde(default)]
     pub previous_response_id: Value,
+    /// The caller's Responses `max_tool_calls`, reflected only when sent so
+    /// budget-free envelopes stay byte-identical.
+    #[serde(default)]
+    pub max_tool_calls: Option<u64>,
     #[serde(default)]
     pub include_encrypted_reasoning: bool,
     /// Whether the winning rung returns its plaintext reasoning to the caller
@@ -76,6 +80,7 @@ impl Default for ResponsesEnvelope {
             tools: default_tools(),
             max_output_tokens: Value::Null,
             previous_response_id: Value::Null,
+            max_tool_calls: None,
             include_encrypted_reasoning: false,
             reasoning_output_exposed: false,
             reasoning_displayed: false,

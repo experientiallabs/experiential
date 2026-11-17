@@ -133,6 +133,17 @@ def _result_content(matched: Sequence[GatewayToolDefinition], error: str | None)
     )
 
 
+BUDGET_SPENT_RESULT = json.dumps(
+    {
+        "error": "max_tool_calls reached: this search did not run",
+        "matched": [],
+        "loaded": False,
+    },
+    separators=(",", ":"),
+)
+"""Tool result for a search call past the caller's built-in tool-call budget."""
+
+
 def perform_round(
     request: GatewayRequest,
     state: ToolSearchState,
@@ -153,6 +164,23 @@ def perform_round(
     rounds: list[JsonObject] = []
     for call in calls:
         arguments = _arguments(call)
+        if state.call_budget is not None and state.call_budget <= 0:
+            # OpenAI ignores a built-in call past the budget: answer it as not
+            # run so the transcript stays well-formed, and never execute it.
+            tool_calls.append(
+                ToolCall(
+                    call_id=call.call_id,
+                    name=state.tool_name,
+                    arguments=arguments,
+                    raw_arguments=call.raw_arguments or "{}",
+                )
+            )
+            results.append(
+                GatewayMessage(role="tool", tool_call_id=call.call_id, content=BUDGET_SPENT_RESULT)
+            )
+            continue
+        if state.call_budget is not None:
+            state.call_budget -= 1
         matched, query, pattern, error = search_once(state, arguments)
         for tool in matched:
             if tool in state.deferred:

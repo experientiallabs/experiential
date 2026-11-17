@@ -43,6 +43,7 @@ from exp.runtime.models.providers.dialect_dispatch import (
     TOOL_RESULT_IMAGE_FOLD_DISCLOSURE,
     WEB_SEARCH_SOURCES_DROPPED,
     WEB_SEARCH_SOURCES_DROPPED_ON_FALLBACK,
+    responses_origin_tool_call_ceiling,
 )
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
@@ -6656,3 +6657,44 @@ def test_none_on_a_mixed_route_with_a_non_gemini_rung_keeps_the_refusal() -> Non
 
     with pytest.raises(UnsupportedReasoningEffortError):
         route_generation_parameter_requests((flash, other), request)
+
+
+def test_max_tool_calls_forwards_on_native_responses_and_is_gateway_enforced_elsewhere() -> None:
+    """The built-in tool budget rides the native wire; elsewhere it is honored, not sent."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        provider_native_tools=(GatewayProviderNativeTool(index=0, tool={"type": "web_search"}),),
+        max_tool_calls=4,
+        stream=True,
+        include_usage=True,
+    )
+    payload = openai_responses_stream_payload("gpt-6-luna", request, supports_temperature=False)
+    assert payload["max_tool_calls"] == 4
+    capped = openai_responses_stream_payload(
+        "gpt-6-luna", request, supports_temperature=False, max_tool_calls_ceiling=3
+    )
+    assert capped["max_tool_calls"] == 3
+    assert "max_tool_calls" not in openai_responses_stream_payload(
+        "gpt-6-luna",
+        request.model_copy(update={"max_tool_calls": None}),
+        supports_temperature=False,
+    )
+
+    responses = GatewayWireProfile(dialect="openai_responses", url="https://openai.test")
+    openrouter = GatewayWireProfile(
+        dialect="openai_responses", url="https://openrouter.ai/api/v1/responses"
+    )
+    chat = GatewayWireProfile(dialect="openai_compatible", url="https://chat.test")
+    assert responses_origin_tool_call_ceiling(responses) is None
+    assert responses_origin_tool_call_ceiling(openrouter) == 30
+    assert responses_origin_tool_call_ceiling(chat) is None
+    public, provider = route_generation_parameter_requests((responses,), request)
+    assert public.ignored_parameters == ()
+    assert provider.max_tool_calls == 4
+    # No provider on a mixed route receives a hosted tool, so the gateway's own
+    # search planners enforce the budget: nothing is sent and nothing disclosed.
+    public, provider = route_generation_parameter_requests((responses, chat), request)
+    # Only the hosted tool's own foreign-wire drop is disclosed, never the budget.
+    assert not any("max_tool_calls" in path for path in public.ignored_parameters)
+    assert provider.max_tool_calls is None
