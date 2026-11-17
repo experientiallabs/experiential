@@ -6,6 +6,7 @@ import json
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Literal
 
 from pydantic import JsonValue
 
@@ -23,6 +24,8 @@ from exp.runtime.gateway.local_capture_store import LocalCaptureStore
 from exp.runtime.gateway.native_capture import CaptureMetrics
 from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.openai_protocol.requests import decode_responses
+
+CaptureProtocol = Literal["chat_completions", "responses", "messages"]
 
 
 def load_gateway_capture(
