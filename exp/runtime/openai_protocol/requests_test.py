@@ -6721,7 +6721,7 @@ def test_responses_decoder_admits_a_zero_tool_call_budget() -> None:
     assert request.request.max_tool_calls == 0
 
 
-@pytest.mark.parametrize("value", (-1, 1.5, "3", True, [1]))
+@pytest.mark.parametrize("value", (-1, 2**31, 1.5, "3", True, [1]))
 def test_responses_decoder_refuses_a_non_integer_or_negative_tool_call_budget(
     value: JsonValue,
 ) -> None:

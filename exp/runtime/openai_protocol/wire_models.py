@@ -885,7 +885,7 @@ class _ResponsesRequest(_WireModel):
         top_logprobs: Optional strict integer from zero through twenty for alternative tokens.
         truncation: Optional context policy, accepted only as disabled; no input is dropped.
         max_tool_calls: Optional strict non-negative integer bounding built-in (provider- or
-            gateway-run) tool calls per response (0 allows none); null reads as absent.
+            gateway-run) tool calls per response (0 allows none, at most 2**31 - 1); null is absent.
     """
 
     model: str = Field(min_length=1, max_length=256)
@@ -897,7 +897,7 @@ class _ResponsesRequest(_WireModel):
     tools: tuple[_ResponseTool | NativeResponseTool, ...] = ()
     tool_choice: JsonValue = None
     parallel_tool_calls: bool | None = None
-    max_tool_calls: StrictInt | None = Field(default=None, ge=0)
+    max_tool_calls: StrictInt | None = Field(default=None, ge=0, le=2_147_483_647)
     max_output_tokens: int | None = Field(default=None, gt=0)
     temperature: float | None = Field(default=None, ge=0, le=2)
     top_p: float | None = Field(default=None, ge=0, le=1)

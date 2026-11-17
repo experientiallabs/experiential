@@ -596,7 +596,7 @@ class GatewayRequest(ContractModel):
     One canonical carrier for both spellings; the surface decides which public
     path a drop disclosure names.
     """
-    max_tool_calls: int | None = Field(default=None, ge=0, exclude=True)
+    max_tool_calls: int | None = Field(default=None, ge=0, le=2_147_483_647, exclude=True)
     gateway_tool_calls: int = Field(default=0, ge=0, exclude=True)
     client_metadata: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller ``client_metadata`` from the Responses surface.

@@ -12,6 +12,7 @@ from exp.runtime.gateway.contracts import (
     GatewayToolDefinition,
 )
 from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
+from exp.runtime.gateway.web_search.contracts import GatewayWebSearch
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.openai_payloads import openai_responses_stream_payload
@@ -87,6 +88,30 @@ def test_a_plan_backend_cannot_carry_a_positive_cap_over_hosted_tools() -> None:
     assert _shape(_request(2, provider_native_tools=()), _PLAN) == ({"max_tool_calls": None}, [])
     updates, _ = _shape(_request(0), _PLAN)
     assert updates["max_tool_calls"] is None
+    # A no-fallback preview strips the hosted search carrier but keeps the
+    # declaration, which the plan rung would still serve: it narrows out there too.
+    preview = _request(
+        2,
+        provider_native_tools=(),
+        web_search=GatewayWebSearch(declared_as="responses_tool"),
+    )
+    with pytest.raises(ProviderParameterError):
+        _shape(preview, _PLAN)
+    assert _shape(preview, _NATIVE) == ({"max_tool_calls": None}, [])
+
+
+def test_a_choice_that_excludes_every_hosted_tool_needs_no_provider_cap() -> None:
+    """With hosted tools unreachable no built-in call can happen, even on a plan rung."""
+    assert _shape(_request(2, tool_choice="none"), _PLAN) == ({"max_tool_calls": None}, [])
+    custom_only = GatewayAllowedToolsChoice(
+        mode="auto", provider_entries=({"type": "custom", "name": "exec"},)
+    )
+    assert _shape(_request(2, tool_choice=custom_only), _PLAN) == ({"max_tool_calls": None}, [])
+    search_allowed = GatewayAllowedToolsChoice(
+        mode="auto", provider_entries=({"type": "web_search"},)
+    )
+    with pytest.raises(ProviderParameterError):
+        _shape(_request(2, tool_choice=search_allowed), _PLAN)
 
 
 def test_a_spent_budget_withholds_hosted_tools_and_keeps_the_rest_in_order() -> None:

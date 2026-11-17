@@ -25,6 +25,8 @@ from typing import Final
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayProviderNativeTool, GatewayRequest
 from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
+from exp.runtime.gateway.web_search.plan import RESPONSES_WEB_SEARCH_TOOL_TYPES
+from exp.runtime.models.providers.allowed_tools import entry_names_declaration
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderParameterError
 
@@ -37,6 +39,40 @@ TOOL_CHOICE_CLEARED: Final = "tool_choice->cleared(no_serviceable_tool)"
 def _client_executed(entry: JsonObject) -> bool:
     """Whether a Responses tool or allowed-tools entry names a caller-executed tool."""
     return entry.get("type") in CLIENT_EXECUTED_NATIVE_TOOL_TYPES
+
+
+def _may_call_hosted(
+    request: GatewayRequest,
+    hosted: Sequence[GatewayProviderNativeTool],
+    *,
+    declares_search: bool,
+) -> bool:
+    """Whether the tool choice lets the model call any declared hosted tool.
+
+    Args:
+        request: The public canonical request.
+        hosted: The hosted native declarations still on the request.
+        declares_search: Whether a stripped hosted web-search declaration remains.
+
+    Returns:
+        False when ``tool_choice`` is ``none`` or an allowed-tools selector names
+        no hosted tool, so no built-in call can happen; True otherwise.
+    """
+    choice = request.tool_choice
+    if choice == "none":
+        return False
+    if isinstance(choice, GatewayAllowedToolsChoice):
+        if declares_search and any(
+            allowed.get("type") in RESPONSES_WEB_SEARCH_TOOL_TYPES
+            for allowed in choice.provider_entries
+        ):
+            return True
+        return any(
+            entry_names_declaration(entry.tool, allowed)
+            for entry in hosted
+            for allowed in choice.provider_entries
+        )
+    return bool(hosted) or declares_search
 
 
 def remaining_tool_calls(request: GatewayRequest) -> int | None:
@@ -84,19 +120,26 @@ def shape_tool_call_budget(
         if isinstance(entry, GatewayProviderNativeTool)
     )
     hosted = [entry for entry in current if not _client_executed(entry.tool)]
-    if not hosted:
-        return
+    # A no-fallback preview has stripped the hosted web-search carrier but keeps
+    # the declaration, which the provider serves on an all-native route.
+    declares_search = request.web_search is not None and (
+        request.web_search.declared_as == "responses_tool"
+    )
     if remaining > 0:
-        if any(profile.omits_output_token_limit for profile in profiles):
-            raise ProviderParameterError(
-                message=(
-                    "The parameter 'max_tool_calls' is not accepted by a plan account on this "
-                    "model route. Remove it or use a route with an API-key account."
-                ),
-                param="max_tool_calls",
-                code="unsupported_parameter",
-            )
-        provider_updates["max_tool_calls"] = remaining
+        if _may_call_hosted(request, hosted, declares_search=declares_search):
+            if any(profile.omits_output_token_limit for profile in profiles):
+                raise ProviderParameterError(
+                    message=(
+                        "The parameter 'max_tool_calls' is not accepted by a plan account on "
+                        "this model route. Remove it or use a route with an API-key account."
+                    ),
+                    param="max_tool_calls",
+                    code="unsupported_parameter",
+                )
+            if hosted:
+                provider_updates["max_tool_calls"] = remaining
+        return
+    if not hosted:
         return
     # Declarations re-emit at their caller position with function tools filling
     # the gaps, so the survivors close up over the withheld ones.
