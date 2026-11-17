@@ -212,7 +212,11 @@ def plan_tool_search(request: GatewayRequest, dialects: Sequence[str]) -> ToolSe
             None,
             None,
         )
-    budget = request.max_tool_calls
+    budget = (
+        None
+        if request.max_tool_calls is None
+        else max(request.max_tool_calls - request.gateway_tool_calls, 0)
+    )
     if budget is not None and budget < 1:
         every = tuple(tool.model_copy(update={"defer_loading": None}) for tool in request.tools)
         return ToolSearchPlan(

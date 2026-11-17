@@ -582,9 +582,7 @@ def route_generation_parameter_requests(
     if request.text_verbosity is not None and not native_only:
         chat = request.surface == GatewayApiSurface.CHAT_COMPLETIONS
         ignore("text_verbosity", "verbosity" if chat else "text.verbosity")
-    shape_tool_call_budget(
-        request, native_only=native_only, provider_updates=provider_updates, ignored=ignored
-    )
+    shape_tool_call_budget(profiles, request, provider_updates=provider_updates, ignored=ignored)
 
     # A tool-call cache hint is honored only on the Anthropic wire; any other
     # rung silently cannot cache, so the omission is disclosed, never a

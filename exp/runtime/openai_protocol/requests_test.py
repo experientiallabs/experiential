@@ -6715,11 +6715,17 @@ def test_responses_decoder_admits_the_built_in_tool_call_budget() -> None:
     )
 
 
-@pytest.mark.parametrize("value", (0, -1, 1.5, "3", True, [1]))
-def test_responses_decoder_refuses_a_non_positive_integer_tool_call_budget(
+def test_responses_decoder_admits_a_zero_tool_call_budget() -> None:
+    """Zero is OpenAI's own spelling for "no built-in calls" (its SDK tests send it)."""
+    request = decode_responses({"model": "gpt-6-luna", "input": "hi", "max_tool_calls": 0})
+    assert request.request.max_tool_calls == 0
+
+
+@pytest.mark.parametrize("value", (-1, 1.5, "3", True, [1]))
+def test_responses_decoder_refuses_a_non_integer_or_negative_tool_call_budget(
     value: JsonValue,
 ) -> None:
-    """Only a positive integer is a budget; anything else is a named invalid parameter."""
+    """Only a non-negative integer is a budget; anything else is a named invalid parameter."""
     with pytest.raises(OpenAIProtocolError) as captured:
         decode_responses({"model": "gpt-6-luna", "input": "hi", "max_tool_calls": value})
     assert captured.value.detail.code == "invalid_parameter"

@@ -6664,6 +6664,7 @@ def test_max_tool_calls_forwards_on_native_responses_and_is_gateway_enforced_els
     request = GatewayRequest(
         surface=GatewayApiSurface.RESPONSES,
         messages=(GatewayMessage(role="user", content="go"),),
+        provider_native_tools=(GatewayProviderNativeTool(index=0, tool={"type": "web_search"}),),
         max_tool_calls=4,
         stream=True,
         include_usage=True,
@@ -6694,5 +6695,6 @@ def test_max_tool_calls_forwards_on_native_responses_and_is_gateway_enforced_els
     # No provider on a mixed route receives a hosted tool, so the gateway's own
     # search planners enforce the budget: nothing is sent and nothing disclosed.
     public, provider = route_generation_parameter_requests((responses, chat), request)
-    assert public.ignored_parameters == ()
+    # Only the hosted tool's own foreign-wire drop is disclosed, never the budget.
+    assert not any("max_tool_calls" in path for path in public.ignored_parameters)
     assert provider.max_tool_calls is None

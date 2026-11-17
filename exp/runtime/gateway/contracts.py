@@ -467,8 +467,9 @@ class GatewayRequest(ContractModel):
         gateway: Optional request routing/retry policy; excluded from provider serialization.
         zdr_requested: ``provider: {"zdr": true}`` (default false), tightening only: the host
             applies its require_zdr filter, 403 when no rung qualifies. Part of identity.
-        max_tool_calls: Responses built-in tool-call budget still unspent (0 once the gateway's
-            web search used it all); excluded, joins replay identity when present.
+        max_tool_calls: The caller's Responses built-in tool-call budget (0 allows none);
+            excluded, joins replay identity when present, reflected on the response.
+        gateway_tool_calls: Built-in calls the gateway itself already ran against that budget.
     """
 
     surface: GatewayApiSurface
@@ -596,6 +597,7 @@ class GatewayRequest(ContractModel):
     path a drop disclosure names.
     """
     max_tool_calls: int | None = Field(default=None, ge=0, exclude=True)
+    gateway_tool_calls: int = Field(default=0, ge=0, exclude=True)
     client_metadata: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller ``client_metadata`` from the Responses surface.
 

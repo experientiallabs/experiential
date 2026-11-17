@@ -398,8 +398,10 @@ def plan_web_search(
         strip_search_carriers(request), instruction_text(search, query, results)
     )
     if injected.max_tool_calls is not None:
-        # This search is one built-in tool call; what is left caps tool search.
-        injected = injected.model_copy(update={"max_tool_calls": injected.max_tool_calls - 1})
+        # This search is one built-in tool call against the caller's budget.
+        injected = injected.model_copy(
+            update={"gateway_tool_calls": injected.gateway_tool_calls + 1}
+        )
     admission: JsonObject = {
         "query": query,
         "requests": 1,

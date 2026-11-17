@@ -272,6 +272,10 @@ class HostedToolItemEcho(BaseModel):
     caller item forwards byte-for-byte on native Responses rungs only; every
     other rung rejects it by name. The type set is the documented output-item
     union beyond the typed models in ``wire_models`` (openai-python 3.x, 2026-09-04).
+
+    Attributes:
+        type: Required hosted-tool item discriminator from the documented set.
+        id: Optional provider item id, 1 to 256 characters when present.
     """
 
     model_config = ConfigDict(extra="allow")

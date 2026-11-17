@@ -3591,7 +3591,12 @@ def test_responses_max_tool_calls_reaches_the_native_responses_provider(
     response = httpx.post(
         f"{responses_engine.base}/v1/responses",
         headers={"authorization": f"Bearer {responses_engine.raw_key}"},
-        json={"model": "responses", "input": "count-only", "max_tool_calls": 2},
+        json={
+            "model": "responses",
+            "input": "count-only",
+            "tools": [{"type": "web_search"}],
+            "max_tool_calls": 2,
+        },
         timeout=30.0,
     )
     assert response.status_code == 200, response.text
@@ -3627,11 +3632,11 @@ def test_responses_max_tool_calls_is_gateway_enforced_on_a_compatible_provider(
     assert "max_tool_calls" not in dispatched[0]
 
 
-@pytest.mark.parametrize("value", (0, "2"))
+@pytest.mark.parametrize("value", (-1, "2"))
 def test_invalid_responses_max_tool_calls_is_rejected_before_provider_dispatch(
     engine: _ServingEngine, value: JsonValue
 ) -> None:
-    """A budget that is not a positive integer is a named client error, never an attempt."""
+    """A budget that is not a non-negative integer is a named client error, never an attempt."""
     with _SseUpstream.payloads_lock:
         before = len(_SseUpstream.payloads)
     response = httpx.post(

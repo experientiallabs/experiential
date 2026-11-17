@@ -420,8 +420,10 @@ def test_a_gateway_search_spends_one_call_of_the_responses_tool_budget() -> None
         deadline_monotonic=_deadline(),
     )
     assert plan.admission is not None
-    assert plan.request.max_tool_calls == 1
+    # The caller's cap is kept (the response reflects it); the spend is counted beside it.
+    assert plan.request.max_tool_calls == 2
+    assert plan.request.gateway_tool_calls == 1
     # A search the gateway did not run spends nothing.
     dropped = plan_web_search(request, ["openai_compatible"], None, deadline_monotonic=_deadline())
     assert dropped.admission is None
-    assert dropped.request.max_tool_calls == 2
+    assert dropped.request.gateway_tool_calls == 0
