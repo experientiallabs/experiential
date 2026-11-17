@@ -8,7 +8,8 @@ from pydantic import Field
 
 from exp.common.core.artifacts import ContractModel, JsonObject, JsonValue, Sha256
 from exp.common.models import ToolCall
-from exp.simulation.engines.text.generic_delta import apply_delta
+from exp.runtime.sessions.edits import SetValue, StateEdit
+from exp.simulation.engines.text.generic_delta import delta_edits
 
 
 class ReplaceState(ContractModel):
@@ -28,7 +29,7 @@ class ApplyEdits(ContractModel):
 
     Attributes:
         kind: Explicit edit effect, distinct from replacement and RFC JSON Patch.
-        edits: Ordered set/delete/append/remove_value edits.
+        edits: Ordered set/delete/append/remove_value/copy edits.
     """
 
     kind: Literal["edits"] = "edits"
@@ -66,9 +67,23 @@ class ProposedTransition(ContractModel):
 
     def next_state(self, current: JsonObject) -> JsonObject:
         """Compute effects on a detached copy; failed edits never mutate current state."""
+        return self.state_edits(current)[0]
+
+    def state_edits(self, current: JsonObject) -> tuple[JsonObject, tuple[StateEdit, ...]]:
+        """Compute the next state and the runtime structural edits that publish it.
+
+        Replacement becomes one whole-document ``set``; generic edits resolve through the same
+        interpreter that computes the next state, so the store publishes exactly that state.
+
+        Args:
+            current: Committed state the proposal applies to. Not mutated.
+
+        Returns:
+            The detached next state and its ordered structural edits.
+        """
         if isinstance(self.effect, ReplaceState):
-            return copy.deepcopy(self.effect.state)
-        return apply_delta(current, self.effect.edits)
+            return copy.deepcopy(self.effect.state), (SetValue(path=(), value=self.effect.state),)
+        return delta_edits(current, self.effect.edits)
 
 
 class PreparedPrediction(ContractModel):

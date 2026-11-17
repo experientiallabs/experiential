@@ -22,6 +22,7 @@ from exp.common.core.artifacts import (
     stable_id,
     validate_artifact_id,
 )
+from exp.common.core.host_scope import require_host_scope
 from exp.common.traces.sqlite_import import ImportRecord, PreparedImport, prepare_import
 from exp.common.traces.sqlite_schema import TraceStoreError, initialize_schema, validate_schema
 from exp.common.traces.trace import Trace, TraceSource
@@ -175,6 +176,7 @@ class SQLiteTraceStore:
                 _require_private_file(Path(f"{self.path}{suffix}"), optional=True)
             if write:
                 self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                require_host_scope(self.path.parent)
                 try:
                     descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                 except FileExistsError:

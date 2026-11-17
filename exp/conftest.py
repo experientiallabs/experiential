@@ -7,7 +7,7 @@ import fcntl
 import os
 import pty
 import re
-import select
+import selectors
 import struct
 import subprocess
 import sys
@@ -234,34 +234,38 @@ def _run_terminal_child(
     settle_at = 0.0
     deadline = time.monotonic() + timeout
     try:
-        while time.monotonic() < deadline:
-            readable, _, _ = select.select([master], [], [], 0.05)
-            if readable:
-                try:
-                    output.extend(os.read(master, 65_536))
-                except OSError as error:
-                    if error.errno != errno.EIO:
-                        raise
+        with selectors.DefaultSelector() as reader:
+            reader.register(master, selectors.EVENT_READ)
+            while time.monotonic() < deadline:
+                if reader.select(0.05):
+                    try:
+                        output.extend(os.read(master, 65_536))
+                    except OSError as error:
+                        if error.errno != errno.EIO:
+                            raise
+                        break
+                if pending:
+                    marker, keys = pending[0]
+                    ready = (
+                        time.monotonic() >= settle_at
+                        if marker is None
+                        else marker.encode() in output[searched:]
+                    )
+                    if ready:
+                        searched = len(output)
+                        settle_at = time.monotonic() + _SETTLE_SECONDS
+                        os.write(master, keys.encode())
+                        pending.pop(0)
+                        continue
+                if process.poll() is not None:
                     break
-            if pending:
-                marker, keys = pending[0]
-                ready = (
-                    time.monotonic() >= settle_at
-                    if marker is None
-                    else marker.encode() in output[searched:]
-                )
-                if ready:
-                    searched = len(output)
-                    settle_at = time.monotonic() + _SETTLE_SECONDS
-                    os.write(master, keys.encode())
-                    pending.pop(0)
-                    continue
-            if process.poll() is not None:
-                break
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=5)
     finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
         os.close(master)
     transcript = output.decode(errors="replace")
     waiting = pending[0][0] if pending else None

@@ -7,7 +7,7 @@ from dataclasses import replace
 from typing import ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
-from exp.common.models import ChatMaxTokensField, ModelSnapshot
+from exp.common.models import ChatMaxTokensField, ModelSnapshot, ReasoningEffort
 from exp.common.models.azure_endpoints import (
     AzureApiSurface,
     infer_azure_api_surface,
@@ -233,7 +233,7 @@ class AzureClient(OpenAICompatibleClient):
         supports_frequency_penalty: bool = False,
         supports_presence_penalty: bool = False,
         supports_reasoning: bool = False,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
         chat_max_tokens_field: ChatMaxTokensField | None = None,
         sampling_requires_reasoning_none: bool = False,
     ) -> None:
@@ -351,7 +351,7 @@ class AzureResponsesClient(OpenAIClient):
         supports_frequency_penalty: bool = False,
         supports_presence_penalty: bool = False,
         supports_reasoning: bool = False,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         """Create a Responses client bound to one Azure resource, key, and deployment.
 

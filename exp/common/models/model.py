@@ -654,6 +654,17 @@ class ModelCapabilities(ContractModel):
     is an operator declaration and stays out of the frozen identity like the
     other gateway flags.
     """
+    supports_forced_tool_choice: bool | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """Whether this model accepts a ``required`` or named ``tool_choice``.
+
+    ``None`` is unknown and forces as requested; only an explicit ``False`` makes the Anthropic
+    clients send ``auto`` with the single offered tool instead, and refuse a forced choice among
+    several tools before dispatch. Like the other wire declarations it stays out of the identity
+    digest, and an unset value stays out of serialization, so a structured completion profile
+    that binds these capabilities changes only when a catalog declares the fact.
+    """
     chat_max_tokens_field: ChatMaxTokensField | None = None
     minimum_temperature: float | None = Field(default=None, ge=0, le=2)
     maximum_temperature: float | None = Field(default=None, ge=0, le=2)
@@ -750,6 +761,7 @@ class ModelCapabilities(ContractModel):
             "reasoning_output_hidden",
             "reasoning_content_native",
             "system_messages_leading_only",
+            "supports_forced_tool_choice",
             "chat_max_tokens_field",
             "minimum_temperature",
             "maximum_temperature",

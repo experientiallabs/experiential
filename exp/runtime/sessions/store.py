@@ -1,4 +1,4 @@
-"""Durable SQLite session store: immutable binding, step idempotency, expected-version state.
+"""Durable SQLite session store: immutable binding, step idempotency, incremental state.
 
 A session pins one immutable ``SessionBinding`` (target, receipt, knowledge, corpus, and
 representation digests) and one candidate state object. Only the state and version change
@@ -8,312 +8,105 @@ during a session. A step is one caller operation keyed by ``step_id``:
    terminal outcome of the same request.
 2. ``mark_provider_started`` records that a provider call may run. A crash after this point
    makes the step ambiguous rather than releasable.
-3. ``complete_step`` commits the next state, the terminal response, and an audit row in one
-   transaction. ``reject_step`` closes a step whose reply was refused, with no state change.
+3. ``complete_step`` publishes the step's structural state edits, its event, the terminal
+   response, and an audit row in one transaction. ``reject_step`` closes a step whose reply was
+   refused, with no state change.
+
+State is stored incrementally (see ``projection``): each revision is an immutable event plus a
+root of content-addressed nodes, so a commit writes only the containers its edits change, and
+unchanged subtrees are shared across revisions. Callers hold revision-bound ``StateRef`` values
+and materialize JSON explicitly with ``read_state`` or ``read_session``. Historical revisions
+stay readable while a retention pin owns them; ``collect_garbage`` reclaims the rest.
+
+One connection per thread and database is reused across operations, so a step pays one durable
+WAL sync per transaction rather than a connection setup and a checkpoint on every close. Every
+transaction still commits with ``synchronous = FULL`` before the call returns.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from datetime import UTC, datetime
-from enum import StrEnum
+from datetime import datetime
 from pathlib import Path
-from typing import Literal, Self
 from uuid import uuid4
 
-from pydantic import AwareDatetime, Field, model_validator
+from pydantic import JsonValue
 
-from exp.common.core.artifacts import (
-    ContractModel,
-    JsonObject,
-    Sha256,
-    canonical_json_bytes,
-    sha256_json,
+from exp.common.core.artifacts import JsonObject, Sha256, sha256_json
+from exp.common.sqlite.connection import persistent_connection
+from exp.runtime.sessions.edits import StateEdit
+from exp.runtime.sessions.errors import (
+    ClaimLostError,
+    ProviderBudgetExhaustedError,
+    SessionBindingMismatchError,
+    SessionDrainingError,
+    SessionExistsError,
+    SessionNotFoundError,
+    SessionStoreError,
+    StateReferenceError,
+    StateUnavailableError,
+    StepConflictError,
+    StepDeadlineExceededError,
+    StepInFlightError,
+    VersionConflictError,
 )
-from exp.common.sqlite.connection import connect_database
+from exp.runtime.sessions.nodes import EncodedNode, declared_text, encode
+from exp.runtime.sessions.projection import (
+    StateRef,
+    commit_edits,
+    edits_effect,
+    event_root,
+    genesis_effect,
+    insert_nodes,
+    prepare_edits,
+    read_value,
+    record_event,
+    replay_roots,
+)
+from exp.runtime.sessions.records import (
+    OPEN_STATUSES,
+    RecoveryReport,
+    RequestPreflightReceipt,
+    SessionBinding,
+    SessionHead,
+    SessionRecord,
+    StepClaim,
+    StepDecision,
+    StepStatus,
+)
+from exp.runtime.sessions.retention import (
+    CollectionPreview,
+    CollectionReport,
+    RetentionPin,
+    collect,
+    pin_revisions,
+    preview_collection,
+    registered_pins,
+    release_pin,
+)
+from exp.runtime.sessions.schema import open_schema, refuse_stale_schema
+from exp.runtime.sessions.steps import (
+    audit,
+    identity_text,
+    placeholders,
+    replay_or_refuse,
+    require_open_claim,
+    set_status,
+    stored_object,
+    utc_now,
+)
 
 logger = logging.getLogger(__name__)
-
-SCHEMA_VERSION = 3
-"""Schema identity stored in ``PRAGMA user_version``. Mismatches fail closed."""
-
-
-class SessionStoreError(RuntimeError):
-    """Base class for refused session-store operations."""
-
-
-class SessionNotFoundError(SessionStoreError):
-    """The requested session does not exist in this database."""
-
-
-class SessionExistsError(SessionStoreError):
-    """A session with this identifier already exists."""
-
-
-class VersionConflictError(SessionStoreError):
-    """The expected session version does not match the stored version."""
-
-
-class StepConflictError(SessionStoreError):
-    """A step ID was reused with a different request digest."""
-
-
-class StepInFlightError(SessionStoreError):
-    """Another step on the same session is open, so this step must wait."""
-
-
-class StepAmbiguousError(SessionStoreError):
-    """A step reached the provider without a persisted outcome and is blocked for review."""
-
-
-class StepRejectedError(SessionStoreError):
-    """The step was closed without a state change. Its stored reason is in the message."""
-
-
-class SessionBindingMismatchError(SessionStoreError):
-    """The request binding differs from the binding pinned at session creation."""
-
-
-class ProviderBudgetExhaustedError(SessionStoreError):
-    """The session has used its provider-call budget, so no further dispatch may start."""
-
-
-class StepDeadlineExceededError(SessionStoreError):
-    """A returned proposal was retained but cannot commit after its session deadline."""
-
-
-class SessionDrainingError(SessionStoreError):
-    """The session is draining and refuses new steps."""
-
-
-class ClaimLostError(SessionStoreError):
-    """The claim is not the open claim for its step."""
-
-
-class StepStatus(StrEnum):
-    """Durable lifecycle state of one step row."""
-
-    CLAIMED = "claimed"
-    PROVIDER_STARTED = "provider_started"
-    COMPLETED = "completed"
-    REJECTED = "rejected"
-    RELEASED = "released"
-    AMBIGUOUS = "ambiguous"
-
-
-_OPEN_STATUSES = ("claimed", "provider_started", "ambiguous")
-
-
-class SessionBinding(ContractModel):
-    """Immutable identity of the evidence and execution policy a session runs under.
-
-    Attributes:
-        deadline: Absolute commit deadline, fixed for the entire session.
-        target_id: Target name with its deployed profile version, as ``name@version``.
-        initialization_receipt_sha256: Digest of the public initialization receipt.
-        knowledge_sha256: Digest of the frozen knowledge or rulebook.
-        corpus_sha256: Digest of the retrieval corpus snapshot.
-        representation_sha256: Digest of the state representation contract.
-        execution_policy_sha256: Digest of the ``ExecutionPolicy`` that bounds model
-            settings, provider-call caps, and inspection.
-    """
-
-    deadline: AwareDatetime
-    target_id: str = Field(pattern=r"^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$")
-    initialization_receipt_sha256: Sha256
-    knowledge_sha256: Sha256
-    corpus_sha256: Sha256
-    representation_sha256: Sha256
-    execution_policy_sha256: Sha256
-
-
-class SessionRecord(ContractModel):
-    """One session's binding, durable state, and version.
-
-    Attributes:
-        session_id: Caller-chosen stable identifier.
-        binding: Immutable identity, fixed at creation.
-        version: Count of committed transitions; starts at 0.
-        state: The candidate state object.
-        draining: Whether new steps are refused.
-    """
-
-    session_id: str = Field(min_length=1)
-    binding: SessionBinding
-    version: int = Field(ge=0)
-    state: JsonObject
-    draining: bool
-
-
-class StepClaim(ContractModel):
-    """An open claim for exactly one provider attempt.
-
-    Attributes:
-        session_id: Session the step belongs to.
-        step_id: Caller-chosen step identifier, unique within the session.
-        claim_token: Opaque token required by every later call on this claim.
-        base_version: Session version the claim was made against.
-    """
-
-    session_id: str = Field(min_length=1)
-    step_id: str = Field(min_length=1)
-    claim_token: str = Field(min_length=1)
-    base_version: int = Field(ge=0)
-
-
-class RequestPreflightReceipt(ContractModel):
-    """Content-free audit receipt for preparation before provider dispatch.
-
-    Attributes:
-        request_sha256: Order-preserving digest of the complete prepared wire body.
-        capacity_sha256: Digest of the declared model, capacity, counter and renderer policy.
-        input_token_upper_bound: Conservative input bound, not measured provider usage.
-        output_tokens: Declared output reservation, not actual output usage.
-        accepted: Whether the request passed the declared capacity check.
-    """
-
-    request_sha256: Sha256
-    capacity_sha256: Sha256
-    input_token_upper_bound: int = Field(ge=0, strict=True)
-    output_tokens: int = Field(gt=0, strict=True)
-    accepted: bool
-
-
-class CompletedStep(ContractModel):
-    """The stored terminal response of a completed step, replayed verbatim.
-
-    Attributes:
-        response: Exact response object returned by the original attempt.
-        resulting_version: Session version after the step committed.
-    """
-
-    response: JsonObject
-    resulting_version: int = Field(ge=0)
-
-
-class StepDecision(ContractModel):
-    """Outcome of ``begin_step``: a fresh claim or a replayed completion.
-
-    Attributes:
-        kind: ``"claimed"`` for a new attempt, ``"completed"`` for a replay.
-        claim: Set only when ``kind`` is ``"claimed"``.
-        completed: Set only when ``kind`` is ``"completed"``.
-    """
-
-    kind: Literal["claimed", "completed"]
-    claim: StepClaim | None = None
-    completed: CompletedStep | None = None
-
-    @model_validator(mode="after")
-    def _exactly_one_payload(self) -> Self:
-        """Require exactly the payload matching ``kind``.
-
-        Returns:
-            The validated decision.
-
-        Raises:
-            ValueError: If the payload does not match ``kind``.
-        """
-        if (self.kind == "claimed") != (self.claim is not None):
-            raise ValueError("claim is required exactly when kind is claimed")
-        if (self.kind == "completed") != (self.completed is not None):
-            raise ValueError("completed is required exactly when kind is completed")
-        return self
-
-
-class RecoveryReport(ContractModel):
-    """Step keys whose status recovery changed.
-
-    Attributes:
-        released: Claims that never reached the provider.
-        ambiguous: Claims that may have reached the provider; blocked until reviewed.
-    """
-
-    released: tuple[tuple[str, str], ...] = ()
-    ambiguous: tuple[tuple[str, str], ...] = ()
-
-
-_SCHEMA_STATEMENTS = (
-    """CREATE TABLE sessions (
-        session_id TEXT PRIMARY KEY,
-        binding_json TEXT NOT NULL,
-        version INTEGER NOT NULL CHECK (version >= 0),
-        state_json TEXT NOT NULL,
-        draining INTEGER NOT NULL CHECK (draining IN (0, 1))
-    ) STRICT""",
-    """CREATE TRIGGER sessions_binding_immutable BEFORE UPDATE OF binding_json ON sessions
-    BEGIN SELECT RAISE(ABORT, 'session binding is immutable'); END""",
-    """CREATE TABLE steps (
-        session_id TEXT NOT NULL REFERENCES sessions(session_id),
-        step_id TEXT NOT NULL,
-        request_sha256 TEXT NOT NULL,
-        base_version INTEGER NOT NULL,
-        status TEXT NOT NULL,
-        claim_token TEXT NOT NULL,
-        proposal_json TEXT,
-        response_json TEXT,
-        resulting_version INTEGER,
-        PRIMARY KEY (session_id, step_id)
-    ) STRICT""",
-    """CREATE UNIQUE INDEX steps_one_open_per_session
-        ON steps(session_id) WHERE status IN ('claimed', 'provider_started', 'ambiguous')""",
-    """CREATE TABLE audit (
-        seq INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
-        step_id TEXT,
-        event TEXT NOT NULL,
-        detail_sha256 TEXT NOT NULL,
-        recorded_at TEXT NOT NULL
-    ) STRICT""",
-)
-
-
-def _text(value: JsonObject) -> str:
-    """Render a JSON object as canonical UTF-8 text, for identity-bearing values only."""
-    return canonical_json_bytes(value).decode("utf-8")
-
-
-def _declared_text(value: JsonObject) -> str:
-    """Render a JSON object as UTF-8 text that keeps its declared key order.
-
-    Used for state, proposals, and responses, whose key order is data the provider and client
-    declared. Identity digests never use this encoding.
-    """
-    return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-
-
-def _object(text: str) -> JsonObject:
-    """Decode stored canonical JSON text into an object.
-
-    Args:
-        text: Text produced by ``_text``.
-
-    Returns:
-        The decoded object.
-
-    Raises:
-        SessionStoreError: If the stored value is not an object.
-    """
-    decoded = json.loads(text)
-    if not isinstance(decoded, dict):
-        raise SessionStoreError("stored JSON value is not an object")
-    return decoded
-
-
-def _utc_now() -> datetime:
-    """Return the current aware UTC time for commit authorization."""
-    return datetime.now(UTC)
 
 
 class SessionStore:
     """Transactional single-file session store.
 
     Each mutation runs in one ``BEGIN IMMEDIATE`` transaction, so concurrent writers serialize
-    and version checks see the state the write will change.
+    and version checks see the state the write will change. Each read runs in one snapshot.
 
     Args:
         path: SQLite file, created with its schema when absent.
@@ -330,36 +123,23 @@ class SessionStore:
             clock: Aware wall clock sampled under the commit transaction.
 
         Raises:
-            SessionStoreError: If the schema version is not ``SCHEMA_VERSION``.
+            SessionStoreError: If the database has another schema version or codec.
         """
-        self._clock = clock or _utc_now
+        self._clock = clock or utc_now
         self._path = path
+        refuse_stale_schema(path)
         with self._connect() as connection:
-            version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version == 0:
-                connection.execute("BEGIN IMMEDIATE")
-                for statement in _SCHEMA_STATEMENTS:
-                    connection.execute(statement)
-                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-                connection.execute("COMMIT")
-            elif version != SCHEMA_VERSION:
-                raise SessionStoreError(
-                    f"session database schema {version} is not {SCHEMA_VERSION}; "
-                    "use a fresh database path"
-                )
+            self.store_id = open_schema(connection, path)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        """Yield a fresh configured connection, closed on exit.
+        """Yield this thread's reusable configured connection to the store.
 
         Yields:
-            Connection with foreign keys, WAL, and a bounded busy timeout.
+            Connection with foreign keys, WAL, full commit sync, and a bounded busy timeout.
         """
-        connection = connect_database(self._path)
-        try:
+        with persistent_connection(self._path) as connection:
             yield connection
-        finally:
-            connection.close()
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -373,47 +153,85 @@ class SessionStore:
             try:
                 yield connection
             except BaseException:
-                connection.execute("ROLLBACK")
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
                 raise
             connection.execute("COMMIT")
 
+    @contextmanager
+    def _snapshot(self) -> Iterator[sqlite3.Connection]:
+        """Yield a connection inside a read transaction, so every query sees one revision.
+
+        Yields:
+            Connection whose reads share one consistent database snapshot.
+        """
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            try:
+                yield connection
+            finally:
+                connection.execute("COMMIT")
+
     def create_session(
         self, session_id: str, binding: SessionBinding, initial_state: JsonObject
-    ) -> SessionRecord:
-        """Create a session at version 0 with its immutable binding.
+    ) -> SessionHead:
+        """Create a session at version 0 with its immutable binding and recorded genesis.
 
         Args:
             session_id: New stable identifier.
             binding: Evidence identity fixed for the session's lifetime.
-            initial_state: Starting candidate state.
+            initial_state: Starting candidate state, recorded as the replayable genesis.
 
         Returns:
-            The created record.
+            The created head.
 
         Raises:
             SessionExistsError: If the identifier is already used.
         """
+        nodes: dict[bytes, EncodedNode] = {}
+        root = encode(initial_state, nodes)
         with self._transaction() as connection:
             if connection.execute(
                 "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
             ).fetchone():
                 raise SessionExistsError(f"session {session_id!r} already exists")
+            insert_nodes(connection, nodes)
             connection.execute(
-                "INSERT INTO sessions (session_id, binding_json, version, state_json, draining)"
+                "INSERT INTO sessions (session_id, binding_json, version, root, draining)"
                 " VALUES (?, ?, 0, ?, 0)",
-                (session_id, _text(binding.model_dump(mode="json")), _declared_text(initial_state)),
+                (session_id, identity_text(binding.model_dump(mode="json")), root),
             )
-            _audit(
+            record_event(connection, session_id, 0, None, genesis_effect(initial_state), root)
+            audit(
                 connection,
                 session_id,
                 None,
                 "session_created",
                 {"binding_sha256": sha256_json(binding)},
             )
-        return self.read_session(session_id)
+        return self.read_head(session_id)
+
+    def read_head(self, session_id: str) -> SessionHead:
+        """Return the binding, version and current state reference, without reading the state.
+
+        Args:
+            session_id: Session identifier.
+
+        Returns:
+            The current head.
+
+        Raises:
+            SessionNotFoundError: If the session does not exist.
+        """
+        with self._connect() as connection:
+            row = _head_row(connection, session_id)
+        return self._head(row)
 
     def read_session(self, session_id: str) -> SessionRecord:
-        """Return the binding, committed state, and version of one session.
+        """Return the binding, complete committed state, and version of one session.
+
+        This materializes the whole state; callers that need part of it use ``read_head`` and
+        ``read_state`` with a path.
 
         Args:
             session_id: Session identifier.
@@ -424,19 +242,60 @@ class SessionStore:
         Raises:
             SessionNotFoundError: If the session does not exist.
         """
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT session_id, binding_json, version, state_json, draining"
-                " FROM sessions WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()
-        if row is None:
-            raise SessionNotFoundError(f"session {session_id!r} does not exist")
+        with self._snapshot() as connection:
+            row = _head_row(connection, session_id)
+            state = read_value(connection, bytes(row["root"]), ())
+        if not isinstance(state, dict):
+            raise SessionStoreError("stored session state is not an object")
         return SessionRecord(
             session_id=row["session_id"],
             binding=SessionBinding.model_validate_json(row["binding_json"]),
             version=row["version"],
-            state=_object(row["state_json"]),
+            state=state,
+            draining=bool(row["draining"]),
+        )
+
+    def read_state(self, ref: StateRef, path: Sequence[str | int] = ()) -> JsonValue:
+        """Materialize one revision's state, or the value at ``path`` inside it, as fresh JSON.
+
+        Only the containers on ``path`` and the selected subtree are read. The reference must
+        come from this store, and the revision must still be materialized: the head always is,
+        and older revisions are while a retention pin owns them.
+
+        Args:
+            ref: Revision-bound state reference issued by this store.
+            path: Object keys and array indexes inside the state; empty for the whole state.
+
+        Returns:
+            A detached JSON value with its declared key order and exact scalars.
+
+        Raises:
+            StateReferenceError: If the reference is foreign or names another root.
+            StateUnavailableError: If the revision was reclaimed.
+            KeyError: If ``path`` does not exist in the revision.
+        """
+        if ref.store_id != self.store_id:
+            raise StateReferenceError("state reference belongs to another session store")
+        with self._snapshot() as connection:
+            root = event_root(connection, ref.session_id, ref.revision)
+            if root is None or root.hex() != ref.root_sha256:
+                raise StateReferenceError(
+                    f"session {ref.session_id!r} has no revision {ref.revision} with that root"
+                )
+            return read_value(connection, root, tuple(path))
+
+    def _head(self, row: sqlite3.Row) -> SessionHead:
+        """Build a head from one ``sessions`` row."""
+        return SessionHead(
+            session_id=row["session_id"],
+            binding=SessionBinding.model_validate_json(row["binding_json"]),
+            version=row["version"],
+            state=StateRef(
+                store_id=self.store_id,
+                session_id=row["session_id"],
+                revision=row["version"],
+                root_sha256=bytes(row["root"]).hex(),
+            ),
             draining=bool(row["draining"]),
         )
 
@@ -489,13 +348,13 @@ class SessionStore:
                 (session_id, step_id),
             ).fetchone()
             if prior is not None:
-                return _replay_or_refuse(session_id, step_id, request_sha256, prior)
+                return replay_or_refuse(session_id, step_id, request_sha256, prior)
             if bool(session["draining"]):
                 raise SessionDrainingError(f"session {session_id!r} is draining")
             open_step = connection.execute(
                 "SELECT step_id FROM steps WHERE session_id = ?"
-                f" AND status IN ({_placeholders(_OPEN_STATUSES)})",
-                (session_id, *_OPEN_STATUSES),
+                f" AND status IN ({placeholders(OPEN_STATUSES)})",
+                (session_id, *OPEN_STATUSES),
             ).fetchone()
             if open_step is not None:
                 raise StepInFlightError(
@@ -516,8 +375,66 @@ class SessionStore:
                 " status, claim_token) VALUES (?, ?, ?, ?, 'claimed', ?)",
                 (session_id, step_id, request_sha256, expected_version, claim.claim_token),
             )
-            _audit(connection, session_id, step_id, "step_claimed", {"request": request_sha256})
+            audit(connection, session_id, step_id, "step_claimed", {"request": request_sha256})
         return StepDecision(kind="claimed", claim=claim)
+
+    def reclaim_step(
+        self, session_id: str, step_id: str, request_sha256: Sha256, binding: SessionBinding
+    ) -> tuple[StepClaim, StepStatus]:
+        """Take over a step a stopped process left open, for an explicit resumption only.
+
+        A claim that never reached the provider reopens as claimed. One that may have reached
+        it stays ``provider_started`` (its dispatch is already counted) and is never released:
+        the caller replays its saved output or re-dispatches it as an unknown outcome.
+
+        Args:
+            session_id: Session of the step.
+            step_id: Interrupted step.
+            request_sha256: The caller's request digest; it must equal the saved one.
+            binding: The caller's binding; it must equal the session's.
+
+        Returns:
+            A fresh claim on the step, and the status the step was left in.
+
+        Raises:
+            SessionNotFoundError: If the session does not exist.
+            SessionBindingMismatchError: If the binding differs.
+            StepConflictError: If the step is not open or was opened for another request.
+            VersionConflictError: If the session advanced past the step's base version.
+        """
+        with self._transaction() as connection:
+            session = connection.execute(
+                "SELECT version, binding_json FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if session is None:
+                raise SessionNotFoundError(f"session {session_id!r} does not exist")
+            if SessionBinding.model_validate_json(session["binding_json"]) != binding:
+                raise SessionBindingMismatchError(f"binding differs from session {session_id!r}")
+            row = connection.execute(
+                "SELECT request_sha256, status, base_version FROM steps"
+                " WHERE session_id = ? AND step_id = ?",
+                (session_id, step_id),
+            ).fetchone()
+            if row is None or row["status"] not in OPEN_STATUSES:
+                raise StepConflictError(f"step {step_id!r} is not an interrupted open step")
+            if row["request_sha256"] != request_sha256:
+                raise StepConflictError(f"step {step_id!r} was opened for a different request")
+            if session["version"] != row["base_version"]:
+                raise VersionConflictError(f"step {step_id!r} is based on a stale version")
+            left = StepStatus(row["status"])
+            status = "claimed" if left is StepStatus.CLAIMED else "provider_started"
+            claim = StepClaim(
+                session_id=session_id,
+                step_id=step_id,
+                claim_token=uuid4().hex,
+                base_version=row["base_version"],
+            )
+            connection.execute(
+                "UPDATE steps SET status = ?, claim_token = ? WHERE session_id = ? AND step_id = ?",
+                (status, claim.claim_token, session_id, step_id),
+            )
+            audit(connection, session_id, step_id, "step_reclaimed", {"from": left.value})
+        return claim, left
 
     def record_request_preflight(self, claim: StepClaim, receipt: RequestPreflightReceipt) -> None:
         """Persist the digest of a typed preflight receipt for a still-claimed step.
@@ -538,7 +455,7 @@ class SessionStore:
         """
         payload = receipt.model_dump(mode="json")
         with self._transaction() as connection:
-            _require_open_claim(connection, claim, expected_status=StepStatus.CLAIMED)
+            require_open_claim(connection, claim, expected_status=StepStatus.CLAIMED)
             prior = connection.execute(
                 "SELECT detail_sha256 FROM audit WHERE session_id = ? AND step_id = ?"
                 " AND event = 'request_preflight'",
@@ -550,7 +467,7 @@ class SessionStore:
                         "prepared request receipt differs from the stored receipt"
                     )
                 return
-            _audit(connection, claim.session_id, claim.step_id, "request_preflight", payload)
+            audit(connection, claim.session_id, claim.step_id, "request_preflight", payload)
 
     def mark_provider_started(self, claim: StepClaim, maximum_provider_calls: int) -> None:
         """Durably record a provider dispatch, refusing it once the session budget is spent.
@@ -568,7 +485,7 @@ class SessionStore:
             ProviderBudgetExhaustedError: If the session already used its budget.
         """
         with self._transaction() as connection:
-            _require_open_claim(connection, claim, expected_status=StepStatus.CLAIMED)
+            require_open_claim(connection, claim, expected_status=StepStatus.CLAIMED)
             used = connection.execute(
                 "SELECT COUNT(*) AS n FROM audit"
                 " WHERE session_id = ? AND event = 'provider_started'",
@@ -582,7 +499,7 @@ class SessionStore:
                 "UPDATE steps SET status = 'provider_started' WHERE session_id = ? AND step_id = ?",
                 (claim.session_id, claim.step_id),
             )
-            _audit(connection, claim.session_id, claim.step_id, "provider_started", {})
+            audit(connection, claim.session_id, claim.step_id, "provider_started", {})
 
     def record_proposal(self, claim: StepClaim, proposal: JsonObject) -> None:
         """Durably store the paid provider output before any state commit.
@@ -598,12 +515,12 @@ class SessionStore:
             ClaimLostError: If the claim is not open at ``provider_started``.
         """
         with self._transaction() as connection:
-            _require_open_claim(connection, claim, expected_status=StepStatus.PROVIDER_STARTED)
+            require_open_claim(connection, claim, expected_status=StepStatus.PROVIDER_STARTED)
             connection.execute(
                 "UPDATE steps SET proposal_json = ? WHERE session_id = ? AND step_id = ?",
-                (_declared_text(proposal), claim.session_id, claim.step_id),
+                (declared_text(proposal), claim.session_id, claim.step_id),
             )
-            _audit(connection, claim.session_id, claim.step_id, "proposal_recorded", proposal)
+            audit(connection, claim.session_id, claim.step_id, "proposal_recorded", proposal)
 
     def proposal(self, session_id: str, step_id: str) -> JsonObject | None:
         """Return the durably stored provider output for one step, if any.
@@ -622,30 +539,45 @@ class SessionStore:
             ).fetchone()
         if row is None or row["proposal_json"] is None:
             return None
-        return _object(row["proposal_json"])
+        return stored_object(row["proposal_json"])
 
     def complete_step(
-        self, claim: StepClaim, next_state: JsonObject, response: JsonObject
-    ) -> SessionRecord:
+        self,
+        claim: StepClaim,
+        edits: Sequence[StateEdit],
+        response: JsonObject,
+        *,
+        window: datetime | None = None,
+    ) -> SessionHead:
         """Publish one state revision or durably reject a late proposal.
+
+        The edits, the event recording them, the changed nodes, the new head and the replay
+        response commit in one transaction. Edits that do not apply publish nothing and leave
+        the step open.
 
         Args:
             claim: Current provider-started owner of the logical operation.
-            next_state: Fully validated candidate state, serialized before locking.
+            edits: Ordered structural edits of the fully validated proposal; their container
+                values are encoded before locking.
             response: Ordered observations to replay with the committed state.
+            window: Deadline of an explicitly resumed execution window; it extends, never
+                shortens, the binding's commit deadline. The binding itself is unchanged.
 
         Returns:
-            Session at the newly committed revision.
+            Head at the newly committed revision.
 
         Raises:
             ClaimLostError: Ownership or the saved proposal is missing.
             VersionConflictError: The proposal was based on a stale revision.
             StepDeadlineExceededError: Deadline passed; proposal and rejection remain durable.
+            StateEditError: An edit does not apply to the base revision.
         """
-        state_text, response_text = _declared_text(next_state), _declared_text(response)
+        nodes: dict[bytes, EncodedNode] = {}
+        prepared = prepare_edits(edits, nodes)
+        effect, response_text = edits_effect(prepared.edits), declared_text(response)
         expired = False
         with self._transaction() as connection:
-            _require_open_claim(connection, claim, expected_status=StepStatus.PROVIDER_STARTED)
+            require_open_claim(connection, claim, expected_status=StepStatus.PROVIDER_STARTED)
             proposal_row = connection.execute(
                 "SELECT proposal_json FROM steps WHERE session_id = ? AND step_id = ?",
                 (claim.session_id, claim.step_id),
@@ -653,7 +585,7 @@ class SessionStore:
             if proposal_row["proposal_json"] is None:
                 raise ClaimLostError("complete requires a recorded proposal first")
             current = connection.execute(
-                "SELECT version, binding_json FROM sessions WHERE session_id = ?",
+                "SELECT version, binding_json, root FROM sessions WHERE session_id = ?",
                 (claim.session_id,),
             ).fetchone()
             if current["version"] != claim.base_version:
@@ -662,30 +594,35 @@ class SessionStore:
             now = self._clock()
             if now.tzinfo is None:
                 raise ValueError("commit clock must return an aware datetime")
-            expired = now >= binding.deadline
+            expired = now >= max(binding.deadline, window or binding.deadline)
             if expired:
                 connection.execute(
                     "UPDATE steps SET status = 'rejected', response_json = ? "
                     "WHERE session_id = ? AND step_id = ?",
                     (
-                        _declared_text({"reason": "deadline_stopped"}),
+                        declared_text({"reason": "deadline_stopped"}),
                         claim.session_id,
                         claim.step_id,
                     ),
                 )
-                _audit(connection, claim.session_id, claim.step_id, "deadline_stopped", {})
+                audit(connection, claim.session_id, claim.step_id, "deadline_stopped", {})
             else:
                 next_version = claim.base_version + 1
+                root, changed = commit_edits(connection, bytes(current["root"]), prepared, nodes)
+                insert_nodes(connection, changed)
+                record_event(
+                    connection, claim.session_id, next_version, claim.step_id, effect, root
+                )
                 connection.execute(
-                    "UPDATE sessions SET version = ?, state_json = ? WHERE session_id = ?",
-                    (next_version, state_text, claim.session_id),
+                    "UPDATE sessions SET version = ?, root = ? WHERE session_id = ?",
+                    (next_version, root, claim.session_id),
                 )
                 connection.execute(
                     "UPDATE steps SET status = 'completed', response_json = ?, "
                     "resulting_version = ? WHERE session_id = ? AND step_id = ?",
                     (response_text, next_version, claim.session_id, claim.step_id),
                 )
-                _audit(
+                audit(
                     connection,
                     claim.session_id,
                     claim.step_id,
@@ -694,7 +631,7 @@ class SessionStore:
                 )
         if expired:
             raise StepDeadlineExceededError("proposal retained; session deadline forbids commit")
-        return self.read_session(claim.session_id)
+        return self.read_head(claim.session_id)
 
     def reject_step(self, claim: StepClaim, reason: str) -> None:
         """Close an open step with no state change because its reply was refused.
@@ -707,13 +644,13 @@ class SessionStore:
             ClaimLostError: If the claim is not open for its step.
         """
         with self._transaction() as connection:
-            _require_open_claim(connection, claim, expected_status=None)
+            require_open_claim(connection, claim, expected_status=None)
             connection.execute(
                 "UPDATE steps SET status = 'rejected', response_json = ? WHERE session_id = ?"
                 " AND step_id = ?",
-                (_declared_text({"reason": reason}), claim.session_id, claim.step_id),
+                (declared_text({"reason": reason}), claim.session_id, claim.step_id),
             )
-            _audit(connection, claim.session_id, claim.step_id, "step_rejected", {})
+            audit(connection, claim.session_id, claim.step_id, "step_rejected", {})
 
     def mark_ambiguous(self, claim: StepClaim, reason: str) -> None:
         """Record an unresolved dispatched outcome without releasing or repurchasing it.
@@ -723,9 +660,9 @@ class SessionStore:
             reason: Content-free exception classification, never credentials or raw error text.
         """
         with self._transaction() as connection:
-            _require_open_claim(connection, claim, expected_status=StepStatus.PROVIDER_STARTED)
-            _set_status(connection, (claim.session_id, claim.step_id), "ambiguous")
-            _audit(
+            require_open_claim(connection, claim, expected_status=StepStatus.PROVIDER_STARTED)
+            set_status(connection, (claim.session_id, claim.step_id), "ambiguous")
+            audit(
                 connection,
                 claim.session_id,
                 claim.step_id,
@@ -743,12 +680,12 @@ class SessionStore:
             ClaimLostError: If the claim is not open, or the provider already started.
         """
         with self._transaction() as connection:
-            _require_open_claim(connection, claim, expected_status=StepStatus.CLAIMED)
+            require_open_claim(connection, claim, expected_status=StepStatus.CLAIMED)
             connection.execute(
                 "UPDATE steps SET status = 'released' WHERE session_id = ? AND step_id = ?",
                 (claim.session_id, claim.step_id),
             )
-            _audit(connection, claim.session_id, claim.step_id, "step_released", {})
+            audit(connection, claim.session_id, claim.step_id, "step_released", {})
 
     def recover(self) -> RecoveryReport:
         """Resolve open claims left by a crash or restart.
@@ -769,17 +706,17 @@ class SessionStore:
             for row in rows:
                 key = (row["session_id"], row["step_id"])
                 if row["status"] == StepStatus.CLAIMED:
-                    _set_status(connection, key, "released")
+                    set_status(connection, key, "released")
                     released.append(key)
-                    _audit(connection, key[0], key[1], "recovered_released", {})
+                    audit(connection, key[0], key[1], "recovered_released", {})
                 else:
-                    _set_status(connection, key, "ambiguous")
+                    set_status(connection, key, "ambiguous")
                     ambiguous.append(key)
-                    _audit(connection, key[0], key[1], "recovered_ambiguous", {})
+                    audit(connection, key[0], key[1], "recovered_ambiguous", {})
         logger.info("session recovery released=%d ambiguous=%d", len(released), len(ambiguous))
         return RecoveryReport(released=tuple(released), ambiguous=tuple(ambiguous))
 
-    def set_draining(self, session_id: str, draining: bool) -> SessionRecord:
+    def set_draining(self, session_id: str, draining: bool) -> SessionHead:
         """Start or stop refusing new steps for a session.
 
         Args:
@@ -787,7 +724,7 @@ class SessionStore:
             draining: True to refuse new steps.
 
         Returns:
-            The updated record.
+            The updated head.
 
         Raises:
             SessionNotFoundError: If the session does not exist.
@@ -799,8 +736,8 @@ class SessionStore:
             )
             if cursor.rowcount == 0:
                 raise SessionNotFoundError(f"session {session_id!r} does not exist")
-            _audit(connection, session_id, None, "draining_set", {"draining": draining})
-        return self.read_session(session_id)
+            audit(connection, session_id, None, "draining_set", {"draining": draining})
+        return self.read_head(session_id)
 
     def open_steps(self, session_id: str) -> tuple[str, ...]:
         """Return step IDs that are open or ambiguous for one session.
@@ -814,113 +751,200 @@ class SessionStore:
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT step_id FROM steps WHERE session_id = ?"
-                f" AND status IN ({_placeholders(_OPEN_STATUSES)}) ORDER BY step_id",
-                (session_id, *_OPEN_STATUSES),
+                f" AND status IN ({placeholders(OPEN_STATUSES)}) ORDER BY step_id",
+                (session_id, *OPEN_STATUSES),
             ).fetchall()
         return tuple(row["step_id"] for row in rows)
 
+    def pin_revisions(
+        self, owner_id: str, session_id: str, start_revision: int, end_revision: int
+    ) -> RetentionPin:
+        """Durably retain revisions ``[start_revision, end_revision)`` for one named owner.
 
-def _placeholders(values: tuple[str, ...]) -> str:
-    """Return comma-separated SQL placeholders, one per value."""
-    return ", ".join("?" for _ in values)
+        Register the pin before exposing a historical revision or beginning to read it. It lasts
+        until ``release_pin``; a stopped process does not release it.
 
+        Args:
+            owner_id: Stable owner, such as a checkpoint, fork or frozen evaluation identity.
+            session_id: Session whose history is retained.
+            start_revision: First retained revision.
+            end_revision: First revision after the range; at most the head version plus one.
 
-def _set_status(connection: sqlite3.Connection, key: tuple[str, str], status: str) -> None:
-    """Set one step's status inside the caller's transaction."""
-    connection.execute(
-        "UPDATE steps SET status = ? WHERE session_id = ? AND step_id = ?",
-        (status, key[0], key[1]),
-    )
+        Returns:
+            The registered pin.
 
-
-def _replay_or_refuse(
-    session_id: str, step_id: str, request_sha256: str, prior: sqlite3.Row
-) -> StepDecision:
-    """Return the stored outcome of a known step, or raise the matching refusal.
-
-    Args:
-        session_id: Session of the step.
-        step_id: Step identifier.
-        request_sha256: Digest of the caller's current request.
-        prior: The stored step row.
-
-    Returns:
-        A completed decision for a completed step with the same request.
-
-    Raises:
-        StepConflictError: If the request differs or the step was released.
-        StepAmbiguousError: If the step is blocked as ambiguous.
-        StepRejectedError: If the step was rejected.
-        StepInFlightError: If the step is still open.
-    """
-    if prior["request_sha256"] != request_sha256:
-        raise StepConflictError(f"step {step_id!r} was already used with a different request")
-    status = StepStatus(prior["status"])
-    if status is StepStatus.COMPLETED:
-        return StepDecision(
-            kind="completed",
-            completed=CompletedStep(
-                response=_object(prior["response_json"]),
-                resulting_version=prior["resulting_version"],
-            ),
+        Raises:
+            SessionNotFoundError: If the session does not exist.
+            RetentionConflictError: If the owner pins another range or the range is invalid.
+            StateUnavailableError: If a revision in the range was already reclaimed.
+        """
+        pin = RetentionPin(
+            owner_id=owner_id,
+            session_id=session_id,
+            start_revision=start_revision,
+            end_revision=end_revision,
         )
-    if status is StepStatus.AMBIGUOUS:
-        raise StepAmbiguousError(f"step {step_id!r} may have reached the provider; review it")
-    if status is StepStatus.REJECTED:
-        reason = _object(prior["response_json"]).get("reason", "")
-        raise StepRejectedError(f"step {step_id!r} was rejected: {reason}")
-    if status is StepStatus.RELEASED:
-        raise StepConflictError(f"step {step_id!r} was released; use a new step ID")
-    raise StepInFlightError(f"step {step_id!r} in session {session_id!r} is still open")
+        with self._transaction() as connection:
+            return pin_revisions(connection, pin)
+
+    def release_pin(self, owner_id: str, session_id: str) -> bool:
+        """Release one owner's pin; other owners and the head keep what they retain.
+
+        Args:
+            owner_id: Owner that registered the pin.
+            session_id: Pinned session.
+
+        Returns:
+            Whether a pin was released.
+        """
+        with self._transaction() as connection:
+            return release_pin(connection, owner_id, session_id)
+
+    def ref_at(self, session_id: str, revision: int) -> StateRef:
+        """Return the reference to one committed revision, whether or not it is still retained.
+
+        Args:
+            session_id: Session identifier.
+            revision: Committed revision; 0 is genesis.
+
+        Returns:
+            The revision-bound reference.
+
+        Raises:
+            StateReferenceError: If the session has no such revision.
+        """
+        with self._connect() as connection:
+            root = event_root(connection, session_id, revision)
+        if root is None:
+            raise StateReferenceError(f"session {session_id!r} has no revision {revision}")
+        return StateRef(
+            store_id=self.store_id,
+            session_id=session_id,
+            revision=revision,
+            root_sha256=root.hex(),
+        )
+
+    def collect_garbage(
+        self, *, batch_size: int = 500, maximum_batches: int | None = None
+    ) -> CollectionReport:
+        """Reclaim state nodes that no session head and no retention pin reaches.
+
+        Events are never reclaimed. An interrupted or bounded run resumes from its durable
+        cursor on the next call.
+
+        Args:
+            batch_size: Node rows examined per write transaction.
+            maximum_batches: Stop after this many batches; None runs to completion.
+
+        Returns:
+            Reclaimed and retained counts for this run.
+        """
+        if batch_size < 1:
+            raise ValueError("collection batches examine at least one node")
+        with self._connect() as connection:
+            report = collect(
+                connection,
+                self._transaction,
+                batch_size=batch_size,
+                maximum_batches=maximum_batches,
+            )
+        logger.info(
+            "session state collection reclaimed=%d bytes=%d complete=%s",
+            report.reclaimed_nodes,
+            report.reclaimed_bytes,
+            report.complete,
+        )
+        return report
+
+    def pins(self) -> tuple[RetentionPin, ...]:
+        """Return every registered retention pin, ordered by owner and session."""
+        with self._snapshot() as connection:
+            return registered_pins(connection)
+
+    def preview_collection(self) -> CollectionPreview:
+        """Report what ``collect_garbage`` would reclaim and what each pin holds; write nothing.
+
+        Returns:
+            Reclaimable and retained counts and every pin's exclusive holding, from one snapshot.
+        """
+        with self._snapshot() as connection:
+            return preview_collection(connection)
+
+    def vacuum(self) -> int:
+        """Rewrite the database file so pages freed by collection return to the file system.
+
+        SQLite runs the rewrite as one transaction, so an interrupted vacuum leaves the store
+        unchanged; it waits for, and then excludes, concurrent writers.
+
+        Returns:
+            Bytes by which the database and its write-ahead log shrank.
+        """
+        before = _file_bytes(self._path)
+        with self._connect() as connection:
+            connection.execute("VACUUM")
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return max(0, before - _file_bytes(self._path))
+
+    def verify_history(self, session_id: str) -> tuple[StateRef, ...]:
+        """Rebuild every revision from the recorded genesis and edits alone, and check it.
+
+        The replay uses no stored state nodes and calls no model, tool or clock, so it proves
+        that the event log reproduces each published root.
+
+        Args:
+            session_id: Session to verify.
+
+        Returns:
+            One reference per verified revision, from genesis to the head.
+
+        Raises:
+            SessionNotFoundError: If the session does not exist.
+            StateUnavailableError: If a replayed root differs from the recorded one.
+        """
+        with self._snapshot() as connection:
+            head = _head_row(connection, session_id)
+            recorded = [
+                bytes(row["root"])
+                for row in connection.execute(
+                    "SELECT root FROM state_events WHERE session_id = ? ORDER BY revision",
+                    (session_id,),
+                )
+            ]
+            replayed = replay_roots(connection, session_id)
+        if (
+            replayed != recorded
+            or len(recorded) != head["version"] + 1
+            or recorded[-1] != bytes(head["root"])
+        ):
+            raise StateUnavailableError(f"session {session_id!r} event log does not reproduce it")
+        return tuple(
+            StateRef(
+                store_id=self.store_id,
+                session_id=session_id,
+                revision=revision,
+                root_sha256=root.hex(),
+            )
+            for revision, root in enumerate(recorded)
+        )
 
 
-def _audit(
-    connection: sqlite3.Connection,
-    session_id: str,
-    step_id: str | None,
-    event: str,
-    detail: JsonObject,
-) -> None:
-    """Append one audit row. The detail is stored as a digest, never as content.
-
-    Args:
-        connection: Connection with an open transaction.
-        session_id: Session the event belongs to.
-        step_id: Step the event belongs to, when applicable.
-        event: Stable event name.
-        detail: Content whose digest is recorded.
-    """
-    connection.execute(
-        "INSERT INTO audit (session_id, step_id, event, detail_sha256, recorded_at)"
-        " VALUES (?, ?, ?, ?, ?)",
-        (session_id, step_id, event, sha256_json(detail), datetime.now(UTC).isoformat()),
-    )
+def _file_bytes(path: Path) -> int:
+    """Return the size of a database file and its write-ahead log."""
+    wal = path.with_name(path.name + "-wal")
+    return path.stat().st_size + (wal.stat().st_size if wal.exists() else 0)
 
 
-def _require_open_claim(
-    connection: sqlite3.Connection,
-    claim: StepClaim,
-    *,
-    expected_status: StepStatus | None,
-) -> None:
-    """Verify the claim is the open claim for its step, optionally at one status.
-
-    Args:
-        connection: Connection with an open transaction.
-        claim: Claim presented by the caller.
-        expected_status: Required status, or None for any open status.
+def _head_row(connection: sqlite3.Connection, session_id: str) -> sqlite3.Row:
+    """Return one ``sessions`` row.
 
     Raises:
-        ClaimLostError: If the step is missing, not open, has another token, or differs in status.
+        SessionNotFoundError: If the session does not exist.
     """
     row = connection.execute(
-        "SELECT status, claim_token FROM steps WHERE session_id = ? AND step_id = ?",
-        (claim.session_id, claim.step_id),
+        "SELECT session_id, binding_json, version, root, draining FROM sessions"
+        " WHERE session_id = ?",
+        (session_id,),
     ).fetchone()
-    if row is None or row["claim_token"] != claim.claim_token:
-        raise ClaimLostError(f"claim for step {claim.step_id!r} is not the open claim")
-    status = StepStatus(row["status"])
-    if status not in (StepStatus.CLAIMED, StepStatus.PROVIDER_STARTED):
-        raise ClaimLostError(f"step {claim.step_id!r} is {status.value}, not open")
-    if expected_status is not None and status is not expected_status:
-        raise ClaimLostError(f"step {claim.step_id!r} is {status.value}")
+    if row is None:
+        raise SessionNotFoundError(f"session {session_id!r} does not exist")
+    return row

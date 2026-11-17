@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from pydantic import JsonValue
 
 import exp
 import exp.runtime.models.registry as runtime_model_registry
 import exp.simulation.build as build_module
-from exp.common.core.artifacts import SourceIdentity
+from exp.common.core.artifacts import JsonObject, SourceIdentity
 from exp.common.project import (
     ArtifactCorruptionError,
     ArtifactStore,
@@ -23,12 +26,27 @@ from exp.common.project import (
     ProjectStoreError,
     ProjectTracePreparationSettings,
     artifact_input,
+    write_project_config,
 )
 from exp.common.project.paths import ProjectPaths
 from exp.common.project.testing import RawArtifact
 from exp.common.traces import Trace, TraceSource, TraceSpan
 from exp.common.traces.ingest.otlp import TraceNormalizationIssue, TraceNormalizationResult
-from exp.simulation.build import build_project, build_task_set
+from exp.optimize.evaluation.audit.exposure import held_out_exposure
+from exp.optimize.evaluation.audit.lifecycle_test import audit, clock, run
+from exp.optimize.evaluation.audit.panel_test import SimulatedProvider, episode
+from exp.optimize.evaluation.audit.panel_test import build_project as exp_build
+from exp.optimize.evaluation.audit.receipts import record_report
+from exp.simulation.build import (
+    SupersededBuildReviewError,
+    build_project,
+    build_task_set,
+    parse_build_review,
+    select_build_review,
+)
+from exp.simulation.development_scope import development_tasks
+from exp.simulation.mining.bindings import load_task_set_lineage_bindings
+from exp.simulation.mining.deduplicate import LeakageGroup, freeze_task_partition
 from exp.simulation.mining.service import MiningSpec
 
 _PROVIDER_FREE_REVISION = "a" * 40
@@ -175,7 +193,13 @@ def test_package_root_prepares_and_reopens_exact_provider_free_project_stage(
     config = store.load_project()
     trace_manifest = store.artifacts.read(first.trace_dataset.artifact_id).manifest
     task_manifest = store.artifacts.read(first.task_set.artifact_id).manifest
-    assert set(first.model_dump()) == {"schema_version", "trace_dataset", "task_set"}
+    assert set(first.model_dump()) == {
+        "schema_version",
+        "trace_dataset",
+        "task_set",
+        "descriptor_embedder",
+    }
+    assert first.descriptor_embedder == "hashing-descriptor-v3"
     assert trace_manifest.source is not None
     assert trace_manifest.source.source_id == "platform-trace-source:source-123"
     assert trace_manifest.code_revision == _PROVIDER_FREE_REVISION
@@ -426,6 +450,27 @@ def test_build_task_set_uses_only_the_persisted_trace_dataset_as_task_set_input(
     assert store.read(built.task_set.task_set_id).manifest.inputs == (dataset_input,)
 
 
+def test_build_task_set_refuses_simulation_provenance_before_writing(tmp_path: Path) -> None:
+    """Replies a simulated owner produced never become simulator learning evidence."""
+    store = ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
+    simulated = _trace(1).model_copy(
+        update={
+            "source": TraceSource(
+                identity=SourceIdentity(kind="simulation", source_id="generated-simulated:x"),
+                semantic_convention_version="1.37.0",
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="generated-simulated:x carry simulation provenance"):
+        build_task_set(
+            TraceNormalizationResult(traces=(simulated, _trace(2)), issues=()),
+            store,
+            created_at=datetime(2026, 8, 11, tzinfo=UTC),
+            code_revision="test-revision",
+        )
+    assert not store.list_ids()
+
+
 def test_build_project_resumes_without_publishing_unselected_review_readiness(
     tmp_path: Path,
 ) -> None:
@@ -503,3 +548,210 @@ def test_build_project_keeps_unselected_candidates_local_and_verifies_replay_pay
             code_revision="test-revision",
             mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
         )
+
+
+def _superseded_review(
+    tmp_path: Path, version: str = "hashing-descriptor-v1"
+) -> tuple[ProjectStore, build_module.BuildReviewReadiness]:
+    """Store a review recorded under an earlier descriptor grouping, beside a current one.
+
+    Returns:
+        The project store holding the earlier review with build-scoped judge state, and a
+        review freshly mined under the current version.
+    """
+    store = ProjectStore(tmp_path, "project-a")
+    store.initialize(ProjectConfig(project_id="project-a"))
+    current = build_project(
+        TraceNormalizationResult(traces=tuple(_trace(index) for index in range(100)), issues=()),
+        store,
+        created_at=datetime(2026, 8, 11, tzinfo=UTC),
+        code_revision="test-revision",
+        mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
+    ).review
+    binding = current.model_dump(mode="json", exclude={"readiness_id"})
+    binding["descriptor_embedder"] = version
+    earlier = {**binding, "readiness_id": build_module._build_review_id(binding)}
+    store.write_review({"build_review": earlier, "manual_judge": {"bound": "earlier"}})
+    return store, current
+
+
+@pytest.mark.parametrize("version", ["hashing-descriptor-v1", "hashing-descriptor-v2"])
+def test_a_review_grouped_under_another_descriptor_version_is_refused_with_the_remedy(
+    tmp_path: Path,
+    version: str,
+) -> None:
+    """An earlier build's lineages are never reused or silently relabeled as current."""
+    store, current = _superseded_review(tmp_path, version)
+    stored = store.read_review()
+    assert isinstance(stored, dict)
+
+    with pytest.raises(SupersededBuildReviewError) as refused:
+        parse_build_review(stored["build_review"])
+
+    message = str(refused.value)
+    assert version in message and "hashing-descriptor-v3" in message
+    assert "run exp build" in message
+    assert parse_build_review(current.model_dump(mode="json")) == current
+
+
+def test_only_a_freshly_mined_review_replaces_one_grouped_under_another_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rebuild replaces the earlier review and its judge state; a relabel is refused."""
+    store, current = _superseded_review(tmp_path)
+    monkeypatch.setattr(build_module, "_completed_build_matches_review", lambda *_: True)
+
+    with pytest.raises(SupersededBuildReviewError, match="run exp build"):
+        select_build_review(store, current)
+    stored = store.read_review()
+    assert isinstance(stored, dict)
+    assert stored["build_review"]["descriptor_embedder"] == "hashing-descriptor-v1"
+
+    select_build_review(store, current, replace_superseded=True)
+
+    assert store.read_review() == {"build_review": current.model_dump(mode="json")}
+
+
+@pytest.mark.parametrize("include_pin,pin", [(False, None), (True, None), (True, 7)])
+def test_stored_review_requires_an_explicit_descriptor_grouping_version(
+    tmp_path: Path, include_pin: bool, pin: JsonValue
+) -> None:
+    """A missing or invalid stored pin cannot inherit the fresh-construction default."""
+    _, current = _superseded_review(tmp_path)
+    binding = current.model_dump(mode="json")
+    if include_pin:
+        binding["descriptor_embedder"] = pin
+    else:
+        binding.pop("descriptor_embedder")
+
+    with pytest.raises(
+        SupersededBuildReviewError, match="no valid descriptor grouping.*run exp build"
+    ):
+        parse_build_review(binding)
+
+
+@pytest.mark.parametrize("version", [None, "hashing-descriptor-v2"])
+def test_a_provider_free_stage_mined_under_another_version_is_not_relabeled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str | None
+) -> None:
+    """A hosted review of an older stage is refused, never stamped with the current version."""
+    _fix_provider_free_revision(monkeypatch)
+    root = tmp_path / ".exp"
+    stage = exp.prepare_project_traces(
+        "support-project",
+        _chat_export(tmp_path / "upload.json"),
+        root=root,
+        source_id="platform-trace-source:source-123",
+        settings=_provider_free_settings(),
+    )
+    store = ProjectStore(root, "support-project")
+    assert build_module.provider_free_build_review(store).descriptor_embedder == (
+        "hashing-descriptor-v3"
+    )
+    older = stage.model_copy(update={"descriptor_embedder": version})
+    write_project_config(
+        store.paths, store.load_project().model_copy(update={"provider_free_stage": older})
+    )
+
+    with pytest.raises(SupersededBuildReviewError, match="hashing-descriptor-v3.*new project"):
+        build_module.provider_free_build_review(store)
+
+
+def _trace_partitions(project: ProjectStore) -> dict[str, tuple[str, str]]:
+    """Each trace of the project's current build, with its lineage and partition."""
+    build = project.load_project().build
+    assert build is not None
+    bindings = load_task_set_lineage_bindings(project.artifacts, build.task_set.artifact_id)
+    return {row.trace_id: (row.lineage_id, row.partition) for row in bindings.bindings}
+
+
+def _package_trace_id(item: JsonObject) -> str:
+    """The trace ID the package encoding gives one episode."""
+    return hashlib.sha256(str(item["user"]).encode()).hexdigest()[:32]
+
+
+_EPISODES = [episode(index) for index in range(14)]
+
+
+def _audit_in_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: SimulatedProvider
+) -> tuple[str, int]:
+    """Build two users, audit the held-out one with per-trace detail; its lineage and user."""
+    _, project, _ = exp_build(
+        tmp_path, monkeypatch, provider, episodes=_EPISODES[:2], relative_traces=True
+    )
+    with audit(project) as opened:
+        run(project, opened)
+        record_report(
+            project, opened.receipt, opened.panel, kind="evaluation", detail_shown=True, clock=clock
+        )
+        (shown,) = opened.receipt.lineages
+    (user,) = (
+        index
+        for index, item in enumerate(_EPISODES[:2])
+        if _trace_partitions(project)[_package_trace_id(item)][0] == shown
+    )
+    return shown, user
+
+
+def _rebuild_until_ranked_fit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: SimulatedProvider,
+    watched: Sequence[JsonObject],
+) -> tuple[ProjectStore, str, str]:
+    """Rebuild each watched episode with two new users until the plain rank makes it fit.
+
+    Three lineages put two in fit, so each try ranks the watched one there about two times in
+    three. Every other lineage must keep exactly its plain-rank partition. The package is named
+    relatively, so lineage IDs, and so which try ranks fit, are the same on every run.
+
+    Returns:
+        The rebuilt project, the watched lineage and its partition.
+    """
+    for first, item in zip(range(2, 14, 2), watched, strict=True):
+        later = [item, _EPISODES[first], _EPISODES[first + 1]]
+        _, project, _ = exp_build(
+            tmp_path, monkeypatch, provider, episodes=later, relative_traces=True
+        )
+        traces = _trace_partitions(project)
+        partitions = dict(traces.values())
+        lineage = traces[_package_trace_id(item)][0]
+        plain = freeze_task_partition(
+            [LeakageGroup(group, (group,), (group,), 1) for group in partitions]
+        )
+        if plain.partition_for(lineage) == "fit":
+            assert {
+                group: partition for group, partition in partitions.items() if group != lineage
+            } == {group: plain.partition_for(group) for group in partitions if group != lineage}
+            return project, lineage, partitions[lineage]
+    pytest.fail("no rebuild ranked the watched lineage into fit")
+
+
+def test_a_rebuild_never_moves_audited_held_out_content_to_fit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Content a held-out audit showed stays held out, whatever rank a later build gives it."""
+    provider = SimulatedProvider(_EPISODES)
+    shown, user = _audit_in_detail(tmp_path, monkeypatch, provider)
+    project, lineage, partition = _rebuild_until_ranked_fit(
+        tmp_path, monkeypatch, provider, [_EPISODES[user]] * 6
+    )
+    assert (lineage, partition) == (shown, "held_out")
+    assert shown not in {case.lineage_group_id for case in development_tasks(project)}
+    assert shown in held_out_exposure(project).lineages
+
+
+def test_fresh_content_of_an_audited_task_identity_stays_held_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """New content declaring an audited task, without the shown trace, is held out too."""
+    fresh = [episode(index) for index in range(20, 26)]
+    provider = SimulatedProvider([*_EPISODES, *fresh])
+    _, user = _audit_in_detail(tmp_path, monkeypatch, provider)
+    declaring = [{**item, "lineage": _EPISODES[user]["user"]} for item in fresh]
+    project, lineage, partition = _rebuild_until_ranked_fit(
+        tmp_path, monkeypatch, provider, declaring
+    )
+    assert partition == "held_out"
+    assert lineage not in {case.lineage_group_id for case in development_tasks(project)}

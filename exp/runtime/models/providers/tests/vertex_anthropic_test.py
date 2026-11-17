@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import EmbeddingClient, ModelClient
+from exp.common.models import EmbeddingClient, ModelClient, ToolChoice
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.models.providers.dialect_dispatch import (
     _apply_vertex_anthropic_envelope,
@@ -199,3 +199,29 @@ def test_token_provider_is_read_for_every_profile() -> None:
 
     assert client.gateway_wire_profile().headers["authorization"] == "Bearer token-one"
     assert client.gateway_wire_profile().headers["authorization"] == "Bearer token-two"
+
+
+def test_a_model_declared_unable_to_force_is_steered_on_vertex_too() -> None:
+    """The Vertex envelope carries the same automatic single-tool choice as direct Anthropic."""
+    response = _messages_response() | {
+        "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "create_ticket", "input": {}},
+        ],
+        "stop_reason": "tool_use",
+    }
+    transport = ScriptedJsonTransport([JsonHttpResponse(status_code=200, body=response)])
+    client = VertexAnthropicClient(
+        model=_snapshot("vertex", "publishers/anthropic/models/claude-sonnet-5-5"),
+        api_key='{"placeholder": true}',
+        base_url=_BASE_URL,
+        transport=transport,
+        token_provider=lambda: "fixture-bearer-token",
+        supports_forced_tool_choice=False,
+    )
+
+    result = client.complete(_request(tool_choice=ToolChoice(name="create_ticket")))
+
+    payload = transport.requests[0][2]
+    assert payload["tool_choice"] == {"type": "auto", "disable_parallel_tool_use": True}
+    assert payload["anthropic_version"] == VERTEX_ANTHROPIC_VERSION
+    assert [call.name for call in result.output.tool_calls] == ["create_ticket"]

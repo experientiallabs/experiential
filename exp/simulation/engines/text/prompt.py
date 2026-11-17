@@ -16,6 +16,8 @@ from exp.common.models import (
     structured_json_text,
 )
 from exp.common.tasks import TaskCase
+from exp.common.tasks.facts import ConditioningFacts
+from exp.runtime.environments.artifact_edits import NativeArtifactBinding, NativeArtifactPlan
 from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.retrieval import RAGAction, RAGMatch
 from exp.simulation.retrieval.contracts import RAG_KEY_SCHEMA_VERSION
@@ -83,7 +85,9 @@ json, or an exact native text string with encoding text. Do not serialize a JSON
 a string. effect is kind edits: only the changes this call makes to environment_state, as
 ordered ops. set {"op":"set","path":[...],"value":...} creates or replaces an object key
 (missing parent objects are created) or an existing list index; delete removes a key or index;
-append adds to an existing list; remove_value removes the first equal list element. Paths are
+append adds to an existing list; remove_value removes the first equal list element.
+copy {"op":"copy","from":[...],"path":[...]} deep-copies an existing source to a set-compatible
+destination, preserving its values and types exactly. Later edits can change that copy. Paths are
 lists of object keys and list indexes. Use an empty edits list when the state does not change;
 never restate unchanged state. terminal is false.
 The external observation is serialized by code; you decide every reply value and state effect.
@@ -95,6 +99,30 @@ Use actual call IDs, observed formats and current facts, not these fictional fie
 """
     + _RECONSTRUCTED_CONTEXT
 )
+
+
+NATIVE_ARTIFACT_PLAN_GUIDANCE = """
+A registered native_artifact_binding is an additional OUTPUT materialization contract.
+It is not an access restriction on simulated tools and must not change their success or error
+semantics. Continue predicting the supplied original tool action, including script tools, normally.
+The native adapter will later execute only your declared artifact edits, never the supplied script.
+Plan operations use ONLY the tool name declared in native_adapter.tool, with arguments conforming
+to native_adapter.arguments_schema. Translate the script's artifact effects into those typed edits.
+Do not copy candidate_response.tool_calls into plan.operations. A Bash or Python action remains a
+simulated action; it is never itself a native edit operation. Each native edit needs its own \
+call_id.
+When an action writes a declared output and its effects are expressible by the native adapter,
+set the complete NativeArtifactPlan at the registered plan_key in the ROOT of environment_state,
+with an edit whose path is [plan_key]. Do not nest it under environment_state,
+visible_conversation or tool_binding keys: those are input framing, not the world state. The
+plan's operations start from the registered initial input artifact and describe the full
+cumulative transformation. Its
+expected_projection is your prediction of the actual output facts using the supplied adapter's
+projection schema. Preserve input cell types and formats where applicable. Retain the plan during
+later read-only actions. If a native transformation cannot represent an action, keep predicting the
+original environment honestly; native materialization remains unavailable. Do not invent an
+original tool refusal just because the native adapter cannot execute that tool directly.
+"""
 
 
 class SimulatedToolResult(ContractModel):
@@ -159,6 +187,18 @@ normal transition protocol; never claim an automatic state correction occurred.
 """
 
 
+INSTANCE_FACTS_GUIDANCE = """
+instance_facts, when present, is its own channel with its own authority: validated facts about
+this instance's world, each read from a named source by a named adapter and checked by the
+stated method. state_version counts applied actions: 0 is this instance's starting state, and
+instance_facts.state_version is the version this prediction starts from. A fact holds at its
+own state_version; later actions in visible_conversation and environment_state may have changed
+it since. These facts are not learned behavior, rules, or examples from other instances, and
+memory, research history, and grounded examples never override them for the values they state.
+A key absent from instance_facts is unknown, not empty; a null value is an observed empty value.
+"""
+
+
 class MemoryContext(ContractModel):
     """Cross-trajectory memory for one prediction, already selected and split by authority.
 
@@ -187,6 +227,7 @@ def build_world_model_request(
     knowledge: SimulationKnowledge | None = None,
     memory: MemoryContext | None = None,
     output_protocol: Literal["text", "json-tool"] = "text",
+    facts: ConditioningFacts | None = None,
 ) -> ModelRequest:
     """Frame a simulated environment transition without enabling provider tools.
 
@@ -200,6 +241,8 @@ def build_world_model_request(
         knowledge: Frozen behavioral and investigation context, empty for the baseline.
         memory: Cross-trajectory memory, rendered into the declared authority channels.
         output_protocol: Text transition or typed-proposal system instructions.
+        facts: Validated instance facts admissible for this prediction, rendered as the
+            separate ``instance_facts`` channel; never mixed into memory or research history.
 
     Returns:
         A text-only provider request with the pinned prompt and no candidate hidden state.
@@ -246,6 +289,10 @@ def build_world_model_request(
         evidence["research_history"] = knowledge.research_context()
     if output_protocol == "json-tool":
         system_prompt = RECONSTRUCTED_JSON_TOOL_SYSTEM_PROMPT
+    if task.initial_context.get("native_artifact_binding") is not None:
+        NativeArtifactBinding.model_validate(task.initial_context["native_artifact_binding"])
+        system_prompt += NATIVE_ARTIFACT_PLAN_GUIDANCE
+        evidence["native_artifact_plan_schema"] = NativeArtifactPlan.model_json_schema()
     if memory is not None:
         system_prompt += MEMORY_CONTEXT_GUIDANCE
         evidence["memory_observations"] = list(memory.observations)
@@ -256,6 +303,9 @@ def build_world_model_request(
             "prior_trajectories": list(memory.prior_trajectories),
             "memory_overview": list(memory.overview),
         }
+    if facts is not None:
+        system_prompt += INSTANCE_FACTS_GUIDANCE
+        evidence["instance_facts"] = facts.rendered()
     return ModelRequest(
         messages=(
             ModelMessage(role="system", content=system_prompt),

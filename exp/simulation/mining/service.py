@@ -103,6 +103,7 @@ def mine_tasks(
     instruction_cleanup_model: InstructionCleanupModel | None = None,
     input_trace_count: int | None = None,
     invalid_trace_count: int = 0,
+    sealed_trace_ids: frozenset[str] = frozenset(),
 ) -> TaskMiningResult:
     """Mine a small weighted, leakage-safe task set from canonical production traces.
 
@@ -120,6 +121,8 @@ def mine_tasks(
         instruction_cleanup_model: Optional injected proposal model. ``None`` makes no model call.
         input_trace_count: Source record count before invalid exclusions. Defaults to valid count.
         invalid_trace_count: Source record count excluded by canonical normalization.
+        sealed_trace_ids: Traces whose whole leakage group must be held out, because an earlier
+            held-out audit exposed or reserved their content.
 
     Returns:
         Canonical tasks, coverage evidence, duplicate lineage evidence, and frozen split membership.
@@ -161,6 +164,11 @@ def mine_tasks(
         analysis.leakage_groups,
         fit_lineage_target=spec.fit_task_budget,
         held_out_lineage_target=spec.held_out_task_budget,
+        sealed={
+            group.lineage_group_id
+            for group in analysis.leakage_groups
+            if not sealed_trace_ids.isdisjoint(group.source_trace_ids)
+        },
     )
     fit_candidates = tuple(
         candidate

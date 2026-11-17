@@ -25,6 +25,7 @@ from exp.common.models import (
     OperationEconomics,
 )
 from exp.common.rollouts.checkpoint import TextRolloutCheckpoint
+from exp.common.rollouts.containment import ContainmentLevel
 from exp.common.rollouts.otel import (
     ProductionSimulatorSnapshot,
     RolloutSpan,
@@ -98,7 +99,13 @@ class SimulationCellBinding(ContractModel):
 
 
 class SandboxSimulationCellBinding(ContractModel):
-    """Exact task, model, environment, and artifact identity for one sandbox cell."""
+    """Exact task, model, environment, and artifact identity for one sandbox cell.
+
+    ``environment_containment`` is the execution receipt for host containment: the exact level
+    the environment runtime enforces for every session, or None when the runtime reports none.
+    It is part of the binding digest, so rollouts under different containment never resume or
+    replay as one another.
+    """
 
     cell_id: ArtifactId
     task_id: ArtifactId
@@ -119,6 +126,9 @@ class SandboxSimulationCellBinding(ContractModel):
     simulator_id: str = Field(min_length=1, max_length=256)
     environment_id: ArtifactId
     environment_sha256: Sha256
+    environment_containment: ContainmentLevel | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     simulation_spec_input: ArtifactInput
     simulation_spec_sha256: Sha256
     simulation_inputs_sha256: Sha256

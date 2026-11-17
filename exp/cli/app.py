@@ -23,6 +23,7 @@ from exp.cli.gateway.serve import (
 from exp.cli.shared.defer import add_deferred_typer
 from exp.cli.shared.options import ROOT_OPTION
 from exp.common.config import load_env_file
+from exp.common.core.host_scope import HostScopeError
 
 app = typer.Typer(
     help="Build grounded simulations, optimize model use, and serve routers locally.",
@@ -136,10 +137,17 @@ def main() -> None:
 
     The explicit entrypoint keeps environment loading out of import time, so library imports
     cannot mutate an operator's process environment.
+
+    A project shared with another machine is refused by every coordinated write; that refusal is
+    an operator decision, not a defect, so it prints its explanation instead of a traceback.
     """
     load_env_file()
     _quiet_http_logs()
-    app()
+    try:
+        app()
+    except HostScopeError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

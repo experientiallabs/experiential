@@ -4,22 +4,59 @@ from __future__ import annotations
 
 import sys
 from functools import partial
+from pathlib import Path
 from types import ModuleType
 
 import pytest
 
+from exp.common.core.artifacts import sha256_bytes
 from exp.common.models import ModelClient
 from exp.common.project import AgentConfiguration
 from exp.common.rollouts import StopReason
 from exp.common.tasks import TaskCase
 from exp.runtime.agents import AgentEpisode, ChatAgentRuntime
 from exp.runtime.agents.factory import (
+    ActorHarness,
     AgentFactoryError,
+    create_actor_runtime,
     is_builtin_chat_factory,
     preflight_agent_factory,
     resolve_agent_factory,
 )
+from exp.runtime.agents.pi import PiAgentRuntime
 from exp.runtime.environments import EnvironmentSession
+
+
+def test_pi_profile_requires_exact_installed_files_before_construction(tmp_path: Path) -> None:
+    """Changing an entrypoint or declared dependency refuses new calls under the old identity."""
+    executable = tmp_path / "pi"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    dependency = tmp_path / "runtime.js"
+    dependency.write_text("original runtime")
+    profile = ActorHarness(
+        kind="pi",
+        executable=executable,
+        executable_sha256=sha256_bytes(executable.read_bytes()),
+        version="fixture-1",
+        dependencies={dependency: sha256_bytes(dependency.read_bytes())},
+    )
+    assert isinstance(create_actor_runtime(profile, maximum_model_calls=2), PiAgentRuntime)
+    dependency.write_text("changed runtime")
+    with pytest.raises(ValueError, match="changed or unavailable"):
+        create_actor_runtime(profile, maximum_model_calls=2)
+    dependency.write_text("original runtime")
+    executable.write_text("#!/bin/sh\nexit 1\n")
+    with pytest.raises(ValueError, match="changed or unavailable"):
+        profile.preflight()
+
+
+def test_actor_profile_does_not_ignore_conflicting_or_unpinned_configuration() -> None:
+    """Invalid selections cannot quietly fall back to a different actor implementation."""
+    with pytest.raises(ValueError, match="requires executable"):
+        ActorHarness(kind="pi")
+    with pytest.raises(ValueError, match="ignored Pi"):
+        ActorHarness(version="pi-version")
 
 
 def test_absent_project_factory_uses_bounded_chat_runtime() -> None:

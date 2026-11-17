@@ -29,9 +29,10 @@ from exp.common.judging import (
 from exp.common.judging.provenance import JudgingProvenanceError, read_artifact_json
 from exp.common.project import ArtifactCorruptionError, ProjectStore, artifact_input
 from exp.common.rollouts import RolloutArtifact
-from exp.common.tasks import TaskCase, load_task_set
+from exp.common.tasks import TaskCase, ToolSchema, load_task_set
 from exp.common.traces import Trace, load_trace_dataset
 from exp.optimize.model.sft.contracts import (
+    ContinuationExampleSource,
     HumanApproval,
     InfrastructureFailureEvent,
     ProductionAcceptanceEvidence,
@@ -57,7 +58,7 @@ class SFTSourceVerificationError(ValueError):
 class PreparedSFTSource:
     """One accepted source hydrated exclusively from verified immutable artifact bytes."""
 
-    kind: Literal["production_trace", "teacher_rollout", "runtime_interaction"]
+    kind: Literal["production_trace", "teacher_rollout", "runtime_interaction", "continuation"]
     source_id: str
     source_artifact: ArtifactInput
     source_record_sha256: Sha256
@@ -67,13 +68,19 @@ class PreparedSFTSource:
         SFTContextEvent | InfrastructureFailureEvent,
         ...,
     ]
-    example_source: TraceExampleSource | RolloutExampleSource | RuntimeInteractionExampleSource
+    example_source: (
+        TraceExampleSource
+        | RolloutExampleSource
+        | RuntimeInteractionExampleSource
+        | ContinuationExampleSource
+    )
     score: float | None
     direct_inputs: tuple[ArtifactInput, ...]
     acceptance_rule_id: ArtifactId | None
     acceptance_evidence_id: ArtifactId | None
     acceptance_evidence: ArtifactInput | None
     target_action_indexes: tuple[int, ...] | None = None
+    tools: tuple[ToolSchema, ...] = ()
 
     def reference(self) -> SFTSourceReference:
         """Return the auditable immutable-source record for a frozen dataset manifest."""

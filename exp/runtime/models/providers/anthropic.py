@@ -12,10 +12,12 @@ from exp.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    ReasoningEffort,
     ToolCall,
     ToolChoice,
     Usage,
 )
+from exp.common.models.known_models import known_model_metadata
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
@@ -27,6 +29,7 @@ from exp.runtime.models.providers.base import (
     ProviderHttpClient,
 )
 from exp.runtime.models.providers.errors import (
+    ProviderCapabilityError,
     ProviderRefusalError,
     ProviderRefusalSignal,
     ProviderResponseError,
@@ -99,19 +102,28 @@ def anthropic_messages_request(
     supports_top_k: bool = False,
     supports_reasoning: bool = False,
     reasoning_effort: str | None = None,
+    supports_forced_tool_choice: bool | None = None,
 ) -> JsonObject:
     """Convert one EXP request into native Anthropic Messages JSON.
 
     Args:
         model_id: Anthropic model identifier.
         request: Typed EXP request.
+        supports_forced_tool_choice: The catalog's declaration for this model; ``None`` is
+            unknown and forces as requested. When false, a forced choice of the only offered
+            tool is sent as ``auto`` with parallel calls disabled and an instruction naming the
+            tool; callers keep validating that exactly one call of that tool came back.
 
     Returns:
         Native Messages payload preserving tool-use and tool-result blocks.
 
     Raises:
+        ProviderCapabilityError: ``forced_tool_choice`` when the model cannot force a tool and
+            more than one tool is offered, so ``auto`` would let it pick another one, or when
+            the declaration is unset on a model the maintained records say rejects forcing.
         ValueError: A visible request message cannot be represented by the native protocol.
     """
+    steered_tool = _unforceable_tool(model_id, request, supports_forced_tool_choice)
     system_parts: list[str] = []
     messages: list[JsonObject] = []
     for message in request.messages:
@@ -124,6 +136,8 @@ def anthropic_messages_request(
         _append_anthropic_message(messages, role, blocks)
     if request.json_object_output:
         system_parts.append(JSON_OBJECT_SYSTEM_INSTRUCTION)
+    if steered_tool is not None:
+        system_parts.append(f"Respond only by calling the {steered_tool} tool.")
     payload: JsonObject = {
         "model": model_id,
         "messages": messages,
@@ -141,7 +155,9 @@ def anthropic_messages_request(
                 translated["description"] = tool.description
             tools.append(translated)
         payload["tools"] = tools
-    if request.tool_choice is not None:
+    if steered_tool is not None:
+        payload["tool_choice"] = {"type": "auto", "disable_parallel_tool_use": True}
+    elif request.tool_choice is not None:
         payload["tool_choice"] = _anthropic_tool_choice(request.tool_choice)
     if request.temperature is not None and supports_temperature:
         payload["temperature"] = request.temperature
@@ -244,10 +260,11 @@ class AnthropicClient(ProviderHttpClient):
         supports_frequency_penalty: bool = False,
         supports_presence_penalty: bool = False,
         supports_reasoning: bool = False,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
         authorization_bearer: bool = False,
         inference_geo: Literal["us"] | None = None,
         serves_advisor_tool: bool = True,
+        supports_forced_tool_choice: bool | None = None,
     ) -> None:
         """Create an Anthropic client with explicit generation capability gates.
 
@@ -266,6 +283,7 @@ class AnthropicClient(ProviderHttpClient):
             transport=transport,
             retry_policy=retry_policy,
             timeout_seconds=timeout_seconds,
+            reasoning_effort=reasoning_effort,
         )
         self._supports_temperature = supports_temperature
         self._supports_top_p = supports_top_p
@@ -274,10 +292,10 @@ class AnthropicClient(ProviderHttpClient):
         self._supports_frequency_penalty = supports_frequency_penalty
         self._supports_presence_penalty = supports_presence_penalty
         self._supports_reasoning = supports_reasoning
-        self._reasoning_effort = reasoning_effort
         self._authorization_bearer = authorization_bearer
         self._inference_geo = inference_geo
         self._serves_advisor_tool = serves_advisor_tool
+        self._supports_forced_tool_choice = supports_forced_tool_choice
 
     def _headers(self) -> dict[str, str]:
         """Build native Anthropic Messages headers with the connection's auth scheme."""
@@ -328,6 +346,7 @@ class AnthropicClient(ProviderHttpClient):
             supports_top_k=self._supports_top_k,
             supports_reasoning=self._supports_reasoning,
             reasoning_effort=self._reasoning_effort,
+            supports_forced_tool_choice=self._supports_forced_tool_choice,
         )
 
         if self._inference_geo is not None:
@@ -410,6 +429,38 @@ def _anthropic_tool_choice(
     if isinstance(choice, ToolChoice):
         return {"type": "tool", "name": choice.name}
     raise ValueError("unsupported Anthropic tool choice")
+
+
+def _unforceable_tool(
+    model_id: str, request: ModelRequest, supports_forced_tool_choice: bool | None
+) -> str | None:
+    """Return the tool a forced choice must be steered to on a model that cannot force one.
+
+    ``ModelRequest`` already guarantees a forced choice names one of the offered tools. The
+    catalog decides; the maintained record is consulted only to refuse an undeclared model
+    that is known to answer a forced choice with a 400, never to change the request.
+
+    Raises:
+        ProviderCapabilityError: ``auto`` would leave the model another tool to pick, or the
+            catalog leaves the declaration unset on a model known to reject a forced choice.
+    """
+    if request.tool_choice in (None, "auto", "none") or supports_forced_tool_choice:
+        return None
+    if supports_forced_tool_choice is None:
+        known = known_model_metadata("anthropic", model_id)
+        if known is None or known.supports_forced_tool_choice is not False:
+            return None
+        raise ProviderCapabilityError(
+            capability="forced_tool_choice",
+            detail=(
+                f"{model_id} rejects a forced tool_choice; declare "
+                "supports_forced_tool_choice = false in this alias's catalog capabilities, "
+                "or re-sync the catalog, so requests use auto with the single tool"
+            ),
+        )
+    if len(request.tools) != 1:
+        raise ProviderCapabilityError(capability="forced_tool_choice")
+    return request.tools[0].name
 
 
 def _anthropic_tool_call(block: JsonObject, index: int) -> ToolCall:

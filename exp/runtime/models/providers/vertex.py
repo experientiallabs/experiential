@@ -22,7 +22,13 @@ from typing import Literal, Protocol
 from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import ChatMaxTokensField, ModelRequest, ModelResponse, ModelSnapshot
+from exp.common.models import (
+    ChatMaxTokensField,
+    ModelRequest,
+    ModelResponse,
+    ModelSnapshot,
+    ReasoningEffort,
+)
 from exp.runtime.models.providers.anthropic import (
     anthropic_messages_request,
     anthropic_messages_response,
@@ -37,7 +43,6 @@ from exp.runtime.models.providers.base import (
     DEFAULT_TIMEOUT_SECONDS,
     GatewayWireProfile,
     ProviderHttpClient,
-    completion_timeout_seconds,
 )
 from exp.runtime.models.providers.gemini import (
     gemini_generate_request,
@@ -264,7 +269,7 @@ class VertexClient(ProviderHttpClient):
         supports_frequency_penalty: bool = False,
         supports_presence_penalty: bool = False,
         supports_reasoning: bool = False,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         """Create a client with explicit generation gates for one Vertex endpoint root.
 
@@ -294,6 +299,7 @@ class VertexClient(ProviderHttpClient):
             transport=transport,
             retry_policy=retry_policy,
             timeout_seconds=timeout_seconds,
+            reasoning_effort=reasoning_effort,
         )
         self._token_provider = token_provider or ServiceAccountTokenProvider(api_key)
         self._supports_temperature = supports_temperature
@@ -303,7 +309,6 @@ class VertexClient(ProviderHttpClient):
         self._supports_frequency_penalty = supports_frequency_penalty
         self._supports_presence_penalty = supports_presence_penalty
         self._supports_reasoning = supports_reasoning
-        self._reasoning_effort = reasoning_effort
 
     async def complete_async(
         self,
@@ -323,7 +328,7 @@ class VertexClient(ProviderHttpClient):
             The typed completed response with observed request economics.
         """
         request_deadline = deadline or RequestDeadline.after(
-            completion_timeout_seconds(self._timeout_seconds, request.maximum_output_tokens)
+            self._completion_deadline_seconds(request)
         )
         await _warm_vertex_bearer_token(
             self._token_provider, request_deadline, self._timeout_seconds
@@ -423,7 +428,7 @@ class VertexOpenAIClient(OpenAICompatibleClient):
         supports_frequency_penalty: bool = False,
         supports_presence_penalty: bool = False,
         supports_reasoning: bool = False,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
         chat_max_tokens_field: ChatMaxTokensField | None = None,
         sampling_requires_reasoning_none: bool = False,
     ) -> None:
@@ -492,7 +497,7 @@ class VertexOpenAIClient(OpenAICompatibleClient):
             The typed completed response with observed request economics.
         """
         request_deadline = deadline or RequestDeadline.after(
-            completion_timeout_seconds(self._timeout_seconds, request.maximum_output_tokens)
+            self._completion_deadline_seconds(request)
         )
         await _warm_vertex_bearer_token(
             self._token_provider, request_deadline, self._timeout_seconds
@@ -617,7 +622,8 @@ class VertexAnthropicClient(ProviderHttpClient):
         supports_top_p: bool = True,
         supports_top_k: bool = False,
         supports_reasoning: bool = False,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
+        supports_forced_tool_choice: bool | None = None,
     ) -> None:
         """Create a Vertex Anthropic client for one project-and-location endpoint root.
 
@@ -636,6 +642,8 @@ class VertexAnthropicClient(ProviderHttpClient):
             supports_top_k: Whether the exact model accepts top-k sampling.
             supports_reasoning: Whether the exact model accepts extended-thinking configuration.
             reasoning_effort: Optional catalog-pinned reasoning effort.
+            supports_forced_tool_choice: The catalog's declaration that the exact model accepts
+                a forced ``tool_choice``; see :func:`anthropic_messages_request`.
         """
         _require_vertex_host(base_url)
         super().__init__(
@@ -645,13 +653,14 @@ class VertexAnthropicClient(ProviderHttpClient):
             transport=transport,
             retry_policy=retry_policy,
             timeout_seconds=timeout_seconds,
+            reasoning_effort=reasoning_effort,
         )
         self._token_provider = token_provider or ServiceAccountTokenProvider(api_key)
         self._supports_temperature = supports_temperature
         self._supports_top_p = supports_top_p
         self._supports_top_k = supports_top_k
         self._supports_reasoning = supports_reasoning
-        self._reasoning_effort = reasoning_effort
+        self._supports_forced_tool_choice = supports_forced_tool_choice
 
     async def complete_async(
         self,
@@ -662,7 +671,7 @@ class VertexAnthropicClient(ProviderHttpClient):
     ) -> ModelResponse:
         """Warm the bearer token off the event loop, then run the shared completion flow."""
         request_deadline = deadline or RequestDeadline.after(
-            completion_timeout_seconds(self._timeout_seconds, request.maximum_output_tokens)
+            self._completion_deadline_seconds(request)
         )
         await _warm_vertex_bearer_token(
             self._token_provider, request_deadline, self._timeout_seconds
@@ -736,6 +745,7 @@ class VertexAnthropicClient(ProviderHttpClient):
             supports_top_k=self._supports_top_k,
             supports_reasoning=self._supports_reasoning,
             reasoning_effort=self._reasoning_effort,
+            supports_forced_tool_choice=self._supports_forced_tool_choice,
         )
         payload.pop("model", None)
         payload["anthropic_version"] = VERTEX_ANTHROPIC_VERSION

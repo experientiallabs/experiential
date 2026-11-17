@@ -227,6 +227,7 @@ def resolve_discovered_model(discovered: DiscoveredModel) -> ResolvedDiscoveredM
             known.supports_presence_penalty if known else None,
         ),
         supports_reasoning=supports_reasoning,
+        supports_forced_tool_choice=known.supports_forced_tool_choice if known else None,
         reasoning_effort=(
             discovered.reasoning_effort
             or (known.reasoning_effort if known is not None else None)
