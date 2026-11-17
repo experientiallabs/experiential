@@ -33,11 +33,12 @@ from exp.runtime.gateway.tests.optional_input_contention_test import _held_provi
 from exp.runtime.gateway.tests.parallel_input_guardrails_test import _Classifier, _engine
 
 
+@pytest.mark.parametrize("wait_ms", [250, 500])
 @pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("funding", [BillingSource.HOST_MANAGED, BillingSource.CUSTOMER_MANAGED])
 def test_stalled_optional_inspection_releases_response_and_preserves_charge(
-    tmp_path: Path, surface: str, stream: bool, funding: BillingSource
+    tmp_path: Path, surface: str, stream: bool, funding: BillingSource, wait_ms: int
 ) -> None:
     """Parallel and forced predispatch paths both expire without waiving generated usage."""
     classifier = _Classifier("allow")
@@ -45,7 +46,7 @@ def test_stalled_optional_inspection_releases_response_and_preserves_charge(
     policy = template.policies_for(_authorization())[0].model_copy(
         update={
             "fail_open": True,
-            "input_max_wait_ms": 250,
+            "input_max_wait_ms": wait_ms,
             "organization_id": None,
             "identity_id": None,
         }
@@ -80,7 +81,7 @@ def test_stalled_optional_inspection_releases_response_and_preserves_charge(
                 elapsed = time.monotonic() - started
                 assert response.status_code == 200, response.text
                 assert "safe-answer" in response.text
-                assert elapsed < 0.65, elapsed
+                assert wait_ms / 1000 * 0.95 <= elapsed < wait_ms / 1000 + 0.4, elapsed
                 assert classifier.started.is_set()
                 assert not classifier.release.is_set()
                 assert len(received) == 1

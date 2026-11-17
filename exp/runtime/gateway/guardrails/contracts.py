@@ -127,7 +127,8 @@ class GuardrailPolicy(ContractModel):
         revision: Detector and rollout revision used to invalidate cached replay.
         input_execution: Inspect before dispatch by default, or overlap safe generation.
         fail_open: Skip uncertain read-only input checks when explicitly enabled, default False.
-        input_max_wait_ms: One parallel response wait budget per request, default 250 ms.
+        input_max_wait_ms: One parallel response wait budget per request, 0 to 5000 ms,
+            default 250 ms.
         mode: Enforce by default, or observe read-only input checks without gating delivery.
         protected: Fail closed on classifier uncertainty; required for platform policies.
         checks: Ordered checks, empty by default.
@@ -142,7 +143,7 @@ class GuardrailPolicy(ContractModel):
     revision: str = Field(default="configured", min_length=1, max_length=256)
     input_execution: Literal["before_dispatch", "parallel"] = "before_dispatch"
     fail_open: bool = False
-    input_max_wait_ms: int = Field(default=250, ge=0, le=250)
+    input_max_wait_ms: int = Field(default=250, ge=0, le=5000)
     mode: Literal["enforce", "observe"] = "enforce"
     protected: bool = False
     checks: tuple[GuardrailCheck, ...] = ()
