@@ -209,7 +209,7 @@ fn a_single_lane_redials_once_after_a_malformed_tool_call() {
     block_on(async {
         let harness = Harness::new();
         harness
-            .configure(json!({"rules": [null], "same_redial": true}))
+            .configure(json!({"rules": [null], "same_redial": 2}))
             .await;
         let lane = spawn_rung(vec![
             Answer::Stream(BROKEN_CALL_FRAMES),
@@ -247,7 +247,7 @@ fn a_second_malformed_tool_call_is_the_requests_answer() {
     block_on(async {
         let harness = Harness::new();
         harness
-            .configure(json!({"rules": [null], "same_redial": true}))
+            .configure(json!({"rules": [null], "same_redial": 2}))
             .await;
         let lane = spawn_rung(vec![
             Answer::Stream(BROKEN_CALL_FRAMES),
@@ -268,5 +268,87 @@ fn a_second_malformed_tool_call_is_the_requests_answer() {
         assert_eq!(settles.len(), 2);
         assert_eq!(settles[1]["finalize"], true);
         assert_eq!(settles[1]["failure"]["malformed_tool_call"], true);
+    });
+}
+
+/// One rung answering `first`, then resetting a connection, then `last`.
+async fn spawn_resetting_rung(
+    first: &'static [&'static str],
+    last: &'static [&'static str],
+) -> Rung {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    let accepted = Arc::new(Mutex::new(Vec::new()));
+    let keys = Arc::new(Mutex::new(Vec::new()));
+    let (recorder, key_recorder) = (accepted.clone(), keys.clone());
+    tokio::spawn(async move {
+        for answer in [Some(first), None, Some(last)] {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            recorder.lock().expect("lock").push(Instant::now());
+            let (key, _) = read_request(&mut socket).await;
+            key_recorder.lock().expect("lock").push(key);
+            let Some(frames) = answer else {
+                drop(socket);
+                continue;
+            };
+            let mut body: String = frames
+                .iter()
+                .map(|frame| format!("data: {frame}\n\n"))
+                .collect();
+            body.push_str("data: [DONE]\n\n");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+            let _ = socket.shutdown().await;
+        }
+    });
+    Rung {
+        url: format!("http://{address}/v1/chat/completions"),
+        accepted,
+        bodies: Arc::new(Mutex::new(Vec::new())),
+        keys,
+    }
+}
+
+#[test]
+fn a_resample_keeps_its_own_key_through_a_later_safe_retry() {
+    block_on(async {
+        let harness = Harness::new();
+        harness
+            .configure(json!({"rules": [null], "same_redial": 3}))
+            .await;
+        let lane = spawn_resetting_rung(BROKEN_CALL_FRAMES, VALID_CALL_FRAMES).await;
+        let route = [wire("novita", &lane.url, 0)];
+        let policy = RoutePolicy {
+            maximum_total_attempts: 8,
+            maximum_same_deployment_attempts: 3,
+            refusal_failover: false,
+            throttle_redial: None,
+            physical_route_cap: None,
+            backoff: None,
+        };
+        let (won, guard) = harness
+            .run_with_policy("key", None, &route, policy, Duration::from_secs(30))
+            .await;
+        let Won::Committed(committed) = won else {
+            panic!("the resample's safe retry serves the request");
+        };
+        finish(guard, Won::Committed(committed)).await;
+        // The reset resample is retried under the resample's key, never the
+        // original one a deduplicating wire would answer with the bad call.
+        let keys = lane.keys.lock().expect("lock").clone();
+        assert_eq!(
+            keys,
+            vec![
+                Some("op-novita".to_string()),
+                Some("op-novita.resample".to_string()),
+                Some("op-novita.resample".to_string()),
+            ]
+        );
     });
 }

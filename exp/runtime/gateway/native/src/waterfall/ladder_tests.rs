@@ -37,14 +37,14 @@ class Plane:
         # `native_fallback_rules.eligible_depths`; and a scripted first depth
         # for the contract-violation test.
         self.rules = [None, None]
-        self.first_depth = None; self.refusal_failover = False; self.same_redial = False
+        self.first_depth = None; self.refusal_failover = False; self.same_redial = 0
 
     def configure(self, argument):
         data = json.loads(argument)
         with self.lock:
             self.rules = data.get("rules", self.rules); self.counts = [0] * len(self.rules)
             self.first_depth = data.get("first_depth")
-            self.refusal_failover = data.get("refusal_failover", self.refusal_failover); self.same_redial = data.get("same_redial", False)
+            self.refusal_failover = data.get("refusal_failover", self.refusal_failover); self.same_redial = data.get("same_redial", 0)
         return "{}"
 
     def admits(self, depth, failure):
@@ -78,7 +78,7 @@ class Plane:
                 candidate = depth
             elif depth + 1 < len(self.counts) and self.admits(depth + 1, failure):
                 candidate = depth + 1
-            elif self.same_redial and failure.get("retryable_same_deployment") and self.counts[depth] < 2: candidate = depth
+            elif self.same_redial and failure.get("retryable_same_deployment") and self.counts[depth] < self.same_redial: candidate = depth
             else:
                 return json.dumps({"exhausted": True, "failure": failure})
             self.counts[candidate] += 1

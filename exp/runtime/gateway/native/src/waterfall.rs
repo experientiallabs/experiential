@@ -273,6 +273,8 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
     // retried once per request (a sibling first, else the same rung): the
     // model's sampling, not the request, produced it.
     let mut malformed_tool_call_retry_spent = false;
+    // Per depth, whether its dials now carry the resample's own key.
+    let mut resampled: Vec<bool> = vec![false; ctx.route.len()];
     // Once a buffered answer broke mid-body, the caller's first byte is no
     // longer a pre-commit matter: the shared pre-first-byte budget (often
     // spent by then) stops bounding the restart, and the request deadline
@@ -429,9 +431,10 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
         let dial_wire = search_wires[depth].as_ref().unwrap_or(wire);
         // A resample after a malformed tool call is a new provider intent: a
         // wire that deduplicates the stable key would replay the bad answer.
-        let resample_wire = (current_depth == Some(depth)
-            && last_failure.as_ref().is_some_and(|f| f.malformed_tool_call))
-        .then(|| DeploymentWire {
+        // The key then stays for every later safe retry of that intent.
+        resampled[depth] |= current_depth == Some(depth)
+            && last_failure.as_ref().is_some_and(|f| f.malformed_tool_call);
+        let resample_wire = resampled[depth].then(|| DeploymentWire {
             idempotency_key: format!("{}.resample", dial_wire.idempotency_key),
             ..dial_wire.clone()
         });
