@@ -118,14 +118,15 @@ class InputOutcomes:
     def record(
         self, policy: GuardrailPolicy, check: GuardrailCheck, result: GuardrailOutcome
     ) -> None:
-        """Keep a miss sticky across subjects and ignore arrivals after terminalization."""
+        """Keep unsupported subjects unrecoverable and misses sticky until terminalization."""
         key = (policy.policy_id, check.check_id)
         with self._lock:
             if self._frozen is not None:
                 return
             previous = self._results.get(key)
             if (
-                previous is None
+                result is GuardrailOutcome.UNSUPPORTED
+                or previous is None
                 or previous is GuardrailOutcome.ALLOW
                 or (
                     previous is GuardrailOutcome.FLAGGED
@@ -140,7 +141,10 @@ class InputOutcomes:
             if self._frozen is None:
                 for check in policy.input_checks:
                     key = (policy.policy_id, check.check_id)
-                    if key in self._started:
+                    if (
+                        key in self._started
+                        and self._results.get(key) is not GuardrailOutcome.UNSUPPORTED
+                    ):
                         self._results[key] = GuardrailOutcome.TIMEOUT
 
     def freeze(

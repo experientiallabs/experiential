@@ -342,3 +342,29 @@ def test_mutated_native_input_never_reuses_a_stale_digest() -> None:
     tracker.start(policy, request)
     tracker.expire(policy)
     assert tracker.freeze((policy,), blocked=False)[0].latest_user_window_sha256 is None
+
+
+@pytest.mark.parametrize(
+    "miss", [GuardrailOutcome.TIMEOUT, GuardrailOutcome.UNAVAILABLE, GuardrailOutcome.UNCERTAIN]
+)
+@pytest.mark.parametrize("unsupported_first", [False, True])
+@pytest.mark.parametrize("native_expiry", [False, True])
+def test_unsupported_subject_prevents_recovery_in_either_order(
+    miss: GuardrailOutcome, unsupported_first: bool, native_expiry: bool
+) -> None:
+    """A shared user-window digest cannot turn an uninspectable subject into a recovery grant."""
+    policy, tracker = _policy(), InputOutcomes()
+    results = (
+        (GuardrailOutcome.UNSUPPORTED, miss)
+        if unsupported_first
+        else (miss, GuardrailOutcome.UNSUPPORTED)
+    )
+    for result in results:
+        tracker.start(policy, _request("same latest user window"))
+        tracker.record(policy, policy.checks[0], result)
+    if native_expiry:
+        tracker.expire(policy)
+    (record,) = tracker.freeze((policy,), blocked=False)
+    assert record.latest_user_window_sha256 is not None
+    assert record.outcome == "unsupported"
+    assert record.recovery_reason is None

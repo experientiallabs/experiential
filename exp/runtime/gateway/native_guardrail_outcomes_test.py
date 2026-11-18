@@ -44,7 +44,7 @@ def test_documents_bind_request_ownership_and_contain_no_subject() -> None:
 def test_only_declared_ledger_extension_receives_evidence() -> None:
     """Existing ledgers receive no unsolicited keyword; consumers receive the exact records."""
 
-    def consumes(*, input_guardrail_outcomes: tuple[JsonObject, ...]) -> None:
+    def consumes(*, input_guardrail_outcomes: tuple[JsonObject, ...] = ()) -> None:
         """Declare the durable input-evidence capability."""
 
     def plain() -> None:
@@ -71,7 +71,7 @@ def test_terminal_retry_keeps_the_original_input_evidence() -> None:
         failure: GatewayFailure,
         certify_no_effects: bool,
         web_search_requests: int,
-        input_guardrail_outcomes: tuple[JsonObject, ...],
+        input_guardrail_outcomes: tuple[JsonObject, ...] = (),
     ) -> bool:
         """Fail once after observing the attempted durable payload."""
         seen.append(input_guardrail_outcomes)
@@ -96,7 +96,7 @@ def test_unconsumed_or_nonfinal_evidence_is_not_frozen() -> None:
     assert terminal_outcomes(lambda: None, entry) == {}
     entry.guardrails.input_outcomes.assert_not_called()
 
-    def consumes(*, input_guardrail_outcomes: tuple[JsonObject, ...]) -> None:
+    def consumes(*, input_guardrail_outcomes: tuple[JsonObject, ...] = ()) -> None:
         """Declare the optional extension."""
 
     assert terminal_outcomes(consumes, entry, finalize=False) == {}
@@ -115,7 +115,7 @@ def test_request_only_writer_without_extension_never_freezes_enabled_evidence() 
 class _UnhashableWriter:
     """A mutable callable ledger extension with no hash contract."""
 
-    def __call__(self, *, input_guardrail_outcomes: tuple[JsonObject, ...]) -> None:
+    def __call__(self, *, input_guardrail_outcomes: tuple[JsonObject, ...] = ()) -> None:
         """Declare the evidence extension on an unhashable callable instance."""
 
 
@@ -138,3 +138,12 @@ def test_unregistered_nonconsumer_does_not_freeze_a_live_session() -> None:
         settlements.input_outcomes(None, authorization=_authorization(), guardrails=session) == ()
     )
     session.input_outcomes.assert_not_called()
+
+
+def test_required_keyword_does_not_declare_an_optional_capability() -> None:
+    """A terminal extension must remain omittable by all ordinary ledger calls."""
+
+    def required(*, input_guardrail_outcomes: tuple[JsonObject, ...]) -> None:
+        """A required extension does not implement the ordinary ledger contract."""
+
+    assert not consumes_input_outcomes(required)

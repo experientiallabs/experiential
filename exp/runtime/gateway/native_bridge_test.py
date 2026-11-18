@@ -8835,7 +8835,7 @@ def test_admission_failure_retains_input_evidence_before_accounting_registration
         failure: GatewayFailure,
         certify_no_effects: bool,
         web_search_requests: int,
-        input_guardrail_outcomes: tuple[JsonObject, ...],
+        input_guardrail_outcomes: tuple[JsonObject, ...] = (),
     ) -> bool:
         """Record the extension alongside the real SQLite terminal write, failing once if asked."""
         assert control._accounting.entry(authorization.request_id) is None  # noqa: SLF001

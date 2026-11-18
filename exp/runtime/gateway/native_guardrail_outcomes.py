@@ -85,9 +85,10 @@ def _signature_consumes_input_outcomes(write: Callable[..., object]) -> bool:
         parameter = signature(write).parameters.get("input_guardrail_outcomes")
     except (TypeError, ValueError):
         return False
-    return parameter is not None and parameter.kind in (
-        Parameter.KEYWORD_ONLY,
-        Parameter.POSITIONAL_OR_KEYWORD,
+    return (
+        parameter is not None
+        and parameter.default is not Parameter.empty
+        and parameter.kind in (Parameter.KEYWORD_ONLY, Parameter.POSITIONAL_OR_KEYWORD)
     )
 
 
