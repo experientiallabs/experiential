@@ -14,7 +14,7 @@ Chat ``cache_control`` path already retains (``cache_control.py``), so Anthropic
 Bedrock rungs cache at the same boundary at their own default lifetime, while
 ``GatewayRequest.prompt_cache_breakpoints`` tells OpenAI-wire rungs to re-emit the
 boundary as ``prompt_cache_breakpoint``. A marker on a block the canonical carriers
-cannot hold (an image, audio or file part, a Responses tool-output part) is removed
+cannot hold (an image, audio or file part, a Responses tool-output or agent-message part) is removed
 and disclosed, never refused.
 
 A per-breakpoint ``ttl`` is accepted only when it equals the request lifetime:
@@ -173,6 +173,7 @@ def extract_prompt_cache_breakpoints(
     for index, raw_item in enumerate(raw_items):
         item = cast(JsonObject, raw_item) if isinstance(raw_item, dict) else {}
         tool_output = container == "input" and item.get("type") == "function_call_output"
+        agent_message = container == "input" and item.get("type") == "agent_message"
         key = "output" if tool_output else "content"
         parts = item.get(key)
         if not isinstance(parts, list) or not any(
@@ -192,7 +193,7 @@ def extract_prompt_cache_breakpoints(
             marker = _validated(raw_part[BREAKPOINT], param)
             bare = {name: value for name, value in raw_part.items() if name != BREAKPOINT}
             stripped_parts.append(bare)
-            if not tool_output and raw_part.get("type") in _TEXT_PART_TYPES:
+            if not tool_output and not agent_message and raw_part.get("type") in _TEXT_PART_TYPES:
                 present = True
                 if marker.ttl is not None:
                     ttls.append((param, marker.ttl))
@@ -201,6 +202,8 @@ def extract_prompt_cache_breakpoints(
                 marked_parts.append(bare if "cache_control" in bare else {**bare, **_marker()})
             else:
                 reason = "unsupported_tool_output" if tool_output else "unsupported_media"
+                if agent_message:
+                    reason = "unsupported_item"
                 disclosures.append(f"{param}->dropped({reason})")
                 marked_parts.append(bare)
         stripped_items.append({**item, key: stripped_parts})

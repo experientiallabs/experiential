@@ -300,7 +300,13 @@ def test_a_servable_image_before_a_separate_question_is_preserved() -> None:
 def test_text_followup_recovers_after_an_image_rejection_without_an_assistant_reply(
     surface: str, url: str, reason: UnservableReason
 ) -> None:
-    """A rejected attachment becomes history when the caller sends another message."""
+    """Recover a rejected attachment on a text follow-up without mutating caller history.
+
+    Args:
+        surface: The Chat Completions or Responses request surface.
+        url: Inline image URL rejected on the initial request.
+        reason: Expected explanation for the history placeholder.
+    """
     field = "messages" if surface == "chat" else "input"
     part = _chat_image(url) if surface == "chat" else {"type": "input_image", "image_url": url}
     messages: list[JsonValue] = [{"role": "user", "content": [part]}]
@@ -340,7 +346,16 @@ def test_text_followup_recovers_after_an_image_rejection_without_an_assistant_re
 def test_native_user_input_recovers_after_an_image_rejection(
     agent_image: bool, compaction: bool, cache_markers: JsonObject
 ) -> None:
-    """Native user inputs advance history, and agent media obeys the same size limit."""
+    """Recover oversized ordinary or agent images when a native caller input follows.
+
+    Verify initial rejection, immutable caller history, preservation of the newer
+    native item, and disclosure of unsupported cache metadata removed during recovery.
+
+    Args:
+        agent_image: Whether the rejected image belongs to a native agent message.
+        compaction: Whether the follow-up is a compaction request instead of an agent message.
+        cache_markers: Optional cache metadata attached to the rejected image.
+    """
     content: list[JsonValue] = [
         {"type": "input_image", "image_url": _OVERSIZED_URL, **cache_markers}
     ]
@@ -384,6 +399,41 @@ def test_native_user_input_recovers_after_an_image_rejection(
     if agent_image and "prompt_cache_breakpoint" in cache_markers:
         expected.append("input.0.content.0.prompt_cache_breakpoint->dropped(unsupported_item)")
     assert request.ignored_parameters == tuple(expected)
+
+
+@pytest.mark.parametrize("ttl", ["30m", "12h"])
+def test_native_image_history_drops_cache_hints_before_lifetime_validation(ttl: str) -> None:
+    """An unsupported native cache hint cannot introduce a new recovery-time failure.
+
+    Args:
+        ttl: Cache lifetime carried by the rejected agent image.
+    """
+    image: JsonObject = {
+        "type": "agent_message",
+        "author": "/root/worker",
+        "recipient": "/root",
+        "content": [
+            {
+                "type": "input_image",
+                "image_url": _OVERSIZED_URL,
+                "prompt_cache_breakpoint": {"mode": "explicit", "ttl": ttl},
+            }
+        ],
+    }
+    with pytest.raises(OpenAIProtocolError):
+        decode_responses({"model": "coding", "input": [image]})
+    request = decode_responses(
+        {"model": "coding", "input": [image, {"role": "user", "content": "Continue with text."}]}
+    ).request
+    assert request.messages[0].provider_native_item == {
+        **image,
+        "content": [{"type": "input_text", "text": placeholder_text("image", "oversized")}],
+    }
+    assert not request.prompt_cache_breakpoints
+    assert request.ignored_parameters == (
+        "input.content.image->placeholder(oversized)",
+        "input.0.content.0.prompt_cache_breakpoint->dropped(unsupported_item)",
+    )
 
 
 def test_an_unchanged_history_is_returned_without_copies() -> None:

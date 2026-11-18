@@ -202,7 +202,14 @@ def test_decode_serves_a_history_whose_tool_result_image_was_oversized() -> None
 def test_text_followup_recovers_after_an_image_rejection_without_an_assistant_reply(
     data: str, media_type: str, reason: UnservableReason, prefill: bool
 ) -> None:
-    """A text follow-up can recover even when the failed turn produced no assistant output."""
+    """Recover a rejected image on a text follow-up, including an empty assistant prefill.
+
+    Args:
+        data: Inline image bytes encoded as base64, or malformed input.
+        media_type: Declared MIME type of the rejected image.
+        reason: Expected explanation for the history placeholder.
+        prefill: Whether each request ends with an empty assistant prefill.
+    """
     messages: list[JsonObject] = [{"role": "user", "content": [_image(data, media_type)]}]
     suffix: list[JsonObject] = [{"role": "assistant", "content": ""}] if prefill else []
     with pytest.raises(OpenAIProtocolError):

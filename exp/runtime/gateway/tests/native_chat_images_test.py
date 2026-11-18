@@ -26,7 +26,17 @@ _PNG_BASE64 = (
 def test_rejected_opencode_image_allows_text_followup_on_a_text_only_route(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stream: bool
 ) -> None:
-    """A tool image folded into a user message cannot trap later text requests in 400s."""
+    """Serve text follow-ups after rejecting a tool image folded into a user message.
+
+    Drive a local gateway and synthetic provider through rejection and two recovery
+    turns. Verify placeholder disclosure, preserved tool history, and absence of image
+    data upstream, while an image-only request remains refused on the text-only route.
+
+    Args:
+        tmp_path: Isolated gateway configuration and storage directory.
+        monkeypatch: Fixture providing the synthetic provider credential.
+        stream: Whether the caller requests SSE or a buffered response.
+    """
     received: list[JsonObject] = []
 
     class Provider(BaseHTTPRequestHandler):
