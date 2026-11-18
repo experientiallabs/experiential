@@ -126,6 +126,32 @@ pub(super) const MAXIMUM_HELD_TOOL_CALL_BYTES: usize = 262_144;
 /// Events a turn's held tool calls may retain before they stream live.
 pub(super) const MAXIMUM_HELD_TOOL_CALL_EVENTS: usize = 8_192;
 
+/// The bytes `event` owns, or `None` once they exceed `room`: the larger of
+/// the retention estimate and the event's debug rendering, counted by a
+/// writer that never allocates and stops at `room`.
+fn owned_bytes_within(event: &Event, room: usize) -> Option<usize> {
+    struct Counter {
+        bytes: usize,
+        room: usize,
+    }
+    impl std::fmt::Write for Counter {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.bytes += text.len();
+            if self.bytes > self.room {
+                return Err(std::fmt::Error);
+            }
+            Ok(())
+        }
+    }
+    let estimate = crate::relay::event_retained_bytes(event);
+    if estimate > room {
+        return None;
+    }
+    let mut counter = Counter { bytes: 0, room };
+    std::fmt::Write::write_fmt(&mut counter, format_args!("{event:?}")).ok()?;
+    Some(estimate.max(counter.bytes))
+}
+
 /// What [`HeldToolCalls::consider`] decided for one event.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Hold {
@@ -203,17 +229,17 @@ impl HeldToolCalls {
     fn push(&mut self, event: &Event) -> Hold {
         // The retention estimator leaves out identifiers, opaque `caller`
         // metadata and item ids the held clone owns; its debug rendering
-        // carries every owned byte (escaped, so never fewer), so charge that.
-        let bytes = crate::relay::event_retained_bytes(event).max(format!("{event:?}").len());
-        if self.bytes.saturating_add(bytes) > MAXIMUM_HELD_TOOL_CALL_BYTES
-            || self.events.len() + 1 > MAXIMUM_HELD_TOOL_CALL_EVENTS
-        {
+        // carries every owned byte (escaped, so never fewer). It is measured
+        // without allocating and stops as soon as it passes the room left.
+        let room = MAXIMUM_HELD_TOOL_CALL_BYTES.saturating_sub(self.bytes);
+        let fits = self.events.len() < MAXIMUM_HELD_TOOL_CALL_EVENTS;
+        let Some(bytes) = owned_bytes_within(event, room).filter(|_| fits) else {
             return if self.events.is_empty() {
                 Hold::Pass
             } else {
                 Hold::Release
             };
-        }
+        };
         self.bytes += bytes;
         self.events.push(event.clone());
         Hold::Held
