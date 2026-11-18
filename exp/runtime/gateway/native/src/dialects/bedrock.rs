@@ -186,7 +186,11 @@ impl Normalizer {
             .ok_or_else(|| malformed("Bedrock toolUse delta must be an object"))?;
         let fragment = match tool_delta.get("input") {
             Some(Value::String(fragment)) => fragment.clone(),
-            _ => return Err(malformed("Bedrock tool input delta must be text")),
+            _ => {
+                return Err(super::malformed_tool_call(
+                    "Bedrock tool input delta must be text",
+                ))
+            }
         };
         if fragment.is_empty() {
             return Ok(Vec::new());

@@ -633,7 +633,7 @@ impl Normalizer {
                         let caller = optional_openai_caller(item, "OpenAI function call caller")?;
                         let arguments =
                             require_string(item, "arguments", "OpenAI function call arguments")
-                                .map_err(|message| malformed(&message))?;
+                                .map_err(|message| super::malformed_tool_call(&message))?;
                         let tool = self.tools.get(&index).ok_or_else(|| {
                             malformed("OpenAI function call completed before its start")
                         })?;
