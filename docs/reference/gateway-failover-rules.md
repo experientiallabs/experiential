@@ -98,7 +98,13 @@ serve less than the window the model advertises. The data plane files it with
 it, and keeps it failover-eligible once per request; the control plane advances only to an untried
 rung whose advertised window exceeds the stated one (else the failed rung's advertised window), or
 whose window the catalog does not state (`native_context_window.py`). With no such rung, or on a
-second refusal, the caller receives the provider's 400 unchanged.
+second refusal, the caller receives the provider's 400 with its sentence. Every context overflow,
+that verdict or the gateway's own pre-dispatch estimate, carries OpenAI's code
+`context_length_exceeded` on every surface (Codex compacts on it), and on the Messages surface its
+message opens the way Anthropic's does: "prompt is too long: N tokens > M maximum", or "input
+length and `max_tokens` exceed context limit: N + R > M" when the prompt fits but the output budget
+does not, followed by the gateway's own sentence. Claude Code compacts the conversation on that
+wording (`encode_messages/overflow.rs`).
 
 ## Malformed tool calls
 
