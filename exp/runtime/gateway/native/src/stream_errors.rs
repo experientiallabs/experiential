@@ -13,6 +13,8 @@ pub enum StreamErrorKind {
     InvalidRequest,
     /// The model's safety layer declined the content, for this bounded reason.
     Refusal(RefusalReason),
+    /// The provider blocked this request's end user for a prior policy violation.
+    EndUserBlocked,
     /// Rate limit or overload: fail over, advertise a retry.
     Throttled,
     /// The provider ACCOUNT cannot pay.
@@ -354,10 +356,8 @@ pub(crate) fn classify_stream_error_with_raw_message(
     let code_ref = code_lower.as_deref().unwrap_or("");
     let message_ref = message_lower.as_deref().unwrap_or("");
 
-    if message.is_some_and(crate::rejection_shapes::names_account_policy_block)
-        || raw_message.is_some_and(crate::rejection_shapes::names_account_policy_block)
-    {
-        return StreamErrorKind::ProviderAuthentication;
+    if crate::end_user_block::names_any_end_user_policy_block(&[message, raw_message]) {
+        return StreamErrorKind::EndUserBlocked;
     }
     if is_refusal_code(Some(code_ref)) {
         return StreamErrorKind::Refusal(refusal_reason(code, message));
@@ -428,6 +428,7 @@ pub fn stream_failure(kind: StreamErrorKind, detail: Option<String>) -> Failure 
         )
         .with_retry(false, false),
         StreamErrorKind::Refusal(reason) => Failure::refusal(reason),
+        StreamErrorKind::EndUserBlocked => crate::end_user_block::end_user_block_failure(None),
         StreamErrorKind::Throttled => Failure::new(
             FailureClass::Throttled,
             "provider throttled the request; retry after the delay in the Retry-After header",

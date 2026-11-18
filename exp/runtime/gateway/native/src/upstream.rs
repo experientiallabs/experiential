@@ -444,17 +444,13 @@ async fn non_success_failure(
     };
     if body
         .as_deref()
-        .is_some_and(crate::rejection_shapes::names_account_policy_block)
+        .is_some_and(crate::end_user_block::names_end_user_policy_block)
     {
-        // An account-level policy block is the provider's verdict on the
-        // ACCOUNT, under whatever status the relay chose (OpenRouter answers
-        // 403 or a 400 `invalid_prompt`): the credential class, so the ladder
-        // fails over and the lane can be demoted. Ledger detail only.
-        return transport_failure(Some(403))
-            .with_provider_detail(Some(format!(
-                "{}: account_policy_block",
-                status_detail(status)
-            )))
+        // A block on this request's END USER, under whatever status the relay
+        // chose (OpenRouter answers 403 or a 400 `invalid_prompt`): a typed
+        // content-policy refusal, never a credential verdict on the account.
+        let detail = crate::end_user_block::end_user_block_detail(&status_detail(status));
+        return crate::end_user_block::end_user_block_failure(Some(detail))
             .with_rate_limit_facts(rate_limit.clone(), retry_after);
     }
     if status == 429 {

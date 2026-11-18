@@ -123,6 +123,13 @@ fn rewrite(class: FailureClass, message: &str) -> Option<String> {
              Retry later or choose another model; if it persists, ask the gateway operator \
              to update the model's route."
         }
+        FailureClass::Refusal
+            if after(message, crate::end_user_block::END_USER_BLOCK_MESSAGE).is_some() =>
+        {
+            "The model's provider blocked this request's end user for a previous policy \
+             violation, so it refused the request. Choose another model, or contact support \
+             if you believe the block is wrong."
+        }
         FailureClass::Refusal => {
             let rest = after(message, "provider refused the request")?;
             // Only a ":" clause names a refusal category; a ";" clause is

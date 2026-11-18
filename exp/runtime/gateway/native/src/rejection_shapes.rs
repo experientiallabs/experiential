@@ -549,27 +549,6 @@ fn filtered_choice(value: &Value) -> Option<FilteredCompletion> {
     })
 }
 
-/// The sentence OpenAI answers once it has blocked the calling ACCOUNT for an
-/// earlier policy violation ("Policy Violation: this user has been blocked for
-/// a previous policy violation"), relayed by OpenRouter under the generic
-/// `invalid_prompt` code (400, and in-stream) or a 403. It carries no code of
-/// its own, so the sentence is the only discriminator.
-const ACCOUNT_POLICY_BLOCK_SENTENCE: &str = "has been blocked for a previous policy violation";
-
-/// Whether one provider text names an account-level policy block.
-///
-/// The block is a verdict on the house or BYOK account, never on this
-/// caller's content: the same request on another rung (another account)
-/// serves, so it is filed as `provider_authentication`, fails over, and lets
-/// the platform demote the lane instead of handing one tenant a 400 that
-/// reads as their own mistake. Matching is on the raw text (case-insensitive),
-/// which also finds the sentence inside an aggregator's JSON-string
-/// `metadata.raw` envelope.
-pub(crate) fn names_account_policy_block(text: &str) -> bool {
-    text.to_ascii_lowercase()
-        .contains(ACCOUNT_POLICY_BLOCK_SENTENCE)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -975,20 +954,6 @@ mod tests {
         assert!(!rejected_encrypted_reasoning(
             Dialect::OpenAiResponses,
             text
-        ));
-    }
-
-    #[test]
-    fn an_account_policy_block_is_named_in_every_relayed_shape() {
-        // OpenRouter's relay of OpenAI's account block (gpt-6.1-sol, 131
-        // attempts over two days): the sentence sits in metadata.raw as a JSON
-        // string under the generic invalid_prompt code, or flat under a 403.
-        let relayed = r#"{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"{\"error\":{\"message\":\"Policy Violation: this user has been blocked for a previous policy violation\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_prompt\"}}","provider_name":"OpenAI"}}}"#;
-        let flat = r#"{"error":{"message":"Policy Violation: this user has been blocked for a previous policy violation","code":403}}"#;
-        assert!(names_account_policy_block(relayed));
-        assert!(names_account_policy_block(flat));
-        assert!(!names_account_policy_block(
-            r#"{"error":{"message":"Invalid prompt: we've limited access to this content.","code":"invalid_prompt"}}"#
         ));
     }
 }
