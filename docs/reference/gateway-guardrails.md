@@ -559,7 +559,9 @@ text, response text, classifier payload, or credentials.
 
 `latest_user_window_sha256` identifies the labelled latest-user input window
 with 30,000 head/tail characters, zero system characters and zero prior messages,
-using `classification_window`. It is absent when admitted subjects disagree.
+using `classification_window`. It is absent when inspection subjects disagree,
+including validation of a rewritten input. A retained original request cannot
+prove the contents of a different rewritten subject.
 A host recovering a policy that reads exactly that window must verify the
 retained source against this digest before acting. It grants no coverage of
 other text or other window definitions.

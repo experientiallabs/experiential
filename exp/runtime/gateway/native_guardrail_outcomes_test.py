@@ -47,6 +47,7 @@ def test_only_declared_ledger_extension_receives_evidence() -> None:
     documents: tuple[JsonObject, ...] = ({"outcome": "allow"},)
     assert outcome_keyword(consumes, documents) == {"input_guardrail_outcomes": documents}
     assert outcome_keyword(plain, documents) == {}
+    assert outcome_keyword(Mock(wraps=plain), documents) == {}
 
 
 def test_terminal_retry_keeps_the_original_input_evidence() -> None:

@@ -15,6 +15,7 @@ from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.guardrails.classification_window import (
     ClassificationWindow,
     classification_window,
+    message_text,
 )
 from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
@@ -86,19 +87,23 @@ class InputOutcomes:
 
     def start(self, policy: GuardrailPolicy, request: GatewayRequest | None = None) -> None:
         """Remember actual admission of a check without retaining its subject."""
-        digest = None if request is None else latest_user_window_digest(request)
+        if request is not None:
+            self.admit(policy, request)
         with self._lock:
             if self._frozen is None:
                 self._started.update(
                     (policy.policy_id, check.check_id) for check in policy.input_checks
                 )
-                if digest is not None:
-                    for check in policy.input_checks:
-                        windows = self._windows.setdefault(
-                            (policy.policy_id, check.check_id), set()
-                        )
-                        if len(windows) < 2:
-                            windows.add(digest)
+
+    def admit(self, policy: GuardrailPolicy, request: GatewayRequest) -> None:
+        """Remember an input window without claiming that its queued checks executed."""
+        digest = latest_user_window_digest(request)
+        with self._lock:
+            if self._frozen is None:
+                for check in policy.input_checks:
+                    windows = self._windows.setdefault((policy.policy_id, check.check_id), set())
+                    if len(windows) < 2:
+                        windows.add(digest)
 
     def record(
         self, policy: GuardrailPolicy, check: GuardrailCheck, result: GuardrailOutcome
@@ -109,7 +114,14 @@ class InputOutcomes:
             if self._frozen is not None:
                 return
             previous = self._results.get(key)
-            if previous is None or previous is GuardrailOutcome.ALLOW:
+            if (
+                previous is None
+                or previous is GuardrailOutcome.ALLOW
+                or (
+                    previous is GuardrailOutcome.FLAGGED
+                    and check.action in (GuardrailAction.ALLOW, GuardrailAction.MODIFY)
+                )
+            ):
                 self._results[key] = result
 
     def expire(self, policy: GuardrailPolicy) -> None:
@@ -148,7 +160,8 @@ class InputOutcomes:
         elif key not in self._started or policy.mode != "enforce":
             outcome = "not_started"
         elif result is GuardrailOutcome.ALLOW or (
-            result is GuardrailOutcome.FLAGGED and check.action is GuardrailAction.ALLOW
+            result is GuardrailOutcome.FLAGGED
+            and check.action in (GuardrailAction.ALLOW, GuardrailAction.MODIFY)
         ):
             outcome = "allow"
         elif result is GuardrailOutcome.UNSUPPORTED:
@@ -184,7 +197,12 @@ _LATEST_USER_WINDOW = ClassificationWindow(
 def latest_user_window_digest(request: GatewayRequest) -> str:
     """Hash bounded input only, without walking or joining unrelated system/tool text."""
     latest = next(
-        (message for message in reversed(request.messages) if message.role == "user"), None
+        (
+            message
+            for message in reversed(request.messages)
+            if message.role == "user" and message_text(message).strip()
+        ),
+        None,
     )
     subject = request.model_copy(update={"messages": () if latest is None else (latest,)})
     return sha256(classification_window(subject, _LATEST_USER_WINDOW).encode("utf-8")).hexdigest()
@@ -195,5 +213,7 @@ def record_input_outcome(
 ) -> None:
     """Collect a bounded input result only inside its request-owned execution context."""
     current = _CURRENT.get()
-    if current is not None and check is not None and check.stage.value == "input":
-        current.record(policy, check, outcome)
+    if current is not None:
+        for candidate in policy.input_checks if check is None else (check,):
+            if candidate.stage.value == "input":
+                current.record(policy, candidate, outcome)

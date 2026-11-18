@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import lru_cache
+from inspect import Parameter, signature
 from typing import TYPE_CHECKING, TypedDict
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.native_settlement import accepts_keyword
 
 if TYPE_CHECKING:
     from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayFailure
@@ -42,9 +43,22 @@ def outcome_keyword(
     write: Callable[..., object], documents: tuple[JsonObject, ...]
 ) -> InputOutcomeKeyword:
     """Offer the accounting extension only to a ledger explicitly declaring it."""
-    if accepts_keyword(write, "input_guardrail_outcomes"):
+    if _declares_outcomes(write):
         return {"input_guardrail_outcomes": documents}
     return {}
+
+
+@lru_cache(maxsize=128)
+def _declares_outcomes(write: Callable[..., object]) -> bool:
+    """A generic forwarding wrapper does not assert that its destination persists evidence."""
+    try:
+        parameter = signature(write).parameters.get("input_guardrail_outcomes")
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in (
+        Parameter.KEYWORD_ONLY,
+        Parameter.POSITIONAL_OR_KEYWORD,
+    )
 
 
 def terminal_outcomes(

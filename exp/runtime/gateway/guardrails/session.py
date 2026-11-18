@@ -17,7 +17,6 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
     GuardrailCheckStage,
     GuardrailCompletion,
-    GuardrailOutcome,
     GuardrailPolicy,
     GuardrailRejected,
     OutputGuardrailMode,
@@ -339,9 +338,6 @@ class GuardrailSession:
                 if self.detectors and not policy.fail_open
                 else None
             )
-            if native is not None:
-                for check in policy.input_checks:
-                    self._outcomes.record(policy, check, GuardrailOutcome.ALLOW)
             return (
                 native
                 if native is not None
@@ -448,7 +444,7 @@ class GuardrailSession:
         self._input_approved_at = None
         for policy in self.enforcing_policies:
             for subject in remaining:
-                self._outcomes.start(policy, subject)
+                self._outcomes.admit(policy, subject)
         if not overlap:
             self.begin_input_wait()
         self._begin_input_subjects(len(remaining))

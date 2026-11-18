@@ -1,10 +1,18 @@
 """Input evidence survives late classifier results without inventing coverage."""
 
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Coroutine
+from concurrent.futures import Future, ThreadPoolExecutor
+from hashlib import sha256
+from unittest.mock import Mock, patch
 
 import pytest
 
+from exp.runtime.gateway.contracts import GatewayMessage
+from exp.runtime.gateway.guardrails.classification_window import (
+    ClassificationWindow,
+    classification_window,
+)
 from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
 from exp.runtime.gateway.guardrails.contracts import (
@@ -16,8 +24,13 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailPolicy,
     GuardrailRejected,
 )
+from exp.runtime.gateway.guardrails.deterministic import native_input_request
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
-from exp.runtime.gateway.guardrails.input_outcomes import InputOutcomes, record_input_outcome
+from exp.runtime.gateway.guardrails.input_outcomes import (
+    InputOutcomes,
+    latest_user_window_digest,
+    record_input_outcome,
+)
 from exp.runtime.gateway.guardrails.session_test import _request, _session
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 from exp.runtime.gateway.tests.parallel_input_guardrails_test import _Classifier
@@ -104,6 +117,109 @@ def test_disagreeing_input_subjects_cannot_claim_one_recoverable_window() -> Non
     (result,) = tracker.freeze((policy,), blocked=False)
     assert result.outcome == "missed"
     assert result.latest_user_window_sha256 is None
+
+
+@pytest.mark.parametrize("action", [GuardrailAction.ALLOW, GuardrailAction.MODIFY])
+@pytest.mark.parametrize(
+    "later", [GuardrailOutcome.TIMEOUT, GuardrailOutcome.UNAVAILABLE, GuardrailOutcome.UNSUPPORTED]
+)
+def test_covered_flagged_subject_does_not_hide_a_later_miss(
+    action: GuardrailAction, later: GuardrailOutcome
+) -> None:
+    """Only genuine misses stay sticky, including successful non-blocking rewrites."""
+    policy, tracker = _policy(), InputOutcomes()
+    check = policy.checks[0].model_copy(update={"action": action})
+    policy = policy.model_copy(update={"checks": (check,)})
+    tracker.start(policy, _request())
+    tracker.record(policy, check, GuardrailOutcome.FLAGGED)
+    tracker.record(policy, check, later)
+    (result,) = tracker.freeze((policy,), blocked=False)
+    assert result.outcome == ("unsupported" if later is GuardrailOutcome.UNSUPPORTED else "missed")
+
+
+def test_successful_modification_is_covered() -> None:
+    """A fully applied rewrite is an executed, non-blocking result."""
+    policy, tracker = _policy(), InputOutcomes()
+    check = policy.checks[0].model_copy(update={"action": GuardrailAction.MODIFY})
+    policy = policy.model_copy(update={"checks": (check,)})
+    tracker.start(policy, _request())
+    tracker.record(policy, check, GuardrailOutcome.FLAGGED)
+    assert tracker.freeze((policy,), blocked=False)[0].outcome == "allow"
+
+
+def test_queued_but_unstarted_checks_do_not_authorize_recovery() -> None:
+    """A fast provider failure can settle before the scheduled input task starts."""
+    classifier, future = _Classifier("allow"), Future()
+
+    def queued(coroutine: Coroutine[object, object, None]) -> Future[None]:
+        """Model a scheduled task without executing or leaking its coroutine."""
+        coroutine.close()
+        return future
+
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((_policy(),)),
+        client=DirectClassifierClient(ClassifierRegistry({"classifier": classifier})),
+        monotonic=time.monotonic,
+    )
+    try:
+        session = _session(engine)
+        with patch(
+            "exp.runtime.gateway.guardrails.session.start_on_native_loop", side_effect=queued
+        ):
+            session.prepare_dispatch((_request(),), overlap=True)
+        (result,) = session.input_outcomes()
+        assert result.outcome == "not_started"
+        assert result.recovery_reason is None
+        assert result.latest_user_window_sha256 is not None
+        assert not classifier.started.is_set()
+    finally:
+        future.cancel()
+        engine.close(timeout_seconds=2)
+
+
+def test_digest_uses_the_classifier_latest_nonblank_user_selection() -> None:
+    """Trailing nontext user input must not replace the online classifier's chosen turn."""
+    request = _request("earlier input")
+    request = request.model_copy(
+        update={"messages": (*request.messages, GatewayMessage(role="user", content=" "))}
+    )
+    expected = classification_window(
+        request, ClassificationWindow(system_chars=0, latest_user_chars=30000, prior_messages=0)
+    )
+    assert latest_user_window_digest(request) == sha256(expected.encode()).hexdigest()
+
+
+def test_policy_wide_unsupported_input_is_not_a_recoverable_miss() -> None:
+    """An oversized fail-open policy fans its unsupported result out to its input checks."""
+    policy, tracker = _policy(), InputOutcomes()
+    tracker.start(policy, _request())
+    with tracker.collect():
+        record_input_outcome(policy, None, GuardrailOutcome.UNSUPPORTED)
+    (result,) = tracker.freeze((policy,), blocked=False)
+    assert result.outcome == "unsupported"
+    assert result.recovery_reason is None
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_native_uncertainty_preserves_missing_coverage(*, failed: bool) -> None:
+    """Unprotected deterministic checks that skip uncertainty never manufacture ALLOW."""
+    policy = _policy().model_copy(update={"protected": False, "fail_open": False})
+    tracker = InputOutcomes()
+    tracker.start(policy, _request())
+    detector = Mock()
+    detector.matches.return_value = False
+    detector.redact.side_effect = ValueError("synthetic detector failure")
+    with tracker.collect():
+        native_input_request(
+            policy,
+            {"classifier": detector},
+            _request(),
+            monotonic=lambda: 1.0,
+            deadline_monotonic=2.0 if failed else 0.0,
+        )
+    (result,) = tracker.freeze((policy,), blocked=False)
+    assert result.outcome == "missed"
+    assert result.recovery_reason == ("classifier_error" if failed else "deadline_expired")
 
 
 def test_parallel_request_contexts_do_not_cross() -> None:
