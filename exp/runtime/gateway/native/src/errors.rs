@@ -7,6 +7,9 @@ use serde_json::json;
 
 use crate::caller_copy::caller_copy;
 
+mod header_timeout;
+pub use header_timeout::HeaderTimeout;
+
 /// One sanitized public protocol error carrying its HTTP representation.
 ///
 /// Field names match the JSON payload attached to `NativeBridgeError` on the
@@ -372,26 +375,10 @@ pub struct Failure {
     /// rung of another provider (`content_filter.rs`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub provider_content_filter: bool,
-}
-
-/// Which bound ended a dial waiting for its provider's response headers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HeaderTimeout {
-    /// The rung's own first-byte allowance expired: the lane did not answer.
-    Allowance,
-    /// The request's shared budget (or deadline) expired first.
-    Budget,
-}
-
-impl HeaderTimeout {
-    /// The boundary token, shared with python `GatewayHeaderTimeout`.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Allowance => "allowance",
-            Self::Budget => "budget",
-        }
-    }
+    /// A streamed client tool call that never became one valid call: retried
+    /// once while nothing reached the caller (docs: "Malformed tool calls").
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub malformed_tool_call: bool,
 }
 
 impl Failure {
@@ -415,6 +402,7 @@ impl Failure {
             context_window_rejected: false,
             context_window_limit_tokens: None,
             provider_content_filter: false,
+            malformed_tool_call: false,
         }
     }
 
@@ -568,6 +556,7 @@ impl Failure {
                 .with_retry(self.retryable_same_deployment, self.failover_eligible)
                 .with_tenant_origin(self.tenant_origin)
                 .with_provider_detail(Some(self.safe_message))
+                .with_malformed_tool_call(self.malformed_tool_call)
             }
             _ => self,
         }

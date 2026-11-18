@@ -306,6 +306,7 @@ pub(super) async fn run_attempt(
         let mut withheld: Vec<Event> = Vec::new();
         let mut withheld_bytes = 0usize;
         let mut private_reasoning = commit::PrivateReasoning::default();
+        let mut held_tools = commit::HeldToolCalls::default();
         // Any event before a failure (private reasoning included) is generated
         // work: such a dial is the attempt's answer and is never re-dialed.
         let mut produced = false;
@@ -365,6 +366,39 @@ pub(super) async fn run_attempt(
             }
             track_event(&event, &mut usage, &mut tool_names);
             guard.record_first_token(relay.first_token_at());
+            // A turn that opens with a client tool call stays uncommitted
+            // until it ends (bounded), so a call whose arguments never parse
+            // fails before the caller saw any of it and the ladder may retry
+            // it (`commit::HeldToolCalls`).
+            match held_tools.consider(&event, !withheld.iter().any(crate::logprobs::is_refusal)) {
+                commit::Hold::Held => {
+                    relay.private_progress();
+                    continue;
+                }
+                commit::Hold::Release => {
+                    let mut pending = std::mem::take(&mut withheld);
+                    pending.append(&mut held_tools.take());
+                    let prefix = private_reasoning.prefix(&mut pending, event, usage.as_ref());
+                    let visible_refusal = prefix.iter().any(crate::logprobs::is_refusal_text);
+                    let tool_search_dropped_after_output = relay.withheld_search_call_seen();
+                    relay.commit();
+                    return AttemptEnd::Committed(Box::new(CommittedAttempt {
+                        depth,
+                        prefix,
+                        relay,
+                        usage,
+                        tool_names,
+                        visible_refusal,
+                        encrypted_reasoning_stripped,
+                        tool_search_rounds: Vec::new(),
+                        tool_search_dropped_after_output,
+                        pace: None,
+                        rate_limit_headers: caller_rate_limits,
+                        collection_failure: None,
+                    }));
+                }
+                commit::Hold::Discard | commit::Hold::Pass => {}
+            }
             if private_reasoning.withhold(&event, wire.reasoning_output_exposed) {
                 relay.private_progress();
                 continue;

@@ -76,9 +76,9 @@ class FailoverPass:
             failure that earns a forced pass.
         forced: Depths this walk already tried to force past their bound.
         forcing: Whether the current candidate is a forced pass.
-        redial: The rung a transport failure left for its siblings
-            (``next_route_candidate`` tries them first) while its own redial is
-            still permitted: claimed once the sideways walk runs out, so a
+        redial: The rung a transport failure or a malformed tool call left
+            for its siblings (``next_route_candidate`` tries them first) while
+            its own redial is still permitted: claimed once the sideways walk runs out, so a
             sibling that sheds or is rejected never ends the request.
         redial_forced: Whether that redial may take the forced claim (the
             request's only dial failed).
@@ -140,7 +140,7 @@ class FailoverPass:
         policy = entry.attempt_policy
         cap = policy.physical_route_cap
         redial_permitted = (
-            failure.failure_class == GatewayFailureClass.TRANSPORT
+            (failure.failure_class == GatewayFailureClass.TRANSPORT or failure.malformed_tool_call)
             and failure.retryable_same_deployment
             and entry.ordinary_attempt_counts[current_depth]
             < policy.maximum_same_deployment_attempts

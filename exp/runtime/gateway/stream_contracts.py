@@ -529,6 +529,12 @@ class GatewayFailure(ContractModel):
             class. The data plane makes it failover-eligible once per request,
             and only an untried rung of another provider may take it
             (``native_content_filter``).
+        malformed_tool_call: A ``MALFORMED_RESPONSE`` for a streamed client
+            tool call whose arguments never became one valid JSON object. The
+            data plane reports it only while nothing reached the caller and
+            makes the first one per request both failover-eligible and
+            redialable; like ``TRANSPORT``, an untried sibling is preferred
+            over the redial (``native_execution.next_route_candidate``).
     """
 
     failure_class: GatewayFailureClass
@@ -565,6 +571,7 @@ class GatewayFailure(ContractModel):
     context_window_rejected: bool = False
     context_window_limit_tokens: int | None = Field(default=None, ge=1)
     provider_content_filter: bool = False
+    malformed_tool_call: bool = False
 
 
 def _validate_responses_probability_records(

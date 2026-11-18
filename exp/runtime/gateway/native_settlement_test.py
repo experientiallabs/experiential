@@ -1035,3 +1035,31 @@ def test_terminal_from_settlement_carries_the_provider_content_filter() -> None:
         )
         assert failure is not None
         assert failure.provider_content_filter is expected
+
+
+def test_boundary_payload_and_settlement_carry_a_malformed_tool_call() -> None:
+    """The malformed-tool-call verdict reaches the candidate choice and the attempt row."""
+    payload: dict[str, object] = {
+        "failure_class": "malformed_response",
+        "safe_message": "provider returned a malformed response; retry the request",
+        "retryable_same_deployment": True,
+        "failover_eligible": True,
+        "malformed_tool_call": True,
+    }
+    failure = failure_from_boundary_payload(payload)
+    assert failure is not None and failure.malformed_tool_call is True
+    for flag in (1, "true", None):
+        parsed = failure_from_boundary_payload({**payload, "malformed_tool_call": flag})
+        assert parsed is not None and parsed.malformed_tool_call is False
+    for flag, expected in ((True, True), (None, False)):
+        settled: dict[str, object] = {
+            "failure_class": "malformed_response",
+            "safe_message": "provider returned a malformed response; retry the request",
+        }
+        if flag is not None:
+            settled["malformed_tool_call"] = flag
+        _terminal, failure = terminal_from_settlement(
+            {"outcome": "failed", "usage": None, "tool_names": [], "failure": settled}
+        )
+        assert failure is not None
+        assert failure.malformed_tool_call is expected

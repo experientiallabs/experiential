@@ -205,6 +205,7 @@ def failure_from_boundary_payload(payload: object) -> GatewayFailure | None:
             else None
         ),
         provider_content_filter=data.get("provider_content_filter") is True,
+        malformed_tool_call=data.get("malformed_tool_call") is True,
     )
 
 
@@ -426,6 +427,7 @@ def terminal_from_settlement(
             header_timeout=header_timeout_from_payload(failure_payload.get("header_timeout")),
             tenant_origin=failure_payload.get("tenant_origin") is True,
             provider_content_filter=failure_payload.get("provider_content_filter") is True,
+            malformed_tool_call=failure_payload.get("malformed_tool_call") is True,
         )
         if (
             failure.failure_class == GatewayFailureClass.THROTTLED
