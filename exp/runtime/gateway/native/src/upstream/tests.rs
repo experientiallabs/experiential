@@ -760,13 +760,12 @@ async fn a_plain_403_stays_a_credential_failure() {
 #[tokio::test]
 async fn an_end_user_policy_block_is_a_refusal_under_any_relay_status() {
     // OpenRouter's relay of a block on the END USER the request carries: the
-    // exact production 403 body (2026-11-18, the same house account serving
-    // every other caller meanwhile), the flat sentence, and the generic
+    // flat 403 body, and the generic
     // invalid_prompt 400 with OpenAI's document in metadata.raw. None is a
     // verdict on the account credential.
-    let production = r#"{"error":{"code":403,"message":"Policy Violation: this user has been blocked for a previous policy violation. Learn more: https://openrouter.ai/docs"}}"#;
+    let flat = r#"{"error":{"code":403,"message":"Policy Violation: this user has been blocked for a previous policy violation. Learn more: https://openrouter.ai/docs"}}"#;
     let relayed = r#"{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"{\"error\":{\"message\":\"Policy Violation: this user has been blocked for a previous policy violation\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_prompt\"}}","provider_name":"OpenAI"}}}"#;
-    for (status, body) in [("403 Forbidden", production), ("400 Bad Request", relayed)] {
+    for (status, body) in [("403 Forbidden", flat), ("400 Bad Request", relayed)] {
         let failure = open_against_body(status, body, "openai/gpt-6.1-sol").await;
         assert_eq!(failure.failure_class, FailureClass::Refusal, "{status}");
         assert_eq!(

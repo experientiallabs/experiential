@@ -444,7 +444,7 @@ async fn non_success_failure(
     };
     if body
         .as_deref()
-        .is_some_and(crate::end_user_block::names_end_user_policy_block)
+        .is_some_and(crate::end_user_block::body_names_end_user_policy_block)
     {
         // A block on this request's END USER, under whatever status the relay
         // chose (OpenRouter answers 403 or a 400 `invalid_prompt`): a typed

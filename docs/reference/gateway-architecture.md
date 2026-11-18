@@ -741,8 +741,11 @@ malformed and its reason names the frame's sorted key names (never a value).
 **A block on the request's end user is a refusal, not a credential verdict.** "Policy Violation: this
 user has been blocked for a previous policy violation" (OpenAI's verdict on the end-user identifier a
 request carries, relayed by OpenRouter as a 403, a generic 400 `invalid_prompt`, or in-stream) is
-matched on its stable fragments ("user has been blocked" and "policy violation") and filed as a
-`refusal` with reason `content_policy` (ledger detail `http 403: end_user_policy_block`), marked as a
+matched on its stable fragments ("user has been blocked" and "policy violation", both leading the
+error sentence) in the verdict fields only (the envelope's message, or the upstream sentence behind an
+aggregator's generic one in `metadata.raw`; never an echoed prompt or other field) and filed as a
+`refusal` with reason `content_policy` (ledger detail `http <status>: end_user_policy_block`, so
+`http 403` or `http 400`), marked as a
 provider filter so one untried rung of another provider may take it. It never feeds the credential
 class, so one blocked end user cannot demote a shared house account or trip a BYOK connection's
 breaker, and the caller reads that the provider blocked this request's end user rather than that
