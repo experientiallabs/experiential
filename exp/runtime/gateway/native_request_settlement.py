@@ -19,6 +19,7 @@ import threading
 from dataclasses import dataclass, field
 from inspect import signature
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayFailure
 from exp.runtime.gateway.ledger_errors import (
     AccountingRecoverySupersededError,
@@ -30,6 +31,7 @@ from exp.runtime.gateway.ledger_errors import (
 from exp.runtime.gateway.native_accounting_fence import OrganizationFence, fences_after
 from exp.runtime.gateway.native_accounting_recovery import RecoveryRotation
 from exp.runtime.gateway.native_components import SyncWriteLedger
+from exp.runtime.gateway.native_guardrail_outcomes import write_request_outcomes
 
 _logger = logging.getLogger(__name__)
 
@@ -66,6 +68,7 @@ class _Settlement:
         failure: Original terminal failure to preserve across retries.
         certify_no_effects: Whether accounting can certify no paid work occurred.
         web_search_requests: Completed search count to persist with the request.
+        input_guardrail_outcomes: Frozen server-authored inspection results.
         retained: Whether a failed write needs recovery, false initially.
         fences: Whether the latest failed write fences its organization's
             admission; a deliberate ledger refusal never does. False initially.
@@ -77,6 +80,7 @@ class _Settlement:
     failure: GatewayFailure
     certify_no_effects: bool
     web_search_requests: int
+    input_guardrail_outcomes: tuple[JsonObject, ...]
     retained: bool = False
     fences: bool = False
     committed: bool | None = None
@@ -132,6 +136,7 @@ class RequestSettlements:
         *,
         certify_no_effects: bool = False,
         web_search_requests: int = 0,
+        input_guardrail_outcomes: tuple[JsonObject, ...] = (),
     ) -> bool:
         """Retain the original failure and meter before attempting an idempotent write."""
         with self._lock:
@@ -142,6 +147,7 @@ class RequestSettlements:
                     failure,
                     certify_no_effects,
                     web_search_requests,
+                    input_guardrail_outcomes,
                 ),
             )
         return self._commit(settlement)
@@ -152,11 +158,13 @@ class RequestSettlements:
             if settlement.committed is not None:
                 return settlement.committed
             try:
-                committed = self._ledger.finish_request(
+                committed = write_request_outcomes(
+                    self._ledger.finish_request,
                     authorization=settlement.authorization,
                     failure=settlement.failure,
                     certify_no_effects=settlement.certify_no_effects,
                     web_search_requests=settlement.web_search_requests,
+                    input_guardrail_outcomes=settlement.input_guardrail_outcomes,
                 )
             except Exception as exc:  # noqa: BLE001 - failed ownership must survive any ledger fault.
                 if not permanently_refused(exc):

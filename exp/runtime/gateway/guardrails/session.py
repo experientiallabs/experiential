@@ -17,6 +17,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
     GuardrailCheckStage,
     GuardrailCompletion,
+    GuardrailOutcome,
     GuardrailPolicy,
     GuardrailRejected,
     OutputGuardrailMode,
@@ -27,6 +28,7 @@ from exp.runtime.gateway.guardrails.deterministic import (
     native_input_request,
     native_output_plan,
 )
+from exp.runtime.gateway.guardrails.input_outcomes import InputCheckOutcome, InputOutcomes
 from exp.runtime.gateway.guardrails.input_wait import InputWait
 from exp.runtime.gateway.guardrails.recording import ObservationRecord
 from exp.runtime.gateway.guardrails.streaming import StreamSegment
@@ -81,6 +83,7 @@ class GuardrailSession:
         _input_outcomes_lock: Serializes check completion against native expiry observation.
         _native_rejection: One content-free terminal record awaiting native release.
         _synchronous_inputs: Fresh synchronous subjects still running after preparation.
+        _outcomes: Content-free execution facts frozen for durable terminal accounting.
     """
 
     engine: GuardrailEngine
@@ -105,6 +108,14 @@ class GuardrailSession:
     _input_outcomes_lock: Lock = field(default_factory=Lock, init=False, repr=False)
     _native_rejection: ObservationRecord | None = field(default=None, init=False, repr=False)
     _synchronous_inputs: int = field(default=0, init=False, repr=False)
+
+    _outcomes: InputOutcomes = field(default_factory=InputOutcomes, init=False, repr=False)
+
+    def input_outcomes(self) -> tuple[InputCheckOutcome, ...]:
+        """Freeze actual input execution after reconciling the native release decision."""
+        decision = self.input_decision()
+        blocked = decision["action"] == "error"
+        return self._outcomes.freeze(self.policies, blocked=blocked)
 
     def optional_input_wait_ms(self) -> int | None:
         """Authorize native expiry only when every enforcing input check is optional."""
@@ -262,6 +273,7 @@ class GuardrailSession:
         """Count each optional check once, preserving already completed coverage."""
         if self.native_input is None:
             if expired:
+                self._outcomes.expire(policy)
                 self.engine.record_input_expiry(policy)
             return
         with self._input_outcomes_lock:
@@ -288,7 +300,9 @@ class GuardrailSession:
                     0 if expired else self._input_pending_checks.get(key, 1) - 1
                 )
         if expired and remaining:
-            self.engine.record_input_expiry(policy.model_copy(update={"checks": remaining}))
+            expired_policy = policy.model_copy(update={"checks": remaining})
+            self._outcomes.expire(expired_policy)
+            self.engine.record_input_expiry(expired_policy)
 
     def _native_decision_current(self, policy: GuardrailPolicy) -> bool:
         """Keep outcomes after this policy's native boundary from being applied."""
@@ -305,7 +319,14 @@ class GuardrailSession:
     ) -> GatewayRequest:
         """Apply the same native or bounded adapter strategy during execution and validation."""
 
+        self._outcomes.start(policy, request)
+
         async def inspect() -> GatewayRequest:
+            """Collect bounded outcomes in this request coroutine only."""
+            with self._outcomes.collect():
+                return await execute()
+
+        async def execute() -> GatewayRequest:
             """Run this check through its existing native or isolated adapter."""
             native = (
                 native_input_request(
@@ -318,6 +339,9 @@ class GuardrailSession:
                 if self.detectors and not policy.fail_open
                 else None
             )
+            if native is not None:
+                for check in policy.input_checks:
+                    self._outcomes.record(policy, check, GuardrailOutcome.ALLOW)
             return (
                 native
                 if native is not None
@@ -422,6 +446,9 @@ class GuardrailSession:
         if overlap and not all(self.can_overlap_input(subject) for subject in remaining):
             raise RuntimeError("guardrail input cannot overlap this request")
         self._input_approved_at = None
+        for policy in self.enforcing_policies:
+            for subject in remaining:
+                self._outcomes.start(policy, subject)
         if not overlap:
             self.begin_input_wait()
         self._begin_input_subjects(len(remaining))
