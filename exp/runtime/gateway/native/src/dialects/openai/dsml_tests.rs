@@ -229,6 +229,9 @@ fn the_normalizer_fails_the_customers_fragment_without_relaying_markup() {
     assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
     assert_eq!(failure.safe_message, MALFORMED_TOOL_CALL);
     assert!(failure.failover_eligible);
+    // Marked like a JSON-argument failure, so the one pre-commit retry
+    // covers it (a turn that already relayed text never reaches the ladder).
+    assert!(failure.malformed_tool_call);
     let relayed = relayed_text(&events);
     assert_eq!(relayed, "Waiting twenty more to the post-apply boot.\n\n");
     assert!(!relayed.contains('｜') && !relayed.contains('<'));
@@ -279,6 +282,7 @@ fn a_whole_body_drain_never_carries_markup_either() {
     );
     let failure = failure.expect("the malformed fragment fails the drain");
     assert_eq!(failure.safe_message, MALFORMED_TOOL_CALL);
+    assert!(failure.malformed_tool_call);
     assert!(events
         .iter()
         .filter_map(|event| event["text"].as_str())
