@@ -25,6 +25,21 @@ _REJECTED_BLOCK_HINTS = {
     )
     for kind in ("video", "audio")
 }
+# Anthropic's MCP connector (``mcp_servers``) runs remote MCP tools on
+# Anthropic's side and echoes them as ``mcp_tool_use`` / ``mcp_tool_result``
+# blocks; no route here runs that connector, so the history cannot replay them
+# (Claude Code sessions that used a claude.ai connector, 2026-11-18).
+_REJECTED_BLOCK_HINTS.update(
+    {
+        kind: (
+            f"{kind} blocks are not supported: they come from Anthropic's MCP connector "
+            "(mcp_servers), which this gateway does not run. Remove the mcp_tool_use and "
+            "mcp_tool_result blocks from the conversation (or start a new one), and expose "
+            "the MCP server's tools to the model as client tools instead"
+        )
+        for kind in ("mcp_tool_use", "mcp_tool_result")
+    }
+)
 _MESSAGE_BLOCK_TYPES = frozenset(
     {
         "text",

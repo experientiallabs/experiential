@@ -61,6 +61,7 @@ from exp.runtime.models.providers.instruction_turns import (
     SYSTEM_FOLD_DISCLOSURE,
 )
 from exp.runtime.models.providers.streaming_requests import (
+    REASONING_CONTEXT_DROPPED,
     TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
     anthropic_messages_stream_payload,
     bedrock_converse_stream_payload,
@@ -3325,14 +3326,17 @@ def test_reasoning_context_passes_through_verbatim_and_narrows_per_rung() -> Non
         supports_reasoning=True,
         reasoning_wire_format="reasoning_effort",
     )
-    route_generation_parameter_requests((responses,), request)
-    # Per-rung narrowing keeps the compatible rung; the whole-route error
-    # names the field only when no rung qualifies.
+    public, provider = route_generation_parameter_requests((responses,), request)
+    assert provider.reasoning_context == "all_turns"
+    assert REASONING_CONTEXT_DROPPED not in public.ignored_parameters
+    # Per-rung narrowing prefers the rung that carries it.
     assert compatible_generation_parameter_profile_indexes((responses, fallback), request) == (0,)
-    with pytest.raises(ProviderParameterError) as raised:
-        route_generation_parameter_requests((fallback,), request)
-    assert raised.value.param == "reasoning.context"
-    assert raised.value.code == "unsupported_parameter"
+    # A route with no such rung (Codex on a Chat-wire lane) serves without it,
+    # disclosed, instead of refusing every turn.
+    public, provider = route_generation_parameter_requests((fallback,), request)
+    assert provider.reasoning_context is None
+    assert REASONING_CONTEXT_DROPPED in public.ignored_parameters
+    assert compatible_generation_parameter_profile_indexes((fallback,), request) == (0,)
 
 
 def test_union_tool_schemas_are_reshaped_on_anthropic_rungs_and_disclosed() -> None:
