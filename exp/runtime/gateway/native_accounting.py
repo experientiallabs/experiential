@@ -35,7 +35,7 @@ from exp.runtime.gateway.failover_pass import (
     no_failure_claim,
     sideways_claim,
 )
-from exp.runtime.gateway.guardrails.session import discard_guardrails
+from exp.runtime.gateway.guardrails.session import GuardrailSession, discard_guardrails
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.lane_saturation import lane_saturated_failure, overflow_target
 from exp.runtime.gateway.ledger import AttemptRejectedError
@@ -949,6 +949,7 @@ class NativeAttemptAccounting:
         *,
         certify_no_effects: bool = False,
         web_search_requests: int = 0,
+        guardrails: GuardrailSession | None = None,
     ) -> bool:
         """Retain failed terminal writes and their exact meters for the existing sweep."""
         return finish_request_quietly(
@@ -957,6 +958,7 @@ class NativeAttemptAccounting:
             failure,
             certify_no_effects=certify_no_effects,
             web_search_requests=web_search_requests,
+            guardrails=guardrails,
         )
 
     def _record_cache_fraction(

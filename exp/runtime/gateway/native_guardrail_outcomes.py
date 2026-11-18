@@ -35,17 +35,24 @@ def enable_input_outcomes(session: GuardrailSession, ledger: SyncWriteLedger) ->
         session.enable_input_outcomes()
 
 
-def outcome_documents(entry: InflightRequest | None) -> tuple[JsonObject, ...]:
-    """Freeze once and bind the result to authenticated request ownership."""
-    if entry is None or entry.guardrails is None:
+def outcome_documents(
+    entry: InflightRequest | None,
+    *,
+    authorization: AuthorizationSnapshot | None = None,
+    guardrails: GuardrailSession | None = None,
+) -> tuple[JsonObject, ...]:
+    """Bind frozen evidence to authenticated ownership, including before registration."""
+    if entry is not None:
+        authorization, guardrails = entry.authorization, entry.guardrails
+    if authorization is None or guardrails is None:
         return ()
     return tuple(
         {
             **outcome.model_dump(mode="json"),
-            "request_id": entry.authorization.request_id,
-            "organization_id": entry.authorization.organization_id,
+            "request_id": authorization.request_id,
+            "organization_id": authorization.organization_id,
         }
-        for outcome in entry.guardrails.input_outcomes()
+        for outcome in guardrails.input_outcomes()
     )
 
 
@@ -58,8 +65,21 @@ def outcome_keyword(
     return {}
 
 
-@lru_cache(maxsize=128)
 def consumes_input_outcomes(write: Callable[..., object]) -> bool:
+    """Probe the explicit capability without requiring a hashable callable host."""
+    try:
+        return _cached_consumes_input_outcomes(write)
+    except TypeError:
+        return _signature_consumes_input_outcomes(write)
+
+
+@lru_cache(maxsize=128)
+def _cached_consumes_input_outcomes(write: Callable[..., object]) -> bool:
+    """Bound common function/method signature work across host requests."""
+    return _signature_consumes_input_outcomes(write)
+
+
+def _signature_consumes_input_outcomes(write: Callable[..., object]) -> bool:
     """A generic forwarding wrapper does not assert that its destination persists evidence."""
     try:
         parameter = signature(write).parameters.get("input_guardrail_outcomes")
@@ -87,6 +107,7 @@ def finish_request_quietly(
     *,
     certify_no_effects: bool = False,
     web_search_requests: int = 0,
+    guardrails: GuardrailSession | None = None,
 ) -> bool:
     """Retain failure, meters and input evidence together for the existing accounting sweep."""
     entry = accounting.entry(authorization.request_id)
@@ -98,7 +119,9 @@ def finish_request_quietly(
             failure,
             certify_no_effects=certify_no_effects,
             web_search_requests=web_search_requests,
-            input_guardrail_outcomes=accounting.request_settlements.input_outcomes(entry),
+            input_guardrail_outcomes=accounting.request_settlements.input_outcomes(
+                entry, authorization=authorization, guardrails=guardrails
+            ),
         )
     except Exception:  # noqa: BLE001 - the sanitized admission failure wins; recovery retains the write.
         return False

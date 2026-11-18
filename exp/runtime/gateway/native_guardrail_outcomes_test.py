@@ -1,5 +1,6 @@
 """The durable ledger extension is explicit and preserves authenticated identity."""
 
+from dataclasses import dataclass
 from unittest.mock import Mock, patch
 
 import pytest
@@ -11,6 +12,7 @@ from exp.runtime.gateway.guardrails.input_outcomes_test import _policy
 from exp.runtime.gateway.guardrails.store_test import _authorization
 from exp.runtime.gateway.native_accounting_test import _RecordingLedger, _retryable_failure
 from exp.runtime.gateway.native_guardrail_outcomes import (
+    consumes_input_outcomes,
     outcome_documents,
     outcome_keyword,
     terminal_outcomes,
@@ -107,3 +109,32 @@ def test_request_only_writer_without_extension_never_freezes_enabled_evidence() 
     settlements = RequestSettlements(_RecordingLedger())
     assert settlements.input_outcomes(entry) == ()
     entry.guardrails.input_outcomes.assert_not_called()
+
+
+@dataclass
+class _UnhashableWriter:
+    """A mutable callable ledger extension with no hash contract."""
+
+    def __call__(self, *, input_guardrail_outcomes: tuple[JsonObject, ...]) -> None:
+        """Declare the evidence extension on an unhashable callable instance."""
+
+
+def test_unhashable_callable_capability_is_safe() -> None:
+    """A callable's cache eligibility cannot reject an otherwise valid ledger extension."""
+    writer = _UnhashableWriter()
+    with pytest.raises(TypeError):
+        hash(writer)
+    assert consumes_input_outcomes(writer)
+    assert consumes_input_outcomes(writer.__call__)
+    documents: tuple[JsonObject, ...] = ({"outcome": "allow"},)
+    assert outcome_keyword(writer, documents) == {"input_guardrail_outcomes": documents}
+
+
+def test_unregistered_nonconsumer_does_not_freeze_a_live_session() -> None:
+    """Early failure stays cheap when only the attempt writer consumes evidence."""
+    session = Mock()
+    settlements = RequestSettlements(_RecordingLedger())
+    assert (
+        settlements.input_outcomes(None, authorization=_authorization(), guardrails=session) == ()
+    )
+    session.input_outcomes.assert_not_called()

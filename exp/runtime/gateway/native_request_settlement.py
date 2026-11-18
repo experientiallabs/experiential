@@ -39,6 +39,7 @@ from exp.runtime.gateway.native_guardrail_outcomes import (
 )
 
 if TYPE_CHECKING:
+    from exp.runtime.gateway.guardrails.session import GuardrailSession
     from exp.runtime.gateway.native_execution import InflightRequest
 
 _logger = logging.getLogger(__name__)
@@ -115,11 +116,17 @@ class RequestSettlements:
         self._lock = threading.Lock()
         self._recovery = RecoveryRotation[_Settlement](lambda item: item.authorization.request_id)
 
-    def input_outcomes(self, entry: InflightRequest | None) -> tuple[JsonObject, ...]:
-        """Freeze request-only evidence only for the writer that actually consumes it."""
-        return (
-            outcome_documents(entry) if consumes_input_outcomes(self._ledger.finish_request) else ()
-        )
+    def input_outcomes(
+        self,
+        entry: InflightRequest | None,
+        *,
+        authorization: AuthorizationSnapshot | None = None,
+        guardrails: GuardrailSession | None = None,
+    ) -> tuple[JsonObject, ...]:
+        """Freeze evidence for its consuming writer, even before accounting registration."""
+        if not consumes_input_outcomes(self._ledger.finish_request):
+            return ()
+        return outcome_documents(entry, authorization=authorization, guardrails=guardrails)
 
     @property
     def pending(self) -> bool:
