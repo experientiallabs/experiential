@@ -1,4 +1,19 @@
-# Generated images in chat
+# Images in chat
+
+## Input history recovery
+
+On Chat Completions, Responses, and Anthropic Messages, malformed, oversized, or unsupported
+inline images and PDFs in replayed history become disclosed text placeholders before protocol
+validation. Only the newest caller-input message after the last model output retains strict
+inline-media validation. A rejected attachment therefore becomes history when the user sends a
+follow-up, even if the failed request produced no assistant reply. Native Responses agent messages
+and compaction requests also advance this boundary. Valid attachments remain intact; this
+recovery does not grant image access on a text-only route.
+
+Responses placeholders omit unsupported cache metadata with disclosure. Supported prompt-cache
+breakpoints keep their position on canonical messages; native items disclose their removal.
+
+## Generated images
 
 Image-emitting Chat models on Gemini and OpenAI-compatible wires return inline raster images
 in `choices[].delta.images[].image_url.url` while streaming and
