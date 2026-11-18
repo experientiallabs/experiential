@@ -977,9 +977,9 @@ def test_only_the_latest_user_turn_asks_the_model_to_surface_the_error() -> None
 def test_every_user_message_since_the_model_spoke_is_the_latest_turn() -> None:
     """An image, then its question, as two user messages: both are the latest turn.
 
-    Same rule as the decoders' history-media pass (the user messages since the
-    model last spoke), so the image sent just before the question still gets
-    the notice rather than the bare history marker.
+    The notice covers the user messages since the model last spoke, so the
+    image sent just before the question still gets an explanation. Raw-media
+    recovery uses only the newest caller input for strict validation.
     """
     messages = (
         _user_image("old"),

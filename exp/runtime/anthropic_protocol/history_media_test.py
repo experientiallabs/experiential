@@ -16,7 +16,7 @@ from exp.common.models.content import (
 from exp.runtime.anthropic_protocol.history_media import degrade_history_media, unservable_reason
 from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
-from exp.runtime.openai_protocol.history_media import placeholder_text
+from exp.runtime.openai_protocol.history_media import UnservableReason, placeholder_text
 
 _PNG_BASE64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
@@ -187,6 +187,42 @@ def test_decode_serves_a_history_whose_tool_result_image_was_oversized() -> None
     tool_message = next(message for message in request.messages if message.role == "tool")
     assert not tool_message.images
     assert placeholder_text("image", "oversized") in (tool_message.content or "")
+
+
+@pytest.mark.parametrize("prefill", [False, True])
+@pytest.mark.parametrize(
+    ("data", "media_type", "reason"),
+    [
+        (_OVERSIZED_IMAGE, "image/png", "oversized"),
+        ("@@@@", "image/png", "undecodable"),
+        ("PHN2Zy8+", "image/svg+xml", "unsupported_media_type"),
+    ],
+    ids=["oversized", "undecodable", "unsupported-format"],
+)
+def test_text_followup_recovers_after_an_image_rejection_without_an_assistant_reply(
+    data: str, media_type: str, reason: UnservableReason, prefill: bool
+) -> None:
+    """Recover a rejected image on a text follow-up, including an empty assistant prefill.
+
+    Args:
+        data: Inline image bytes encoded as base64, or malformed input.
+        media_type: Declared MIME type of the rejected image.
+        reason: Expected explanation for the history placeholder.
+        prefill: Whether each request ends with an empty assistant prefill.
+    """
+    messages: list[JsonObject] = [{"role": "user", "content": [_image(data, media_type)]}]
+    suffix: list[JsonObject] = [{"role": "assistant", "content": ""}] if prefill else []
+    with pytest.raises(OpenAIProtocolError):
+        decode_messages(_body([*messages, *suffix]))
+    followup = _body([*messages, {"role": "user", "content": "Continue with text."}, *suffix])
+    request = decode_messages(followup).request
+    assert request.images == ()
+    assert request.messages[0].content == placeholder_text("image", reason)
+    assert request.messages[-1].content == "Continue with text."
+    expected = (f"messages.content.image->placeholder({reason})",)
+    if prefill:
+        expected += ("messages.assistant->dropped(empty_final_prefill)",)
+    assert request.ignored_parameters == expected
 
 
 def test_a_messages_placeholder_carries_only_the_cache_control_key() -> None:

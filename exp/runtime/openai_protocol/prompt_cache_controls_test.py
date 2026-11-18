@@ -239,8 +239,14 @@ def test_invalid_shapes_are_typed_400s(body: JsonObject, param: str) -> None:
     assert captured.value.detail.param == param
 
 
-def test_a_breakpoint_on_an_agent_message_part_is_disclosed_as_dropped() -> None:
-    """A verbatim agent message reaches the provider unmarked, so the breakpoint is named."""
+@pytest.mark.parametrize("ttl", [None, "30m", "12h"])
+def test_a_breakpoint_on_an_agent_message_part_is_disclosed_as_dropped(ttl: str | None) -> None:
+    """Discard unsupported native breakpoints before they affect request cache fields.
+
+    Args:
+        ttl: Optional lifetime on a native breakpoint that cannot be retained.
+    """
+    marker: JsonObject = _BREAKPOINT if ttl is None else {**_BREAKPOINT, "ttl": ttl}
     decoded = decode_responses(
         {
             "model": "gpt-5.6-sol",
@@ -252,7 +258,7 @@ def test_a_breakpoint_on_an_agent_message_part_is_disclosed_as_dropped() -> None
                     "recipient": "/root/worker",
                     "content": [
                         {"type": "input_text", "text": "a"},
-                        {"type": "input_text", "text": "b", "prompt_cache_breakpoint": _BREAKPOINT},
+                        {"type": "input_text", "text": "b", "prompt_cache_breakpoint": marker},
                     ],
                 },
             ],
@@ -262,4 +268,37 @@ def test_a_breakpoint_on_an_agent_message_part_is_disclosed_as_dropped() -> None
         "input.1.content.1.prompt_cache_breakpoint->dropped(unsupported_item)"
         in decoded.ignored_parameters
     )
+    assert not decoded.prompt_cache_breakpoints
     assert "prompt_cache_breakpoint" not in json.dumps(decoded.messages[-1].provider_native_item)
+
+
+@pytest.mark.parametrize("marker", [{"mode": "implicit"}, {"mode": "explicit", "ttl": "1h"}])
+def test_discarded_native_breakpoints_still_require_valid_shapes(marker: JsonObject) -> None:
+    """Reject malformed native cache hints while discarding supported but unusable hints.
+
+    Args:
+        marker: Invalid breakpoint mode or lifetime.
+    """
+    with pytest.raises(OpenAIProtocolError) as rejected:
+        decode_responses(
+            {
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {
+                        "type": "agent_message",
+                        "author": "/root",
+                        "recipient": "/root/worker",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "done",
+                                "prompt_cache_breakpoint": marker,
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    assert rejected.value.status_code == 400
+    assert rejected.value.detail.param is not None
+    assert rejected.value.detail.param.startswith("input.0.content.0.prompt_cache_breakpoint.")

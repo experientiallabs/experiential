@@ -1,4 +1,4 @@
-"""Copilot image references survive the served gateway and reach the provider intact."""
+"""Image delivery and conversation recovery through the served gateway."""
 
 from __future__ import annotations
 
@@ -15,10 +15,165 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models import GatewayDeploymentCapabilities, ModelCapabilities
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.tests.launch_test import _provider_frame, _ServedGateway, _unused_port
+from exp.runtime.openai_protocol.history_media import placeholder_text
 
 _PNG_BASE64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
 )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_rejected_opencode_image_allows_text_followup_on_a_text_only_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stream: bool
+) -> None:
+    """Serve text follow-ups after rejecting a tool image folded into a user message.
+
+    Drive a local gateway and synthetic provider through rejection and two recovery
+    turns. Verify placeholder disclosure, preserved tool history, and absence of image
+    data upstream, while an image-only request remains refused on the text-only route.
+
+    Args:
+        tmp_path: Isolated gateway configuration and storage directory.
+        monkeypatch: Fixture providing the synthetic provider credential.
+        stream: Whether the caller requests SSE or a buffered response.
+    """
+    received: list[JsonObject] = []
+
+    class Provider(BaseHTTPRequestHandler):
+        """Record provider input and return a bounded text response."""
+
+        def do_POST(self) -> None:  # noqa: N802
+            """Capture the provider payload before completing its stream."""
+            received.append(json.loads(self.rfile.read(int(self.headers["content-length"]))))
+            frames = (
+                _provider_frame(
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": "We can continue."},
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    }
+                )
+                + _provider_frame(
+                    {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 2}}
+                )
+                + b"data: [DONE]\n\n"
+            )
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("content-length", str(len(frames)))
+            self.end_headers()
+            self.wfile.write(frames)
+
+        def log_message(self, format: str, *args: object) -> None:
+            """Keep synthetic traffic out of test logs."""
+            del format, args
+
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("TEST_PROVIDER_KEY", "synthetic-provider-key")
+    _manager, raw_key = _configured_gateway(
+        tmp_path, base_url=f"http://127.0.0.1:{provider.server_port}/v1"
+    )
+    gateway = _ServedGateway(tmp_path, _unused_port())
+    messages: list[JsonObject] = [
+        {"role": "user", "content": "Read the generated file, then continue the task."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_image",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": '{"path":"pixel.svg"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_image", "content": "Image read successfully"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/svg+xml;base64,PHN2Zy8+"}}
+            ],
+        },
+    ]
+    try:
+        gateway.start()
+        with httpx.Client(
+            base_url=f"http://127.0.0.1:{gateway.port}",
+            headers={"Authorization": f"Bearer {raw_key}"},
+            timeout=10,
+        ) as client:
+            refused = client.post(
+                "/v1/chat/completions",
+                json={"model": "coding", "stream": stream, "messages": messages},
+            )
+            assert refused.status_code == 400, refused.text
+            assert received == []
+
+            messages.append({"role": "user", "content": "Continue without the image."})
+            for turn in range(2):
+                response = client.post(
+                    "/v1/chat/completions",
+                    json={"model": "coding", "stream": stream, "messages": messages},
+                )
+                assert response.status_code == 200, response.text
+                assert "We can continue." in response.text
+                envelopes = (
+                    [
+                        json.loads(line[6:])
+                        for line in response.iter_lines()
+                        if line.startswith("data: ") and line != "data: [DONE]"
+                    ]
+                    if stream
+                    else [response.json()]
+                )
+                assert any(
+                    "messages.content.image->placeholder(unsupported_media_type)"
+                    in envelope.get("x-experiential-ignored-parameters", [])
+                    for envelope in envelopes
+                )
+                sent = cast(list[JsonObject], received[turn]["messages"])
+                assert sent[2] == messages[2]
+                assert sent[3]["content"] == placeholder_text("image", "unsupported_media_type")
+                assert sent[-1] == messages[-1]
+                assert "image_url" not in json.dumps(received[turn])
+                messages.extend(
+                    [
+                        {"role": "assistant", "content": "We can continue."},
+                        {"role": "user", "content": "Keep going."},
+                    ]
+                )
+
+            image_only = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "coding",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"},
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+            assert image_only.status_code == 400, image_only.text
+            assert image_only.json()["error"]["code"] == "unsupported_capability"
+            assert len(received) == 2
+    finally:
+        gateway.stop()
+        provider.shutdown()
+        provider.server_close()
+        thread.join(timeout=5)
 
 
 @pytest.mark.parametrize("stream", [False, True])

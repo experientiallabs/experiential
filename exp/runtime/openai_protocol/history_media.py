@@ -12,10 +12,12 @@ omitted and why, and the substitution is disclosed in ``ignored_parameters``.
 The rule follows the tool-result image precedent in ``capability_policy``:
 media in a tool output (a tool screenshot, a PDF a tool read) is history the
 moment the tool returns it, so it degrades in every turn; media in any other
-message degrades everywhere except the LATEST turn (the user messages since
-the model last spoke). Those keep the fail-closed contract, since the caller can still resend it
-differently: an oversized part gets a typed 400 that states the limit, and an
-undecodable or unsupported one keeps the decoder's own typed rejection.
+message degrades everywhere except the newest caller-input message after
+the model last spoke. That message keeps the fail-closed contract: an
+oversized part gets a typed 400 that states the limit, and an undecodable or
+unsupported one keeps the decoder's own typed rejection. A later caller
+message makes the rejected attachment history even without an intervening
+assistant reply, so a text follow-up can recover the conversation.
 
 This module owns the shared rule (classification, placeholder text, the
 limit-stating error) and the Chat and Responses walkers; the Anthropic
@@ -295,6 +297,7 @@ def _degrade_parts(
     latest: bool,
     position: str,
     disclosures: dict[str, None],
+    cache_keys: tuple[str, ...] = OPENAI_CACHE_KEYS,
 ) -> list[JsonValue] | None:
     """Degrade the unservable media in one ordered part list.
 
@@ -305,6 +308,7 @@ def _degrade_parts(
         latest: Whether the list is a user message of the latest turn.
         position: Disclosure position class (``messages.content`` or a tool output).
         disclosures: Ordered disclosure set, extended in place.
+        cache_keys: Cache markers supported on the replacement text part.
 
     Returns:
         The rebuilt list, or ``None`` when nothing was replaced.
@@ -327,8 +331,14 @@ def _degrade_parts(
             continue
         if rebuilt is None:
             rebuilt = list(parts)
-        rebuilt[index] = placeholder_part(text_type, kind, reason, cast(JsonObject, part))
+        part_object = cast(JsonObject, part)
+        rebuilt[index] = placeholder_part(
+            text_type, kind, reason, part_object, cache_keys=cache_keys
+        )
         disclosures[f"{position}.{kind}->placeholder({reason})"] = None
+        for key in OPENAI_CACHE_KEYS:
+            if key in part_object and key not in cache_keys:
+                disclosures[f"{param}.{index}.{key}->dropped(unsupported_item)"] = None
     return rebuilt
 
 
@@ -355,50 +365,53 @@ def _model_turn(item: JsonObject) -> bool:
 
 
 def _user_input(item: JsonObject) -> bool:
-    """Whether one history entry is caller input: a user message or an unpaired output.
+    """Whether an entry is caller input, including native agent and compaction requests.
 
     A ``function_call_output`` without a ``call_id`` answers no call; the
     decoder carries it as user input (a thread message or notification), so
     its media is the caller's current input, not historical tool data.
     """
-    return item.get("role") == "user" or (
-        item.get("type") == "function_call_output" and item.get("call_id") is None
+    return (
+        item.get("role") == "user"
+        or item.get("type") in {"agent_message", "compaction_trigger"}
+        or (item.get("type") == "function_call_output" and item.get("call_id") is None)
     )
 
 
 def latest_turn(items: list[JsonValue]) -> frozenset[int]:
-    """Return the indexes of the caller-input entries after the last model-output entry.
+    """Return the newest caller-input index after the last model-output entry, if any.
 
     Model output is an assistant message, a reasoning or function/custom tool
     call item, or any provider-authored hosted item (compaction and program
     items included).
 
-    The latest turn is everything the caller added since the model last
-    spoke, so consecutive user messages (an image, then its question) all
-    stay strict, exactly as the document-count pass reads the turn.
+    Only the newest caller-input message keeps strict inline-media validation.
+    Rejection produces no model output, so requiring an assistant reply before
+    an attachment becomes history would also reject every later text follow-up.
+    Servable attachments in earlier messages remain unchanged.
 
     Args:
         items: Raw conversation entries, in order.
 
     Returns:
-        The latest turn's user-entry indexes.
+        The newest caller-input index, or an empty set after model output.
     """
-    last_model = max(
-        (index for index, item in enumerate(items) if isinstance(item, dict) and _model_turn(item)),
-        default=-1,
-    )
-    return frozenset(
-        index
-        for index, item in enumerate(items)
-        if index > last_model and isinstance(item, dict) and _user_input(item)
-    )
+    for index in range(len(items) - 1, -1, -1):
+        item = items[index]
+        if not isinstance(item, dict):
+            continue
+        if _model_turn(item):
+            return frozenset()
+        if _user_input(item):
+            return frozenset({index})
+    return frozenset()
 
 
 def degrade_chat_media(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
     """Replace unservable inline media in a Chat Completions history.
 
     Tool messages degrade in every position; every other message degrades
-    except the latest turn's user messages. The payload is never mutated.
+    except the newest caller-input message. The payload is never mutated.
 
     Args:
         payload: Parsed Chat Completions body, before strict wire validation.
@@ -446,9 +459,9 @@ def degrade_chat_media(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]
 def degrade_responses_media(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
     """Replace unservable inline media in a Responses input history.
 
+    Message and ``agent_message`` items degrade except the newest caller input.
     ``function_call_output`` parts degrade in every position except an
-    unpaired output in the latest turn; message items degrade except the
-    latest turn's user messages. The payload is never mutated.
+    unpaired output that is the newest caller input. The payload is never mutated.
 
     Args:
         payload: Parsed Responses body, before strict wire validation.
@@ -480,7 +493,7 @@ def degrade_responses_media(payload: JsonObject) -> tuple[JsonObject, tuple[str,
                 "input.function_call_output.output",
                 index in latest,
             )
-        elif "role" in item_object:
+        elif "role" in item_object or item_object.get("type") == "agent_message":
             assistant = item_object.get("role") == "assistant"
             field, text_type, position, is_latest = (
                 "content",
@@ -500,6 +513,9 @@ def degrade_responses_media(payload: JsonObject) -> tuple[JsonObject, tuple[str,
             latest=is_latest,
             position=position,
             disclosures=disclosures,
+            # Responses text has no cache_control field. The breakpoint pass
+            # extracts prompt_cache_breakpoint before strict wire validation.
+            cache_keys=("prompt_cache_breakpoint",),
         )
         if parts is not None:
             if rebuilt is None:

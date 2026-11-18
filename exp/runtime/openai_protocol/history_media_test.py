@@ -9,11 +9,13 @@ import random
 from typing import cast
 
 import pytest
+from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import MAXIMUM_DOCUMENT_BASE64_BYTES, MAXIMUM_IMAGE_BASE64_BYTES
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.history_media import (
+    UnservableReason,
     base64_decodable,
     data_url_reason,
     degrade_chat_media,
@@ -262,28 +264,176 @@ def test_a_malformed_data_url_in_history_is_undecodable_not_remote() -> None:
     assert degraded is not payload
 
 
-def test_every_user_message_of_the_latest_turn_stays_strict() -> None:
-    """An image sent, then its question, are one turn: the image still gets the typed 400."""
+def test_a_servable_image_before_a_separate_question_is_preserved() -> None:
+    """A split image-and-question input keeps its valid image verbatim."""
     payload = _chat_body(
         [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "hello"},
-            {"role": "user", "content": [_chat_image(_OVERSIZED_URL)]},
+            {"role": "user", "content": [_chat_image(_PNG_URL)]},
             {"role": "user", "content": "what is this?"},
         ]
     )
-    with pytest.raises(OpenAIProtocolError) as info:
-        degrade_chat_media(payload)
-    assert info.value.detail.param == "messages.2.content.0.image_url.url"
+    degraded, disclosures = degrade_chat_media(payload)
+    assert degraded is payload and disclosures == ()
     responses: JsonObject = {
         "model": "coding",
         "input": [
-            {"role": "user", "content": [{"type": "input_image", "image_url": _OVERSIZED_URL}]},
+            {"role": "user", "content": [{"type": "input_image", "image_url": _PNG_URL}]},
             {"role": "user", "content": [{"type": "input_text", "text": "what is this?"}]},
         ],
     }
+    degraded, disclosures = degrade_responses_media(responses)
+    assert degraded is responses and disclosures == ()
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses"])
+@pytest.mark.parametrize(
+    ("url", "reason"),
+    [
+        (_OVERSIZED_URL, "oversized"),
+        ("data:image/png;base64,@@@@", "undecodable"),
+        ("data:image/svg+xml;base64,PHN2Zy8+", "unsupported_media_type"),
+    ],
+    ids=["oversized", "undecodable", "unsupported-format"],
+)
+def test_text_followup_recovers_after_an_image_rejection_without_an_assistant_reply(
+    surface: str, url: str, reason: UnservableReason
+) -> None:
+    """Recover a rejected attachment on a text follow-up without mutating caller history.
+
+    Args:
+        surface: The Chat Completions or Responses request surface.
+        url: Inline image URL rejected on the initial request.
+        reason: Expected explanation for the history placeholder.
+    """
+    field = "messages" if surface == "chat" else "input"
+    part = _chat_image(url) if surface == "chat" else {"type": "input_image", "image_url": url}
+    messages: list[JsonValue] = [{"role": "user", "content": [part]}]
+    payload: JsonObject = {"model": "coding", field: messages}
+    decode = decode_chat if surface == "chat" else decode_responses
     with pytest.raises(OpenAIProtocolError):
-        degrade_responses_media(responses)
+        decode(payload)
+
+    followup: JsonObject = {
+        **payload,
+        field: [*messages, {"role": "user", "content": "Continue with text."}],
+    }
+    original = copy.deepcopy(followup)
+    request = decode(followup).request
+    assert followup == original
+    assert request.images == ()
+    assert request.messages[0].content == placeholder_text("image", reason)
+    assert request.messages[-1].content == "Continue with text."
+    assert request.ignored_parameters == (f"{field}.content.image->placeholder({reason})",)
+
+
+@pytest.mark.parametrize("agent_image", [False, True], ids=["user-image", "agent-image"])
+@pytest.mark.parametrize("compaction", [False, True], ids=["agent-followup", "compaction-followup"])
+@pytest.mark.parametrize(
+    "cache_markers",
+    [
+        {},
+        {"cache_control": {"type": "ephemeral"}},
+        {"prompt_cache_breakpoint": {"mode": "explicit"}},
+        {
+            "cache_control": {"type": "ephemeral"},
+            "prompt_cache_breakpoint": {"mode": "explicit"},
+        },
+    ],
+    ids=["no-cache-marker", "cache-control", "prompt-cache-breakpoint", "both-cache-markers"],
+)
+def test_native_user_input_recovers_after_an_image_rejection(
+    agent_image: bool, compaction: bool, cache_markers: JsonObject
+) -> None:
+    """Recover oversized ordinary or agent images when a native caller input follows.
+
+    Verify initial rejection, immutable caller history, preservation of the newer
+    native item, and disclosure of unsupported cache metadata removed during recovery.
+
+    Args:
+        agent_image: Whether the rejected image belongs to a native agent message.
+        compaction: Whether the follow-up is a compaction request instead of an agent message.
+        cache_markers: Optional cache metadata attached to the rejected image.
+    """
+    content: list[JsonValue] = [
+        {"type": "input_image", "image_url": _OVERSIZED_URL, **cache_markers}
+    ]
+    rejected: JsonObject = (
+        {
+            "type": "agent_message",
+            "author": "/root/worker",
+            "recipient": "/root",
+            "content": content,
+        }
+        if agent_image
+        else {"role": "user", "content": content}
+    )
+    with pytest.raises(OpenAIProtocolError):
+        decode_responses({"model": "coding", "input": [rejected]})
+    newest: JsonObject = (
+        {"type": "compaction_trigger"}
+        if compaction
+        else {
+            "type": "agent_message",
+            "author": "/root/worker",
+            "recipient": "/root",
+            "content": [{"type": "input_text", "text": "Continue without the image."}],
+        }
+    )
+    payload: JsonObject = {"model": "coding", "input": [rejected, newest]}
+    original = copy.deepcopy(payload)
+    request = decode_responses(payload).request
+    assert payload == original
+    if agent_image:
+        assert request.messages[0].provider_native_item == {
+            **rejected,
+            "content": [{"type": "input_text", "text": placeholder_text("image", "oversized")}],
+        }
+    else:
+        assert request.messages[0].content == placeholder_text("image", "oversized")
+    assert request.messages[-1].provider_native_item == newest
+    expected = ["input.content.image->placeholder(oversized)"]
+    if "cache_control" in cache_markers:
+        expected.append("input.0.content.0.cache_control->dropped(unsupported_item)")
+    if agent_image and "prompt_cache_breakpoint" in cache_markers:
+        expected.append("input.0.content.0.prompt_cache_breakpoint->dropped(unsupported_item)")
+    assert request.ignored_parameters == tuple(expected)
+
+
+@pytest.mark.parametrize("ttl", ["30m", "12h"])
+def test_native_image_history_drops_cache_hints_before_lifetime_validation(ttl: str) -> None:
+    """An unsupported native cache hint cannot introduce a new recovery-time failure.
+
+    Args:
+        ttl: Cache lifetime carried by the rejected agent image.
+    """
+    image: JsonObject = {
+        "type": "agent_message",
+        "author": "/root/worker",
+        "recipient": "/root",
+        "content": [
+            {
+                "type": "input_image",
+                "image_url": _OVERSIZED_URL,
+                "prompt_cache_breakpoint": {"mode": "explicit", "ttl": ttl},
+            }
+        ],
+    }
+    with pytest.raises(OpenAIProtocolError):
+        decode_responses({"model": "coding", "input": [image]})
+    request = decode_responses(
+        {"model": "coding", "input": [image, {"role": "user", "content": "Continue with text."}]}
+    ).request
+    assert request.messages[0].provider_native_item == {
+        **image,
+        "content": [{"type": "input_text", "text": placeholder_text("image", "oversized")}],
+    }
+    assert not request.prompt_cache_breakpoints
+    assert request.ignored_parameters == (
+        "input.content.image->placeholder(oversized)",
+        "input.0.content.0.prompt_cache_breakpoint->dropped(unsupported_item)",
+    )
 
 
 def test_an_unchanged_history_is_returned_without_copies() -> None:

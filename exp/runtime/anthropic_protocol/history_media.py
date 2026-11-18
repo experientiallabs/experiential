@@ -12,11 +12,11 @@ disclosed in ``ignored_parameters``.
 The rule follows the tool-result image precedent in ``capability_policy``:
 media inside a ``tool_result`` (a tool screenshot, a PDF a tool read) is
 history the moment the tool returns it, so it degrades in every turn; a
-top-level image or document degrades in every user turn before the latest
-one. A top-level block in the LATEST turn (the user messages since the last
-assistant message) keeps the fail-closed contract, since the caller can still
-resend it differently: an oversized one gets a typed 400 that states the
-limit, and an undecodable one keeps the decoder's own typed rejection.
+top-level image or document degrades in every user message before the newest
+one. The newest message after the last assistant output keeps the fail-closed
+contract: an oversized block gets a typed 400 that states the limit, and an
+undecodable one keeps the decoder's own typed rejection. A later user message
+can recover from that rejection without needing an assistant reply first.
 """
 
 from __future__ import annotations
