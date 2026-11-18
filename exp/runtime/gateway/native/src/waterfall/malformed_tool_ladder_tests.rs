@@ -352,3 +352,42 @@ fn a_resample_keeps_its_own_key_through_a_later_safe_retry() {
         );
     });
 }
+
+/// DeepSeek DSML tool-call markup a self-hosted vLLM lane relayed as content
+/// because its parser did not recognise it (a lost opening tag): the guard
+/// holds it and fails the turn as a malformed tool call.
+const BROKEN_DSML_FRAMES: &[&str] = &[
+    "{\"choices\":[{\"delta\":{\"content\":\"<｜DSML｜invoke name=\\\"read\\\">\"}}]}",
+    "{\"choices\":[{\"delta\":{\"content\":\"<｜DSML｜parameter name=\\\"path\\\" string=\\\"true\\\">a\"}}]}",
+    "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+];
+
+#[test]
+fn a_single_lane_redials_once_after_malformed_dsml_markup() {
+    block_on(async {
+        let harness = Harness::new();
+        harness
+            .configure(json!({"rules": [null], "same_redial": 2}))
+            .await;
+        let lane = spawn_rung(vec![
+            Answer::Stream(BROKEN_DSML_FRAMES),
+            Answer::Stream(VALID_CALL_FRAMES),
+        ])
+        .await;
+        let route = [wire("vllm", &lane.url, 0)];
+        let (won, guard) = harness.run(&route, None, Duration::from_secs(30)).await;
+        let Won::Committed(mut committed) = won else {
+            panic!("the redial's valid call serves the request");
+        };
+        assert_eq!(committed.depth, 0);
+        let events = std::mem::take(&mut committed.prefix);
+        assert_eq!(completed_call(&events), "{\"path\": \"a\"}");
+        finish(guard, Won::Committed(committed)).await;
+        assert_eq!(lane.accepted.lock().expect("lock").len(), 2);
+        let story = harness.story().await;
+        let starts = story["starts"].as_array().expect("starts");
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[1]["failure"]["malformed_tool_call"], true);
+        assert_eq!(starts[1]["failure"]["retryable_same_deployment"], true);
+    });
+}

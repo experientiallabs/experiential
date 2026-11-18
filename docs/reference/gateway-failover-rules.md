@@ -123,6 +123,11 @@ to the failed attempt row. A second malformed call in the same request is its an
 surface (non-streaming, or a guardrail-buffered stream) follows the same one-retry rule. A malformed
 call in a turn that already streamed to the caller keeps the protocol's terminal error event.
 
+DeepSeek DSML tool-call markup that a self-hosted lane relays as answer text and the DSML guard
+cannot turn into calls (`dialects/openai/dsml.rs`) is the same failure: the guard holds the markup
+and never relays it, so when it is the turn's first output the failure is marked
+`malformed_tool_call` and takes the same one retry.
+
 ## Provider content filters
 
 A provider's own content filter (Azure's content management system, an account-side moderation
