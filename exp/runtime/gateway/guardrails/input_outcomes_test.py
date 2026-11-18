@@ -101,11 +101,12 @@ def test_blocked_request_cannot_authorize_recovery() -> None:
     assert (result.outcome, result.recovery_reason) == ("block", None)
 
 
-def test_excluded_and_unstarted_checks_are_not_misses() -> None:
+@pytest.mark.parametrize("blocked", [False, True])
+def test_excluded_and_unstarted_checks_are_not_misses(blocked: bool) -> None:
     """Missing execution is not an implicit grant to enforce later."""
     policy, tracker = _policy(), InputOutcomes()
-    assert tracker.freeze((), blocked=False) == ()
-    (result,) = InputOutcomes().freeze((policy,), blocked=False)
+    assert tracker.freeze((), blocked=blocked) == ()
+    (result,) = InputOutcomes().freeze((policy,), blocked=blocked)
     assert (result.outcome, result.recovery_reason) == ("not_started", None)
 
 

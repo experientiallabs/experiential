@@ -165,10 +165,10 @@ class InputOutcomes:
         windows = self._windows.get(key, set())
         outcome: Literal["allow", "block", "missed", "unsupported", "not_started"]
         reason: Literal["deadline_expired", "classifier_error", "result_unavailable"] | None = None
-        if blocked:
-            outcome = "block"
-        elif key not in self._started or policy.mode != "enforce":
+        if key not in self._started or policy.mode != "enforce":
             outcome = "not_started"
+        elif blocked:
+            outcome = "block"
         elif result is GuardrailOutcome.ALLOW or (
             result is GuardrailOutcome.FLAGGED
             and check.action in (GuardrailAction.ALLOW, GuardrailAction.MODIFY)

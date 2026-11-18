@@ -8781,10 +8781,19 @@ def test_count_tokens_counts_a_tool_change_turn(tmp_path: Path) -> None:
     assert counted["input_tokens"] > 0
 
 
-@pytest.mark.parametrize("failure_point", ["route", "capture", "escalation"])
+@pytest.mark.parametrize(
+    ("failure_point", "parallel"),
+    [
+        ("route", False),
+        ("capture", False),
+        ("escalation", False),
+        ("route", True),
+        ("escalation", True),
+    ],
+)
 @pytest.mark.parametrize("retry", [False, True])
 def test_admission_failure_retains_input_evidence_before_accounting_registration(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_point: str, retry: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_point: str, retry: bool, parallel: bool
 ) -> None:
     """An accepted request retains its checked input even when it never registers an attempt."""
     control, raw_key = _control_plane(tmp_path)
@@ -8794,6 +8803,7 @@ def test_admission_failure_retains_input_evidence_before_accounting_registration
         policy_id="input-policy",
         protected=True,
         fail_open=True,
+        input_execution="parallel" if parallel else "before_dispatch",
         checks=(
             GuardrailCheck(
                 check_id="input",
@@ -8871,7 +8881,7 @@ def test_admission_failure_retains_input_evidence_before_accounting_registration
         )
     assert len(seen) == 1
     (document,) = seen[0]
-    assert document["outcome"] == "allow"
+    assert document["outcome"] == ("not_started" if parallel else "allow")
     assert document["request_id"] == owners[0].request_id
     assert document["organization_id"] == owners[0].organization_id
     if retry:
