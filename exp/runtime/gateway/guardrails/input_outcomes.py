@@ -234,9 +234,12 @@ def _window_digest(request: GatewayRequest) -> tuple[str, bool]:
             latest = message
             break
     subject = request.model_copy(update={"messages": () if latest is None else (latest,)})
-    return sha256(
-        classification_window(subject, _LATEST_USER_WINDOW).encode("utf-8")
-    ).hexdigest(), immutable
+    payload = classification_window(subject, _LATEST_USER_WINDOW).encode("utf-8")
+    digest = sha256()
+    # hashlib releases the GIL above 2047 bytes; avoid a handoff for this bounded window.
+    for offset in range(0, len(payload), 2047):
+        digest.update(payload[offset : offset + 2047])
+    return digest.hexdigest(), immutable
 
 
 def record_input_outcome(

@@ -368,3 +368,12 @@ def test_unsupported_subject_prevents_recovery_in_either_order(
     assert record.latest_user_window_sha256 is not None
     assert record.outcome == "unsupported"
     assert record.recovery_reason is None
+
+
+@pytest.mark.parametrize("text", ["", "a" * 2047, "b" * 2048, "c" * 30000, "🚀" * 30001])
+def test_window_digest_matches_standard_sha256_across_update_boundaries(text: str) -> None:
+    """Bounded hashing preserves the exact classifier window, including multibyte text."""
+    request = _request(text)
+    window = ClassificationWindow(system_chars=0, latest_user_chars=30000, prior_messages=0)
+    expected = sha256(classification_window(request, window).encode("utf-8")).hexdigest()
+    assert latest_user_window_digest(request) == expected
