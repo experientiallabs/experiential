@@ -30,6 +30,7 @@ import json
 from typing import Literal
 
 from exp.common.core.artifacts import JsonObject, JsonValue
+from exp.runtime.openai_protocol.chat_client_shapes import repair_chat_client_shapes
 from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.legacy_functions import translate_legacy_functions
 from exp.runtime.openai_protocol.manifest import RESPONSES_REASONING_EFFORTS_ACCEPTED
@@ -890,7 +891,9 @@ def repair_chat(
 ) -> tuple[JsonObject, tuple[str, ...]]:
     """Apply every Chat repair, appending its disclosures to ``disclosures``.
 
-    The deprecated ``functions`` shapes are rewritten first
+    Other clients' Chat shapes are rewritten first
+    (:mod:`exp.runtime.openai_protocol.chat_client_shapes`), then the
+    deprecated ``functions`` shapes
     (:mod:`exp.runtime.openai_protocol.legacy_functions`), so the rewritten
     ``tool`` messages and ``tool_calls`` entries pass through the same repairs
     as modern ones.
@@ -898,6 +901,7 @@ def repair_chat(
     Raises:
         OpenAIProtocolError: A legacy function-calling shape cannot be paired.
     """
+    payload, shapes = repair_chat_client_shapes(payload)
     payload, legacy = translate_legacy_functions(payload)
     payload, names = drop_chat_participant_names(payload)
     payload, unknown = drop_unknown_chat_message_fields(payload)
@@ -911,6 +915,7 @@ def repair_chat(
     payload = accept_chat_output_modalities(payload)
     return payload, (
         *disclosures,
+        *shapes,
         *legacy,
         *unknown,
         *names,

@@ -307,6 +307,7 @@ def shape_message(param: str, details: list[ErrorDetails]) -> str | None:
     got: str | None = None
     member_error = False
     open_string = False
+    empty_string = False
     for detail in details:
         if detail["type"] == "string_too_long":
             # The bound and the arriving LENGTH are both display-safe facts
@@ -334,6 +335,11 @@ def shape_message(param: str, details: list[ErrorDetails]) -> str | None:
         # so it contributes no honest "got" type.
         if detail["type"] != "missing" and "input" in detail:
             got = _WIRE_TYPE_NAMES.get(type(detail["input"]).__name__, got)
+        # An empty string is the right JSON type with nothing in it: "expected
+        # a non-empty string, but got a string" read as a contradiction to the
+        # caller (GitHub Copilot sending ``"model": ""``), so say it is empty.
+        if detail["type"] == "string_too_short" and detail.get("input") == "":
+            empty_string = True
     if open_string:
         # An open vocabulary (``str | Literal[...]``, the SDK's ``model``)
         # admits any string, so its member list names no constraint; listing
@@ -345,6 +351,8 @@ def shape_message(param: str, details: list[ErrorDetails]) -> str | None:
     if not expected:
         return None
     description = " or ".join(expected)
+    if empty_string and got == "a string":
+        got = "an empty string"
     if got is not None and not member_error:
         return f"Invalid value for '{param}': expected {description}, but got {got} instead."
     return f"Invalid value for '{param}': expected {description}."
