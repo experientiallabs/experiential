@@ -738,19 +738,6 @@ under a 250 ms budget so throttle failover stays near-immediate: OpenAI's `insuf
 which window closed); the public throttle error is unchanged. A frame with a non-array `choices` stays
 malformed and its reason names the frame's sorted key names (never a value).
 
-**A block on the request's end user is a refusal, not a credential verdict.** "Policy Violation: this
-user has been blocked for a previous policy violation" (OpenAI's verdict on the end-user identifier a
-request carries, relayed by OpenRouter as a 403, a generic 400 `invalid_prompt`, or in-stream) is
-matched on its stable fragments ("user has been blocked" and "policy violation", both leading the
-error sentence) in the verdict fields only (the envelope's message, or the upstream sentence behind an
-aggregator's generic one in `metadata.raw`; never an echoed prompt or other field) and filed as a
-`refusal` with reason `content_policy` (ledger detail `http <status>: end_user_policy_block`, so
-`http 403` or `http 400`), marked as a
-provider filter so one untried rung of another provider may take it. It never feeds the credential
-class, so one blocked end user cannot demote a shared house account or trip a BYOK connection's
-breaker, and the caller reads that the provider blocked this request's end user rather than that
-authentication failed. Every other 401/403 keeps the credential class.
-
 **Sampling controls a route cannot carry are dropped with disclosure, not refused.** A
 `temperature` or `top_p` sent to a route where some rung's provider rejects the field outright (a
 reasoning model such as GPT-6 Astra) is dropped and disclosed (`temperature->dropped(unsupported_by_provider)`)
