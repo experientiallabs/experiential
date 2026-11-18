@@ -281,7 +281,9 @@ impl Normalizer {
         let mut tool = ToolAccumulator::new(call_id.clone(), name.clone());
         tool.raw_arguments = raw_arguments.clone();
         tool.thought_signature = thought_signature.clone();
-        let completed = tool.complete().map_err(|message| malformed(&message))?;
+        let completed = tool
+            .complete()
+            .map_err(|message| super::malformed_tool_call(&message))?;
         Ok(vec![
             Event::ToolCallStarted {
                 custom: false,

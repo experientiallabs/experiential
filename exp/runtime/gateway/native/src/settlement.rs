@@ -156,6 +156,11 @@ fn settle_argument(
             if failure.provider_content_filter {
                 wire["provider_content_filter"] = json!(true);
             }
+            // A malformed streamed tool call, so the attempt row says why the
+            // request was retried (or why its one retry did not help).
+            if failure.malformed_tool_call {
+                wire["malformed_tool_call"] = json!(true);
+            }
             // A customer-addressed origin's failure: health keeps no nameable
             // cause for it, so a later refusal cannot replay it.
             failure.with_wire_origin(wire)

@@ -419,6 +419,38 @@ def test_a_transport_failure_returns_to_its_rung_when_the_sibling_cannot_take_it
     assert reserved["route_depth"] == 0
 
 
+_MALFORMED_TOOL_CALL: JsonObject = {
+    "failure_class": "malformed_response",
+    "safe_message": "provider returned a malformed response; retry the request",
+    "retryable_same_deployment": True,
+    "failover_eligible": True,
+    "malformed_tool_call": True,
+}
+
+
+def test_a_malformed_tool_call_returns_to_its_rung_when_the_sibling_cannot_take_it() -> None:
+    """The one retry of a malformed tool call resamples its rung when the sibling sheds."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    lane_a, lane_b = _refusing_pair()
+    _fill(registry, (lane_a,), 2, "occupied")
+    _admit(registry, (lane_b, lane_a), request_id="resample")
+    started = _start(registry, ordinal=0, request_id="resample")
+    assert started["route_depth"] == 0
+    _settle(
+        registry,
+        attempt_id=str(started["attempt_id"]),
+        outcome="failed",
+        finalize=False,
+        failure=_MALFORMED_TOOL_CALL,
+        request_id="resample",
+    )
+    reserved = _start(
+        registry, ordinal=1, current_depth=0, failure=_MALFORMED_TOOL_CALL, request_id="resample"
+    )
+    assert reserved["route_depth"] == 0
+
+
 # A provider 429 exactly as the data plane classifies it (never redialed on its own).
 _RATE_LIMITED: JsonObject = {
     "failure_class": "throttled",

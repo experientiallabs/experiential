@@ -462,7 +462,9 @@ def next_route_candidate(
 
     A provider context-window rejection advances once, only to a wider rung
     (``native_context_window``). A transport failure is never decided by cache
-    stakes: it takes an untried sibling before any redial of the failed rung.
+    stakes: it takes an untried sibling before any redial of the failed rung,
+    and so does a malformed streamed tool call (``malformed_tool_call``), whose
+    one retry redials the failed rung only when no sibling can take it.
     When a request's only dial failed and no sibling can serve, its redial
     through the rung's open circuit gets the forced claim a fresh first dial
     would; any later redial stays behind the circuit.
@@ -539,8 +541,12 @@ def next_route_candidate(
     )
     # A reset is the path to the provider failing: a redial mid-burst meets the
     # same reset, so transport takes an untried sibling (and its cache miss) first.
-    transport = failure.failure_class == GatewayFailureClass.TRANSPORT
-    if same_redial and not transport and not reserved and health.claim(keys[current_depth]):
+    # A malformed tool call does too: the rung that sampled it once is the
+    # likeliest to sample it again, so its redial is the fallback, not the lead.
+    sibling_first = (
+        failure.failure_class == GatewayFailureClass.TRANSPORT or failure.malformed_tool_call
+    )
+    if same_redial and not sibling_first and not reserved and health.claim(keys[current_depth]):
         return current_depth
     throttled = failure.failure_class in _CACHE_PRESERVING_NO_FAILOVER_CLASSES
     if throttle_redial is not None and throttled:

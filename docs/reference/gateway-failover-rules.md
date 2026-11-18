@@ -100,6 +100,27 @@ rung whose advertised window exceeds the stated one (else the failed rung's adve
 whose window the catalog does not state (`native_context_window.py`). With no such rung, or on a
 second refusal, the caller receives the provider's 400 unchanged.
 
+## Malformed tool calls
+
+A model can sample a client tool call whose streamed arguments never become one JSON object
+("streamed tool arguments are not valid JSON"); another dial, on a sibling lane or the same one, will
+usually sample a valid call. So a turn whose first outward output is a client tool call is held
+uncommitted until the turn ends (`waterfall/commit.rs`, `HeldToolCalls`): the call's opening, its
+argument deltas, and every later event wait in order, and the turn commits on its successful
+terminal with exactly the events the caller would otherwise have received live. The hold is bounded
+(64 KiB of retained output, 8,192 events): past it, or as soon as the provider reports a tool it
+executes itself, the turn commits and streams live as before. Output the caller already saw (text
+before the call, a provider-executed tool) is never held.
+
+A held call that fails to validate is filed `malformed_response` with `malformed_tool_call`, and
+the waterfall retries it once per request, taking the cache miss: the control plane prefers an
+untried sibling (like a `transport` failure, under every failover mode) and redials the same rung
+only when no sibling can take it, with no backoff. The retry runs under the request deadline, not
+the pre-first-byte budget the held turn has already been generating in. Settlement carries the flag
+to the failed attempt row. A second malformed call in the same request is its answer. A buffered
+surface (non-streaming, or a guardrail-buffered stream) follows the same one-retry rule. A malformed
+call in a turn that already streamed to the caller keeps the protocol's terminal error event.
+
 ## Provider content filters
 
 A provider's own content filter (Azure's content management system, an account-side moderation

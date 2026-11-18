@@ -50,7 +50,8 @@ empty literals such as `""` is dropped and the call completes — Azure Foundry'
 streams `{}` then `""` for every zero-argument call — so the deltas a client receives always
 concatenate to the completed call's bytes. Any other tail, and any syntax error inside the
 object, keeps the strict contract: the attempt fails as `malformed_response` (a provider
-fault, eligible to fail over to a later deployment), the ledger names the parse position and
+fault, retried once on a sibling or the same deployment while the caller has seen none of the
+turn; see [malformed tool calls](gateway-failover-rules.md#malformed-tool-calls)), the ledger names the parse position and
 byte count, and the operator log names the tool (bounded to an identifier token, since a
 relay can put arbitrary model output in the name field); argument bytes are never logged or
 repaired by guessing.
@@ -222,7 +223,7 @@ applies the same rule after commitment, when every committed event was one it ca
 Provider-internal retry layers are disabled so every
 possible billable dispatch is visible to the gateway ledger.
 See [graceful connection retirement](gateway-failover-rules.md#graceful-connection-retirement) for the health-only HTTP/2 hint.
-Transport failures, buffered answers broken mid-body, and context-window refusals: [failover rules](gateway-failover-rules.md#transport-buffered-answers-and-context-windows); provider content-filter refusals: [failover rules](gateway-failover-rules.md#provider-content-filters).
+Transport failures, buffered answers broken mid-body, and context-window refusals: [failover rules](gateway-failover-rules.md#transport-buffered-answers-and-context-windows); provider content-filter refusals: [failover rules](gateway-failover-rules.md#provider-content-filters); malformed tool calls: [failover rules](gateway-failover-rules.md#malformed-tool-calls).
 
 **Which rung a failover reaches.** A pre-commit failover-eligible failure advances to the first
 claimable rung this request has NOT dispatched yet, in route order, so a rung skipped earlier (shed

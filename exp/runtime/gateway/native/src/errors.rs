@@ -372,6 +372,13 @@ pub struct Failure {
     /// rung of another provider (`content_filter.rs`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub provider_content_filter: bool,
+    /// A provider streamed a client tool call whose arguments do not parse as
+    /// one JSON object (or that never became a complete call). Sampling may
+    /// produce a valid call on another dial, so while nothing reached the
+    /// caller the waterfall takes it once: to an untried sibling first, else a
+    /// redial of the same rung (python `native_execution.next_route_candidate`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub malformed_tool_call: bool,
 }
 
 /// Which bound ended a dial waiting for its provider's response headers.
@@ -415,6 +422,7 @@ impl Failure {
             context_window_rejected: false,
             context_window_limit_tokens: None,
             provider_content_filter: false,
+            malformed_tool_call: false,
         }
     }
 
@@ -462,6 +470,12 @@ impl Failure {
     /// Attach one already-sanitized provider explanation.
     pub fn with_provider_detail(mut self, detail: Option<String>) -> Self {
         self.provider_detail = detail;
+        self
+    }
+
+    /// Mark (or keep marking) a malformed streamed tool call.
+    pub fn with_malformed_tool_call(mut self, malformed_tool_call: bool) -> Self {
+        self.malformed_tool_call = malformed_tool_call;
         self
     }
 
@@ -568,6 +582,7 @@ impl Failure {
                 .with_retry(self.retryable_same_deployment, self.failover_eligible)
                 .with_tenant_origin(self.tenant_origin)
                 .with_provider_detail(Some(self.safe_message))
+                .with_malformed_tool_call(self.malformed_tool_call)
             }
             _ => self,
         }

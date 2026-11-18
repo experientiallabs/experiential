@@ -39,6 +39,9 @@ class Plane:
         self.rules = [None, None]
         self.first_depth = None
         self.refusal_failover = False
+        # When set, a retryable failure with no admitted later depth redials
+        # the same depth once, mirroring `next_route_candidate`'s fallback.
+        self.same_redial = False
 
     def configure(self, argument):
         data = json.loads(argument)
@@ -46,6 +49,7 @@ class Plane:
             self.rules = data.get("rules", self.rules); self.counts = [0] * len(self.rules)
             self.first_depth = data.get("first_depth")
             self.refusal_failover = data.get("refusal_failover", self.refusal_failover)
+            self.same_redial = data.get("same_redial", self.same_redial)
         return "{}"
 
     def admits(self, depth, failure):
@@ -79,6 +83,8 @@ class Plane:
                 candidate = depth
             elif depth + 1 < len(self.counts) and self.admits(depth + 1, failure):
                 candidate = depth + 1
+            elif self.same_redial and failure.get("retryable_same_deployment") and self.counts[depth] < 2:
+                candidate = depth
             else:
                 return json.dumps({"exhausted": True, "failure": failure})
             self.counts[candidate] += 1

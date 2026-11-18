@@ -119,3 +119,179 @@ pub(crate) fn is_semantic(event: &Event) -> bool {
     ) || matches!(event, Event::ProviderResponsesLogprobs { records, .. }
         if records.as_array().is_some_and(|items| !items.is_empty()))
 }
+
+/// Bytes a turn's held tool calls may retain before they stream live.
+pub(super) const MAXIMUM_HELD_TOOL_CALL_BYTES: usize = 65_536;
+/// Events a turn's held tool calls may retain before they stream live.
+pub(super) const MAXIMUM_HELD_TOOL_CALL_EVENTS: usize = 8_192;
+
+/// What [`HeldToolCalls::consider`] decided for one event.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Hold {
+    /// The event joined the hold; the attempt stays uncommitted.
+    Held,
+    /// Commit now: the held events lead the prefix, then this event.
+    Release,
+    /// A failure ended the held turn: the held events were dropped (the
+    /// caller never saw them) and the failure takes the ordinary path.
+    Discard,
+    /// Not the hold's business: the ordinary commit rules decide.
+    Pass,
+}
+
+/// A turn whose first outward output is a client tool call is held
+/// uncommitted until it ends, so a call whose arguments never become one
+/// valid JSON object (sampling, not the request) can still take the ladder:
+/// the caller has seen nothing of it. Once the hold begins every later event
+/// joins it in order, exactly as it would have streamed after a commit, so a
+/// release replays the same sequence the caller would otherwise have
+/// received. The hold is bounded: past [`MAXIMUM_HELD_TOOL_CALL_BYTES`] (a
+/// large file write) the turn commits and streams live as before, and a tool
+/// the provider itself executes commits at once (its effects must never be
+/// repeated by a retry).
+#[derive(Default)]
+pub(super) struct HeldToolCalls {
+    events: Vec<Event>,
+    bytes: usize,
+}
+
+impl HeldToolCalls {
+    /// Decide `event`. A hold starts only on a client tool call's start
+    /// while nothing else is withheld (`nothing_withheld`), so the held
+    /// events never interleave with a withheld refusal or reasoning carrier.
+    pub(super) fn consider(&mut self, event: &Event, nothing_withheld: bool) -> Hold {
+        if self.events.is_empty() {
+            if nothing_withheld && matches!(event, Event::ToolCallStarted { .. }) {
+                return self.push(event);
+            }
+            return Hold::Pass;
+        }
+        match event {
+            Event::Failed(_) => {
+                self.events.clear();
+                self.bytes = 0;
+                Hold::Discard
+            }
+            // Pre-commit usage stays tracked, never relayed: a release on the
+            // terminal leads it with the tracked report, as any commit does.
+            Event::Usage(_) => Hold::Held,
+            event if event.is_terminal() => Hold::Release,
+            event if super::buffered::provider_executed(event) => Hold::Release,
+            event => self.push(event),
+        }
+    }
+
+    fn push(&mut self, event: &Event) -> Hold {
+        let bytes = crate::relay::event_retained_bytes(event);
+        if self.bytes.saturating_add(bytes) > MAXIMUM_HELD_TOOL_CALL_BYTES
+            || self.events.len() + 1 > MAXIMUM_HELD_TOOL_CALL_EVENTS
+        {
+            return if self.events.is_empty() {
+                Hold::Pass
+            } else {
+                Hold::Release
+            };
+        }
+        self.bytes += bytes;
+        self.events.push(event.clone());
+        Hold::Held
+    }
+
+    /// The held events, in arrival order, leaving the hold empty.
+    pub(super) fn take(&mut self) -> Vec<Event> {
+        self.bytes = 0;
+        std::mem::take(&mut self.events)
+    }
+}
+
+#[cfg(test)]
+mod held_tool_call_tests {
+    use super::*;
+
+    fn started() -> Event {
+        Event::ToolCallStarted {
+            custom: false,
+            index: 0,
+            call_id: "call_1".to_string(),
+            name: "write".to_string(),
+            namespace: None,
+            caller: None,
+            thought_signature: None,
+        }
+    }
+
+    fn delta(bytes: usize) -> Event {
+        Event::ToolArgumentsDelta {
+            index: 0,
+            delta: "x".repeat(bytes),
+        }
+    }
+
+    #[test]
+    fn only_a_client_tool_call_opening_with_nothing_withheld_starts_a_hold() {
+        let mut held = HeldToolCalls::default();
+        assert_eq!(
+            held.consider(&Event::TextDelta("hi".into()), true),
+            Hold::Pass
+        );
+        assert_eq!(held.consider(&started(), false), Hold::Pass);
+        let server = Event::ServerToolUseStarted {
+            index: 0,
+            call_id: "srv_1".to_string(),
+            name: "web_search".to_string(),
+        };
+        assert_eq!(held.consider(&server, true), Hold::Pass);
+        assert_eq!(held.consider(&started(), true), Hold::Held);
+    }
+
+    #[test]
+    fn a_held_turn_keeps_every_later_event_in_order_until_its_terminal() {
+        let mut held = HeldToolCalls::default();
+        assert_eq!(held.consider(&started(), true), Hold::Held);
+        assert_eq!(held.consider(&delta(8), true), Hold::Held);
+        assert_eq!(
+            held.consider(&Event::TextDelta("after".into()), true),
+            Hold::Held
+        );
+        assert_eq!(
+            held.consider(&Event::Usage(Usage::default()), true),
+            Hold::Held
+        );
+        assert_eq!(held.consider(&Event::Completed, true), Hold::Release);
+        let events = held.take();
+        assert_eq!(events.len(), 3, "usage stays tracked, never held");
+        assert!(matches!(events[0], Event::ToolCallStarted { .. }));
+        assert!(matches!(events[2], Event::TextDelta(_)));
+    }
+
+    #[test]
+    fn a_failure_discards_the_held_turn() {
+        let mut held = HeldToolCalls::default();
+        held.consider(&started(), true);
+        held.consider(&delta(8), true);
+        let failed = Event::Failed(crate::errors::Failure::new(
+            crate::errors::FailureClass::MalformedResponse,
+            "broken",
+        ));
+        assert_eq!(held.consider(&failed, true), Hold::Discard);
+        assert!(held.take().is_empty());
+    }
+
+    #[test]
+    fn a_large_or_provider_executed_turn_streams_live() {
+        let mut held = HeldToolCalls::default();
+        held.consider(&started(), true);
+        assert_eq!(
+            held.consider(&delta(MAXIMUM_HELD_TOOL_CALL_BYTES), true),
+            Hold::Release
+        );
+        let mut held = HeldToolCalls::default();
+        held.consider(&started(), true);
+        let server = Event::ServerToolUseStarted {
+            index: 1,
+            call_id: "srv_1".to_string(),
+            name: "web_search".to_string(),
+        };
+        assert_eq!(held.consider(&server, true), Hold::Release);
+    }
+}
