@@ -445,7 +445,7 @@ impl Normalizer {
                             let raw_fragment = match fragment {
                                 Value::String(text) => text.clone(),
                                 _ => {
-                                    return Err(malformed(
+                                    return Err(super::super::malformed_tool_call(
                                         "OpenAI-compatible argument delta must be text",
                                     ))
                                 }

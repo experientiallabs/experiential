@@ -118,6 +118,14 @@ pub(crate) fn malformed_tool_call(message: &str) -> Failure {
     malformed(message).with_malformed_tool_call(true)
 }
 
+impl Failure {
+    /// Mark (or keep marking) a malformed streamed tool call.
+    pub fn with_malformed_tool_call(mut self, malformed_tool_call: bool) -> Self {
+        self.malformed_tool_call = malformed_tool_call;
+        self
+    }
+}
+
 /// One provider-supplied discriminator (an item or event type) reduced to a
 /// token safe to embed in a malformed-stream reason. The reason crosses into
 /// the operator log at the failure boundary, so anything but a short

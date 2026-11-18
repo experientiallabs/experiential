@@ -53,7 +53,8 @@ fn unwrap_custom_input(raw_arguments: &str) -> Result<String, Failure> {
     Err(Failure::new(
         FailureClass::MalformedResponse,
         "translated custom tool requires an object with a string input",
-    ))
+    )
+    .with_malformed_tool_call(true))
 }
 
 /// Rewrite one tool-call event in place using the translation map.

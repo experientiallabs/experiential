@@ -157,9 +157,14 @@ pub(super) struct HeldToolCalls {
 
 impl HeldToolCalls {
     /// Decide `event`. A hold starts only on a client function call's start
-    /// while nothing else is withheld (`nothing_withheld`), so the held
-    /// events never interleave with a withheld refusal or reasoning carrier.
-    pub(super) fn consider(&mut self, event: &Event, nothing_withheld: bool) -> Hold {
+    /// while no refusal is withheld (`no_refusal_withheld`): withheld
+    /// metadata (an empty logprobs delta) is fine, since it leads the held
+    /// events in the prefix exactly as it arrived, while a withheld refusal
+    /// keeps its own ladder rules. A translated freeform wrapper (Codex
+    /// `custom` on a function wire) is not held: its inverter withholds the
+    /// wrapper's bytes itself, so no size bound would ever release the hold
+    /// and the caller would get nothing until the whole input was generated.
+    pub(super) fn consider(&mut self, event: &Event, no_refusal_withheld: bool) -> Hold {
         if self.events.is_empty() {
             // Freeform (custom) input is opaque text that never fails to
             // parse, so it gains nothing from a hold and streams as before.
@@ -174,7 +179,7 @@ impl HeldToolCalls {
                         ..
                     }
             );
-            if nothing_withheld && opens_function_call {
+            if no_refusal_withheld && opens_function_call {
                 return self.push(event);
             }
             return Hold::Pass;
@@ -195,20 +200,34 @@ impl HeldToolCalls {
     }
 
     fn push(&mut self, event: &Event) -> Hold {
-        // The retention estimator charges a call's opening a flat size; the
-        // held clone owns its provider-set identifiers, so charge them too.
+        // The retention estimator charges a call's opening a flat size and a
+        // completed call its arguments; the held clone also owns the
+        // provider-set identifiers and opaque `caller`, so charge them too.
         let identifiers = match event {
             Event::ToolCallStarted {
                 call_id,
                 name,
                 namespace,
+                caller,
                 thought_signature,
                 ..
             } => {
                 call_id.len()
                     + name.len()
                     + namespace.as_deref().map_or(0, str::len)
+                    + caller
+                        .as_ref()
+                        .map_or(0, crate::dialects::json_retained_bytes)
                     + thought_signature.as_deref().map_or(0, str::len)
+            }
+            Event::ToolCallCompleted { call, .. } => {
+                call.call_id.len()
+                    + call.name.len()
+                    + call.namespace.as_deref().map_or(0, str::len)
+                    + call
+                        .caller
+                        .as_ref()
+                        .map_or(0, crate::dialects::json_retained_bytes)
             }
             _ => 0,
         };
@@ -346,6 +365,22 @@ mod held_tool_call_tests {
         assert_eq!(held.consider(&long, true), Hold::Pass);
         held.consider(&started(), true);
         assert_eq!(held.consider(&long, true), Hold::Release);
+    }
+
+    #[test]
+    fn a_call_opening_is_charged_its_caller_metadata() {
+        let mut held = HeldToolCalls::default();
+        held.consider(&started(), true);
+        let heavy = Event::ToolCallStarted {
+            custom: false,
+            index: 1,
+            call_id: "call_2".to_string(),
+            name: "write".to_string(),
+            namespace: None,
+            caller: Some(serde_json::json!({"trace": "t".repeat(MAXIMUM_HELD_TOOL_CALL_BYTES)})),
+            thought_signature: None,
+        };
+        assert_eq!(held.consider(&heavy, true), Hold::Release);
     }
 
     #[test]

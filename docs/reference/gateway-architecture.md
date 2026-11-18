@@ -50,8 +50,7 @@ empty literals such as `""` is dropped and the call completes — Azure Foundry'
 streams `{}` then `""` for every zero-argument call — so the deltas a client receives always
 concatenate to the completed call's bytes. Any other tail, and any syntax error inside the
 object, keeps the strict contract: the attempt fails as `malformed_response` (a provider
-fault, retried once on a sibling or the same deployment while the caller has seen none of the
-turn; see [malformed tool calls](gateway-failover-rules.md#malformed-tool-calls)), the ledger names the parse position and
+fault, retried once while the caller has seen none of the turn: [malformed tool calls](gateway-failover-rules.md#malformed-tool-calls)), the ledger names the parse position and
 byte count, and the operator log names the tool (bounded to an identifier token, since a
 relay can put arbitrary model output in the name field); argument bytes are never logged or
 repaired by guessing.

@@ -7,6 +7,9 @@ use serde_json::json;
 
 use crate::caller_copy::caller_copy;
 
+mod header_timeout;
+pub use header_timeout::HeaderTimeout;
+
 /// One sanitized public protocol error carrying its HTTP representation.
 ///
 /// Field names match the JSON payload attached to `NativeBridgeError` on the
@@ -372,33 +375,10 @@ pub struct Failure {
     /// rung of another provider (`content_filter.rs`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub provider_content_filter: bool,
-    /// A provider streamed a client tool call whose arguments do not parse as
-    /// one JSON object (or that never became a complete call). Sampling may
-    /// produce a valid call on another dial, so while nothing reached the
-    /// caller the waterfall takes it once: to an untried sibling first, else a
-    /// redial of the same rung (python `native_execution.next_route_candidate`).
+    /// A streamed client tool call that never became one valid call: retried
+    /// once while nothing reached the caller (docs: "Malformed tool calls").
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub malformed_tool_call: bool,
-}
-
-/// Which bound ended a dial waiting for its provider's response headers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HeaderTimeout {
-    /// The rung's own first-byte allowance expired: the lane did not answer.
-    Allowance,
-    /// The request's shared budget (or deadline) expired first.
-    Budget,
-}
-
-impl HeaderTimeout {
-    /// The boundary token, shared with python `GatewayHeaderTimeout`.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Allowance => "allowance",
-            Self::Budget => "budget",
-        }
-    }
 }
 
 impl Failure {
@@ -470,12 +450,6 @@ impl Failure {
     /// Attach one already-sanitized provider explanation.
     pub fn with_provider_detail(mut self, detail: Option<String>) -> Self {
         self.provider_detail = detail;
-        self
-    }
-
-    /// Mark (or keep marking) a malformed streamed tool call.
-    pub fn with_malformed_tool_call(mut self, malformed_tool_call: bool) -> Self {
-        self.malformed_tool_call = malformed_tool_call;
         self
     }
 

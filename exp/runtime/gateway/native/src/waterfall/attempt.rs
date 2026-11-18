@@ -370,7 +370,7 @@ pub(super) async fn run_attempt(
             // until it ends (bounded), so a call whose arguments never parse
             // fails before the caller saw any of it and the ladder may retry
             // it (`commit::HeldToolCalls`).
-            match held_tools.consider(&event, withheld.is_empty()) {
+            match held_tools.consider(&event, !withheld.iter().any(crate::logprobs::is_refusal)) {
                 commit::Hold::Held => {
                     relay.private_progress();
                     continue;

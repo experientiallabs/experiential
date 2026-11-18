@@ -462,9 +462,7 @@ def next_route_candidate(
 
     A provider context-window rejection advances once, only to a wider rung
     (``native_context_window``). A transport failure is never decided by cache
-    stakes: it takes an untried sibling before any redial of the failed rung,
-    and so does a malformed streamed tool call (``malformed_tool_call``), whose
-    one retry redials the failed rung only when no sibling can take it.
+    stakes: it (like a ``malformed_tool_call``) takes an untried sibling before any redial.
     When a request's only dial failed and no sibling can serve, its redial
     through the rung's open circuit gets the forced claim a fresh first dial
     would; any later redial stays behind the circuit.
@@ -539,10 +537,8 @@ def next_route_candidate(
         and failure.retryable_same_deployment
         and attempt_counts[current_depth] < maximum_same_deployment_attempts
     )
-    # A reset is the path to the provider failing: a redial mid-burst meets the
-    # same reset, so transport takes an untried sibling (and its cache miss) first.
-    # A malformed tool call does too: the rung that sampled it once is the
-    # likeliest to sample it again, so its redial is the fallback, not the lead.
+    # A reset (a redial meets the same burst) and a malformed tool call (its rung
+    # resamples it likeliest) take an untried sibling, and its cache miss, first.
     sibling_first = (
         failure.failure_class == GatewayFailureClass.TRANSPORT or failure.malformed_tool_call
     )
