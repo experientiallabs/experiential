@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Protocol, cast
 
 from exp_gateway_native import OptionalInputDecision
@@ -23,8 +23,10 @@ from exp.runtime.gateway.guardrails.session import GuardrailSession, denied_inpu
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
 from exp.runtime.gateway.native_capture import (
     CaptureController,
+    CaptureSource,
     PendingCapture,
     begin_capture,
+    capture_unavailable_error,
     capture_unavailable_failure,
     discard_capture,
 )
@@ -61,13 +63,49 @@ def require_capture(
         controller, authorization, pending.request, session_id=pending.session_id
     ):
         return
-    failure = capture_unavailable_failure()
-    accounting.finish_request_quietly(authorization, failure)
-    raise NativeBridgeError(
-        OpenAIProtocolError(
-            status_code=503, code="capture_unavailable", message=failure.safe_message
-        )
-    )
+    accounting.finish_request_quietly(authorization, capture_unavailable_failure())
+    raise NativeBridgeError(capture_unavailable_error())
+
+
+def admit_with_capture(
+    controller: CaptureController | None,
+    accounting: NativeAttemptAccounting,
+    authorization: AuthorizationSnapshot,
+    request: CaptureSource,
+    session_id: str | None,
+    admit: Callable[[], str],
+) -> str:
+    """Register a media surface's capture, then route it; release a capture it never serves.
+
+    Called right after the request is durably accepted, like the chat
+    surfaces' capture. A routing failure or an escalation disposition answers
+    without a response tap, so its capture is discarded here rather than left
+    to expire.
+
+    Args:
+        controller: Optional host-configured capture collector and policy.
+        accounting: Owner of the accepted request's durable terminal write.
+        authorization: Exact authenticated request identity.
+        request: The effective request.
+        session_id: Validated caller correlation, or None.
+        admit: Route and package the accepted request into its wire reply.
+
+    Returns:
+        ``admit``'s reply.
+
+    Raises:
+        NativeBridgeError: Capture is unavailable (503), or ``admit`` refused.
+    """
+    pending = None if controller is None else PendingCapture(request, session_id)
+    require_capture(controller, accounting, authorization, pending)
+    try:
+        reply = admit()
+    except BaseException:
+        discard_capture(controller, authorization.request_id)
+        raise
+    if reply.startswith('{"escalate"'):
+        discard_capture(controller, authorization.request_id)
+    return reply
 
 
 def validate_guardrail_engine(engine: GuardrailEngine | None) -> None:

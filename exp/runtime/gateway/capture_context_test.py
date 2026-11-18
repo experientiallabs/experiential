@@ -8,9 +8,12 @@ import pytest
 from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.capture_context import (
     capture_context_document,
+    media_capture_context_document,
     restore_capture_context,
 )
 from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
+from exp.runtime.gateway.images_contracts import ImageEditInput, ImagesRequest
 from exp.runtime.gateway.replay_identity import canonical_request_sha256, provider_replay_authority
 from exp.runtime.openai_protocol.requests import decode_chat
 
@@ -213,3 +216,30 @@ def test_lossless_context_retains_colliding_keys() -> None:
     context = capture_context_document(request)
     restored = GatewayRequest.model_validate(restore_capture_context(context)["request"])
     assert restored.messages[0].content == "a\0b"
+
+
+def test_media_context_names_edit_images_without_copying_their_bytes() -> None:
+    """An edit's base64 parts become input media parts; the context only names them."""
+    request = ImagesRequest(
+        prompt="make it blue",
+        edit=ImageEditInput(image="aW1hZ2U=", mask="bWFzaw=="),
+    )
+    context = media_capture_context_document(request, session_id="episode")
+    assert context["schema_version"] == 1
+    assert context["session_id"] == "episode"
+    captured = context["request"]
+    assert isinstance(captured, dict)
+    assert captured["prompt"] == "make it blue"
+    assert captured["edit"] == {"inputs": ["image", "mask"]}
+    assert "aW1hZ2U=" not in json.dumps(context)
+
+
+def test_media_context_keeps_exceptional_text_losslessly() -> None:
+    """Embeddings input with NUL keeps the same lossless sidecar as chat context."""
+    request = EmbeddingsRequest(inputs=("a\x00b",))
+    context = media_capture_context_document(request)
+    assert "source_json" in context
+    assert restore_capture_context(context)["request"] == {
+        "surface": "embeddings",
+        "inputs": ["a\x00b"],
+    }

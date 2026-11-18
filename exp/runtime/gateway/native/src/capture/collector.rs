@@ -126,6 +126,9 @@ struct Entry {
     relay_required: bool,
     request_bytes: usize,
     expires: Instant,
+    /// Lifetime renewed on each checkpoint release: the configured TTL, or a
+    /// longer job deadline (`begin_until`).
+    ttl: Duration,
     bytes: usize,
     attached: bool,
     output_finished: bool,
@@ -197,6 +200,10 @@ mod logprobs_sidecar;
 #[path = "collector_spill.rs"]
 mod spill_sidecar;
 
+// Media parts, vector summaries and provider jobs (`super::media`).
+#[path = "collector_media.rs"]
+mod media_sidecar;
+
 pub(crate) struct Collector {
     pub config: Configuration,
     delivery: Delivery,
@@ -251,7 +258,17 @@ impl Collector {
     }
 
     /// Admission is the sole authority for input. Duplicate ids never replace a record.
-    pub(crate) fn begin(&self, mut request: Request) -> bool {
+    #[cfg(test)]
+    pub(crate) fn begin(&self, request: Request) -> bool {
+        self.begin_until(request, None)
+    }
+
+    /// Register input whose entry may outlive the configured TTL (a provider
+    /// job that settles later); `ttl` never shortens the configured one.
+    pub(crate) fn begin_until(&self, mut request: Request, ttl: Option<Duration>) -> bool {
+        let ttl = ttl.map_or(Duration::from_secs(self.config.ttl_seconds), |ttl| {
+            ttl.max(Duration::from_secs(self.config.ttl_seconds))
+        });
         let request_bytes = if self.config.truncate_request {
             super::bounds::bound(&mut request, self.config.maximum_request_bytes)
         } else {
@@ -274,6 +291,7 @@ impl Collector {
             provider_logprobs: None,
             transport_body: None,
             messages_part,
+            media: Default::default(),
             captured_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_secs_f64())
@@ -314,7 +332,8 @@ impl Collector {
                 relay_attached: false,
                 relay_required: self.config.relay_metadata,
                 request_bytes,
-                expires: Instant::now() + Duration::from_secs(self.config.ttl_seconds),
+                expires: Instant::now() + ttl,
+                ttl,
                 bytes,
                 attached: false,
                 output_finished: false,
@@ -429,6 +448,7 @@ impl Collector {
             provider_logprobs: None,
             transport_body: None,
             messages_part: entry.record.messages_part.clone(),
+            media: entry.record.media.clone(),
             captured_at: entry.record.captured_at,
         };
         // The context Arc is shared; charge the copied identifiers and receipt/queue nodes.
@@ -456,7 +476,7 @@ impl Collector {
             admission: entry._admission.clone(),
             pending: self.pending.clone(),
             request_id: request_id.to_owned(),
-            ttl: Duration::from_secs(self.config.ttl_seconds),
+            ttl: entry.ttl,
         };
         pending.bytes -= map_bytes;
         drop(pending);
@@ -493,12 +513,17 @@ impl Collector {
             return;
         };
         pending.bytes -= entry.map_bytes();
-        if !keep_prompt {
+        if !keep_prompt && !keep_response {
             entry.response_discarded.store(true, Ordering::Release);
             return;
         }
+        if !keep_prompt {
+            // The response alone is kept: the request leaves the record.
+            media_sidecar::omit_request(&mut entry);
+        }
         if !keep_response {
             entry.response_discarded.store(true, Ordering::Release);
+            entry.record.media.omit(super::media::MediaRole::Output);
             entry.record.response = None;
             entry.wire = None;
             entry.record.provider_reasoning = None;
@@ -696,7 +721,7 @@ impl Collector {
                 admission: entry._admission,
                 pending: self.pending.clone(),
                 request_id: entry.record.request.request_id.clone(),
-                ttl: Duration::from_secs(self.config.ttl_seconds),
+                ttl: entry.ttl,
             };
             self.delivery
                 .checkpoint(entry.record, entry.wire, lease, true)

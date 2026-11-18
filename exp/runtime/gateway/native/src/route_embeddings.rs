@@ -100,7 +100,11 @@ pub(crate) async fn embeddings(
     };
     let client_request_id = latin1_header(&headers, "x-client-request-id");
 
-    let mut admit_value = json!({"raw_key": raw_key, "body": body_text});
+    let mut admit_value = json!({
+        "raw_key": raw_key,
+        "body": body_text,
+        "capture_session_id": crate::capture::session_id(&headers),
+    });
     with_app_identity(&mut admit_value, &headers);
     let admit_argument = compact_json(&admit_value);
     let admission_text = match state.bridge.call("admit_embeddings", admit_argument).await {
@@ -121,28 +125,40 @@ pub(crate) async fn embeddings(
         Ok(admission) => admission,
         Err(_) => return wire_drift_response(&state, &admission_value, started).await,
     };
-    let mut guard = new_guard(&state, admission.request_id.clone(), started);
-    let permit = match acquire_permit(&state, &mut guard, deadline, None).await {
-        Ok(permit) => permit,
-        Err(response) => return *response,
-    };
-    let _permit = permit;
+    let capture = state.capture.clone();
+    let request_id = admission.request_id.clone();
+    let response = async {
+        let mut guard = new_guard(&state, admission.request_id.clone(), started);
+        let permit = match acquire_permit(&state, &mut guard, deadline, None).await {
+            Ok(permit) => permit,
+            Err(response) => return *response,
+        };
+        let _permit = permit;
 
-    match run_ladder(&state, &admission, &raw_key, &mut guard, deadline).await {
-        Err(error) => error_response(&error),
-        Ok(served) => {
-            if !guard
-                .settle("completed", Some(&served.usage), &[], None, true)
-                .await
-            {
-                // The ledger never learned the outcome; the caller must not
-                // receive vectors the gateway cannot account for.
-                return error_response(&guard.settlement_error());
+        match run_ladder(&state, &admission, &raw_key, &mut guard, deadline).await {
+            Err(error) => error_response(&error),
+            Ok(served) => {
+                if !guard
+                    .settle("completed", Some(&served.usage), &[], None, true)
+                    .await
+                {
+                    // The ledger never learned the outcome; the caller must not
+                    // receive vectors the gateway cannot account for.
+                    return error_response(&guard.settlement_error());
+                }
+                let response_headers = served_headers(&admission, served.depth, client_request_id);
+                json_response(StatusCode::OK, &served.body, &response_headers)
             }
-            let response_headers = served_headers(&admission, served.depth, client_request_id);
-            json_response(StatusCode::OK, &served.body, &response_headers)
         }
     }
+    .await;
+    crate::capture::media::capture_buffered(
+        capture,
+        &request_id,
+        crate::capture::media::MediaSurface::Embeddings,
+        response,
+    )
+    .await
 }
 
 /// Walk the certified ladder to one validated provider answer or the public

@@ -38,6 +38,11 @@ from exp.runtime.gateway.ledger_errors import (
 from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError, authority_error
 from exp.runtime.gateway.native_accounting_recovery import RecoveryRotation
+from exp.runtime.gateway.native_capture import (
+    CaptureController,
+    capture_unavailable_error,
+    capture_unavailable_failure,
+)
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
 from exp.runtime.gateway.native_execution import (
     _resolve_deployment_profile,  # The identity-checked resolver every admission uses.
@@ -52,6 +57,7 @@ from exp.runtime.gateway.stream_contracts import (
     GatewayFailure,
     GatewayFailureClass,
 )
+from exp.runtime.gateway.video.capture import VideoCapture
 from exp.runtime.gateway.video.contracts import (
     VIDEO_JOB_SETTLEMENT_SECONDS,
     VIDEO_LEDGER_DEADLINE_SLACK_SECONDS,
@@ -60,6 +66,14 @@ from exp.runtime.gateway.video.contracts import (
     VideoStatus,
     video_ceiling_nano_usd,
     video_unit_rate,
+)
+from exp.runtime.gateway.video.failures import (
+    internal_failure,
+    not_a_video_model_error,
+    storage_failure,
+    unavailable_error,
+    unsupported_failure,
+    video_not_found_error,
 )
 from exp.runtime.gateway.video.output import VideoOutputStore
 from exp.runtime.gateway.video.providers import (
@@ -100,29 +114,6 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def not_a_video_model_error(alias: str) -> OpenAIProtocolError:
-    """Build the public 400 for an alias none of whose rungs generate video."""
-    return OpenAIProtocolError(
-        status_code=400,
-        code="unsupported_capability",
-        message=(
-            f"The model {alias!r} does not generate video. Choose a video model from "
-            "GET /v1/models and resend the request to /v1/videos."
-        ),
-        param="model",
-    )
-
-
-def video_not_found_error(video_id: str) -> OpenAIProtocolError:
-    """Build the public 404 shared by absent, deleted, and foreign video ids."""
-    return OpenAIProtocolError(
-        status_code=404,
-        code="not_found",
-        message=f"No video found with id {video_id!r}.",
-        param="video_id",
-    )
-
-
 class VideoEngine:
     """Video job lifecycle over the native control plane's shared seams.
 
@@ -142,6 +133,7 @@ class VideoEngine:
         clock: Callable[[], datetime] = _now,
         poll_interval_seconds: float = POLL_INTERVAL_SECONDS,
         outputs: VideoOutputStore | None = None,
+        capture: CaptureController | None = None,
     ) -> None:
         """Bind the shared seams and the provider client registry.
 
@@ -155,6 +147,7 @@ class VideoEngine:
             poll_interval_seconds: Minimum spacing between polls of one job.
             outputs: Host storage rendered videos upload into; when set, every
                 job on a dialect that ``stores_output`` uploads there.
+            capture: Optional traffic capture of each job (``video.capture``).
         """
         self._components = components
         self._ledger = ledger
@@ -165,6 +158,7 @@ class VideoEngine:
         self._clock = clock
         self._poll_interval = timedelta(seconds=max(0.0, poll_interval_seconds))
         self._outputs = outputs
+        self._capture = VideoCapture(capture)
         self._pending_lock = threading.Lock()
         self._active_creates = 0
         self._pending: dict[str, PendingSettlement] = {}
@@ -184,6 +178,7 @@ class VideoEngine:
         request: VideoRequest,
         reference_image: bytes | None,
         client_headers: Mapping[str, object],
+        session_id: str | None = None,
     ) -> VideoJob:
         """Admit, reserve, and submit one video job.
 
@@ -193,6 +188,7 @@ class VideoEngine:
             request: The decoded canonical request.
             reference_image: First-frame image bytes matching ``request.input_reference``.
             client_headers: Forwarded calling-application header values.
+            session_id: Validated caller correlation for capture, or None.
 
         Returns:
             The accepted job.
@@ -202,7 +198,7 @@ class VideoEngine:
         """
         with self._pending_lock:
             if self._poll_stop.is_set():
-                raise NativeBridgeError(_unavailable_error())
+                raise NativeBridgeError(unavailable_error())
             self._active_creates += 1
         try:
             deadline = (
@@ -223,7 +219,11 @@ class VideoEngine:
                 self._ledger.accept_request(authorization=authorization)
             except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
                 raise authority_error(exc) from exc
-            return self._dispatch(authorization, request, reference_image)
+            if not self._capture.begin(authorization, request, reference_image, session_id):
+                self._finish_request(authorization, capture_unavailable_failure())
+                raise NativeBridgeError(capture_unavailable_error())
+            with self._capture.releasing(authorization.request_id):
+                return self._capture.record(self._dispatch(authorization, request, reference_image))
         finally:
             with self._pending_lock:
                 self._active_creates -= 1
@@ -245,7 +245,7 @@ class VideoEngine:
     ) -> VideoJob:
         """Route one accepted request and walk its video rungs until one accepts."""
         if not isinstance(authorization.target, DirectTarget):
-            self._finish_request(authorization, _unsupported_failure())
+            self._finish_request(authorization, unsupported_failure())
             raise NativeBridgeError(not_a_video_model_error(authorization.alias))
         try:
             route = self._components.routes.resolve_direct(authorization)
@@ -279,7 +279,7 @@ class VideoEngine:
                 failure = dispatchable.dead[0].failure
                 self._finish_request(authorization, failure)
                 raise NativeBridgeError(public_failure_error(failure))
-            self._finish_request(authorization, _unsupported_failure())
+            self._finish_request(authorization, unsupported_failure())
             raise NativeBridgeError(not_a_video_model_error(authorization.alias))
         if not candidates:
             param, message = refusal or ("model", "No rung of this model can render the request.")
@@ -327,7 +327,7 @@ class VideoEngine:
             try:
                 self._jobs.create(job=job)
             except Exception as exc:  # noqa: BLE001 - nothing reached the provider.
-                self._settle_unsent(job, _internal_failure(), finalize=True)
+                self._settle_unsent(job, internal_failure(), finalize=True)
                 raise authority_error(exc) from exc
             upload_url: str | None = None
             if stored:
@@ -339,10 +339,10 @@ class VideoEngine:
                 except Exception as exc:  # noqa: BLE001 - nothing reached the provider.
                     _LOGGER.exception("video %s upload target unavailable", job.video_id)
                     failover = depth < last
-                    self._settle_unsent(job, _storage_failure(), finalize=not failover)
+                    self._settle_unsent(job, storage_failure(), finalize=not failover)
                     if failover:
                         continue
-                    raise NativeBridgeError(public_failure_error(_storage_failure())) from exc
+                    raise NativeBridgeError(public_failure_error(storage_failure())) from exc
             try:
                 provider_job_id = client.submit(
                     profile,
@@ -559,7 +559,7 @@ class VideoEngine:
             return self._stored_content(job)
         resolved = self._resolve(job)
         if resolved is None:
-            raise NativeBridgeError(_unavailable_error())
+            raise NativeBridgeError(unavailable_error())
         profile, client = resolved
         assert job.content_url is not None
         return client.content(profile, job.content_url)
@@ -572,14 +572,14 @@ class VideoEngine:
                 404 when the stored object is gone.
         """
         if self._outputs is None:
-            raise NativeBridgeError(_unavailable_error())
+            raise NativeBridgeError(unavailable_error())
         try:
             fetch = self._outputs.download(
                 video_id=job.video_id, organization_id=job.organization_id
             )
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             _LOGGER.exception("video %s stored output unreadable", job.video_id)
-            raise NativeBridgeError(_unavailable_error()) from exc
+            raise NativeBridgeError(unavailable_error()) from exc
         if fetch is None:
             raise NativeBridgeError(
                 OpenAIProtocolError(
@@ -756,6 +756,7 @@ class VideoEngine:
             saved = self._settled_job_winner(pending)
             if saved is None:
                 if not pending.ledger_written:
+                    self._capture.record(pending.closed)  # the terminal job, before settlement
                     self._ledger.finish_attempt(
                         attempt_id=pending.job.attempt_id,
                         terminal_event=pending.event,
@@ -961,38 +962,3 @@ class VideoEngine:
         restart. Idle host eviction must keep their poller alive instead.
         """
         return self._recovery_drained() and not self._jobs.open_jobs(limit=1)
-
-
-def _unsupported_failure() -> GatewayFailure:
-    """The terminal failure for an alias that does not generate video."""
-    return GatewayFailure(
-        failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
-        safe_message="the model alias does not generate video",
-    )
-
-
-def _storage_failure() -> GatewayFailure:
-    """The failure for a rung whose host upload destination could not be minted."""
-    return GatewayFailure(
-        failure_class=GatewayFailureClass.INTERNAL,
-        safe_message="the video output storage is unavailable",
-        failover_eligible=True,
-    )
-
-
-def _unavailable_error() -> OpenAIProtocolError:
-    """The 503 for a video whose serving provider or storage is unreachable now."""
-    return OpenAIProtocolError(
-        status_code=503,
-        code="unavailable_route",
-        message="The provider serving this video is not available; retry shortly.",
-        error_type="api_error",
-    )
-
-
-def _internal_failure() -> GatewayFailure:
-    """The terminal failure for a job row that could not be persisted."""
-    return GatewayFailure(
-        failure_class=GatewayFailureClass.INTERNAL,
-        safe_message="the video job could not be recorded",
-    )

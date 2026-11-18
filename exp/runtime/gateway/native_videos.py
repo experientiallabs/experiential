@@ -24,7 +24,9 @@ from typing import Protocol
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError, authority_error
+from exp.runtime.gateway.native_capture import CaptureController
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
+from exp.runtime.gateway.native_settlement import optional_text
 from exp.runtime.gateway.video.contracts import render_deleted_object, render_video_object
 from exp.runtime.gateway.video.engine import VideoEngine
 from exp.runtime.gateway.video.output import VideoOutputStore
@@ -42,6 +44,7 @@ class _VideoPlane(Protocol):
     _write_ledger: SyncWriteLedger
     _guardrails: GuardrailEngine | None
     _videos: VideoEngine | None
+    _capture: CaptureController | None
 
 
 def _disabled() -> NativeBridgeError:
@@ -112,6 +115,7 @@ class NativeVideosMixin:
                 jobs=jobs,
                 guardrails=self._guardrails,
                 outputs=outputs,
+                capture=self._capture,
             )
         )
         if self._videos is not None and start_poller:
@@ -172,6 +176,7 @@ class NativeVideosMixin:
             request=decoded.request,
             reference_image=decoded.reference_image,
             client_headers={key: data[key] for key in _CLIENT_HEADER_KEYS if key in data},
+            session_id=optional_text(data.get("capture_session_id")),
         )
         return json.dumps(render_video_object(job), separators=(",", ":"))
 

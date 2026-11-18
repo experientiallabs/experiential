@@ -34,6 +34,12 @@ impl CaptureResponse {
             "chat" => Protocol::ChatCompletions,
             "messages" => Protocol::Messages,
             "generate_content" => Protocol::GenerateContent,
+            "embeddings" => Protocol::Embeddings,
+            "images" => Protocol::Images,
+            "decisions" => Protocol::Decisions,
+            "speech" => Protocol::Speech,
+            "transcription" => Protocol::Transcription,
+            "video" => Protocol::Video,
             _ => return Err(PyValueError::new_err("unknown capture protocol")),
         };
         let (body_json, completed, events_json) =
@@ -363,13 +369,96 @@ impl CaptureCollector {
 
     /// Register effective input from authenticated admission, without writing content.
     fn begin(&self, py: Python<'_>, request_json: &str) -> bool {
-        self.begin_bytes(py, request_json.as_bytes())
+        let collector = self.inner.clone();
+        py.detach(|| begin_bytes(&collector, request_json.as_bytes()))
     }
 
     /// Borrow immutable UTF-8 bytes without widening and re-encoding a Python string.
-    fn begin_bytes(&self, py: Python<'_>, request_json: &[u8]) -> bool {
+    ///
+    /// `ttl_seconds` keeps the entry past the configured TTL for a request
+    /// that settles later (a provider job), up to `MAXIMUM_JOB_TTL_SECONDS`.
+    #[pyo3(signature = (request_json, ttl_seconds=None))]
+    fn begin_bytes(
+        &self,
+        py: Python<'_>,
+        request_json: &[u8],
+        ttl_seconds: Option<f64>,
+    ) -> PyResult<bool> {
+        let ttl = match ttl_seconds {
+            None => None,
+            Some(seconds)
+                if seconds.is_finite() && (0.0..=MAXIMUM_JOB_TTL_SECONDS).contains(&seconds) =>
+            {
+                Some(Duration::from_secs_f64(seconds))
+            }
+            Some(_) => return Err(PyValueError::new_err("invalid capture ttl")),
+        };
         let collector = self.inner.clone();
-        py.detach(|| begin_bytes(&collector, request_json))
+        Ok(py.detach(|| begin_bytes_until(&collector, request_json, ttl)))
+    }
+
+    /// Describe one caller-sent or produced binary part of a live capture.
+    /// `part` is `input` or `output`; `kind` is `image`, `audio`, `video` or
+    /// `vector`. The bytes go to the spill directory, never into the record.
+    fn attach_media(
+        &self,
+        py: Python<'_>,
+        request_id: &str,
+        part: &str,
+        kind: &str,
+        mime: &str,
+        data: Vec<u8>,
+    ) -> PyResult<bool> {
+        use super::media::{MediaKind, MediaPart, MediaRole};
+        let role = match part {
+            "input" => MediaRole::Input,
+            "output" => MediaRole::Output,
+            _ => return Err(PyValueError::new_err("unknown media part")),
+        };
+        let kind = match kind {
+            "image" => MediaKind::Image,
+            "audio" => MediaKind::Audio,
+            "video" => MediaKind::Video,
+            "vector" => MediaKind::Vector,
+            _ => return Err(PyValueError::new_err("unknown media kind")),
+        };
+        let collector = self.inner.clone();
+        Ok(py.detach(|| {
+            if !collector.registered(request_id) {
+                return false;
+            }
+            let store = collector.spill().cloned();
+            let media =
+                MediaPart::new(role, kind, mime, bytes::Bytes::from(data), store.as_deref());
+            collector.attach_media(request_id, vec![media])
+        }))
+    }
+
+    /// Record a provider job's state as its request's response: the job at
+    /// creation, then again at its terminal state, before settlement.
+    #[pyo3(signature = (request_id, body_json, job_id, deadline, deployment_id=None))]
+    fn finish_job(
+        &self,
+        py: Python<'_>,
+        request_id: &str,
+        body_json: &str,
+        job_id: &str,
+        deadline: f64,
+        deployment_id: Option<String>,
+    ) -> PyResult<bool> {
+        if job_id.is_empty() || job_id.len() > 512 || !deadline.is_finite() || deadline < 0.0 {
+            return Err(PyValueError::new_err("invalid provider job"));
+        }
+        let body: Value = serde_json::from_str(body_json)
+            .ok()
+            .filter(Value::is_object)
+            .ok_or_else(|| PyValueError::new_err("provider job body must be a JSON object"))?;
+        let job = super::media::ProviderJob {
+            id: job_id.to_owned(),
+            deadline,
+        };
+        let collector = self.inner.clone();
+        Ok(py.detach(|| collector.finish_job(request_id, body, job, deployment_id)))
     }
 
     /// Freeze resolved model provenance before response collection begins.
@@ -438,8 +527,20 @@ impl CaptureCollector {
     }
 }
 
+/// Longest capture lifetime a provider job may ask for: a video job's settlement window.
+const MAXIMUM_JOB_TTL_SECONDS: f64 = 4.0 * 3600.0;
+
 /// Register an already prepared authenticated envelope through the one capture boundary.
 pub(crate) fn begin_bytes(collector: &Collector, request_json: &[u8]) -> bool {
+    begin_bytes_until(collector, request_json, None)
+}
+
+/// [`begin_bytes`] with an entry lifetime past the configured TTL.
+pub(crate) fn begin_bytes_until(
+    collector: &Collector,
+    request_json: &[u8],
+    ttl: Option<Duration>,
+) -> bool {
     if !collector.config.truncate_request
         && request_json.len() > collector.config.maximum_request_bytes
     {
@@ -469,5 +570,5 @@ pub(crate) fn begin_bytes(collector: &Collector, request_json: &[u8]) -> bool {
             Value::String(source.context.get().to_owned()),
         );
     }
-    collector.begin(request)
+    collector.begin_until(request, ttl)
 }

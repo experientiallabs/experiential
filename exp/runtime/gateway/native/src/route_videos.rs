@@ -200,6 +200,7 @@ pub(crate) async fn videos_create(
         "bearer_key": key,
         "fields": Value::Object(fields),
         "reference": reference.unwrap_or(Value::Null),
+        "capture_session_id": crate::capture::session_id(&headers),
     });
     with_app_identity(&mut payload, &headers);
     plane_json(&state, "video_create", payload).await

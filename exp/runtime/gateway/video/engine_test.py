@@ -41,6 +41,7 @@ from exp.runtime.gateway.lifecycle import LocalGatewayComponents, load_gateway_c
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
 from exp.runtime.gateway.native_bridge import NativeControlPlane
+from exp.runtime.gateway.native_capture import ALL_CAPTURE_PROTOCOLS, CaptureController
 from exp.runtime.gateway.stream_contracts import (
     BilledUnits,
     GatewayEvent,
@@ -50,8 +51,10 @@ from exp.runtime.gateway.stream_contracts import (
     GatewayUsage,
 )
 from exp.runtime.gateway.tests.certified_pool_fixture_test import upsert_certified_pool
+from exp.runtime.gateway.video.capture import VideoCapture
 from exp.runtime.gateway.video.contracts import (
     VIDEO_JOB_SETTLEMENT_SECONDS,
+    VIDEO_LEDGER_DEADLINE_SLACK_SECONDS,
     VideoJob,
     VideoRequest,
     VideoStatus,
@@ -1668,3 +1671,73 @@ def test_without_a_store_xai_is_submitted_without_output(setup: _Setup) -> None:
     job = _create(setup, alias="grok-video", seconds=6)
     assert not job.output_stored
     assert "output" not in setup.provider.bodies[0]
+
+
+class _JobCapture:
+    """Record what a video job hands its capture collector."""
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.begun: list[tuple[dict[str, object], float | None]] = []
+        self.jobs: list[tuple[str, dict[str, object], str, float]] = []
+
+    def begin_bytes(self, request_json: bytes, ttl_seconds: float | None = None) -> bool:
+        """Accept the registration."""
+        self.begun.append((json.loads(request_json), ttl_seconds))
+        return True
+
+    def finish_job(
+        self,
+        request_id: str,
+        body_json: str,
+        job_id: str,
+        deadline: float,
+        deployment_id: str | None = None,
+    ) -> bool:
+        """Remember each job state."""
+        del deployment_id
+        self.jobs.append((request_id, json.loads(body_json), job_id, deadline))
+        return True
+
+    def settle(self, request_id: str, keep_prompt: bool, keep_response: bool) -> None:
+        """Releases are not expected on a served job."""
+        raise AssertionError((request_id, keep_prompt, keep_response))
+
+
+def test_a_captured_job_lives_to_its_deadline_and_records_its_terminal_state(
+    setup: _Setup,
+) -> None:
+    """The record holds the request, then the created job, then the settled job."""
+    collector = _JobCapture()
+    setup.engine._capture = VideoCapture(  # noqa: SLF001
+        CaptureController(
+            collector,  # ty: ignore[invalid-argument-type]
+            application_for=lambda _authorization: "app",
+            protocols=ALL_CAPTURE_PROTOCOLS,
+        )
+    )
+    job = _create(setup, alias="grok-video", seconds=6)
+    envelope, ttl = collector.begun[0]
+    assert envelope["protocol"] == "video"
+    assert ttl == VIDEO_JOB_SETTLEMENT_SECONDS + VIDEO_LEDGER_DEADLINE_SLACK_SECONDS
+    request_id, created, job_id, deadline = collector.jobs[0]
+    assert request_id == job.request_id
+    assert created["status"] == "queued"
+    assert job_id == job.provider_job_id
+    assert deadline == job.settle_by.timestamp()
+    setup.engine.refresh(job)
+    assert collector.jobs[-1][1]["status"] == "completed"
+
+
+def test_a_controller_without_video_never_sees_a_job(setup: _Setup) -> None:
+    """A host that did not opt into video capture gets no call at all."""
+    collector = _JobCapture()
+    setup.engine._capture = VideoCapture(  # noqa: SLF001
+        CaptureController(
+            collector,  # ty: ignore[invalid-argument-type]
+            application_for=lambda _authorization: "app",
+        )
+    )
+    _create(setup, alias="grok-video", seconds=6)
+    assert collector.begun == []
+    assert collector.jobs == []

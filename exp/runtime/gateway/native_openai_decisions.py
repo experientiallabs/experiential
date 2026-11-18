@@ -35,7 +35,10 @@ from exp.runtime.gateway.google_decisions_contracts import (
 )
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
-from exp.runtime.gateway.guardrails.native import require_unguarded_surface
+from exp.runtime.gateway.guardrails.native import (
+    admit_with_capture,
+    require_unguarded_surface,
+)
 from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
@@ -45,6 +48,7 @@ from exp.runtime.gateway.native_accounting import (
 from exp.runtime.gateway.native_admission import (
     record_dead_admission_rungs,
 )
+from exp.runtime.gateway.native_capture import CaptureController
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
 from exp.runtime.gateway.native_dead_rungs import UNAVAILABLE_AT_ADMISSION
 from exp.runtime.gateway.native_decisions import (
@@ -76,6 +80,7 @@ class _OpenAIDecisionsPlane(Protocol):
 
     _components: NativeGatewayComponents
     _accounting: NativeAttemptAccounting
+    _capture: CaptureController | None
     _write_ledger: SyncWriteLedger
     _request_timeout_seconds: float
     _guardrails: GuardrailEngine | None
@@ -217,7 +222,14 @@ class NativeOpenAIDecisionsMixin:
         except Exception as exc:  # noqa: BLE001 - sanitize the authority boundary.
             raise authority_error(exc) from exc
         try:
-            return _admit_accepted(self, authorization, decoded.request, deadline)
+            return admit_with_capture(
+                self._capture,
+                self._accounting,
+                authorization,
+                decoded.request,
+                optional_text(data.get("capture_session_id")),
+                lambda: _admit_accepted(self, authorization, decoded.request, deadline),
+            )
         except NativeBridgeError:
             raise
         except Exception as exc:  # noqa: BLE001 - close every accepted failure.
