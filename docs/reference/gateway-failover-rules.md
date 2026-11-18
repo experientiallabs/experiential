@@ -104,12 +104,13 @@ second refusal, the caller receives the provider's 400 unchanged.
 
 A model can sample a client tool call whose streamed arguments never become one JSON object
 ("streamed tool arguments are not valid JSON"); another dial, on a sibling lane or the same one, will
-usually sample a valid call. So a turn whose first outward output is a client tool call is held
+usually sample a valid call. So a turn whose first outward output is a client function call is held
 uncommitted until the turn ends (`waterfall/commit.rs`, `HeldToolCalls`): the call's opening, its
 argument deltas, and every later event wait in order, and the turn commits on its successful
 terminal with exactly the events the caller would otherwise have received live. The hold is bounded
 (64 KiB of retained output, 8,192 events): past it, or as soon as the provider reports a tool it
-executes itself, the turn commits and streams live as before. Output the caller already saw (text
+executes itself, the turn commits and streams live as before. A freeform (custom) tool's input is
+opaque text that never fails to parse, so a turn opening with one is not held. Output the caller already saw (text
 before the call, a provider-executed tool) is never held.
 
 A held call that fails to validate is filed `malformed_response` with `malformed_tool_call`, and

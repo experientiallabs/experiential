@@ -273,9 +273,16 @@ impl Normalizer {
         };
         let raw_arguments = match call.get("args") {
             None => "{}".to_string(),
-            Some(arguments @ Value::Object(_)) => serde_json::to_string(arguments)
-                .map_err(|_| malformed("Gemini functionCall args must be an object"))?,
-            Some(_) => return Err(malformed("Gemini functionCall args must be an object")),
+            Some(arguments @ Value::Object(_)) => {
+                serde_json::to_string(arguments).map_err(|_| {
+                    super::malformed_tool_call("Gemini functionCall args must be an object")
+                })?
+            }
+            Some(_) => {
+                return Err(super::malformed_tool_call(
+                    "Gemini functionCall args must be an object",
+                ))
+            }
         };
         self.reserve_tool_bytes(raw_arguments.len())?;
         let mut tool = ToolAccumulator::new(call_id.clone(), name.clone());

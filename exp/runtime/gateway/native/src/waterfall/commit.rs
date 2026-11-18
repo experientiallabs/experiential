@@ -156,12 +156,25 @@ pub(super) struct HeldToolCalls {
 }
 
 impl HeldToolCalls {
-    /// Decide `event`. A hold starts only on a client tool call's start
+    /// Decide `event`. A hold starts only on a client function call's start
     /// while nothing else is withheld (`nothing_withheld`), so the held
     /// events never interleave with a withheld refusal or reasoning carrier.
     pub(super) fn consider(&mut self, event: &Event, nothing_withheld: bool) -> Hold {
         if self.events.is_empty() {
-            if nothing_withheld && matches!(event, Event::ToolCallStarted { .. }) {
+            // Freeform (custom) input is opaque text that never fails to
+            // parse, so it gains nothing from a hold and streams as before.
+            // A Responses rung opens the function call's item scaffold
+            // just before the call itself; the scaffold carries no call data,
+            // so it starts the hold too.
+            let opens_function_call = matches!(
+                event,
+                Event::ToolCallStarted { custom: false, .. }
+                    | Event::ProviderOutputItemStarted {
+                        kind: crate::events::ProviderOutputItemKind::FunctionCall,
+                        ..
+                    }
+            );
+            if nothing_withheld && opens_function_call {
                 return self.push(event);
             }
             return Hold::Pass;
@@ -182,7 +195,24 @@ impl HeldToolCalls {
     }
 
     fn push(&mut self, event: &Event) -> Hold {
-        let bytes = crate::relay::event_retained_bytes(event);
+        // The retention estimator charges a call's opening a flat size; the
+        // held clone owns its provider-set identifiers, so charge them too.
+        let identifiers = match event {
+            Event::ToolCallStarted {
+                call_id,
+                name,
+                namespace,
+                thought_signature,
+                ..
+            } => {
+                call_id.len()
+                    + name.len()
+                    + namespace.as_deref().map_or(0, str::len)
+                    + thought_signature.as_deref().map_or(0, str::len)
+            }
+            _ => 0,
+        };
+        let bytes = crate::relay::event_retained_bytes(event).saturating_add(identifiers);
         if self.bytes.saturating_add(bytes) > MAXIMUM_HELD_TOOL_CALL_BYTES
             || self.events.len() + 1 > MAXIMUM_HELD_TOOL_CALL_EVENTS
         {
@@ -241,6 +271,16 @@ mod held_tool_call_tests {
             name: "web_search".to_string(),
         };
         assert_eq!(held.consider(&server, true), Hold::Pass);
+        let custom = Event::ToolCallStarted {
+            custom: true,
+            index: 0,
+            call_id: "call_1".to_string(),
+            name: "apply_patch".to_string(),
+            namespace: None,
+            caller: None,
+            thought_signature: None,
+        };
+        assert_eq!(held.consider(&custom, true), Hold::Pass);
         assert_eq!(held.consider(&started(), true), Hold::Held);
     }
 
@@ -262,6 +302,50 @@ mod held_tool_call_tests {
         assert_eq!(events.len(), 3, "usage stays tracked, never held");
         assert!(matches!(events[0], Event::ToolCallStarted { .. }));
         assert!(matches!(events[2], Event::TextDelta(_)));
+    }
+
+    #[test]
+    fn a_responses_function_call_scaffold_starts_the_hold() {
+        let mut held = HeldToolCalls::default();
+        let scaffold = |kind| Event::ProviderOutputItemStarted {
+            output_index: 0,
+            item_id: Some("fc_1".to_string()),
+            kind,
+            status: None,
+            phase: None,
+        };
+        assert_eq!(
+            held.consider(
+                &scaffold(crate::events::ProviderOutputItemKind::Message),
+                true
+            ),
+            Hold::Pass
+        );
+        assert_eq!(
+            held.consider(
+                &scaffold(crate::events::ProviderOutputItemKind::FunctionCall),
+                true
+            ),
+            Hold::Held
+        );
+        assert_eq!(held.consider(&started(), true), Hold::Held);
+    }
+
+    #[test]
+    fn a_call_opening_is_charged_its_identifiers() {
+        let mut held = HeldToolCalls::default();
+        let long = Event::ToolCallStarted {
+            custom: false,
+            index: 0,
+            call_id: "c".repeat(MAXIMUM_HELD_TOOL_CALL_BYTES),
+            name: "write".to_string(),
+            namespace: None,
+            caller: None,
+            thought_signature: None,
+        };
+        assert_eq!(held.consider(&long, true), Hold::Pass);
+        held.consider(&started(), true);
+        assert_eq!(held.consider(&long, true), Hold::Release);
     }
 
     #[test]
