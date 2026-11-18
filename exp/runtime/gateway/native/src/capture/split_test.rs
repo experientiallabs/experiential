@@ -32,6 +32,7 @@ pub(crate) fn record(context: Value, response: Option<Response>) -> Record {
         provider_logprobs: None,
         transport_body: None,
         messages_part: None,
+        media: Default::default(),
     }
 }
 

@@ -54,7 +54,8 @@ output is exposed. A host for which capture must never fail a request sets
 `CaptureCollector.checkpoint_discarded()`, and the response is returned unchanged.
 Monitor that counter; a discarded request leaves no capture record.
 
-Chat Completions, Responses and Messages HTTP surfaces share the same native tap.
+Chat Completions, Responses and Messages HTTP surfaces share the same native tap
+(media surfaces: see "Media surfaces" below).
 JSON bodies and ordered SSE data payloads retain unknown fields. The observation
 boundary is the native HTTP listener, which may feed a hosted relay; it does not
 prove that an end user consumed every byte. `truncated` and
@@ -336,6 +337,48 @@ after pruning. A concurrent reader can temporarily prevent WAL truncation; this 
 reported as a maintenance failure and retried on idle maintenance, not claimed as
 successful physical erasure. OS snapshots, backups, and storage-device remanence are
 outside this database lifecycle. Expired rows are never returned by the reader API.
+
+## Media surfaces
+
+`CaptureController(..., protocols=ALL_CAPTURE_PROTOCOLS)` also captures the
+embeddings, images (generations and edits), decisions, speech, transcription
+and video surfaces. The default, `TEXT_CAPTURE_PROTOCOLS`, captures only Chat
+Completions, Responses, Messages and Gemini `generateContent`; a host opts in
+once its destination stores the records below. `request.protocol` is the public
+surface name (`embeddings`, `images`, `decisions`, `speech`, `transcription`,
+`video`). The context is the request's public JSON projection; an edit's
+uploaded images are named in `request.edit.inputs` but never copied there.
+
+Binary content never enters the record JSON. Each part becomes an entry of
+`media` with `part` (`input` or `output`), `kind` (`image`, `audio`, `video` or
+`vector`), `mime`, `bytes` and `sha256`. With a spilling collector the Rust data
+plane writes the bytes to the spill directory and the entry names the complete
+file as `spill_path`, removed once the destination acknowledges the record;
+without one, or when a disk budget cut the file, `spill_path` is null. The
+response keeps its JSON with the binary values removed:
+
+| Surface | Response JSON | Media parts |
+| --- | --- | --- |
+| Embeddings | `data[]` without `embedding` | one `vector` output part (a JSON array in data order), plus `vector_summary` `{count, dimensions}` |
+| Images | `data[]` without `b64_json` | one decoded `image` output part per item, in data order; an edit's uploads as `image` input parts |
+| Speech | `{content_type, bytes}` | the `audio` output |
+| Transcription | the transcript JSON, or `{content_type, text}` for text formats | the uploaded `audio` input |
+| Decisions | the answer, as on chat | none |
+| Video | the video job object | the reference image as an `image` input |
+
+A video record lives until the job's settlement deadline instead of the
+configured TTL and carries `provider_job` `{id, deadline}`. Its response is the
+job at creation, replaced by the terminal job before the job's settlement, so
+the record emitted at settlement describes the finished render. The rendered
+file itself is not captured; the job id lets a host fetch it while the provider
+still holds it. A job settled by another process leaves this capture to expire.
+
+`settle(request_id, keep_prompt, keep_response)` keeps both halves, or one: with
+`keep_prompt=False, keep_response=True` the record's context becomes the empty
+`{"schema_version": 1, "request": {}}`, input parts and the redacted wire request
+are dropped, and `omitted_parts` is `["request"]`; with `keep_response=False` the
+response, output parts and vector summary are dropped and `omitted_parts` is
+`["response"]`. A destination can honor either half without parsing bodies.
 
 ## Uncapped capture: disk spill and split records
 

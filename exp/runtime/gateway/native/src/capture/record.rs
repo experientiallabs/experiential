@@ -27,6 +27,38 @@ pub(crate) enum Protocol {
     Responses,
     Messages,
     GenerateContent,
+    Embeddings,
+    Images,
+    Decisions,
+    Speech,
+    Transcription,
+    Video,
+}
+
+impl Protocol {
+    /// Whether this is a media surface rather than a conversation protocol.
+    pub(crate) fn is_media(self) -> bool {
+        !matches!(
+            self,
+            Self::ChatCompletions | Self::Responses | Self::Messages | Self::GenerateContent
+        )
+    }
+
+    /// The wire name, equal to the public surface value the ledger records.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat_completions",
+            Self::Responses => "responses",
+            Self::Messages => "messages",
+            Self::GenerateContent => "generate_content",
+            Self::Embeddings => "embeddings",
+            Self::Images => "images",
+            Self::Decisions => "decisions",
+            Self::Speech => "speech",
+            Self::Transcription => "transcription",
+            Self::Video => "video",
+        }
+    }
 }
 
 /// Effective input supplied by the authenticated, post-guardrail admission seam.
@@ -42,12 +74,7 @@ pub(crate) struct Request {
 
 impl Request {
     pub(crate) fn json_bytes(&self) -> usize {
-        let protocol = match self.protocol {
-            Protocol::ChatCompletions => "chat_completions",
-            Protocol::Responses => "responses",
-            Protocol::Messages => "messages",
-            Protocol::GenerateContent => "generate_content",
-        };
+        let protocol = self.protocol.as_str();
         r#"{"request_id":,"scope":{"organization_id":,"identity_id":,"application_id":},"protocol":,"model_id":,"context":}"#.len()
             + string_bytes(&self.request_id)
             + string_bytes(&self.scope.organization_id)
@@ -135,8 +162,10 @@ impl Response {
 }
 
 /// One idempotent request update. A later update may supply its response.
+///
+/// Decoding (used by tests reading back what a destination received) ignores
+/// the media keys, which serialization writes by hand from `media`.
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct Record<R = Response> {
     /// Internal delivery dependency, never part of a complete capture record.
     #[serde(skip)]
@@ -170,6 +199,11 @@ pub(crate) struct Record<R = Response> {
     /// holds every other field. Only a split record can carry it.
     #[serde(skip)]
     pub messages_part: Option<Arc<super::spill::PendingPart>>,
+    /// Binary parts, vector summary and provider job of a media surface, and
+    /// the halves settlement omitted (any surface). Only keys that carry
+    /// something are serialized.
+    #[serde(skip)]
+    pub media: super::media::MediaCapture,
 }
 
 /// Borrow ordinary reasoning; materialize a lossless projection only for NUL text.
@@ -296,6 +330,7 @@ impl<R: Serialize> Record<R> {
         {
             record.serialize_field("provider_logprobs", logprobs)?;
         }
+        self.media.serialize_fields(&mut record)?;
         record.end()
     }
 }
@@ -330,6 +365,7 @@ impl Record {
             provider_logprobs: self.provider_logprobs.clone(),
             transport_body: None,
             messages_part: None,
+            media: self.media.clone(),
         };
         serde_json::to_value(&copy).ok()
     }
@@ -424,6 +460,7 @@ impl Record {
                 .gemini_thought_parts_source_json
                 .as_ref()
                 .map_or(0, String::capacity)
+            + self.media.heap_bytes()
     }
 }
 

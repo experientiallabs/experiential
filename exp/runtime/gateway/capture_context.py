@@ -8,9 +8,10 @@ import re
 from pydantic import JsonValue
 from pydantic_core import to_jsonable_python
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.core.durable_json import normalize_durable_object
 from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.replay_identity import provider_replay_authority
 
 _SURROGATE = re.compile("[\ud800-\udfff]")
@@ -45,6 +46,41 @@ def capture_context_document(
     }
     if internal:
         document["provider_internal"] = internal
+    return _finish_document(document, session_id)
+
+
+def media_capture_context_document(
+    request: ContractModel, *, session_id: str | None = None
+) -> JsonObject:
+    """Project a media surface's effective request, without its binary inputs.
+
+    An edit's caller-sent images are named but not copied: their bytes become
+    input media parts of the record. A video's reference image is already
+    only its facts (type, size, digest). The rest of the request is its public
+    JSON projection.
+
+    Args:
+        request: A decoded embeddings, images, speech, transcription, decisions
+            or video request.
+        session_id: Optional non-authoritative caller correlation.
+
+    Returns:
+        Storable capture context, with exact exceptional text in source_json.
+    """
+    projection = request.model_dump(mode="json", exclude_none=True, exclude={"idempotency_key"})
+    if isinstance(request, ImagesRequest) and request.edit is not None:
+        projection["edit"] = {
+            "inputs": [
+                name
+                for name in ("image", "mask", "style_image")
+                if getattr(request.edit, name) is not None
+            ]
+        }
+    return _finish_document({"schema_version": 1, "request": projection}, session_id)
+
+
+def _finish_document(document: JsonObject, session_id: str | None) -> JsonObject:
+    """Add a valid session id and the lossless sidecar for exceptional text."""
     if session_id and len(session_id) <= 512 and all("!" <= char <= "~" for char in session_id):
         document["session_id"] = session_id
     if not _exceptional_text(document):

@@ -3,6 +3,7 @@
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
+use axum::http::HeaderMap;
 use pyo3::prelude::*;
 
 use super::*;

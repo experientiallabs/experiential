@@ -30,6 +30,7 @@ fn record<R>(response: R) -> Record<R> {
         captured_at: 1.0,
         transport_body: None,
         messages_part: None,
+        media: Default::default(),
     }
 }
 

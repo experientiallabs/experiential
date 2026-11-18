@@ -40,6 +40,7 @@ class _Plane(NativeVideosMixin):
         self._components = cast(Any, SimpleNamespace(video_jobs=video_jobs))
         self._write_ledger = cast(Any, _Ledger())
         self._guardrails = None
+        self._capture = None
         self._bind_videos(start_poller=False)
 
 

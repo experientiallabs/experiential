@@ -51,6 +51,8 @@ impl<'a> CapturedResponse<'a> {
             Protocol::Responses => body["status"] == "completed",
             Protocol::Messages => body["stop_reason"].as_str().is_some_and(|v| !v.is_empty()),
             Protocol::ChatCompletions | Protocol::GenerateContent => terminal(protocol, &body),
+            protocol if protocol.is_media() => terminal(protocol, &body),
+            _ => unreachable!("every text protocol is matched above"),
         };
         Self {
             body,
@@ -75,6 +77,8 @@ impl<'a> CapturedResponse<'a> {
                     .as_str()
                     .is_some_and(|r| !r.is_empty())
             }),
+            // Media surfaces answer whole JSON bodies; a stream is not one of them.
+            _ => false,
         };
         let mut valid = true;
         let body = match protocol {
@@ -101,6 +105,7 @@ impl<'a> CapturedResponse<'a> {
                 valid = assembled;
                 Some(Cow::Owned(body))
             }
+            _ => None,
         };
         let mut body = body.unwrap_or_else(|| Cow::Owned(json!({"capture_incomplete": true})));
         if let Some(error) = frames.iter().find(|v| has_error(v)) {
@@ -188,6 +193,13 @@ fn terminal(protocol: Protocol, body: &Value) -> bool {
                     .iter()
                     .all(|v| v["finishReason"].as_str().is_some_and(|v| !v.is_empty()))
         }),
+        // A video answer is a job; it is terminal once the render completed.
+        Protocol::Video => body["status"] == "completed",
+        Protocol::Embeddings
+        | Protocol::Images
+        | Protocol::Decisions
+        | Protocol::Speech
+        | Protocol::Transcription => body.is_object() && !has_error(body),
     }
 }
 

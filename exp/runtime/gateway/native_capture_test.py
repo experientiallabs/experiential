@@ -23,12 +23,14 @@ from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPl
 from exp.runtime.gateway.native_capture import (
     CaptureConfiguration,
     CaptureController,
+    CaptureSource,
     CaptureDeliveryLimits,
     CaptureMetrics,
     CaptureRecord,
     CaptureRequest,
     CaptureSpillConfiguration,
     CaptureSseResponse,
+    begin_capture,
 )
 from exp.runtime.gateway.native_server import serve_native_gateway
 from exp.runtime.gateway.routing import GatewayRoutingError
@@ -1447,3 +1449,127 @@ def test_capture_metrics_admit_the_twelve_hour_write_subset() -> None:
     )
     assert metrics.usage is not None
     assert metrics.usage.cache_creation_12h_input_tokens == 3247
+
+
+def _media_request_json(request_id: str, protocol: str) -> bytes:
+    """One prepared media envelope, as a controller would hand it over."""
+    return json.dumps(
+        {
+            "request_id": request_id,
+            "scope": {"organization_id": "org", "identity_id": "identity", "application_id": "app"},
+            "protocol": protocol,
+            "model_id": "model",
+            "context": {"schema_version": 1, "request": {"prompt": "waves"}},
+        }
+    ).encode()
+
+
+def test_media_records_carry_parts_jobs_and_omitted_halves(tmp_path: Path) -> None:
+    """A job keeps its latest state; a refused half is named, never silently absent."""
+    records: list[str] = []
+    configuration = CaptureConfiguration(spill=CaptureSpillConfiguration(directory=str(tmp_path)))
+    collector = native.CaptureCollector.batched(
+        configuration.model_dump_json(),
+        lambda batch: [records.append(record) is None for record in batch],
+    )
+    assert collector.begin_bytes(_media_request_json("video", "video"), 7200.0)
+    assert collector.attach_media("video", "input", "image", "image/png", b"\x89PNGframe")
+    created = json.dumps({"id": "video_1", "object": "video", "status": "queued"})
+    assert collector.finish_job("video", created, "job-1", 1_900_000_000.0, "deployment-v")
+    finished = json.dumps({"id": "video_1", "object": "video", "status": "completed"})
+    assert collector.finish_job("video", finished, "job-1", 1_900_000_000.0)
+    collector.settle("video", True, True)
+    assert collector.begin_bytes(_media_request_json("private", "video"), 60.0)
+    assert collector.attach_media("private", "input", "image", "image/png", b"frame")
+    assert collector.finish_job("private", finished, "job-2", 1_900_000_000.0)
+    collector.settle("private", False, True)
+    assert collector.close(5)
+    by_id = {
+        record.request.request_id: record
+        for record in (CaptureRecord.model_validate_json(raw) for raw in records)
+    }
+    video = by_id["video"]
+    assert video.request.protocol == "video"
+    assert video.response is not None and video.response.kind == "json"
+    assert video.response.body == {"id": "video_1", "object": "video", "status": "completed"}
+    assert video.deployment_id == "deployment-v"
+    assert video.provider_job is not None and video.provider_job.id == "job-1"
+    (part,) = video.media
+    assert (part.part, part.kind, part.mime, part.bytes) == ("input", "image", "image/png", 9)
+    assert part.spill_path is not None and part.spill_path.startswith(str(tmp_path))
+    private = by_id["private"]
+    assert private.omitted_parts == ("request",)
+    assert private.request.context == {"schema_version": 1, "request": {}}
+    assert private.media == ()
+    assert private.response is not None
+
+
+def test_media_capture_rejects_invalid_parts_jobs_and_lifetimes() -> None:
+    """The native boundary refuses unknown vocabularies and unbounded lifetimes."""
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), lambda _r: None)
+    with pytest.raises(ValueError, match="capture ttl"):
+        collector.begin_bytes(_media_request_json("job", "video"), 5 * 3600.0)
+    assert collector.begin_bytes(_media_request_json("job", "video"), 60.0)
+    with pytest.raises(ValueError, match="media part"):
+        collector.attach_media("job", "middle", "image", "image/png", b"x")
+    with pytest.raises(ValueError, match="media kind"):
+        collector.attach_media("job", "input", "document", "application/pdf", b"x")
+    with pytest.raises(ValueError, match="JSON object"):
+        collector.finish_job("job", "[]", "job-1", 1.0)
+    assert not collector.attach_media("unknown", "input", "image", "image/png", b"x")
+    collector.settle("job", False, False)
+    assert collector.close(1)
+
+
+def test_capture_requests_accept_every_surface_protocol() -> None:
+    """The envelope vocabulary is the public surface vocabulary."""
+    for protocol in (
+        "embeddings",
+        "images",
+        "decisions",
+        "speech",
+        "transcription",
+        "video",
+    ):
+        envelope = json.loads(_media_request_json("request", protocol))
+        assert CaptureRequest.model_validate(envelope).protocol == protocol
+    with pytest.raises(ValidationError):
+        CaptureRequest.model_validate(json.loads(_media_request_json("request", "decision")))
+
+
+def test_begin_capture_keeps_the_subclass_signature_without_a_lifetime() -> None:
+    """A host subclass that overrides begin without ttl_seconds keeps capturing."""
+
+    class _Host(CaptureController):
+        """A host override written before job lifetimes existed."""
+
+        def begin(  # ty: ignore[invalid-method-override]
+            self,
+            authorization: AuthorizationSnapshot,
+            request: CaptureSource,
+            model_id: str | None,
+            *,
+            session_id: str | None = None,
+        ) -> bool:
+            """Admit every request."""
+            del authorization, request, model_id, session_id
+            return True
+
+    collector = native.CaptureCollector(CaptureConfiguration().model_dump_json(), lambda _r: None)
+    host = _Host(collector, application_for=lambda _authorization: "app")
+    request = decode_chat({"model": "m", "messages": [{"role": "user", "content": "x"}]}).request
+    authorization = AuthorizationSnapshot(
+        request_id="request",
+        organization_id="org",
+        identity_id="identity",
+        virtual_key_id="key",
+        alias="coding",
+        alias_revision_id="revision",
+        target=DirectTarget(pool_id="pool"),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        catalog_sha256="a" * 64,
+        canonical_request_sha256="b" * 64,
+        deadline_monotonic=1.0,
+    )
+    assert begin_capture(host, authorization, request)
+    assert collector.close(1)

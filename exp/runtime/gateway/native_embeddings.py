@@ -32,7 +32,10 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
-from exp.runtime.gateway.guardrails.native import require_unguarded_surface
+from exp.runtime.gateway.guardrails.native import (
+    admit_with_capture,
+    require_unguarded_surface,
+)
 from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
@@ -42,6 +45,7 @@ from exp.runtime.gateway.native_accounting import (
 from exp.runtime.gateway.native_admission import (
     record_dead_admission_rungs,
 )
+from exp.runtime.gateway.native_capture import CaptureController
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
 from exp.runtime.gateway.native_dead_rungs import UNAVAILABLE_AT_ADMISSION
 from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_embeddings_body
@@ -54,7 +58,7 @@ from exp.runtime.gateway.native_execution import (
     dispatchable_route_profiles,
     select_route_deployments,
 )
-from exp.runtime.gateway.native_settlement import gateway_updating_failure
+from exp.runtime.gateway.native_settlement import gateway_updating_failure, optional_text
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers import require_gateway_provider
 from exp.runtime.models.providers.openai_compatible import openai_embedding_request
@@ -66,6 +70,7 @@ class _EmbeddingsPlane(Protocol):
 
     _components: NativeGatewayComponents
     _accounting: NativeAttemptAccounting
+    _capture: CaptureController | None
     _write_ledger: SyncWriteLedger
     _request_timeout_seconds: float
     _guardrails: GuardrailEngine | None
@@ -158,7 +163,14 @@ class NativeEmbeddingsMixin:
             self._write_ledger.accept_request(authorization=authorization)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise authority_error(exc) from exc
-        return _admit_accepted(self, authorization, request, deadline)
+        return admit_with_capture(
+            self._capture,
+            self._accounting,
+            authorization,
+            request,
+            optional_text(data.get("capture_session_id")),
+            lambda: _admit_accepted(self, authorization, request, deadline),
+        )
 
 
 def _admit_accepted(

@@ -144,6 +144,9 @@ struct Pending {
     // Keep collector admission charged until the destination acknowledges.
     _admission: Option<Arc<Admission>>,
     checkpoint: Option<(CheckpointLease, Option<tokio::sync::oneshot::Sender<bool>>)>,
+    /// Media spill files the prepared payload names; they outlive the freed
+    /// record tree until the destination acknowledges.
+    media_files: Vec<super::spill::SpillFile>,
 }
 
 struct Prepared<P> {
@@ -320,6 +323,9 @@ fn run_worker<S: Sink>(
                         // The prepared payload owns all retry evidence now. Free
                         // the decoded tree before preparing the next batch member,
                         // but keep its admission charge until durable acknowledgement.
+                        if let Some(record) = entry.item.value.as_ref() {
+                            entry.item.media_files = record.media.files();
+                        }
                         entry.item.value = None;
                     } else {
                         counters.failed.fetch_add(1, Ordering::Relaxed);
@@ -516,6 +522,7 @@ fn admit_checkpoint(
         completed: None,
         _admission: None,
         checkpoint: Some((checkpoint.lease, checkpoint.completed)),
+        media_files: Vec::new(),
     })
 }
 
@@ -716,6 +723,7 @@ impl Delivery {
             completed,
             _admission: admission,
             checkpoint: None,
+            media_files: Vec::new(),
         };
         if sender.send(Some(item)).is_err() {
             return self.dropped();

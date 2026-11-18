@@ -16,6 +16,7 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayRequest,
 )
+from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.guardrails.bounded import BoundedInspect
 from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry, ScriptedClassifier
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
@@ -32,6 +33,7 @@ from exp.runtime.gateway.guardrails.contracts import (
 )
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import (
+    admit_with_capture,
     encode_output_decision,
     enforce_native_output,
     enforce_native_output_segment,
@@ -49,7 +51,9 @@ from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 from exp.runtime.gateway.guardrails.store_test import _authorization
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
+from exp.runtime.gateway.native_capture import ALL_CAPTURE_PROTOCOLS, CaptureController
 from exp.runtime.gateway.tests.mandatory_guardrails_test import _Guard
+from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 
 def _engine() -> GuardrailEngine:
@@ -574,3 +578,132 @@ def test_optional_unsupported_surface_preserves_strict_sibling(strict_sibling: b
             require_unguarded_surface(engine, _authorization(), "images")
     finally:
         engine.close()
+
+
+class _MediaCollector:
+    """Record capture registrations and releases without a native collector."""
+
+    def __init__(self, *, accept: bool = True) -> None:
+        """Answer every registration with ``accept``."""
+        self.accept = accept
+        self.begun: list[dict[str, object]] = []
+        self.settled: list[tuple[str, bool, bool]] = []
+
+    def begin_bytes(self, request_json: bytes, ttl_seconds: float | None = None) -> bool:
+        """Remember the prepared envelope."""
+        del ttl_seconds
+        self.begun.append(json.loads(request_json))
+        return self.accept
+
+    def settle(self, request_id: str, keep_prompt: bool, keep_response: bool) -> None:
+        """Remember a release."""
+        self.settled.append((request_id, keep_prompt, keep_response))
+
+
+class _Finished:
+    """Record the accepted request's terminal write."""
+
+    def __init__(self) -> None:
+        """Start with no terminal write."""
+        self.failures: list[str] = []
+
+    def finish_request_quietly(self, authorization: object, failure: object) -> None:
+        """Remember that the request was finished."""
+        del authorization
+        self.failures.append(type(failure).__name__)
+
+
+def _media_controller(collector: _MediaCollector) -> CaptureController:
+    """A controller capturing every surface through the fake collector."""
+    return CaptureController(
+        collector,  # ty: ignore[invalid-argument-type]
+        application_for=lambda _authorization: "app",
+        protocols=ALL_CAPTURE_PROTOCOLS,
+    )
+
+
+@pytest.mark.parametrize(
+    ("reply", "raises", "discarded"),
+    [
+        ('{"request_id":"request-one","route":[]}', False, False),
+        ('{"escalate":"no native dialect"}', False, True),
+        ("", True, True),
+    ],
+)
+def test_media_admission_registers_capture_and_releases_one_it_never_serves(
+    reply: str, raises: bool, discarded: bool
+) -> None:
+    """A routed request keeps its capture; an escalation or refusal releases it."""
+    collector = _MediaCollector()
+    accounting = _Finished()
+
+    def admit() -> str:
+        """Route the request, or refuse it."""
+        if raises:
+            raise NativeBridgeError(
+                OpenAIProtocolError(status_code=400, code="invalid_request", message="refused")
+            )
+        return reply
+
+    request = EmbeddingsRequest(inputs=("hello",))
+    if raises:
+        with pytest.raises(NativeBridgeError):
+            admit_with_capture(
+                _media_controller(collector),
+                accounting,  # ty: ignore[invalid-argument-type]
+                _authorization(),
+                request,
+                "session-1",
+                admit,
+            )
+    else:
+        assert (
+            admit_with_capture(
+                _media_controller(collector),
+                accounting,  # ty: ignore[invalid-argument-type]
+                _authorization(),
+                request,
+                "session-1",
+                admit,
+            )
+            == reply
+        )
+    envelope = collector.begun[0]
+    assert envelope["protocol"] == "embeddings"
+    assert envelope["context"] == {
+        "schema_version": 1,
+        "request": {"surface": "embeddings", "inputs": ["hello"]},
+        "session_id": "session-1",
+    }
+    assert collector.settled == ([("request-one", False, False)] if discarded else [])
+    assert accounting.failures == []
+
+
+def test_media_admission_refuses_unavailable_capture_before_routing() -> None:
+    """A collector at capacity finishes the request with a 503 and never routes it."""
+    collector = _MediaCollector(accept=False)
+    accounting = _Finished()
+    routed: list[bool] = []
+    with pytest.raises(NativeBridgeError) as refused:
+        admit_with_capture(
+            _media_controller(collector),
+            accounting,  # ty: ignore[invalid-argument-type]
+            _authorization(),
+            EmbeddingsRequest(inputs=("hello",)),
+            None,
+            lambda: routed.append(True) or "",
+        )
+    assert json.loads(refused.value.public_error_json)["status_code"] == 503
+    assert routed == []
+    assert accounting.failures == ["GatewayFailure"]
+
+
+def test_media_surfaces_are_not_captured_unless_the_host_opts_in() -> None:
+    """The default controller captures conversation surfaces only."""
+    collector = _MediaCollector()
+    controller = CaptureController(
+        collector,  # ty: ignore[invalid-argument-type]
+        application_for=lambda _authorization: "app",
+    )
+    assert controller.begin(_authorization(), EmbeddingsRequest(inputs=("x",)), None)
+    assert collector.begun == []

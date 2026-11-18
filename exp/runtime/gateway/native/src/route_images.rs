@@ -167,6 +167,7 @@ pub(crate) async fn serve_images(
     upload_permit: Option<DispatchPermit>,
 ) -> Response {
     let client_request_id = latin1_header(headers, "x-client-request-id");
+    admit_value["capture_session_id"] = json!(crate::capture::session_id(headers));
     with_app_identity(&mut admit_value, headers);
     let admit_argument = compact_json(&admit_value);
     let admission_text = match state.bridge.call(admit_method, admit_argument).await {
@@ -185,33 +186,75 @@ pub(crate) async fn serve_images(
         Ok(admission) => admission,
         Err(_) => return wire_drift_response(state, &admission_value, started).await,
     };
-    let mut guard = new_guard(state, admission.request_id.clone(), started);
-    let permit = match upload_permit {
-        Some(permit) => {
-            guard.hold_dispatch(permit.clone());
-            permit
-        }
-        None => match acquire_permit(state, &mut guard, deadline, None).await {
-            Ok(permit) => permit,
-            Err(response) => return *response,
-        },
-    };
-    let _permit = permit;
-
-    match run_ladder(state, &admission, raw_key, &mut guard, deadline).await {
-        Err(error) => error_response(&error),
-        Ok(served) => {
-            if !guard
-                .settle("completed", Some(&served.usage), &[], None, true)
-                .await
-            {
-                // Never hand out images the ledger did not record.
-                return error_response(&guard.settlement_error());
+    let capture = state.capture.clone();
+    let request_id = admission.request_id.clone();
+    crate::capture::media::attach_inputs(capture.as_ref(), &request_id, || {
+        edit_inputs(&admit_value)
+    });
+    let response = async {
+        let mut guard = new_guard(state, admission.request_id.clone(), started);
+        let permit = match upload_permit {
+            Some(permit) => {
+                guard.hold_dispatch(permit.clone());
+                permit
             }
-            let response_headers = served_headers(&admission, served.depth, client_request_id);
-            json_response(StatusCode::OK, &served.body, &response_headers)
+            None => match acquire_permit(state, &mut guard, deadline, None).await {
+                Ok(permit) => permit,
+                Err(response) => return *response,
+            },
+        };
+        let _permit = permit;
+
+        match run_ladder(state, &admission, raw_key, &mut guard, deadline).await {
+            Err(error) => error_response(&error),
+            Ok(served) => {
+                if !guard
+                    .settle("completed", Some(&served.usage), &[], None, true)
+                    .await
+                {
+                    // Never hand out images the ledger did not record.
+                    return error_response(&guard.settlement_error());
+                }
+                let response_headers = served_headers(&admission, served.depth, client_request_id);
+                json_response(StatusCode::OK, &served.body, &response_headers)
+            }
         }
     }
+    .await;
+    crate::capture::media::capture_buffered(
+        capture,
+        &request_id,
+        crate::capture::media::MediaSurface::Images,
+        response,
+    )
+    .await
+}
+
+/// An edit's caller-sent images (`upload.files`, base64 by part name), decoded.
+fn edit_inputs(
+    admit_value: &Value,
+) -> Vec<(crate::capture::media::MediaKind, String, bytes::Bytes)> {
+    use base64::Engine;
+    let Some(files) = admit_value["upload"]["files"].as_object() else {
+        return Vec::new();
+    };
+    files
+        .values()
+        .filter_map(Value::as_str)
+        .filter_map(|encoded| {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+        })
+        .map(|raw| {
+            let mime = crate::capture::media::image_mime(None, &raw).to_owned();
+            (
+                crate::capture::media::MediaKind::Image,
+                mime,
+                bytes::Bytes::from(raw),
+            )
+        })
+        .collect()
 }
 
 /// Walk the certified ladder to one validated provider answer or the public

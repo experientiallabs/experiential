@@ -11,20 +11,65 @@ from pydantic import Field, JsonValue, model_validator
 from pydantic_core import to_json
 
 from exp.common.core.artifacts import ContractModel, JsonObject
-from exp.runtime.gateway.capture_context import capture_context_document
+from exp.runtime.gateway.audio_contracts import SpeechRequest, TranscriptionRequest
+from exp.runtime.gateway.capture_context import (
+    capture_context_document,
+    media_capture_context_document,
+)
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayFailure,
     GatewayFailureClass,
     GatewayRequest,
 )
+from exp.runtime.gateway.decisions_contracts import DecisionRequest
+from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
+from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.stream_contracts import TokenLogprob
+from exp.runtime.gateway.video.contracts import VideoRequest
+from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 if TYPE_CHECKING:
     from exp_gateway_native import CaptureCollector
 
 _LOGGER = logging.getLogger(__name__)
 Identifier = Annotated[str, Field(min_length=1, max_length=512)]
+
+CaptureProtocol = Literal[
+    "chat_completions",
+    "responses",
+    "messages",
+    "generate_content",
+    "embeddings",
+    "images",
+    "decisions",
+    "speech",
+    "transcription",
+    "video",
+]
+"""Every public surface a capture record can belong to; the value equals the surface name."""
+
+TEXT_CAPTURE_PROTOCOLS: frozenset[CaptureProtocol] = frozenset(
+    {"chat_completions", "responses", "messages", "generate_content"}
+)
+"""The conversation surfaces a controller captures unless told otherwise."""
+
+ALL_CAPTURE_PROTOCOLS: frozenset[CaptureProtocol] = frozenset(
+    TEXT_CAPTURE_PROTOCOLS
+    | {"embeddings", "images", "decisions", "speech", "transcription", "video"}
+)
+"""Every capturable surface, for a host whose destination stores media records."""
+
+CaptureSource = (
+    GatewayRequest
+    | EmbeddingsRequest
+    | ImagesRequest
+    | SpeechRequest
+    | TranscriptionRequest
+    | DecisionRequest
+    | VideoRequest
+)
+"""A decoded request of any capturable surface."""
 
 
 class CaptureDeliveryLimits(ContractModel):
@@ -194,7 +239,7 @@ class CaptureRequest(ContractModel):
 
     request_id: Identifier
     scope: CaptureScope
-    protocol: Literal["chat_completions", "responses", "messages", "generate_content"]
+    protocol: CaptureProtocol
     model_id: Identifier | None
     context: JsonObject
 
@@ -296,6 +341,53 @@ class CaptureProviderLogprobs(ContractModel):
     nul_replaced: bool = Field(default=False, strict=True)
 
 
+class CaptureMediaRef(ContractModel):
+    """One binary part of a media record, kept out of the record's JSON.
+
+    Attributes:
+        part: ``input`` (sent by the caller) or ``output`` (produced for it).
+        kind: ``image``, ``audio``, ``video`` or ``vector`` (embedding vectors
+            as one JSON array in data order).
+        mime: The part's MIME type.
+        bytes: Exact size of the part.
+        sha256: Lowercase hexadecimal SHA-256 of the exact bytes.
+        spill_path: A complete file holding the bytes, present only with a
+            spilling collector; the file is removed once the destination
+            acknowledges the record.
+    """
+
+    part: Literal["input", "output"]
+    kind: Literal["image", "audio", "video", "vector"]
+    mime: str = Field(min_length=1, max_length=128)
+    bytes: int = Field(ge=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    spill_path: str | None = None
+
+
+class CaptureVectorSummary(ContractModel):
+    """Shape of the vectors an embeddings answer returned.
+
+    Attributes:
+        count: Vectors returned.
+        dimensions: Width of the widest vector (float32 values for base64).
+    """
+
+    count: int = Field(ge=0)
+    dimensions: int = Field(ge=0)
+
+
+class CaptureProviderJob(ContractModel):
+    """The provider job a record's response describes (a video render).
+
+    Attributes:
+        id: The job identifier the caller polls.
+        deadline: Unix seconds by which the job settles.
+    """
+
+    id: Identifier
+    deadline: float = Field(ge=0, allow_inf_nan=False)
+
+
 class CaptureRecord(ContractModel):
     """One idempotent update delivered to a local or hosted persistence adapter.
 
@@ -315,6 +407,13 @@ class CaptureRecord(ContractModel):
         provider_logprobs: Gateway-requested Chat probabilities of the winning
             attempt (``logprobs_injected``, ``truncated``, ``content``, ``refusal``),
             present only when the gateway asked for them; otherwise absent.
+        media: Binary parts of a media surface (images, audio, vectors), in
+            the order the request and answer carried them; empty otherwise.
+            A shaped answer keeps its JSON with these values removed.
+        vector_summary: Count and width of an embeddings answer's vectors.
+        omitted_parts: The halves settlement chose not to keep: ``request``
+            (the context is then the empty schema 1 shell) or ``response``.
+        provider_job: The provider job a video record's response describes.
     """
 
     schema_version: Literal[1]
@@ -332,6 +431,10 @@ class CaptureRecord(ContractModel):
     gemini_thought_parts_source_json: str | None
     transport: JsonObject | None = None
     provider_logprobs: CaptureProviderLogprobs | None = None
+    media: tuple[CaptureMediaRef, ...] = ()
+    vector_summary: CaptureVectorSummary | None = None
+    omitted_parts: tuple[Literal["request", "response"], ...] = ()
+    provider_job: CaptureProviderJob | None = None
 
 
 class CaptureController:
@@ -342,46 +445,69 @@ class CaptureController:
         native: CaptureCollector,
         *,
         application_for: Callable[[AuthorizationSnapshot], str | None],
+        protocols: frozenset[CaptureProtocol] = TEXT_CAPTURE_PROTOCOLS,
     ) -> None:
         """Bind the collector to a host-owned authenticated capture-policy decision.
 
         Args:
             native: Collector also supplied to this instance's native server or execution handle.
             application_for: Return a configured application or None to decline capture.
+            protocols: Surfaces to capture. Media surfaces (``embeddings``,
+                ``images``, ``decisions``, ``speech``, ``transcription``,
+                ``video``) produce records with ``media``, ``vector_summary``
+                and ``provider_job``; a host opts in once its destination
+                stores them (``ALL_CAPTURE_PROTOCOLS``).
         """
         self.native = native
         self._application_for = application_for
+        self.protocols = protocols
 
     def begin(
         self,
         authorization: AuthorizationSnapshot,
-        request: GatewayRequest,
+        request: CaptureSource,
         model_id: str | None,
         *,
         session_id: str | None = None,
+        ttl_seconds: float | None = None,
     ) -> bool:
-        """Prepare only an allowed identity's post-guardrail, expanded request."""
+        """Prepare only an allowed identity's post-guardrail, expanded request.
+
+        Args:
+            authorization: Exact authenticated request identity.
+            request: The effective request of any capturable surface.
+            model_id: Selected model, unknown before routing.
+            session_id: Optional caller correlation.
+            ttl_seconds: Keep the capture past the configured TTL, for a
+                provider job that settles later (at most four hours).
+        """
         prepared = self.prepare(authorization, request, model_id, session_id=session_id)
-        return prepared is None or self.native.begin_bytes(prepared)
+        if prepared is None:
+            return True
+        if ttl_seconds is None:
+            return self.native.begin_bytes(prepared)
+        return self.native.begin_bytes(prepared, ttl_seconds)
 
     def prepare(
         self,
         authorization: AuthorizationSnapshot,
-        request: GatewayRequest,
+        request: CaptureSource,
         model_id: str | None,
         *,
         session_id: str | None = None,
     ) -> bytes | None:
         """Prepare an authenticated envelope without registering, retaining or spilling it."""
-        application_id = self._application_for(authorization)
-        if application_id is None or request.surface.value not in {
-            "chat_completions",
-            "responses",
-            "messages",
-            "generate_content",
-        }:
+        protocol = request.surface.value
+        if protocol not in self.protocols:
             return None
-        context = capture_context_document(request, session_id=session_id)
+        application_id = self._application_for(authorization)
+        if application_id is None:
+            return None
+        context = (
+            capture_context_document(request, session_id=session_id)
+            if isinstance(request, GatewayRequest)
+            else media_capture_context_document(request, session_id=session_id)
+        )
         # Authority and effective context are already typed. Serialize that
         # projection once; the native admission boundary validates the envelope.
         # Revalidating JsonObject here would copy every tool/schema container.
@@ -392,7 +518,7 @@ class CaptureController:
                 "identity_id": authorization.identity_id,
                 "application_id": application_id,
             },
-            "protocol": request.surface.value,
+            "protocol": protocol,
             "model_id": model_id,
             "context": context,
         }
@@ -408,7 +534,7 @@ class PendingCapture:
         session_id: Validated caller session identifier, or None when absent.
     """
 
-    request: GatewayRequest
+    request: CaptureSource
     session_id: str | None
 
 
@@ -421,19 +547,33 @@ def capture_unavailable_failure() -> GatewayFailure:
     )
 
 
+def capture_unavailable_error() -> OpenAIProtocolError:
+    """Return the public 503 a request gets when its required capture is unavailable."""
+    failure = capture_unavailable_failure()
+    return OpenAIProtocolError(
+        status_code=503, code="capture_unavailable", message=failure.safe_message
+    )
+
+
 def begin_capture(
     controller: CaptureController | None,
     authorization: AuthorizationSnapshot,
-    request: GatewayRequest,
+    request: CaptureSource,
     model_id: str | None = None,
     *,
     session_id: str | None = None,
+    ttl_seconds: float | None = None,
 ) -> bool:
     """Reject unavailable required capture without exposing customer content or exceptions."""
     if controller is None:
         return True
     try:
-        return controller.begin(authorization, request, model_id, session_id=session_id)
+        if ttl_seconds is None:
+            # Hosts may subclass CaptureController.begin; only a job passes a lifetime.
+            return controller.begin(authorization, request, model_id, session_id=session_id)
+        return controller.begin(
+            authorization, request, model_id, session_id=session_id, ttl_seconds=ttl_seconds
+        )
     except Exception:  # noqa: BLE001 - sanitize policy and collector failures at admission.
         _LOGGER.warning("capture.admission_failed request_id=%s", authorization.request_id)
         return False

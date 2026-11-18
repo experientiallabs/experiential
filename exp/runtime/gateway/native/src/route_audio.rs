@@ -238,7 +238,11 @@ async fn serve(
     }
     let client_request_id = latin1_header(headers, "x-client-request-id");
     let remaining_milli = u64::try_from(remaining(deadline).as_millis()).unwrap_or(u64::MAX);
-    let mut admit_value = json!({"raw_key": raw_key, "remaining_milli": remaining_milli});
+    let mut admit_value = json!({
+        "raw_key": raw_key,
+        "remaining_milli": remaining_milli,
+        "capture_session_id": crate::capture::session_id(headers),
+    });
     admit_value[body_key] = body_value;
     with_app_identity(&mut admit_value, headers);
     let admission_text = match state
@@ -261,24 +265,44 @@ async fn serve(
         Ok(admission) if admission.billing_modes.len() == admission.route.len() => admission,
         _ => return wire_drift_response(state, &admission_value, started).await,
     };
-    let mut guard = new_guard(state, admission.request_id.clone(), started);
-    guard.hold_dispatch(permit.clone());
-    let _permit = permit;
-    match run_ladder(state, &admission, raw_key, &mut guard, deadline, &job).await {
-        Err(error) => error_response(&error),
-        Ok(served) => {
-            if !guard
-                .settle("completed", Some(&served.usage), &[], None, true)
-                .await
-            {
-                // Never hand out audio or a transcript the ledger did not record.
-                return error_response(&guard.settlement_error());
+    let capture = state.capture.clone();
+    let request_id = admission.request_id.clone();
+    let surface = match &job {
+        Job::Speech => crate::capture::media::MediaSurface::Speech,
+        Job::Transcription(upload) => {
+            crate::capture::media::attach_inputs(capture.as_ref(), &request_id, || {
+                vec![(
+                    crate::capture::media::MediaKind::Audio,
+                    upload.content_type.clone(),
+                    bytes::Bytes::copy_from_slice(&upload.bytes),
+                )]
+            });
+            crate::capture::media::MediaSurface::Transcription
+        }
+    };
+    let response = async {
+        let mut guard = new_guard(state, admission.request_id.clone(), started);
+        guard.hold_dispatch(permit.clone());
+        let _permit = permit;
+        match run_ladder(state, &admission, raw_key, &mut guard, deadline, &job).await {
+            Err(error) => error_response(&error),
+            Ok(served) => {
+                if !guard
+                    .settle("completed", Some(&served.usage), &[], None, true)
+                    .await
+                {
+                    // Never hand out audio or a transcript the ledger did not record.
+                    return error_response(&guard.settlement_error());
+                }
+                let mut response_headers =
+                    served_headers(&admission, served.depth, client_request_id);
+                response_headers.push((header::CONTENT_TYPE.to_string(), served.content_type));
+                binary_response(served.body, &response_headers)
             }
-            let mut response_headers = served_headers(&admission, served.depth, client_request_id);
-            response_headers.push((header::CONTENT_TYPE.to_string(), served.content_type));
-            binary_response(served.body, &response_headers)
         }
     }
+    .await;
+    crate::capture::media::capture_buffered(capture, &request_id, surface, response).await
 }
 
 /// Check the caller's bearer key against the control plane before any body is read.
