@@ -284,10 +284,10 @@ def image_input_notice(message: str | None) -> str:
 def latest_turn_user_indexes(messages: tuple[GatewayMessage, ...]) -> frozenset[int]:
     """Return the indexes of the user messages after the last assistant message.
 
-    The latest turn is everything the caller added since the model last spoke,
-    the same rule the decoders' history-media pass applies to raw wire entries
-    (``openai_protocol.history_media.latest_turn``), so consecutive user
-    messages (an image, then its question) are all the latest turn.
+    The notice covers everything the caller added since the model last spoke,
+    so an image followed by a separate question still gets an explanation.
+    Raw inline-media validation uses only the newest caller input to allow
+    recovery after a rejected attachment (``openai_protocol.history_media.latest_turn``).
 
     Args:
         messages: The request's canonical messages.
