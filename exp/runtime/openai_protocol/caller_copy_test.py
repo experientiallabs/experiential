@@ -112,3 +112,13 @@ def test_a_refusal_remediation_clause_is_not_a_category() -> None:
         "The model's provider declined to answer this request. Rephrase the request "
         "or choose another model."
     )
+
+
+def test_an_end_user_policy_block_names_the_block_not_authentication() -> None:
+    text = caller_copy(
+        GatewayFailureClass.REFUSAL,
+        "provider blocked the request's end user for a previous policy violation",
+    )
+    assert text.startswith("The model's provider blocked this request's end user")
+    assert "policy violation" in text
+    assert "authentication" not in text.lower()

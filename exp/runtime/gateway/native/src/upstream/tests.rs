@@ -758,30 +758,53 @@ async fn a_plain_403_stays_a_credential_failure() {
 }
 
 #[tokio::test]
-async fn an_account_policy_block_is_a_credential_failure_under_any_relay_status() {
-    // OpenRouter's relay of OpenAI's account block on openai/gpt-6.1-sol: the
-    // generic invalid_prompt 400 with OpenAI's document in metadata.raw, and
-    // the flat 403. Both are the ACCOUNT's verdict, so both fail over.
+async fn an_end_user_policy_block_is_a_refusal_under_any_relay_status() {
+    // OpenRouter's relay of a block on the END USER the request carries: the
+    // flat 403 body, and the generic
+    // invalid_prompt 400 with OpenAI's document in metadata.raw. None is a
+    // verdict on the account credential.
+    let flat = r#"{"error":{"code":403,"message":"Policy Violation: this user has been blocked for a previous policy violation. Learn more: https://openrouter.ai/docs"}}"#;
     let relayed = r#"{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"{\"error\":{\"message\":\"Policy Violation: this user has been blocked for a previous policy violation\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_prompt\"}}","provider_name":"OpenAI"}}}"#;
-    let flat = r#"{"error":{"message":"Policy Violation: this user has been blocked for a previous policy violation","code":403}}"#;
-    for (status, body) in [("400 Bad Request", relayed), ("403 Forbidden", flat)] {
+    for (status, body) in [("403 Forbidden", flat), ("400 Bad Request", relayed)] {
         let failure = open_against_body(status, body, "openai/gpt-6.1-sol").await;
-        assert_eq!(failure.failure_class, FailureClass::ProviderAuthentication);
-        assert!(failure.failover_eligible && !failure.retryable_same_deployment);
-        assert!(failure.refusal_reason.is_none());
+        assert_eq!(failure.failure_class, FailureClass::Refusal, "{status}");
+        assert_eq!(
+            failure.refusal_reason,
+            Some(crate::errors::RefusalReason::ContentPolicy)
+        );
+        assert!(failure.provider_content_filter && !failure.retryable_same_deployment);
         assert!(failure
             .provider_detail
             .as_deref()
-            .is_some_and(|detail| detail.ends_with("account_policy_block")));
+            .is_some_and(|detail| detail.ends_with("end_user_policy_block")));
+        let public = failure.public_error();
+        assert_eq!(public.code, "refusal");
+        assert!(public.message.contains("end user"), "{}", public.message);
+        assert!(!public
+            .message
+            .to_ascii_lowercase()
+            .contains("authentication"));
     }
     // The same block arriving in-stream (OpenRouter's response.failed).
-    assert_eq!(
-        crate::stream_errors::classify_stream_error(
-            Some("invalid_prompt"),
-            Some("Policy Violation: this user has been blocked for a previous policy violation"),
-        ),
-        crate::stream_errors::StreamErrorKind::ProviderAuthentication
+    let kind = crate::stream_errors::classify_stream_error(
+        Some("invalid_prompt"),
+        Some("Policy Violation: this user has been blocked for a previous policy violation"),
     );
+    assert_eq!(kind, crate::stream_errors::StreamErrorKind::EndUserBlocked);
+    let failure = crate::stream_errors::stream_failure(kind, None);
+    assert_eq!(failure.failure_class, FailureClass::Refusal);
+}
+
+#[tokio::test]
+async fn a_plain_invalid_key_403_stays_a_credential_failure() {
+    let failure = open_against_body(
+        "403 Forbidden",
+        r#"{"error":{"code":403,"message":"Invalid API key"}}"#,
+        "openai/gpt-6.1-sol",
+    )
+    .await;
+    assert_eq!(failure.failure_class, FailureClass::ProviderAuthentication);
+    assert!(failure.failover_eligible && failure.refusal_reason.is_none());
 }
 
 #[tokio::test]

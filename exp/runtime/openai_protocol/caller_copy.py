@@ -98,6 +98,13 @@ _FIXED: tuple[tuple[GatewayFailureClass, str, str], ...] = (
         "to update the model's route.",
     ),
     (
+        _C.REFUSAL,
+        "provider blocked the request's end user for a previous policy violation",
+        "The model's provider blocked this request's end user for a previous policy "
+        "violation, so it refused the request. Choose another model, or contact support "
+        "if you believe the block is wrong.",
+    ),
+    (
         _C.INTERNAL,
         "the native engine cannot serve the authorized route",
         "The gateway cannot serve this model right now because of a problem on its side. "

@@ -757,6 +757,28 @@ the shared envelope reader (`crate::error_envelope`), all pinned in
   `FAILED_TO_AUTH` / `ACCESS_DENY` authenticate), see the architecture
   reference.
 
+## End-user policy blocks (OpenRouter, OpenAI)
+
+"Policy Violation: this user has been blocked for a previous policy
+violation" is OpenAI's verdict on the end-user identifier a request carries,
+relayed by OpenRouter as a 403, as a generic 400 `invalid_prompt`, or
+in-stream. It is not a verdict on the account credential: the same account
+keeps serving every other end user.
+
+- It is matched on its stable fragments ("user has been blocked" and "policy
+  violation", both leading the error sentence) in the verdict fields only: the
+  envelope's message, or the upstream sentence behind an aggregator's generic
+  one in `metadata.raw`. An echoed prompt or any other field is never read.
+- It is filed as a `refusal` with reason `content_policy` (ledger detail
+  `http <status>: end_user_policy_block`, so `http 403` or `http 400`), marked
+  as a provider filter so one untried rung of another provider may take it.
+- It never feeds the credential class, so one blocked end user cannot demote a
+  shared house account or trip a BYOK connection's breaker. The caller reads
+  that the provider blocked this request's end user for a previous policy
+  violation, never that authentication failed.
+- Every other 401/403 keeps the credential class. Pinned in
+  `end_user_block.rs` and `upstream/tests.rs`.
+
 ## OpenAI Decisions API
 
 `POST /v1/decisions` is the OpenAI Decisions API wire of the decisions surface (ledger

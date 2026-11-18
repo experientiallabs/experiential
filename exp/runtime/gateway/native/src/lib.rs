@@ -22,6 +22,7 @@ mod encode;
 mod encode_generate_content;
 mod encode_messages;
 mod encode_responses;
+mod end_user_block;
 mod error_envelope;
 mod errors;
 mod events;
