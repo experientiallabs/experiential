@@ -8,6 +8,7 @@ from contextvars import ContextVar
 from hashlib import sha256
 from threading import Lock
 from typing import Literal
+from weakref import ReferenceType, ref
 
 from pydantic import BaseModel, ConfigDict
 
@@ -73,6 +74,7 @@ class InputOutcomes:
         self._results: dict[tuple[str, str], GuardrailOutcome] = {}
         self._started: set[tuple[str, str]] = set()
         self._windows: dict[tuple[str, str], set[str]] = {}
+        self._subjects: list[tuple[ReferenceType[GatewayRequest], str]] = []
         self._lock = Lock()
         self._frozen: tuple[InputCheckOutcome, ...] | None = None
 
@@ -97,9 +99,17 @@ class InputOutcomes:
 
     def admit(self, policy: GuardrailPolicy, request: GatewayRequest) -> None:
         """Remember an input window without claiming that its queued checks executed."""
-        digest = latest_user_window_digest(request)
         with self._lock:
             if self._frozen is None:
+                # Weak identity caches only immutable text projections, without
+                # retaining prompts or confusing recycled object IDs.
+                digest = next(
+                    (value for subject, value in self._subjects if subject() is request), None
+                )
+                if digest is None:
+                    digest, immutable = _window_digest(request)
+                    if immutable:
+                        self._subjects = [*self._subjects[-1:], (ref(request), digest)]
                 for check in policy.input_checks:
                     windows = self._windows.setdefault((policy.policy_id, check.check_id), set())
                     if len(windows) < 2:
@@ -195,17 +205,34 @@ _LATEST_USER_WINDOW = ClassificationWindow(
 
 
 def latest_user_window_digest(request: GatewayRequest) -> str:
-    """Hash bounded input only, without walking or joining unrelated system/tool text."""
-    latest = next(
-        (
-            message
-            for message in reversed(request.messages)
-            if message.role == "user" and message_text(message).strip()
-        ),
-        None,
-    )
+    """Hash the exact latest-user classifier window, excluding unrelated text."""
+    return _window_digest(request)[0]
+
+
+def _window_digest(request: GatewayRequest) -> tuple[str, bool]:
+    """Return the digest and whether its selected text can safely use identity caching."""
+    latest = None
+    immutable = True
+    for message in reversed(request.messages):
+        if message.role != "user":
+            continue
+        # Frozen Pydantic models can still carry caller-owned mutable dictionaries.
+        # A blank mutable suffix can also change which earlier message is selected.
+        if message.provider_native_item is not None or (
+            message.content is None
+            and (
+                message.provider_anthropic_block is not None
+                or message.provider_anthropic_blocks is not None
+            )
+        ):
+            immutable = False
+        if message_text(message).strip():
+            latest = message
+            break
     subject = request.model_copy(update={"messages": () if latest is None else (latest,)})
-    return sha256(classification_window(subject, _LATEST_USER_WINDOW).encode("utf-8")).hexdigest()
+    return sha256(
+        classification_window(subject, _LATEST_USER_WINDOW).encode("utf-8")
+    ).hexdigest(), immutable
 
 
 def record_input_outcome(

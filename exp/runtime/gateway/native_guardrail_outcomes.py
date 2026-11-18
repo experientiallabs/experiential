@@ -11,7 +11,9 @@ from exp.common.core.artifacts import JsonObject
 
 if TYPE_CHECKING:
     from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayFailure
+    from exp.runtime.gateway.guardrails.session import GuardrailSession
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+    from exp.runtime.gateway.native_components import SyncWriteLedger
     from exp.runtime.gateway.native_execution import InflightRequest
 
 
@@ -23,6 +25,14 @@ class InputOutcomeKeyword(TypedDict, total=False):
     """
 
     input_guardrail_outcomes: tuple[JsonObject, ...]
+
+
+def enable_input_outcomes(session: GuardrailSession, ledger: SyncWriteLedger) -> None:
+    """Collect only when a terminal writer explicitly consumes the evidence."""
+    if consumes_input_outcomes(ledger.finish_attempt) or consumes_input_outcomes(
+        ledger.finish_request
+    ):
+        session.enable_input_outcomes()
 
 
 def outcome_documents(entry: InflightRequest | None) -> tuple[JsonObject, ...]:
@@ -43,13 +53,13 @@ def outcome_keyword(
     write: Callable[..., object], documents: tuple[JsonObject, ...]
 ) -> InputOutcomeKeyword:
     """Offer the accounting extension only to a ledger explicitly declaring it."""
-    if _declares_outcomes(write):
+    if consumes_input_outcomes(write):
         return {"input_guardrail_outcomes": documents}
     return {}
 
 
 @lru_cache(maxsize=128)
-def _declares_outcomes(write: Callable[..., object]) -> bool:
+def consumes_input_outcomes(write: Callable[..., object]) -> bool:
     """A generic forwarding wrapper does not assert that its destination persists evidence."""
     try:
         parameter = signature(write).parameters.get("input_guardrail_outcomes")
@@ -65,7 +75,9 @@ def terminal_outcomes(
     write: Callable[..., object], entry: InflightRequest, *, finalize: bool = True
 ) -> InputOutcomeKeyword:
     """Intermediate attempts never freeze the request's eventual inspection outcome."""
-    return outcome_keyword(write, outcome_documents(entry)) if finalize else {}
+    if not finalize or not consumes_input_outcomes(write):
+        return {}
+    return {"input_guardrail_outcomes": outcome_documents(entry)}
 
 
 def finish_request_quietly(
@@ -86,7 +98,7 @@ def finish_request_quietly(
             failure,
             certify_no_effects=certify_no_effects,
             web_search_requests=web_search_requests,
-            input_guardrail_outcomes=outcome_documents(entry),
+            input_guardrail_outcomes=accounting.request_settlements.input_outcomes(entry),
         )
     except Exception:  # noqa: BLE001 - the sanitized admission failure wins; recovery retains the write.
         return False

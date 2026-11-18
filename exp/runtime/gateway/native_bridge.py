@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable
 
 from exp.common.core.artifacts import JsonObject
+from exp.runtime.gateway import native_guardrail_outcomes as input_evidence
 from exp.runtime.gateway.attempt_tokens import counted_input_tokens
 from exp.runtime.gateway.class_throttles import admission_priority_class, tier_authorization
 from exp.runtime.gateway.client_apps import with_client_identity
@@ -350,7 +351,6 @@ class NativeControlPlane(
                 )
             except OpenAIProtocolError as exc:
                 raise NativeBridgeError(exc) from exc
-
         pinned_reasoning_route: GatewayRoute | None = None
         try:
             request, pinned_reasoning_route = authenticate_reasoning_history(
@@ -367,13 +367,13 @@ class NativeControlPlane(
                 carrier, f"'{carrier}' must be an authentic continuation for this route."
             )
             raise NativeBridgeError(error) from exc
-
         original_subject = request
         guardrails = open_admission_guardrails(
             self._guardrails, authorization, request, data, deadline_monotonic=deadline
         )
         if guardrails is not None:
             guardrails.detectors = self._guardrail_detectors
+            input_evidence.enable_input_outcomes(guardrails, self._write_ledger)
         parallel_guardrail = isinstance(authorization.target, DirectTarget) and (
             guardrails is not None and guardrails.can_overlap_input(request)
         )

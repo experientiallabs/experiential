@@ -18,6 +18,7 @@ import logging
 import threading
 from dataclasses import dataclass, field
 from inspect import signature
+from typing import TYPE_CHECKING
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayFailure
@@ -31,7 +32,14 @@ from exp.runtime.gateway.ledger_errors import (
 from exp.runtime.gateway.native_accounting_fence import OrganizationFence, fences_after
 from exp.runtime.gateway.native_accounting_recovery import RecoveryRotation
 from exp.runtime.gateway.native_components import SyncWriteLedger
-from exp.runtime.gateway.native_guardrail_outcomes import write_request_outcomes
+from exp.runtime.gateway.native_guardrail_outcomes import (
+    consumes_input_outcomes,
+    outcome_documents,
+    write_request_outcomes,
+)
+
+if TYPE_CHECKING:
+    from exp.runtime.gateway.native_execution import InflightRequest
 
 _logger = logging.getLogger(__name__)
 
@@ -106,6 +114,12 @@ class RequestSettlements:
         self._fence = OrganizationFence()  # Fencing retained writes per org, under ``_lock``.
         self._lock = threading.Lock()
         self._recovery = RecoveryRotation[_Settlement](lambda item: item.authorization.request_id)
+
+    def input_outcomes(self, entry: InflightRequest | None) -> tuple[JsonObject, ...]:
+        """Freeze request-only evidence only for the writer that actually consumes it."""
+        return (
+            outcome_documents(entry) if consumes_input_outcomes(self._ledger.finish_request) else ()
+        )
 
     @property
     def pending(self) -> bool:

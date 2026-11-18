@@ -108,10 +108,16 @@ class GuardrailSession:
     _native_rejection: ObservationRecord | None = field(default=None, init=False, repr=False)
     _synchronous_inputs: int = field(default=0, init=False, repr=False)
 
-    _outcomes: InputOutcomes = field(default_factory=InputOutcomes, init=False, repr=False)
+    _outcomes: InputOutcomes | None = field(default=None, init=False, repr=False)
+
+    def enable_input_outcomes(self) -> None:
+        """Opt in before execution when the host ledger explicitly consumes evidence."""
+        self._outcomes = InputOutcomes()
 
     def input_outcomes(self) -> tuple[InputCheckOutcome, ...]:
         """Freeze actual input execution after reconciling the native release decision."""
+        if self._outcomes is None:
+            return ()
         decision = self.input_decision()
         blocked = decision["action"] == "error"
         return self._outcomes.freeze(self.policies, blocked=blocked)
@@ -272,7 +278,8 @@ class GuardrailSession:
         """Count each optional check once, preserving already completed coverage."""
         if self.native_input is None:
             if expired:
-                self._outcomes.expire(policy)
+                if self._outcomes is not None:
+                    self._outcomes.expire(policy)
                 self.engine.record_input_expiry(policy)
             return
         with self._input_outcomes_lock:
@@ -300,7 +307,8 @@ class GuardrailSession:
                 )
         if expired and remaining:
             expired_policy = policy.model_copy(update={"checks": remaining})
-            self._outcomes.expire(expired_policy)
+            if self._outcomes is not None:
+                self._outcomes.expire(expired_policy)
             self.engine.record_input_expiry(expired_policy)
 
     def _native_decision_current(self, policy: GuardrailPolicy) -> bool:
@@ -318,10 +326,13 @@ class GuardrailSession:
     ) -> GatewayRequest:
         """Apply the same native or bounded adapter strategy during execution and validation."""
 
-        self._outcomes.start(policy, request)
+        if self._outcomes is not None:
+            self._outcomes.start(policy, request)
 
         async def inspect() -> GatewayRequest:
             """Collect bounded outcomes in this request coroutine only."""
+            if self._outcomes is None:
+                return await execute()
             with self._outcomes.collect():
                 return await execute()
 
@@ -442,9 +453,10 @@ class GuardrailSession:
         if overlap and not all(self.can_overlap_input(subject) for subject in remaining):
             raise RuntimeError("guardrail input cannot overlap this request")
         self._input_approved_at = None
-        for policy in self.enforcing_policies:
-            for subject in remaining:
-                self._outcomes.admit(policy, subject)
+        if self._outcomes is not None:
+            for policy in self.enforcing_policies:
+                for subject in remaining:
+                    self._outcomes.admit(policy, subject)
         if not overlap:
             self.begin_input_wait()
         self._begin_input_subjects(len(remaining))

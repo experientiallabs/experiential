@@ -10,7 +10,11 @@ from exp.runtime.gateway.guardrails.input_outcomes import InputCheckOutcome
 from exp.runtime.gateway.guardrails.input_outcomes_test import _policy
 from exp.runtime.gateway.guardrails.store_test import _authorization
 from exp.runtime.gateway.native_accounting_test import _RecordingLedger, _retryable_failure
-from exp.runtime.gateway.native_guardrail_outcomes import outcome_documents, outcome_keyword
+from exp.runtime.gateway.native_guardrail_outcomes import (
+    outcome_documents,
+    outcome_keyword,
+    terminal_outcomes,
+)
 from exp.runtime.gateway.native_request_settlement import RequestSettlements
 
 
@@ -82,3 +86,24 @@ def test_terminal_retry_keeps_the_original_input_evidence() -> None:
             )
         settlements.retry(limit=1)
     assert seen == [documents, documents]
+
+
+def test_unconsumed_or_nonfinal_evidence_is_not_frozen() -> None:
+    """Legacy and intermediate terminal writes cannot trigger digest serialization."""
+    entry = Mock()
+    assert terminal_outcomes(lambda: None, entry) == {}
+    entry.guardrails.input_outcomes.assert_not_called()
+
+    def consumes(*, input_guardrail_outcomes: tuple[JsonObject, ...]) -> None:
+        """Declare the optional extension."""
+
+    assert terminal_outcomes(consumes, entry, finalize=False) == {}
+    entry.guardrails.input_outcomes.assert_not_called()
+
+
+def test_request_only_writer_without_extension_never_freezes_enabled_evidence() -> None:
+    """An attempt-only consumer does not opt its unconsumed request-only writer in."""
+    entry = Mock()
+    settlements = RequestSettlements(_RecordingLedger())
+    assert settlements.input_outcomes(entry) == ()
+    entry.guardrails.input_outcomes.assert_not_called()

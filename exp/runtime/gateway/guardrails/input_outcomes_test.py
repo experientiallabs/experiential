@@ -28,6 +28,7 @@ from exp.runtime.gateway.guardrails.deterministic import native_input_request
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.input_outcomes import (
     InputOutcomes,
+    _window_digest,
     latest_user_window_digest,
     record_input_outcome,
 )
@@ -163,6 +164,7 @@ def test_queued_but_unstarted_checks_do_not_authorize_recovery() -> None:
     )
     try:
         session = _session(engine)
+        session.enable_input_outcomes()
         with patch(
             "exp.runtime.gateway.guardrails.session.start_on_native_loop", side_effect=queued
         ):
@@ -273,6 +275,7 @@ def test_executed_input_outcome_survives_the_session(
     )
     try:
         session = _session(engine)
+        session.enable_input_outcomes()
         if verdict == "block":
             with pytest.raises(GuardrailRejected):
                 session.inspect_input(_request())
@@ -283,3 +286,58 @@ def test_executed_input_outcome_survives_the_session(
     finally:
         classifier.release.set()
         engine.close(timeout_seconds=2)
+
+
+def test_unchanged_subject_is_hashed_once_across_checks_and_execution() -> None:
+    """Pre-admission and execution reuse a bounded digest without retaining content."""
+    policy, tracker, request = _policy(), InputOutcomes(), _request()
+    with patch(
+        "exp.runtime.gateway.guardrails.input_outcomes._window_digest",
+        wraps=_window_digest,
+    ) as digest:
+        tracker.admit(policy, request)
+        tracker.start(policy, request)
+        tracker.admit(policy.model_copy(update={"policy_id": "another"}), request)
+        assert digest.call_count == 1
+        tracker.admit(policy, _request("different"))
+        assert digest.call_count == 2
+    assert tracker.freeze((policy,), blocked=False)[0].latest_user_window_sha256 is None
+
+
+def test_sessions_without_consumers_do_not_hash_input() -> None:
+    """Legacy hosts pay no digest or collector cost for the optional extension."""
+    classifier = _Classifier("allow")
+    classifier.release.set()
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((_policy(),)),
+        client=DirectClassifierClient(ClassifierRegistry({"classifier": classifier})),
+        monotonic=time.monotonic,
+    )
+    try:
+        session = _session(engine)
+        with patch("exp.runtime.gateway.guardrails.input_outcomes._window_digest") as digest:
+            session.inspect_input(_request())
+            assert session.input_outcomes() == ()
+            digest.assert_not_called()
+    finally:
+        engine.close(timeout_seconds=2)
+
+
+def test_mutated_native_input_never_reuses_a_stale_digest() -> None:
+    """A shallowly frozen request can contain mutable native caller input."""
+    policy, tracker = _policy(), InputOutcomes()
+    message = GatewayMessage(
+        role="user",
+        provider_native_item={
+            "type": "function_call_output",
+            "call_id": "unknown",
+            "output": "first",
+        },
+    )
+    request = _request().model_copy(update={"messages": (message,)})
+    tracker.admit(policy, request)
+    assert message.provider_native_item is not None
+    message.provider_native_item["output"] = "second"
+    tracker.start(policy, request)
+    tracker.expire(policy)
+    assert tracker.freeze((policy,), blocked=False)[0].latest_user_window_sha256 is None

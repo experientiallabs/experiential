@@ -67,7 +67,6 @@ from exp.runtime.gateway.native_execution import (
 from exp.runtime.gateway.native_fallback_rules import eligible_ladder, rule_fallback_reason
 from exp.runtime.gateway.native_guardrail_outcomes import (
     finish_request_quietly,
-    outcome_documents,
     terminal_outcomes,
 )
 from exp.runtime.gateway.native_recovery import (
@@ -923,7 +922,7 @@ class NativeAttemptAccounting:
                     self.request_settlements.finish(
                         entry.authorization,
                         failure,
-                        input_guardrail_outcomes=outcome_documents(entry),
+                        input_guardrail_outcomes=self.request_settlements.input_outcomes(entry),
                         web_search_requests=entry.web_search_requests
                         if not entry.total_attempts
                         else 0,
