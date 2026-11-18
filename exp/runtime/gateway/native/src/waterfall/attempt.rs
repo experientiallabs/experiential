@@ -228,7 +228,11 @@ pub(super) async fn run_attempt(
                 }
                 return AttemptEnd::Ladder {
                     failure: customer_owned(
-                        attribute_header_timeout(ctx, failure, allowance_deadline),
+                        attribute_header_timeout(
+                            ctx,
+                            repair.unrepaired(failure),
+                            allowance_deadline,
+                        ),
                         wire,
                     ),
                     refusal_eligible: false,
@@ -542,6 +546,7 @@ pub(super) async fn run_attempt(
                             tool_names,
                         };
                     }
+                    let failure = &repair.unrepaired(failure.clone());
                     let typed_refusal = failure.failure_class == FailureClass::Refusal;
                     let exhaustion_flush = if withheld.iter().any(crate::logprobs::is_refusal_text)
                         && !typed_refusal
