@@ -17,6 +17,9 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.openai_protocol.caller_copy import caller_copy
 
 THROTTLED_RETRY_AFTER_SECONDS = 5
+CONTEXT_LENGTH_EXCEEDED_CODE = "context_length_exceeded"
+"""OpenAI's code for a context-window overflow; the same literal as ``prompt_size``'s
+(imported there would be circular; ``errors_test`` pins the two equal)."""
 UNAVAILABLE_RETRY_AFTER_SECONDS = 2
 
 
@@ -225,6 +228,14 @@ def public_failure_error(
         detail_param = failure.safe_details.get("param")
         if param is None and isinstance(detail_param, str):
             param = detail_param
+    # A context-window overflow, the gateway's own estimate or a provider's
+    # verdict, carries OpenAI's own code on every surface: Codex compacts on
+    # it, and the Messages surface words it as Anthropic's "prompt is too
+    # long" (``encode_messages::overflow`` in the native crate).
+    if failure.failure_class is GatewayFailureClass.INVALID_REQUEST and (
+        failure.context_window_rejected or detail_code == CONTEXT_LENGTH_EXCEEDED_CODE
+    ):
+        code = CONTEXT_LENGTH_EXCEEDED_CODE
     # The caller wording of the durable sentence; a relayed provider detail
     # rebuilds the message from the durable head below instead.
     message = caller_copy(failure.failure_class, failure.safe_message)

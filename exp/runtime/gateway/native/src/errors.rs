@@ -626,6 +626,14 @@ impl Failure {
         } else {
             caller_copy(self.failure_class, &self.safe_message)
         };
+        // A context-window overflow carries OpenAI's own code on every surface
+        // (Codex and Claude Code compact on it; `encode_messages::overflow`).
+        let overflow = self.context_window_rejected && status == 400;
+        let code = if overflow {
+            "context_length_exceeded"
+        } else {
+            code
+        };
         let mut error = PublicError::new(status, code, &message, error_type);
         if self.failure_class == FailureClass::Refusal {
             // Every refusal answer names its category; a refusal built

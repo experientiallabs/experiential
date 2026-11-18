@@ -28,9 +28,13 @@ pub fn anthropic_error_body(error: &PublicError) -> Value {
         _ if error.error_type == "invalid_request_error" => "invalid_request_error",
         _ => "api_error",
     };
+    // A context-window overflow is worded the way Anthropic words it, which
+    // is what lets Claude Code compact the conversation on its own.
+    let text =
+        super::overflow::anthropic_overflow_message(error).unwrap_or_else(|| error.message.clone());
     let message = match &error.param {
-        Some(param) if !param.is_empty() => format!("{} (param: {param})", error.message),
-        _ => error.message.clone(),
+        Some(param) if !param.is_empty() => format!("{text} (param: {param})"),
+        _ => text,
     };
     let mut body = json!({
         "type": "error",
