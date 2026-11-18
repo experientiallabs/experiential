@@ -108,15 +108,16 @@ usually sample a valid call. So a turn whose first outward output is a client fu
 uncommitted until the turn ends (`waterfall/commit.rs`, `HeldToolCalls`): the call's opening, its
 argument deltas, and every later event wait in order, and the turn commits on its successful
 terminal with exactly the events the caller would otherwise have received live. The hold is bounded
-(64 KiB of retained output, 8,192 events): past it, or as soon as the provider reports a tool it
-executes itself, the turn commits and streams live as before. A freeform (custom) tool's input is
-opaque text that never fails to parse, so a turn opening with one is not held. Output the caller already saw (text
+(256 KiB, each held event charged its full owned size, or 8,192 events): past it, or as soon as the provider reports a tool it
+executes itself, the turn commits and streams live as before. A freeform (custom) tool is not held:
+native custom input never fails to parse, and a translated wrapper keeps its never-replay contract. Output the caller already saw (text
 before the call, a provider-executed tool) is never held.
 
 A held call that fails to validate is filed `malformed_response` with `malformed_tool_call`, and
 the waterfall retries it once per request, taking the cache miss: the control plane prefers an
 untried sibling (like a `transport` failure, under every failover mode) and redials the same rung
-only when no sibling can take it, with no backoff. The retry runs under the request deadline, not
+only when no sibling can take it, with no backoff and under a fresh `Idempotency-Key` (a resample is a
+new provider intent, never a replay). The retry runs under the request deadline, not
 the pre-first-byte budget the held turn has already been generating in. Settlement carries the flag
 to the failed attempt row. A second malformed call in the same request is its answer. A buffered
 surface (non-streaming, or a guardrail-buffered stream) follows the same one-retry rule. A malformed

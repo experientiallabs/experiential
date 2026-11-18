@@ -120,8 +120,9 @@ pub(crate) fn is_semantic(event: &Event) -> bool {
         if records.as_array().is_some_and(|items| !items.is_empty()))
 }
 
-/// Bytes a turn's held tool calls may retain before they stream live.
-pub(super) const MAXIMUM_HELD_TOOL_CALL_BYTES: usize = 65_536;
+/// Bytes a turn's held tool calls may retain (each event charged its full
+/// owned size) before they stream live.
+pub(super) const MAXIMUM_HELD_TOOL_CALL_BYTES: usize = 262_144;
 /// Events a turn's held tool calls may retain before they stream live.
 pub(super) const MAXIMUM_HELD_TOOL_CALL_EVENTS: usize = 8_192;
 
@@ -200,38 +201,10 @@ impl HeldToolCalls {
     }
 
     fn push(&mut self, event: &Event) -> Hold {
-        // The retention estimator charges a call's opening a flat size and a
-        // completed call its arguments; the held clone also owns the
-        // provider-set identifiers and opaque `caller`, so charge them too.
-        let identifiers = match event {
-            Event::ToolCallStarted {
-                call_id,
-                name,
-                namespace,
-                caller,
-                thought_signature,
-                ..
-            } => {
-                call_id.len()
-                    + name.len()
-                    + namespace.as_deref().map_or(0, str::len)
-                    + caller
-                        .as_ref()
-                        .map_or(0, crate::dialects::json_retained_bytes)
-                    + thought_signature.as_deref().map_or(0, str::len)
-            }
-            Event::ToolCallCompleted { call, .. } => {
-                call.call_id.len()
-                    + call.name.len()
-                    + call.namespace.as_deref().map_or(0, str::len)
-                    + call
-                        .caller
-                        .as_ref()
-                        .map_or(0, crate::dialects::json_retained_bytes)
-            }
-            _ => 0,
-        };
-        let bytes = crate::relay::event_retained_bytes(event).saturating_add(identifiers);
+        // The retention estimator leaves out identifiers, opaque `caller`
+        // metadata and item ids the held clone owns; its debug rendering
+        // carries every owned byte (escaped, so never fewer), so charge that.
+        let bytes = crate::relay::event_retained_bytes(event).max(format!("{event:?}").len());
         if self.bytes.saturating_add(bytes) > MAXIMUM_HELD_TOOL_CALL_BYTES
             || self.events.len() + 1 > MAXIMUM_HELD_TOOL_CALL_EVENTS
         {

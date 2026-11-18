@@ -427,6 +427,15 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
         // A rung a tool-search round rebuilt dials its rebuilt wire; the
         // route's own entry still answers every policy question above.
         let dial_wire = search_wires[depth].as_ref().unwrap_or(wire);
+        // A resample after a malformed tool call is a new provider intent: a
+        // wire that deduplicates the stable key would replay the bad answer.
+        let resample_wire = (current_depth == Some(depth)
+            && last_failure.as_ref().is_some_and(|f| f.malformed_tool_call))
+        .then(|| DeploymentWire {
+            idempotency_key: format!("{}.resample", dial_wire.idempotency_key),
+            ..dial_wire.clone()
+        });
+        let dial_wire = resample_wire.as_ref().unwrap_or(dial_wire);
         // Whether a timeout of this dial would leave the ladder anywhere to
         // go; when it would not, the dial waits out the request's budget
         // rather than its own allowance (`run_attempt`).

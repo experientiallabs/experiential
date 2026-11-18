@@ -228,6 +228,11 @@ fn a_single_lane_redials_once_after_a_malformed_tool_call() {
         assert_eq!(completed_call(&events), "{\"path\": \"a\"}");
         finish(guard, Won::Committed(committed)).await;
         assert_eq!(lane.accepted.lock().expect("lock").len(), 2);
+        // The resample is a new provider intent: a wire that deduplicates
+        // the stable key must not replay the malformed answer.
+        let keys = lane.keys.lock().expect("lock").clone();
+        assert_eq!(keys[0].as_deref(), Some("op-novita"));
+        assert_eq!(keys[1].as_deref(), Some("op-novita.resample"));
         let story = harness.story().await;
         let starts = story["starts"].as_array().expect("starts");
         assert_eq!(starts.len(), 2);
