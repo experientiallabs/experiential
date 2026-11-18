@@ -640,3 +640,102 @@ fn an_in_stream_refusal_of_encrypted_reasoning_is_repaired_like_a_pre_stream_one
         assert_eq!(rung.accepted.lock().expect("lock").len(), 1);
     });
 }
+
+/// OpenAI failing a Codex stream on a replayed function output part sealed by
+/// another account (live, gpt-6.1-sol, 2026-11-18): a 200, then this terminal.
+const RESPONSES_FAILED_FUNCTION_OUTPUT_FRAME: &str = concat!(
+    "{\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",",
+    "\"usage\":{\"input_tokens\":30,\"output_tokens\":0,\"total_tokens\":30},\"error\":",
+    "{\"code\":\"invalid_encrypted_content\",\"message\":\"Encrypted function output content ",
+    "could not be decrypted or decoded.\"}}}"
+);
+
+/// A Codex replay whose foreign reasoning item AND foreign function output
+/// part both carry another account's encrypted content. `tag` keeps each
+/// test's payloads apart in the per-worker memory of refused payloads.
+fn function_output_wire(tag: &str, url: &str, extra: Option<Value>) -> DeploymentWire {
+    let reasoning = format!("rsn_foreign_reasoning_{tag}_hA==");
+    let mut wire = responses_wire("a", url, &[&reasoning]);
+    let input = wire.upstream_payload["input"].as_array_mut().unwrap();
+    input.insert(
+        4,
+        json!({"type": "function_call", "id": "fc_turn_2", "call_id": "call_2", "name": "spawn", "arguments": "{}"}),
+    );
+    input.insert(
+        5,
+        json!({"type": "function_call_output", "id": "fco_2", "call_id": "call_2", "output": [
+            {"type": "encrypted_content", "encrypted_content": format!("gAAA_foreign_function_output_{tag}==")}
+        ]}),
+    );
+    input.extend(extra);
+    wire
+}
+
+#[test]
+fn a_refused_encrypted_function_output_is_degraded_and_the_same_rung_redialed() {
+    block_on(async {
+        let harness = Harness::new();
+        let rung = spawn_rung(vec![
+            Answer::ResponsesFailed(RESPONSES_FAILED_FUNCTION_OUTPUT_FRAME),
+            Answer::ResponsesStream(&[RESPONSES_TEXT_FRAME]),
+        ])
+        .await;
+        let route = [function_output_wire("degraded", &rung.url, None)];
+        let (won, guard) = harness.run(&route, None, Duration::from_secs(60)).await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("the one repair strips every refused payload and the re-dial serves");
+        };
+        assert!(committed.encrypted_reasoning_stripped);
+        drop(committed);
+        let bodies = rung.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2);
+        let repaired: Value = serde_json::from_str(&bodies[1]).unwrap();
+        assert!(!bodies[1].contains("gAAA_foreign_function_output"));
+        assert!(!bodies[1].contains("rsn_foreign_reasoning"));
+        let output = repaired["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["call_id"] == "call_2" && item["type"] == "function_call_output")
+            .expect("the call keeps its result");
+        assert_eq!(
+            output["output"],
+            json!(crate::replay_repair::ENCRYPTED_PART_PLACEHOLDER)
+        );
+        assert!(output.get("id").is_none());
+    });
+}
+
+#[test]
+fn a_refused_compaction_item_surfaces_an_invalid_request_naming_it() {
+    block_on(async {
+        let harness = Harness::new();
+        // The strippable payloads go on the first repair; the compaction item
+        // cannot, so the second refusal is the caller's 400, not a 502.
+        let rung = spawn_rung(vec![
+            Answer::ResponsesFailed(RESPONSES_FAILED_FUNCTION_OUTPUT_FRAME),
+            Answer::ResponsesFailed(RESPONSES_FAILED_ENCRYPTED_FRAME),
+        ])
+        .await;
+        let compaction =
+            json!({"type": "compaction", "id": "cmp_1", "encrypted_content": "gAAA_compacted=="});
+        let route = [function_output_wire(
+            "compaction",
+            &rung.url,
+            Some(compaction),
+        )];
+        let (won, guard) = harness.run(&route, None, Duration::from_secs(60)).await;
+        let Won::Failed(error) = finish(guard, won).await else {
+            panic!("an unstrippable item is the caller's to remove");
+        };
+        assert_eq!(error.status_code, 400, "{error:?}");
+        assert!(error.message.contains("'compaction' item"), "{error:?}");
+        assert!(error
+            .message
+            .contains("Resend the request without that item"));
+        assert_eq!(rung.bodies.lock().unwrap().len(), 2);
+        let story = harness.story().await;
+        let settles = story["settles"].as_array().unwrap();
+        assert_eq!(settles[1]["failure"]["failure_class"], "invalid_request");
+    });
+}
