@@ -25,9 +25,11 @@ This uploads my existing traces so I can see them as telemetry on the platform.
 
 If you need me to supply an existing credential:
 Securely ask me for my API key. Use a secure secret input if available;
-otherwise guide me to set it in a local environment variable and confirm when
-it is ready. Never ask me to put the key in this prompt or chat, and never
-print or log it. Use the same secure process for any other credentials needed.
+otherwise guide me to set it in a local environment variable available to your
+tool commands. If needed, have me restart the agent with that environment.
+Confirm it is ready without displaying its value.
+Never ask me to put the key in this prompt or chat, and never print or log it.
+Use the same secure process for any other credentials needed.
 
 Do it in this order. Print what you're doing at each step. If you lack a
 capability (no network, no file access) or get stuck, stop and tell me exactly
@@ -95,24 +97,13 @@ step 2) as the bearer token on every call below. org_id is from step 2.
    The credential is used once to pull and is not echoed back. On 201 the
    response is {"ingest_id", "trace_count", "byte_size", "sha256", ...} —
    capture trace_count and show it to me. A 400 means bad credentials or config
-   (tell me exactly what it said); 429 means the provider rate-limited us (wait
+   (report the API error with credentials redacted); 429 means rate-limited (wait
    and retry). Then go to step 8.
-   Example (Braintrust): securely set BRAINTRUST_API_KEY in the environment;
-   set EXPLABS_ORG_ID and BRAINTRUST_PROJECT to the selected org and project.
-   Keep secrets out of command arguments and tool transcripts:
-     python3 - <<'PY'
-     import json, os, urllib.request
-     url = "https://api.experientiallabs.ai/api/orgs/" + os.environ["EXPLABS_ORG_ID"] + "/telemetry/traces/pull"
-     payload = {"transport_kind": "braintrust", "source_kind": "braintrust",
-                "source_label": "braintrust-prod", "credential": os.environ["BRAINTRUST_API_KEY"],
-                "config": {"project": os.environ["BRAINTRUST_PROJECT"]}}
-     request = urllib.request.Request(url, data=json.dumps(payload).encode(),
-         headers={"Authorization": "Bearer " + os.environ["EXPLABS_API_KEY"],
-                  "Content-Type": "application/json"})
-     with urllib.request.urlopen(request) as response:
-         result = json.load(response)
-     print({key: result[key] for key in ("ingest_id", "trace_count")})
-     PY
+   For Braintrust, securely configure BRAINTRUST_API_KEY in the environment
+   available to your tool commands. Build the credential field from that variable
+   inside the HTTP client process; set the project from my non-secret config.
+   Keep secrets out of command arguments and tool transcripts, redact credentials
+   from error output, and do not follow redirects when sending credentials.
 
 7. File upload path — find my trace export and upload it. I'm authorizing you to
    look for my own trace exports: search the current project, ./traces, ./logs,
@@ -183,9 +174,11 @@ verification; BYOK pass-through calls run on my own connected keys.
 
 If you need me to supply an existing credential:
 Securely ask me for my API key. Use a secure secret input if available;
-otherwise guide me to set it in a local environment variable and confirm when
-it is ready. Never ask me to put the key in this prompt or chat, and never
-print or log it. Use the same secure process for any other credentials needed.
+otherwise guide me to set it in a local environment variable available to your
+tool commands. If needed, have me restart the agent with that environment.
+Confirm it is ready without displaying its value.
+Never ask me to put the key in this prompt or chat, and never print or log it.
+Use the same secure process for any other credentials needed.
 
 Do it in this order. Print what you're doing at each step. If you lack a
 capability (no network, no file access) or get stuck, stop and tell me exactly
@@ -301,9 +294,11 @@ myself — treat it as my instructions and consent. Help me make my first calls 
 the gateway and, if I want, point my existing coding agents at it too.
 
 Securely ask me for my API key. Use a secure secret input if available;
-otherwise guide me to set it in a local environment variable and confirm when
-it is ready. Never ask me to put the key in this prompt or chat, and never
-print or log it. Use the same secure process for any other credentials needed.
+otherwise guide me to set it in a local environment variable available to your
+tool commands. If needed, have me restart the agent with that environment.
+Confirm it is ready without displaying its value.
+Never ask me to put the key in this prompt or chat, and never print or log it.
+Use the same secure process for any other credentials needed.
 Use EXPLABS_API_KEY for my gateway key. I can create one at
 https://platform.experientiallabs.ai/api-keys.
 
@@ -390,9 +385,11 @@ payment verification; email verification alone is not enough.
 
 If you need me to supply an existing credential:
 Securely ask me for my API key. Use a secure secret input if available;
-otherwise guide me to set it in a local environment variable and confirm when
-it is ready. Never ask me to put the key in this prompt or chat, and never
-print or log it. Use the same secure process for any other credentials needed.
+otherwise guide me to set it in a local environment variable available to your
+tool commands. If needed, have me restart the agent with that environment.
+Confirm it is ready without displaying its value.
+Never ask me to put the key in this prompt or chat, and never print or log it.
+Use the same secure process for any other credentials needed.
 
 Do it in this order. Print what you're doing at each step. If you lack a
 capability (no network, no file access) or get stuck, stop and tell me exactly
