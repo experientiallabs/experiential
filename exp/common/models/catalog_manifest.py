@@ -32,7 +32,7 @@ from pydantic import Field, ValidationError, model_validator
 
 from exp.common.core.artifacts import ContractModel, Sha256
 from exp.common.models.catalog import ConnectionConfig, ModelCatalog, ModelRecord
-from exp.common.models.gateway_catalog import load_forward_compatible
+from exp.common.models.gateway_catalog import load_forward_compatible, normalize_gateway_catalog
 from exp.common.models.gateway_chains import GatewayModelChain
 from exp.common.models.gateway_pools import GatewayPoolRecord
 
@@ -72,6 +72,7 @@ ArtifactRefusalReason = Literal[
     "deployment_conflict",
     "pool_conflict",
     "chain_conflict",
+    "invalid_artifact",
 ]
 
 
@@ -288,7 +289,7 @@ def read_catalog_manifest(data: bytes | str) -> CatalogManifest:
     if not isinstance(raw, dict):
         raise ValueError("catalog manifest is not a JSON object")
     version = raw.get("manifest_schema_version", CATALOG_MANIFEST_SCHEMA_VERSION)
-    if version != CATALOG_MANIFEST_SCHEMA_VERSION:
+    if type(version) is not int or version != CATALOG_MANIFEST_SCHEMA_VERSION:
         raise ValueError(f"catalog manifest schema {version!r} is not readable by this build")
     manifest, _dropped = load_forward_compatible(CatalogManifest, json.dumps(raw))
     return manifest
@@ -312,11 +313,20 @@ class ParsedArtifactCache:
             return self._entries.get(artifact_sha256)
 
     def load(self, artifact_sha256: str, data: bytes) -> LoadedModelArtifact:
-        """Return the cached artifact, or verify, parse and cache these bytes.
+        """Verify these bytes, then return the cached parse or parse and cache them.
+
+        The bytes in hand are hashed on every call, so changed or corrupted
+        bytes for a hash parsed earlier are refused rather than served from the
+        earlier parse.
 
         Raises:
             ModelArtifactError: As :func:`read_model_artifact`.
         """
+        actual = model_artifact_sha256(data)
+        if actual != artifact_sha256:
+            raise ModelArtifactError(
+                "digest_mismatch", f"stored bytes hash to {actual}, not {artifact_sha256}"
+            )
         cached = self.get(artifact_sha256)
         if cached is not None:
             return cached
@@ -372,7 +382,10 @@ def assemble_manifest_catalog(
     """Assemble one manifest's verified artifacts into a single authored catalog.
 
     Per-artifact problems never raise: they become refusals, and a refused
-    model also refuses every model whose chain depends on it.
+    model also refuses every model whose chain depends on it. When the merged
+    survivors fail catalog validation, each survivor is validated together
+    with its model dependencies (in dependency order), so only the artifacts
+    that cannot be served are refused and the rest still assemble.
 
     Args:
         manifest: The cut to assemble.
@@ -382,7 +395,8 @@ def assemble_manifest_catalog(
         The assembled catalog and the refused entries.
 
     Raises:
-        ValueError: The surviving artifacts together fail catalog validation.
+        ValueError: Survivors that each validate with their dependencies still
+            fail catalog validation together.
     """
     entries = sorted(manifest.entries, key=lambda entry: entry.model_id)
     by_model = {entry.model_id: entry.artifact_sha256 for entry in entries}
@@ -390,6 +404,7 @@ def assemble_manifest_catalog(
     loaded: dict[str, ModelArtifact] = {}
 
     def refuse(model_id: str, reason: ArtifactRefusalReason, detail: str) -> None:
+        """Record the first refusal reason for one manifest entry."""
         if model_id not in refused:
             refused[model_id] = ArtifactRefusal(
                 model_id=model_id,
@@ -411,6 +426,17 @@ def assemble_manifest_catalog(
                 f"artifact serves model {artifact.model_id!r}",
             )
             continue
+        if not artifact.models and not artifact.gateway_model_chains:
+            refuse(entry.model_id, "model_mismatch", "artifact carries no deployment or chain")
+            continue
+        foreign = _foreign_model_ids(artifact)
+        if foreign:
+            refuse(
+                entry.model_id,
+                "model_mismatch",
+                "artifact carries other models: " + ", ".join(repr(m) for m in foreign),
+            )
+            continue
         mismatched = sorted(
             dependency
             for dependency, sha in artifact.model_dependencies().items()
@@ -425,6 +451,29 @@ def assemble_manifest_catalog(
             continue
         loaded[entry.model_id] = artifact
     _refuse_conflicts(loaded, refuse)
+    _refuse_dependents(loaded, refused, refuse)
+    survivors = [loaded[model_id] for model_id in sorted(loaded) if model_id not in refused]
+    catalog = _catalog_or_error(manifest.catalog_schema_version, survivors)
+    if isinstance(catalog, Exception):
+        _refuse_invalid(manifest.catalog_schema_version, loaded, refused, refuse)
+        survivors = [loaded[model_id] for model_id in sorted(loaded) if model_id not in refused]
+        catalog = _catalog_or_error(manifest.catalog_schema_version, survivors)
+        if isinstance(catalog, Exception):
+            raise ValueError(f"surviving artifacts fail catalog validation: {catalog}")
+    return ManifestCatalog(
+        manifest=manifest,
+        catalog=catalog,
+        served_model_ids=tuple(artifact.model_id for artifact in survivors),
+        refusals=tuple(refused[model_id] for model_id in sorted(refused)),
+    )
+
+
+def _refuse_dependents(
+    loaded: Mapping[str, ModelArtifact],
+    refused: Mapping[str, ArtifactRefusal],
+    refuse: Callable[[str, ArtifactRefusalReason, str], None],
+) -> None:
+    """Refuse every loaded model that depends on a refused one, to a fixpoint."""
     changed = True
     while changed:
         changed = False
@@ -435,32 +484,89 @@ def assemble_manifest_catalog(
             if blocked:
                 refuse(model_id, "dependency_refused", "depends on refused " + ", ".join(blocked))
                 changed = True
-    survivors = [loaded[model_id] for model_id in sorted(loaded) if model_id not in refused]
+
+
+_CATALOG_ERRORS = (ValueError, KeyError)
+"""What building or normalizing a malformed catalog raises (``ValidationError`` included)."""
+
+
+def _catalog_or_error(
+    schema_version: int, artifacts: Collection[ModelArtifact]
+) -> ModelCatalog | None | Exception:
+    """Merge artifacts into a validated, normalizable catalog, or return why they cannot be.
+
+    Returns ``None`` when no connection survives (nothing to serve).
+    """
     connections: dict[str, ConnectionConfig] = {}
     models: dict[str, ModelRecord] = {}
     pools: dict[str, GatewayPoolRecord] = {}
     chains: dict[str, GatewayModelChain] = {}
-    for artifact in survivors:
+    for artifact in artifacts:
         connections.update(artifact.connections)
         models.update(artifact.models)
         pools.update(artifact.gateway_pools)
         chains.update(artifact.gateway_model_chains)
-    refusals = tuple(refused[model_id] for model_id in sorted(refused))
-    served = tuple(artifact.model_id for artifact in survivors)
     if not connections:
-        return ManifestCatalog(
-            manifest=manifest, catalog=None, served_model_ids=served, refusals=refusals
+        return None
+    try:
+        catalog = ModelCatalog(
+            schema_version=schema_version,
+            connections=connections,
+            models=models,
+            gateway_pools=pools,
+            gateway_model_chains=chains,
         )
-    catalog = ModelCatalog(
-        schema_version=manifest.catalog_schema_version,
-        connections=connections,
-        models=models,
-        gateway_pools=pools,
-        gateway_model_chains=chains,
-    )
-    return ManifestCatalog(
-        manifest=manifest, catalog=catalog, served_model_ids=served, refusals=refusals
-    )
+        normalize_gateway_catalog(catalog)
+    except _CATALOG_ERRORS as error:
+        return error
+    return catalog
+
+
+def _refuse_invalid(
+    schema_version: int,
+    loaded: Mapping[str, ModelArtifact],
+    refused: Mapping[str, ArtifactRefusal],
+    refuse: Callable[[str, ArtifactRefusalReason, str], None],
+) -> None:
+    """Refuse each survivor that fails validation together with its model dependencies.
+
+    Survivors are visited in dependency order, so a model whose dependency was
+    refused here is reported as ``dependency_refused`` rather than revalidated.
+    """
+    pending = {model_id for model_id in loaded if model_id not in refused}
+    while pending:
+        ready = sorted(
+            model_id
+            for model_id in pending
+            if not any(dep in pending for dep in loaded[model_id].model_dependencies())
+        )
+        if not ready:
+            for model_id in sorted(pending):
+                refuse(model_id, "dependency_refused", "model dependencies form a cycle")
+            return
+        for model_id in ready:
+            pending.discard(model_id)
+            blocked = sorted(dep for dep in loaded[model_id].model_dependencies() if dep in refused)
+            if blocked:
+                refuse(model_id, "dependency_refused", "depends on refused " + ", ".join(blocked))
+                continue
+            closure = _dependency_closure(model_id, loaded)
+            error = _catalog_or_error(schema_version, [loaded[item] for item in sorted(closure)])
+            if isinstance(error, Exception):
+                refuse(model_id, "invalid_artifact", str(error)[:1_000])
+
+
+def _dependency_closure(model_id: str, loaded: Mapping[str, ModelArtifact]) -> set[str]:
+    """The model and every model it transitively depends on."""
+    closure: set[str] = set()
+    stack = [model_id]
+    while stack:
+        current = stack.pop()
+        if current in closure:
+            continue
+        closure.add(current)
+        stack.extend(dep for dep in loaded[current].model_dependencies() if dep in loaded)
+    return closure
 
 
 def _refuse_conflicts(
@@ -499,3 +605,25 @@ def _refuse_conflicts(
         if len(model_ids) > 1:
             for model_id in sorted(model_ids):
                 refuse(model_id, reasons[kind], f"{kind} {name!r} is claimed by {len(model_ids)}")
+
+
+def _foreign_model_ids(artifact: ModelArtifact) -> tuple[str, ...]:
+    """Models the artifact's records, pools or chains serve other than its own, sorted.
+
+    A deployment belongs to its pool's exact model, else to its declared
+    ``gateway.exact_model_id``, else to its own alias (an unpooled singleton).
+    """
+    pool_model = {
+        alias: pool.exact_model_id
+        for pool in artifact.gateway_pools.values()
+        for alias in pool.deployment_aliases
+    }
+    owners: set[str] = set()
+    for alias, record in artifact.models.items():
+        declared = record.gateway.exact_model_id if record.gateway is not None else None
+        owners.add(pool_model.get(alias) or declared or alias)
+    owners.update(pool.exact_model_id for pool in artifact.gateway_pools.values())
+    for key, chain in artifact.gateway_model_chains.items():
+        owners.update((key, chain.model_id))
+    owners.discard(artifact.model_id)
+    return tuple(sorted(owners))

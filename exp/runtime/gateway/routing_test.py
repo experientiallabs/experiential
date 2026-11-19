@@ -440,6 +440,9 @@ def test_index_serves_a_manifest_pinned_catalog_without_re_deriving_identity() -
     resolver = CatalogRouteResolver({pinned: _single_pool_catalog()}, manifest_pins={pinned: 7})
     assert resolver.manifest_version(*pinned) == 7
     assert resolver.manifest_version(_REVISION, "c" * 64) is None
+    # The route carries the cut of the view it was resolved against.
+    before = resolver.resolve_direct(_hint_authorization("b" * 64, "pool-one"))
+    assert before.manifest_version == 7
     resolver.swap_catalogs(
         {pinned: _single_pool_catalog()},
         project_resolver=None,
@@ -447,6 +450,9 @@ def test_index_serves_a_manifest_pinned_catalog_without_re_deriving_identity() -
         manifest_pins={pinned: 8},
     )
     assert resolver.manifest_version(*pinned) == 8
+    assert before.manifest_version == 7
+    after = resolver.resolve_direct(_hint_authorization("b" * 64, "pool-one"))
+    assert after.manifest_version == 8
     with pytest.raises(ValueError, match="wrong digest"):
         resolver.swap_catalogs(
             {pinned: _single_pool_catalog()}, project_resolver=None, listing_pools={}

@@ -166,12 +166,16 @@ class _CatalogView:
         chains: Immutable authored-chain index keyed by canonical model identity.
         pools: Immutable exact-model pool index keyed by pool identity.
         deployments: Immutable deployment index used to resolve stage leaves.
+        manifest_version: The manifest version this key serves when the host
+            assembled it from a verified manifest, else ``None``. It lives on the
+            view so a lookup reads the catalog and its manifest cut together.
     """
 
     catalog: NormalizedGatewayCatalog
     chains: Mapping[str, GatewayModelChain]
     pools: Mapping[str, ExactModelPool]
     deployments: Mapping[str, ExactModelDeployment]
+    manifest_version: int | None = None
 
 
 def _index_catalogs(
@@ -209,7 +213,7 @@ def _index_catalogs(
     # each distinct object once, but verify every key's digest independently.
     # ``catalogs`` keeps object IDs stable by retaining them for the whole loop.
     identity_by_object: dict[int, str] = {}
-    view_by_object: dict[int, _CatalogView] = {}
+    view_by_object: dict[tuple[int, int | None], _CatalogView] = {}
     pinned = manifest_pins or {}
     for key, catalog in catalogs.items():
         revision_id, catalog_sha256 = key
@@ -220,7 +224,8 @@ def _index_catalogs(
                 identity_by_object[id(catalog)] = identity
             if identity != catalog_sha256:
                 raise ValueError(f"catalog for alias revision {revision_id!r} has the wrong digest")
-        view = view_by_object.get(id(catalog))
+        manifest_version = pinned.get(key)
+        view = view_by_object.get((id(catalog), manifest_version))
         if view is None:
             view = _CatalogView(
                 catalog=catalog,
@@ -229,7 +234,8 @@ def _index_catalogs(
                 deployments=MappingProxyType(
                     {deployment.deployment_id: deployment for deployment in catalog.deployments}
                 ),
+                manifest_version=manifest_version,
             )
-            view_by_object[id(catalog)] = view
+            view_by_object[(id(catalog), manifest_version)] = view
         indexed[key] = view
     return indexed

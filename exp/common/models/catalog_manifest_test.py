@@ -340,6 +340,7 @@ def test_model_mismatch_and_conflicts_refuse_every_claimant() -> None:
                 "connection": "openai",
                 "model": "third",
                 "billing_source": "customer_managed",
+                "gateway": {"exact_model_id": "third"},
             }
         },
     }
@@ -363,6 +364,7 @@ def test_model_mismatch_and_conflicts_refuse_every_claimant() -> None:
     other["model_id"] = "other"
     other["gateway_model_chains"] = {}
     other["gateway_pools"] = {}
+    other["models"]["small-1"]["gateway"]["exact_model_id"] = "other"
     data = canonical_json_bytes(other)
     sha = model_artifact_sha256(data)
     loaded = _load_all(blobs)
@@ -428,3 +430,154 @@ def test_cache_shares_unchanged_artifacts_across_manifest_versions() -> None:
     assert cache.retain(new_hashes.values()) == 1
     assert hashes["big"] not in cache
     assert len(cache) == 2
+
+
+def _artifact_entry(body: dict[str, Any]) -> tuple[str, LoadedModelArtifact]:
+    """Encode one hand-written artifact and return its hash and verified parse."""
+    data = canonical_json_bytes(body)
+    sha = model_artifact_sha256(data)
+    return sha, read_model_artifact(data, artifact_sha256=sha)
+
+
+def _with_entries(
+    manifest: CatalogManifest, loaded: dict[str, LoadedModelArtifact], **extra: str
+) -> CatalogManifest:
+    """The manifest plus one entry per ``model_id=sha`` keyword."""
+    added = tuple(ManifestEntry(model_id=k, artifact_sha256=v) for k, v in extra.items())
+    assert all(v in loaded for v in extra.values())
+    return manifest.model_copy(update={"entries": (*manifest.entries, *added)})
+
+
+def test_cache_rehashes_the_bytes_in_hand_even_for_a_cached_hash() -> None:
+    _, blobs = _split(_catalog())
+    sha, data = next(iter(blobs.items()))
+    cache = ParsedArtifactCache()
+    cache.load(sha, data)
+    with pytest.raises(ModelArtifactError) as raised:
+        cache.load(sha, data + b" ")
+    assert raised.value.reason == "digest_mismatch"
+
+
+def test_manifest_schema_marker_must_be_an_integer() -> None:
+    manifest, _ = _split(_catalog())
+    body = json.loads(canonical_json_bytes(manifest))
+    for marker in (True, 1.0, "1"):
+        body["manifest_schema_version"] = marker
+        with pytest.raises(ValueError, match="not readable"):
+            read_catalog_manifest(json.dumps(body))
+
+
+def test_artifact_must_serve_only_its_declared_model() -> None:
+    manifest, blobs = _split(_catalog())
+    hashes = {entry.model_id: entry.artifact_sha256 for entry in manifest.entries}
+    loaded = _load_all(blobs)
+    # The wrapper and entry say "renamed" but the body still serves "small".
+    body = json.loads(blobs[hashes["small"]])
+    body["model_id"] = "renamed"
+    renamed_sha, renamed = _artifact_entry(body)
+    loaded[renamed_sha] = renamed
+    empty_sha, empty = _artifact_entry(
+        {"artifact_schema_version": 1, "model_id": "empty", "connections": {}, "models": {}}
+    )
+    loaded[empty_sha] = empty
+    result = assemble_manifest_catalog(
+        _with_entries(manifest, loaded, renamed=renamed_sha, empty=empty_sha), loaded
+    )
+    refusals = {r.model_id: (r.reason, r.detail) for r in result.refusals}
+    assert refusals["renamed"] == ("model_mismatch", "artifact carries other models: 'small'")
+    assert refusals["empty"][0] == "model_mismatch"
+    assert result.served_model_ids == ("big", "small")
+
+
+def test_a_catalog_invalid_artifact_is_refused_and_the_rest_still_serve() -> None:
+    manifest, blobs = _split(_catalog())
+    hashes = {entry.model_id: entry.artifact_sha256 for entry in manifest.entries}
+    loaded = _load_all(blobs)
+    # A chain naming a pool the artifact does not carry.
+    broken_chain_sha, broken_chain = _artifact_entry(
+        {
+            "artifact_schema_version": 1,
+            "model_id": "lost",
+            "connections": {"openai": {"provider": "openai"}},
+            "models": {
+                "lost-1": {
+                    "connection": "openai",
+                    "model": "lost",
+                    "billing_source": "customer_managed",
+                    "gateway": {"exact_model_id": "lost"},
+                }
+            },
+            "gateway_model_chains": {
+                "lost": {
+                    "model_id": "lost",
+                    "pool_id": "pool-missing",
+                    "revision": "r1",
+                    "rungs": [{"kind": "deployment", "deployment_id": "lost-1"}],
+                }
+            },
+        }
+    )
+    loaded[broken_chain_sha] = broken_chain
+    # An explicit-capability provider without capabilities.
+    no_caps_sha, no_caps = _artifact_entry(
+        {
+            "artifact_schema_version": 1,
+            "model_id": "bare",
+            "connections": {
+                "bare-local": {
+                    "provider": "openai-compatible",
+                    "base_url": "https://bare.example.test/v1",
+                }
+            },
+            "models": {
+                "bare": {
+                    "connection": "bare-local",
+                    "model": "bare",
+                    "billing_source": "customer_managed",
+                }
+            },
+        }
+    )
+    loaded[no_caps_sha] = no_caps
+    # A model whose chain enters the broken one is refused as its dependent.
+    rider_sha, rider = _artifact_entry(
+        {
+            "artifact_schema_version": 1,
+            "model_id": "rider",
+            "required_to_serve": ["model_chains"],
+            "dependencies": [{"kind": "model", "key": "lost", "sha256": broken_chain_sha}],
+            "connections": {"openai": {"provider": "openai"}},
+            "models": {
+                "rider-1": {
+                    "connection": "openai",
+                    "model": "rider",
+                    "billing_source": "customer_managed",
+                    "gateway": {"exact_model_id": "rider"},
+                }
+            },
+            "gateway_model_chains": {
+                "rider": {
+                    "model_id": "rider",
+                    "pool_id": "rider-1",
+                    "revision": "r1",
+                    "rungs": [
+                        {"kind": "deployment", "deployment_id": "rider-1"},
+                        {"kind": "model", "model_id": "lost"},
+                    ],
+                }
+            },
+        }
+    )
+    loaded[rider_sha] = rider
+    result = assemble_manifest_catalog(
+        _with_entries(manifest, loaded, lost=broken_chain_sha, bare=no_caps_sha, rider=rider_sha),
+        loaded,
+    )
+    assert {(r.model_id, r.reason) for r in result.refusals} == {
+        ("bare", "invalid_artifact"),
+        ("lost", "invalid_artifact"),
+        ("rider", "dependency_refused"),
+    }
+    assert result.served_model_ids == ("big", "small")
+    assert result.catalog == _catalog()
+    assert hashes["big"] in loaded
