@@ -171,15 +171,16 @@ class InputOutcomes:
         reason: Literal["deadline_expired", "classifier_error", "result_unavailable"] | None = None
         if key not in self._started or policy.mode != "enforce":
             outcome = "not_started"
-        elif blocked:
-            outcome = "block"
         elif result is GuardrailOutcome.ALLOW or (
-            result is GuardrailOutcome.FLAGGED
-            and check.action in (GuardrailAction.ALLOW, GuardrailAction.MODIFY)
+            result is GuardrailOutcome.FLAGGED and check.action is GuardrailAction.ALLOW
         ):
             outcome = "allow"
         elif result is GuardrailOutcome.UNSUPPORTED:
             outcome = "unsupported"
+        elif blocked:
+            outcome = "block"
+        elif result is GuardrailOutcome.FLAGGED and check.action is GuardrailAction.MODIFY:
+            outcome = "allow"
         else:
             outcome = "missed"
             reason = (

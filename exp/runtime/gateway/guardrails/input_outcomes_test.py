@@ -289,6 +289,86 @@ def test_executed_input_outcome_survives_the_session(
         engine.close(timeout_seconds=2)
 
 
+@pytest.mark.parametrize(
+    ("first_verdict", "first_action", "second_verdict", "expected"),
+    [
+        pytest.param(
+            "allow",
+            GuardrailAction.BLOCK,
+            "unsupported",
+            ("allow", "unsupported"),
+            id="allow-before-unsupported",
+        ),
+        pytest.param(
+            "allow",
+            GuardrailAction.BLOCK,
+            "block",
+            ("allow", "block"),
+            id="allow-before-rejection",
+        ),
+        pytest.param(
+            "block",
+            GuardrailAction.ALLOW,
+            "unsupported",
+            ("allow", "unsupported"),
+            id="flagged-allow-before-unsupported",
+        ),
+        pytest.param(
+            "unsupported",
+            GuardrailAction.BLOCK,
+            "allow",
+            ("unsupported", "not_started"),
+            id="fail-closed-unsupported",
+        ),
+        pytest.param(
+            "block",
+            GuardrailAction.MODIFY,
+            "allow",
+            ("block", "not_started"),
+            id="invalid-modification",
+        ),
+    ],
+)
+def test_rejected_session_preserves_known_check_outcomes(
+    first_verdict: str,
+    first_action: GuardrailAction,
+    second_verdict: str,
+    expected: tuple[str, str],
+) -> None:
+    """Retain completed check results while denied requests grant no recovery authority."""
+    first, second = _Classifier(first_verdict), _Classifier(second_verdict)
+    first.release.set()
+    second.release.set()
+    policy = _policy()
+    policy = policy.model_copy(
+        update={
+            "input_execution": "blocking",
+            "fail_open": False,
+            "checks": (
+                policy.checks[0].model_copy(
+                    update={"check_id": "first", "adapter_id": "first", "action": first_action}
+                ),
+                policy.checks[0].model_copy(update={"check_id": "second", "adapter_id": "second"}),
+            ),
+        }
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"first": first, "second": second})),
+        monotonic=time.monotonic,
+    )
+    try:
+        session = _session(engine)
+        session.enable_input_outcomes()
+        with pytest.raises(GuardrailRejected):
+            session.inspect_input(_request())
+        outcomes = session.input_outcomes()
+        assert tuple(result.outcome for result in outcomes) == expected
+        assert all(result.recovery_reason is None for result in outcomes)
+    finally:
+        engine.close(timeout_seconds=2)
+
+
 def test_unchanged_subject_is_hashed_once_across_checks_and_execution() -> None:
     """Pre-admission and execution reuse a bounded digest without retaining content."""
     policy, tracker, request = _policy(), InputOutcomes(), _request()

@@ -553,7 +553,8 @@ keyword keep their existing call contract.
 Outcomes are `allow`, `block`, `missed`, `unsupported`, or `not_started`. Only an
 executed enforcing check can report `missed`, with `deadline_expired`,
 `classifier_error`, or `result_unavailable`. An input rejection suppresses misses
-across the request. Excluded policies produce no record; optional observation and
+across the request while preserving completed `allow` and `unsupported` results.
+Excluded policies produce no record; optional observation and
 unstarted checks never authorize enforcement. These records contain no request
 text, response text, classifier payload, or credentials.
 
