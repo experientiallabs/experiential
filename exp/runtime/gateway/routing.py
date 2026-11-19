@@ -196,6 +196,7 @@ class CatalogRouteResolver:
         *,
         project_resolver: ProjectTargetResolver | None = None,
         listing_pools: Mapping[tuple[str, str, str], str] | None = None,
+        manifest_pins: Mapping[tuple[str, str], int] | None = None,
     ) -> None:
         """Index one immutable catalog and optional learned-selection seam.
 
@@ -204,10 +205,14 @@ class CatalogRouteResolver:
             project_resolver: Optional resolver for project-backed targets.
             listing_pools: Direct-target pool IDs keyed by granted alias, revision,
                 and catalog digest. Project aliases are omitted and stay identity-only.
+            manifest_pins: Keys the host assembled from a byte-verified catalog
+                manifest, mapped to the manifest version they pin; indexed
+                without re-deriving identity (see ``catalog_manifest``).
         """
         self._project_resolver = project_resolver
         self._listing_pools = dict(listing_pools or {})
-        self._catalogs = _index_catalogs(catalogs)
+        self._manifest_pins = dict(manifest_pins or {})
+        self._catalogs = _index_catalogs(catalogs, self._manifest_pins)
 
     def swap_catalogs(
         self,
@@ -215,6 +220,7 @@ class CatalogRouteResolver:
         *,
         project_resolver: ProjectTargetResolver | None,
         listing_pools: Mapping[tuple[str, str, str], str],
+        manifest_pins: Mapping[tuple[str, str], int] | None = None,
     ) -> None:
         """Atomically replace the served catalog index with one validated superset.
 
@@ -226,14 +232,22 @@ class CatalogRouteResolver:
             project_resolver: Replacement resolver covering all retained activations.
             listing_pools: Direct-target pool IDs keyed by granted alias, revision,
                 and catalog digest, covering the replacement generation.
+            manifest_pins: Keys served from a verified manifest, mapped to the
+                manifest version they pin; ``None`` serves none.
 
         Raises:
             ValueError: One catalog does not match its declared digest.
         """
-        indexed = _index_catalogs(catalogs)
+        pins = dict(manifest_pins or {})
+        indexed = _index_catalogs(catalogs, pins)
         self._project_resolver = project_resolver
         self._listing_pools = dict(listing_pools)
+        self._manifest_pins = pins
         self._catalogs = indexed
+
+    def manifest_version(self, revision_id: str, catalog_sha256: str) -> int | None:
+        """The manifest version a request on this key pins, ``None`` for a whole document."""
+        return self._manifest_pins.get((revision_id, catalog_sha256))
 
     def published_metadata(
         self,

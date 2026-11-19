@@ -429,6 +429,31 @@ def test_index_rejects_a_same_version_catalog_under_the_wrong_digest() -> None:
         CatalogRouteResolver({(_REVISION, "b" * 64): _single_pool_catalog()})
 
 
+def test_index_serves_a_manifest_pinned_catalog_without_re_deriving_identity() -> None:
+    """A key the host assembled from a byte-verified manifest is indexed under
+    its pin even though its catalog does not reproduce the key digest; the
+    same catalog under the same key without the pin still fails closed, and the
+    resolver reports which manifest version each pinned key serves."""
+    pinned = (_REVISION, "b" * 64)
+    with pytest.raises(ValueError, match="wrong digest"):
+        CatalogRouteResolver({pinned: _single_pool_catalog()})
+    resolver = CatalogRouteResolver({pinned: _single_pool_catalog()}, manifest_pins={pinned: 7})
+    assert resolver.manifest_version(*pinned) == 7
+    assert resolver.manifest_version(_REVISION, "c" * 64) is None
+    resolver.swap_catalogs(
+        {pinned: _single_pool_catalog()},
+        project_resolver=None,
+        listing_pools={},
+        manifest_pins={pinned: 8},
+    )
+    assert resolver.manifest_version(*pinned) == 8
+    with pytest.raises(ValueError, match="wrong digest"):
+        resolver.swap_catalogs(
+            {pinned: _single_pool_catalog()}, project_resolver=None, listing_pools={}
+        )
+    assert resolver.manifest_version(*pinned) == 8
+
+
 def test_index_hashes_a_shared_catalog_object_once_and_shares_its_view() -> None:
     """Keys sharing one immutable catalog verify with ONE identity computation.
 

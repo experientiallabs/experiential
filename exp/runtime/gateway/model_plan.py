@@ -176,6 +176,7 @@ class _CatalogView:
 
 def _index_catalogs(
     catalogs: Mapping[tuple[str, str], NormalizedGatewayCatalog],
+    manifest_pins: Mapping[tuple[str, str], int] | None = None,
 ) -> dict[tuple[str, str], _CatalogView]:
     """Index digest-verified catalogs by alias revision and catalog digest.
 
@@ -186,8 +187,16 @@ def _index_catalogs(
     reproduce it; that catalog is indexed under its pinned digest without the
     byte-exact check, so a roll never hard-fails route resolution.
 
+    A key named in ``manifest_pins`` was assembled by the host from per-model
+    artifacts it verified byte for byte against a manifest
+    (:mod:`exp.common.models.catalog_manifest`); identity is never re-derived
+    for it, so it is indexed under its pin without the digest check. Every
+    other key keeps the rule above.
+
     Args:
         catalogs: Alias-revision and digest pairs mapped to normalized snapshots.
+        manifest_pins: Keys served from a verified manifest, mapped to the
+            manifest version each request on that key pins.
 
     Returns:
         Fully built revision-scoped catalog views.
@@ -201,9 +210,10 @@ def _index_catalogs(
     # ``catalogs`` keeps object IDs stable by retaining them for the whole loop.
     identity_by_object: dict[int, str] = {}
     view_by_object: dict[int, _CatalogView] = {}
+    pinned = manifest_pins or {}
     for key, catalog in catalogs.items():
         revision_id, catalog_sha256 = key
-        if not is_foreign_snapshot(catalog):
+        if key not in pinned and not is_foreign_snapshot(catalog):
             identity = identity_by_object.get(id(catalog))
             if identity is None:
                 identity = catalog.identity_sha256()
