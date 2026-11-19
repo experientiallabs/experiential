@@ -751,9 +751,12 @@ async fn non_success_failure(
     // A refused replayed reasoning payload keeps the caller's class too,
     // but the waterfall re-dials this rung once without those items
     // before the class is allowed to surface.
-    let encrypted_reasoning = body
-        .as_deref()
-        .is_some_and(|body| rejected_encrypted_reasoning(dialect, body));
+    // Gemini's refusal of a thought signature another Google backend minted
+    // takes the same repair (`thought_signature_repair`).
+    let encrypted_reasoning = body.as_deref().is_some_and(|body| {
+        rejected_encrypted_reasoning(dialect, body)
+            || crate::thought_signature_repair::rejected_thought_signature(dialect, body)
+    });
     // A context-window verdict keeps the caller's class and sentence, but a
     // lane can serve less than the window the model advertises: the ladder
     // may take it once, to a rung whose window is larger (`next_route_candidate`).

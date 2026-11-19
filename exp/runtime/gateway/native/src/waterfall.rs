@@ -871,6 +871,8 @@ mod buffered_ladder_tests;
 #[cfg(test)]
 mod content_filter_ladder_tests;
 #[cfg(test)]
+mod gemini_signature_ladder_tests;
+#[cfg(test)]
 mod ladder_tests;
 #[cfg(test)]
 mod malformed_tool_ladder_tests;

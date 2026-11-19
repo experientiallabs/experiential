@@ -43,6 +43,7 @@ use sha2::{Digest, Sha256};
 
 use crate::errors::{Failure, FailureClass};
 use crate::metrics::METRICS;
+use crate::thought_signature_repair::{unrepaired_thought_signature, ReplayedState};
 use crate::waterfall::DeploymentWire;
 
 /// Response header disclosing a data-plane repair of the caller's replayed
@@ -257,7 +258,7 @@ fn encrypted_part(part: &Value) -> Option<&str> {
 /// Every replayed `encrypted_content` the strip can remove, in order: each
 /// reasoning item's payload and each encrypted part of an item's `output`
 /// or `content` array.
-fn encrypted_payloads(payload: &Value) -> Vec<&str> {
+pub(crate) fn encrypted_payloads(payload: &Value) -> Vec<&str> {
     let Some(items) = payload.get("input").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -298,12 +299,6 @@ pub fn unstrippable_encrypted_item(payload: &Value) -> Option<String> {
                 .unwrap_or("input")
                 .to_string()
         })
-}
-
-/// The Responses payload with every strippable replayed `encrypted_content`
-/// removed, or `None` when there is nothing to strip.
-pub fn without_encrypted_content(payload: &Value) -> Option<Value> {
-    without_encrypted_content_where(payload, |_| true)
 }
 
 /// Remove the encrypted parts `strip` selects from one item's `output` or
@@ -447,6 +442,10 @@ pub fn unrepaired_encrypted_content(failure: &Failure, item: Option<&str>) -> Fa
 /// fate is decided.
 pub(crate) struct AttemptRepair<'a> {
     wire: &'a DeploymentWire,
+    /// The rung's plain wire, which the strip reads: a Google cache overlay
+    /// (`wire`) holds part of the history in its cached prefix.
+    plain: &'a DeploymentWire,
+    state: ReplayedState,
     scope: Option<&'a str>,
     request_id: &'a str,
     repaired: &'a mut Option<Value>,
@@ -467,12 +466,16 @@ impl<'a> AttemptRepair<'a> {
     /// Prepare the first dial of this attempt.
     pub(crate) fn begin(
         wire: &'a DeploymentWire,
+        plain: &'a DeploymentWire,
         scope: Option<&'a str>,
         repaired: &'a mut Option<Value>,
         request_id: &'a str,
     ) -> Self {
+        let state = ReplayedState::of(wire);
         let mut repair = Self {
             wire,
+            plain,
+            state,
             scope,
             request_id,
             repaired,
@@ -486,12 +489,11 @@ impl<'a> AttemptRepair<'a> {
         if repair.repaired.is_some() {
             repair.stripped = true;
         } else if let (None, Some(scope)) = (&wire.upstream_body, scope) {
-            let remembered = |content: &str| MEMORY.recall(&payload_digest(scope, content));
-            if let Some(stripped) =
-                without_encrypted_content_where(&wire.upstream_payload, remembered)
-            {
-                repair.proactive_strips = encrypted_payloads(&wire.upstream_payload).len()
-                    - encrypted_payloads(&stripped).len();
+            let remembered =
+                |content: &str| MEMORY.recall(&state.memory_key(scope, plain, content));
+            if let Some(stripped) = state.strip_where(&plain.upstream_payload, remembered) {
+                repair.proactive_strips =
+                    state.payloads(&plain.upstream_payload).len() - state.payloads(&stripped).len();
                 *repair.repaired = Some(stripped);
                 repair.stripped = true;
                 repair.proactive = true;
@@ -534,11 +536,17 @@ impl<'a> AttemptRepair<'a> {
         {
             return false;
         }
-        let Some(stripped) = without_encrypted_content(self.payload()) else {
+        // Strip the whole history, never a cache overlay's live suffix: the
+        // repaired successor dials plain (it never prepares a cache).
+        let source = self
+            .repaired
+            .as_ref()
+            .unwrap_or(&self.plain.upstream_payload);
+        let Some(stripped) = self.state.strip_where(source, |_| true) else {
             return false;
         };
         let (present_count, digests) = {
-            let present = encrypted_payloads(self.payload());
+            let present = self.state.payloads(source);
             let hint = failure
                 .provider_detail
                 .as_deref()
@@ -555,7 +563,7 @@ impl<'a> AttemptRepair<'a> {
             let digests: Vec<[u8; 32]> = match self.scope {
                 Some(scope) => refused
                     .iter()
-                    .map(|content| payload_digest(scope, content))
+                    .map(|content| self.state.memory_key(scope, self.plain, content))
                     .collect(),
                 None => Vec::new(),
             };
@@ -580,6 +588,9 @@ impl<'a> AttemptRepair<'a> {
         if !failure.encrypted_reasoning_rejected {
             return failure;
         }
+        if self.state == ReplayedState::ThoughtSignatures {
+            return unrepaired_thought_signature(&failure);
+        }
         let item = unstrippable_encrypted_item(self.payload());
         unrepaired_encrypted_content(&failure, item.as_deref())
     }
@@ -587,9 +598,11 @@ impl<'a> AttemptRepair<'a> {
     /// Keep a repaired successor's disclosure attached to its own physical attempt.
     pub(crate) fn mark_reactive_successor(&mut self) {
         self.reactive = true;
-        self.reactive_strips = encrypted_payloads(&self.wire.upstream_payload)
+        self.reactive_strips = self
+            .state
+            .payloads(&self.wire.upstream_payload)
             .len()
-            .saturating_sub(encrypted_payloads(self.payload()).len());
+            .saturating_sub(self.state.payloads(self.payload()).len());
     }
 
     /// Note that the current dial opened (the provider answered 2xx).
@@ -636,6 +649,11 @@ impl Drop for AttemptRepair<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every strippable replayed `encrypted_content` removed (the reactive strip).
+    fn without_encrypted_content(payload: &Value) -> Option<Value> {
+        without_encrypted_content_where(payload, |_| true)
+    }
 
     #[test]
     fn stripping_encrypted_reasoning_removes_only_those_items_and_keeps_order() {
