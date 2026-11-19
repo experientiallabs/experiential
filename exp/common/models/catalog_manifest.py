@@ -37,7 +37,11 @@ from exp.common.models.catalog import (
     ModelCatalog,
     ModelRecord,
 )
-from exp.common.models.gateway_catalog import load_forward_compatible, normalize_gateway_catalog
+from exp.common.models.gateway_catalog import (
+    GATEWAY_EXCLUDED_PROVIDERS,
+    load_forward_compatible,
+    normalize_gateway_catalog,
+)
 from exp.common.models.gateway_chains import GatewayModelChain
 from exp.common.models.gateway_pools import GatewayPoolRecord
 from exp.common.models.nano_usd_upgrade import (
@@ -446,6 +450,13 @@ def assemble_manifest_catalog(
         if not artifact.models and not artifact.gateway_model_chains:
             refuse(entry.model_id, "model_mismatch", "artifact carries no deployment or chain")
             continue
+        if not _serves_gateway_content(artifact):
+            refuse(
+                entry.model_id,
+                "invalid_artifact",
+                "artifact has no gateway deployment and no explicitly unavailable chain",
+            )
+            continue
         foreign = _foreign_model_ids(artifact)
         if foreign:
             refuse(
@@ -724,3 +735,17 @@ def _foreign_model_ids(artifact: ModelArtifact) -> tuple[str, ...]:
         owners.update((key, chain.model_id))
     owners.discard(artifact.model_id)
     return tuple(sorted(owners))
+
+
+def _serves_gateway_content(artifact: ModelArtifact) -> bool:
+    """Whether normalization keeps a deployment of this artifact, or it marks its model unavailable.
+
+    Gateway normalization drops excluded-provider records and SFT sampling
+    handles, so an artifact carrying only those would be acknowledged as served
+    with nothing to route to.
+    """
+    for record in artifact.models.values():
+        provider = artifact.connections[record.connection].provider
+        if provider not in GATEWAY_EXCLUDED_PROVIDERS and record.sft_provenance is None:
+            return True
+    return any(not chain.available for chain in artifact.gateway_model_chains.values())

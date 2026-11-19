@@ -48,6 +48,11 @@ was compiled from. Kinds in use are `model`, `account`, `name` and `card`.
   exactly that artifact hash, and every model-reference rung in the artifact's
   chains must be declared as one. A chain that enters another model therefore
   always sees the version of that model it was compiled against.
+- Because a dependency names a content hash, model dependencies form an
+  acyclic graph: a self-reference or a reciprocal pair of model references
+  would need an artifact to contain its own hash. A catalog whose chains form
+  such a cycle has no manifest form; a writer refuses to split it and the host
+  keeps serving it as the whole document, which supports those back-edges.
 - Other kinds are opaque to the reader. They are part of the artifact bytes,
   so a change to any of them changes the artifact hash.
 
@@ -65,7 +70,7 @@ rows that a host reports (for example as a negative acknowledgement):
 | `dependency_mismatch` | a `model` dependency is absent or at another hash |
 | `connection_conflict` | a connection name is defined differently by several artifacts (every definer is refused; identical copies merge) |
 | `deployment_conflict`, `pool_conflict`, `chain_conflict` | two artifacts claim one deployment alias, pool id or chain key (both are refused; an unpooled deployment claims the singleton pool keyed by its alias), or a chain names a pool another artifact claims (that artifact is refused) |
-| `invalid_artifact` | the artifact, together with the models it depends on, fails catalog validation or normalization (for example a chain naming a pool it does not carry, or a provider that needs explicit capabilities without them) |
+| `invalid_artifact` | the artifact would normalize to nothing servable (no gateway deployment survives normalization, which drops excluded providers and SFT sampling handles, and no chain marks the model unavailable), or the artifact, together with the models it depends on, fails catalog validation or normalization (for example a chain naming a pool it does not carry, or a provider that needs explicit capabilities without them) |
 | `dependency_refused` | a model this artifact depends on was refused (closed to a fixpoint) |
 
 The merged survivors are validated and normalized once. Only when that fails
@@ -105,3 +110,8 @@ The pin is a host assertion: assembly never re-derives the assembled
 catalog's identity, so it cannot prove the cut reproduces the key's digest (a
 cut that holds or canaries a model intentionally does not). A host pins only
 keys it assembled itself from a manifest it verified.
+
+The version is provenance, not a clock the resolver enforces: the host owns the
+manifest pointer and its canary state, and a canary abort or a rollback
+legitimately returns a key to an earlier promoted cut. Each swap serves the
+versions the host passes, and every route records the one it used.

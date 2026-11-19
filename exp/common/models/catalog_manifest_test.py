@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from exp.common.core.artifacts import canonical_json_bytes
+from exp.common.core.artifacts import ArtifactInput, canonical_json_bytes, sha256_json
 from exp.common.models import catalog_manifest
 from exp.common.models.catalog import (
     BillingSource,
@@ -18,6 +18,7 @@ from exp.common.models.catalog import (
     GatewayTokenPrices,
     ModelCatalog,
     ModelRecord,
+    SFTModelProvenance,
 )
 from exp.common.models.catalog_manifest import (
     MANIFEST_READER_VERSION,
@@ -40,7 +41,7 @@ from exp.common.models.gateway_chains import (
     GatewayModelReferenceRung,
 )
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification, GatewayPoolRecord
-from exp.common.models.model import ModelCapabilities
+from exp.common.models.model import ModelCapabilities, ModelSnapshot
 
 _DIGEST = "a" * 64
 
@@ -702,3 +703,50 @@ def test_survivors_that_clash_only_together_are_admitted_one_at_a_time(
     assert [(r.model_id, r.reason) for r in result.refusals] == [("off", "invalid_artifact")]
     assert result.served_model_ids == ("big", "small")
     assert result.catalog == _catalog()
+
+
+def test_an_artifact_normalization_drops_entirely_is_refused() -> None:
+    """An artifact carrying only an SFT sampling handle on an excluded provider
+    is never acknowledged as served: normalization would leave nothing to route."""
+    handle = "tinker://sampling-handle"
+    provenance = SFTModelProvenance(
+        source_dataset=ArtifactInput(artifact_id="dataset", sha256="a" * 64),
+        optimization_config=ArtifactInput(artifact_id="config", sha256="b" * 64),
+        training_spec_sha256="c" * 64,
+        run_id="run",
+        model_id="model",
+        model_sha256="d" * 64,
+        result_id="result",
+        result_sha256="e" * 64,
+        base_model=ModelSnapshot(
+            provider="tinker",
+            model_id="base-model",
+            billing_source=BillingSource.HOST_MANAGED,
+            capabilities_sha256="f" * 64,
+            connection_sha256="0" * 64,
+        ),
+        connection_config_sha256="1" * 64,
+        sampling_handle_sha256=sha256_json({"sampling_handle": handle}),
+    )
+    artifact = ModelArtifact(
+        artifact_schema_version=1,
+        model_id="fine-tuned",
+        connections={"tinker": ConnectionConfig(provider="tinker")},
+        models={
+            "fine-tuned": ModelRecord(
+                connection="tinker",
+                model=handle,
+                billing_source=BillingSource.HOST_MANAGED,
+                sft_provenance=provenance,
+            )
+        },
+    )
+    manifest, blobs = _split(_catalog())
+    loaded = _load_all(blobs)
+    sha, tuned = _artifact_entry(artifact.model_dump(mode="json", by_alias=True))
+    loaded[sha] = tuned
+    result = assemble_manifest_catalog(
+        _with_entries(manifest, loaded, **{"fine-tuned": sha}), loaded
+    )
+    assert [(r.model_id, r.reason) for r in result.refusals] == [("fine-tuned", "invalid_artifact")]
+    assert result.served_model_ids == ("big", "small")
