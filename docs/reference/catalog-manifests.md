@@ -35,7 +35,8 @@ costs) names a feature in `required_to_serve`; an older reader then refuses the
 artifact instead of serving it wrongly.
 
 `read_catalog_manifest` parses a manifest forward-compatibly and refuses a
-manifest schema marker that is not the integer `CATALOG_MANIFEST_SCHEMA_VERSION`.
+manifest schema marker that is not the integer `CATALOG_MANIFEST_SCHEMA_VERSION`;
+every version field must be a JSON integer (`true` or `1.0` are refused).
 It, and `assemble_manifest_catalog`, also refuse a manifest whose
 `snapshot_schema_version` is not this build's `SNAPSHOT_SCHEMA_VERSION`: pins
 skip the digest check, so a cut is served only by a build that normalizes
@@ -78,13 +79,17 @@ rows that a host reports (for example as a negative acknowledgement):
 | `invalid_artifact` | the artifact would normalize to nothing servable (no gateway deployment survives normalization, which drops excluded providers and SFT sampling handles, and no chain marks the model unavailable), or the artifact, together with the models it depends on, fails catalog validation or normalization (for example a chain naming a pool it does not carry, or a provider that needs explicit capabilities without them) |
 | `dependency_refused` | a model this artifact depends on was refused (closed to a fixpoint) |
 
-The merged survivors are validated and normalized once. Only when that fails
-is each survivor validated with its dependency closure, in dependency order,
-so a malformed artifact is refused alone. Survivors that validate alone but
-still clash together are admitted one at a time (dependencies first, artifacts
-with deployments before chain-only ones, then by model id), and each that would
-break the accepted catalog is refused as `invalid_artifact`. Assembly never
-aborts the manifest.
+The merged artifacts are validated and normalized once. Only when that fails,
+or a name is claimed twice, is each artifact first validated with its
+dependency closure, in dependency order; shared names are then checked one at
+a time among the artifacts still active (a chain naming another artifact's pool
+is resolved to a fixpoint, independent of model ids), so a malformed artifact
+is refused alone and never takes a valid one down. Survivors that validate
+alone but still clash together are admitted one at a time (dependencies first,
+artifacts with deployments before chain-only ones, then by model id), and each
+that would break the accepted catalog is refused as `invalid_artifact`. No
+per-artifact problem aborts the manifest.
+
 Results are deterministic (entries are processed by model id). The catalog is
 `None` only when no connection survives. Assembling a manifest written from a
 catalog yields an equal `ModelCatalog`, so its normalized identity equals the

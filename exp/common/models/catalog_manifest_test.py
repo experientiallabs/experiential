@@ -926,3 +926,56 @@ def test_connection_conflicts_count_only_still_active_definers() -> None:
         ("first", "connection_conflict"),
     }
     assert "third" in result.served_model_ids
+
+
+def test_an_artifact_invalid_alone_is_refused_before_it_can_claim_a_name() -> None:
+    """A malformed artifact sharing a valid one's deployment alias is refused as
+    invalid on its own, so the valid owner of the alias keeps serving."""
+    manifest, blobs = _split(_catalog())
+    loaded = _load_all(blobs)
+    keeper_sha, keeper = _artifact_entry(_serving_artifact("keeper"))
+    broken = _serving_artifact("broken")
+    broken["connections"] = {
+        "bare": {"provider": "openai-compatible", "base_url": "https://bare.example.test/v1"}
+    }
+    record = broken["models"].pop("broken-1")
+    broken["models"]["keeper-1"] = {**record, "connection": "bare"}
+    broken["gateway_model_chains"] = {}
+    broken_sha, breaking = _artifact_entry(broken)
+    loaded.update({keeper_sha: keeper, broken_sha: breaking})
+    cut = _with_entries(manifest, loaded, keeper=keeper_sha, broken=broken_sha)
+    result = assemble_manifest_catalog(cut, loaded)
+    assert [(r.model_id, r.reason) for r in result.refusals] == [("broken", "invalid_artifact")]
+    assert result.served_model_ids == ("big", "keeper", "small")
+
+
+def test_a_chain_naming_a_refused_artifacts_pool_is_judged_against_active_owners() -> None:
+    """Once "thief" is refused for naming keeper's pool, "gate" (an unavailable,
+    rung-less chain naming a pool only the refused thief claimed) serves, and so
+    does the serving model that depends on it."""
+    manifest, blobs = _split(_catalog())
+    loaded = _load_all(blobs)
+    keeper_sha, keeper = _artifact_entry(_serving_artifact("keeper"))
+    thief = _serving_artifact("thief")
+    thief["gateway_model_chains"]["thief"]["pool_id"] = "keeper-1"
+    thief["gateway_model_chains"]["thief"]["rungs"] = []
+    thief["gateway_model_chains"]["thief"]["available"] = False
+    thief_sha, thieving = _artifact_entry(thief)
+    gate_sha, gate = _artifact_entry(_unavailable_chain("gate", "thief-1"))
+    rider_sha, rider = _artifact_entry(_serving_artifact("rider", chain_to=("gate", gate_sha)))
+    loaded.update({keeper_sha: keeper, thief_sha: thieving, gate_sha: gate, rider_sha: rider})
+    cut = _with_entries(
+        manifest, loaded, keeper=keeper_sha, thief=thief_sha, gate=gate_sha, rider=rider_sha
+    )
+    result = assemble_manifest_catalog(cut, loaded)
+    assert [(r.model_id, r.reason) for r in result.refusals] == [("thief", "pool_conflict")]
+    assert result.served_model_ids == ("big", "gate", "keeper", "rider", "small")
+
+
+def test_manifest_version_fields_must_be_json_integers() -> None:
+    manifest, _ = _split(_catalog())
+    body = json.loads(canonical_json_bytes(manifest))
+    for field in ("manifest_version", "catalog_schema_version", "snapshot_schema_version"):
+        for coerced in (True, float(body[field])):
+            with pytest.raises(ValidationError, match="must be integers"):
+                read_catalog_manifest(json.dumps({**body, field: coerced}))

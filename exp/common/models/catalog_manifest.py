@@ -27,7 +27,7 @@ from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import Field, ValidationError, model_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 
 from exp.common.core.artifacts import ContractModel, Sha256
 from exp.common.core.verified_cache import VerifiedCache
@@ -165,7 +165,14 @@ class ModelArtifact(ContractModel):
 
 
 class ManifestEntry(ContractModel):
-    """One model and the artifact hash serving it in a manifest."""
+    """One model and the artifact hash serving it in a manifest.
+
+    Attributes:
+        model_id: The model this entry serves; unique within a manifest and
+            equal to the artifact's own ``model_id``.
+        artifact_sha256: The sha256 of the artifact's exact stored bytes; the
+            reader refuses bytes that hash to anything else.
+    """
 
     model_id: str = Field(min_length=1, max_length=2_048)
     artifact_sha256: Sha256
@@ -192,6 +199,20 @@ class CatalogManifest(ContractModel):
     catalog_sha256: Sha256 | None = None
     entries: tuple[ManifestEntry, ...] = ()
 
+    @field_validator(
+        "manifest_schema_version",
+        "manifest_version",
+        "catalog_schema_version",
+        "snapshot_schema_version",
+        mode="before",
+    )
+    @classmethod
+    def _require_json_integers(cls, value: object) -> object:
+        """Refuse a version that is not a JSON integer (``true`` or ``1.0`` never coerce)."""
+        if type(value) is not int:
+            raise ValueError("manifest version fields must be integers")
+        return value
+
     @model_validator(mode="after")
     def _require_unique_models(self) -> CatalogManifest:
         """Reject a manifest that names one model twice."""
@@ -202,7 +223,14 @@ class CatalogManifest(ContractModel):
 
 
 class ArtifactRefusal(ContractModel):
-    """Why one manifest entry is not served (the host reports it as a NACK)."""
+    """Why one manifest entry is not served (the host reports it as a NACK).
+
+    Attributes:
+        model_id: The refused manifest entry's model.
+        artifact_sha256: The artifact hash that entry names.
+        reason: The typed refusal reason; the first one found is kept.
+        detail: A display-safe explanation, free of secrets.
+    """
 
     model_id: str
     artifact_sha256: str
@@ -406,9 +434,10 @@ def assemble_manifest_catalog(
 
     Per-artifact problems never raise: they become refusals, and a refused
     model also refuses every model whose chain depends on it. When the merged
-    survivors fail catalog validation, each survivor is validated together
-    with its model dependencies (in dependency order), so only the artifacts
-    that cannot be served are refused and the rest still assemble.
+    artifacts fail catalog validation or claim a name twice, each one is first
+    validated together with its model dependencies (in dependency order), then
+    shared names are checked among the artifacts still active, so only the
+    artifacts that cannot be served are refused and the rest still assemble.
 
     Survivors that each validate with their dependencies but still clash
     together are admitted one at a time in dependency order, and each one that
@@ -486,17 +515,20 @@ def assemble_manifest_catalog(
             )
             continue
         loaded[entry.model_id] = artifact
-    _refuse_conflicts(loaded, refused, refuse)
-    _refuse_dependents(loaded, refused, refuse)
-    survivors = [loaded[model_id] for model_id in sorted(loaded) if model_id not in refused]
-    catalog = _catalog_or_error(manifest.catalog_schema_version, survivors)
-    if isinstance(catalog, Exception):
-        _refuse_invalid(manifest.catalog_schema_version, loaded, refused, refuse)
+    schema = manifest.catalog_schema_version
+    candidates = [loaded[model_id] for model_id in sorted(loaded)]
+    catalog = _catalog_or_error(schema, candidates)
+    if isinstance(catalog, Exception) or _has_conflicts(loaded):
+        # Slow path: find the artifacts invalid on their own first, so a
+        # malformed artifact never takes a valid one down through a shared name.
+        _refuse_invalid(schema, loaded, refused, refuse)
+        _refuse_conflicts(loaded, refused, refuse)
+        _refuse_dependents(loaded, refused, refuse)
         survivors = [loaded[model_id] for model_id in sorted(loaded) if model_id not in refused]
-        catalog = _catalog_or_error(manifest.catalog_schema_version, survivors)
+        catalog = _catalog_or_error(schema, survivors)
         if isinstance(catalog, Exception):
-            catalog = _admit_incrementally(manifest.catalog_schema_version, survivors, refuse)
-            survivors = [item for item in survivors if item.model_id not in refused]
+            catalog = _admit_incrementally(schema, survivors, refuse)
+    survivors = [loaded[model_id] for model_id in sorted(loaded) if model_id not in refused]
     return ManifestCatalog(
         manifest=manifest,
         catalog=catalog,
@@ -649,19 +681,49 @@ def _refuse_conflicts(
         if len(model_ids) > 1:
             for model_id in sorted(model_ids):
                 refuse(model_id, reasons[kind], f"{kind} {name!r} is claimed by {len(model_ids)}")
-    owners = _claims(loaded, refused)
-    for model_id, artifact in sorted(loaded.items()):
-        if model_id in refused:
-            continue
-        own = _claimed_pool_ids(artifact)
-        for chain in artifact.gateway_model_chains.values():
-            others = owners.get(("pool", chain.pool_id), [])
-            if chain.pool_id not in own and others:
-                refuse(
-                    model_id,
-                    "pool_conflict",
-                    f"chain names pool {chain.pool_id!r} of {others[0]!r}",
+    _refuse_foreign_pool_chains(loaded, refused, refuse)
+
+
+def _refuse_foreign_pool_chains(
+    loaded: Mapping[str, ModelArtifact],
+    refused: Mapping[str, ArtifactRefusal],
+    refuse: Callable[[str, ArtifactRefusalReason, str], None],
+) -> None:
+    """Refuse each active artifact whose chain names a pool another active artifact claims.
+
+    Resolved to a fixpoint so the result does not depend on model ids: each
+    round refuses only references to an owner that names no foreign pool itself
+    (that owner certainly stays), and a pool whose every owner was refused stops
+    counting. References left only among owners that all point at each other
+    are refused together.
+    """
+    while True:
+        claims = {
+            model_id: _claimed_pool_ids(artifact)
+            for model_id, artifact in loaded.items()
+            if model_id not in refused
+        }
+        pending: dict[str, tuple[str, list[str]]] = {}
+        for model_id in sorted(claims):
+            for chain in loaded[model_id].gateway_model_chains.values():
+                owners = sorted(
+                    owner
+                    for owner, pools in claims.items()
+                    if owner != model_id and chain.pool_id in pools
                 )
+                if chain.pool_id not in claims[model_id] and owners:
+                    pending.setdefault(model_id, (chain.pool_id, owners))
+        if not pending:
+            return
+        settled = {
+            model_id: (pool_id, owners)
+            for model_id, (pool_id, owners) in pending.items()
+            if any(owner not in pending for owner in owners)
+        }
+        for model_id, (pool_id, owners) in sorted((settled or pending).items()):
+            refuse(model_id, "pool_conflict", f"chain names pool {pool_id!r} of {owners[0]!r}")
+        if not settled:
+            return
 
 
 def _claims(
@@ -823,3 +885,17 @@ def _require_this_snapshot_schema(manifest: CatalogManifest) -> None:
             f"catalog manifest snapshot schema {manifest.snapshot_schema_version} is not "
             f"this build's {SNAPSHOT_SCHEMA_VERSION}; serve the whole catalog document instead"
         )
+
+
+def _has_conflicts(loaded: Mapping[str, ModelArtifact]) -> bool:
+    """Whether any shared name is defined inconsistently or claimed twice."""
+    found: dict[str, ArtifactRefusal] = {}
+
+    def note(model_id: str, reason: ArtifactRefusalReason, detail: str) -> None:
+        """Record that a conflict exists."""
+        found[model_id] = ArtifactRefusal(
+            model_id=model_id, artifact_sha256="0" * 64, reason=reason, detail=detail
+        )
+
+    _refuse_conflicts(loaded, found, note)
+    return bool(found)
