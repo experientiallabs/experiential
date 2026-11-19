@@ -300,7 +300,7 @@ Confirm it is ready without displaying its value.
 Never ask me to put the key in this prompt or chat, and never print or log it.
 Use the same secure process for any other credentials needed.
 Use EXPLABS_API_KEY for my gateway key. I can create one at
-https://platform.experientiallabs.ai/api-keys.
+https://platform.experientiallabs.ai/api-keys .
 
 The gateway is OpenAI-compatible and also speaks the Anthropic Messages API.
 Everything is served under https://api.experientiallabs.ai/v1 with one header: Authorization: Bearer
