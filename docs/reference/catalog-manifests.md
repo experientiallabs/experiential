@@ -64,13 +64,17 @@ rows that a host reports (for example as a negative acknowledgement):
 | `model_mismatch` | the artifact's `model_id` is not the entry's, it carries no deployment or chain, or a record, pool or chain in it belongs to another model (a deployment belongs to its pool's exact model, else its `gateway.exact_model_id`, else its own alias) |
 | `dependency_mismatch` | a `model` dependency is absent or at another hash |
 | `connection_conflict` | a connection name is defined differently by several artifacts (every definer is refused; identical copies merge) |
-| `deployment_conflict`, `pool_conflict`, `chain_conflict` | two artifacts claim one deployment alias, pool id or chain key (both are refused) |
+| `deployment_conflict`, `pool_conflict`, `chain_conflict` | two artifacts claim one deployment alias, pool id or chain key (both are refused; an unpooled deployment claims the singleton pool keyed by its alias), or a chain names a pool another artifact claims (that artifact is refused) |
 | `invalid_artifact` | the artifact, together with the models it depends on, fails catalog validation or normalization (for example a chain naming a pool it does not carry, or a provider that needs explicit capabilities without them) |
 | `dependency_refused` | a model this artifact depends on was refused (closed to a fixpoint) |
 
 The merged survivors are validated and normalized once. Only when that fails
 is each survivor validated with its dependency closure, in dependency order,
-so a malformed artifact is refused alone and never aborts the manifest.
+so a malformed artifact is refused alone. Survivors that validate alone but
+still clash together are admitted one at a time (dependencies first, artifacts
+with deployments before chain-only ones, then by model id), and each that would
+break the accepted catalog is refused as `invalid_artifact`. Assembly never
+aborts the manifest.
 Results are deterministic (entries are processed by model id). The catalog is
 `None` only when no connection survives. Assembling a manifest written from a
 catalog yields an equal `ModelCatalog`, so its normalized identity equals the

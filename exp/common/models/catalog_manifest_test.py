@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from exp.common.core.artifacts import canonical_json_bytes
+from exp.common.models import catalog_manifest
 from exp.common.models.catalog import (
     BillingSource,
     ConnectionConfig,
@@ -653,3 +654,51 @@ def test_cache_is_bounded_without_retain() -> None:
     for sha, data in blobs.items():
         cache.load(sha, data)
     assert len(cache) == 1
+
+
+def _off_chain_naming(pool_id: str) -> tuple[str, LoadedModelArtifact]:
+    """An unavailable, rung-less chain for model "off" naming ``pool_id``."""
+    return _artifact_entry(
+        {
+            "artifact_schema_version": 1,
+            "model_id": "off",
+            "connections": {},
+            "models": {},
+            "gateway_model_chains": {
+                "off": {
+                    "model_id": "off",
+                    "pool_id": pool_id,
+                    "revision": "r1",
+                    "available": False,
+                    "rungs": [],
+                }
+            },
+        }
+    )
+
+
+def test_a_chain_naming_another_models_singleton_pool_is_refused_alone() -> None:
+    manifest, blobs = _split(_catalog())
+    loaded = _load_all(blobs)
+    sha, off = _off_chain_naming("small-1")
+    loaded[sha] = off
+    result = assemble_manifest_catalog(_with_entries(manifest, loaded, off=sha), loaded)
+    assert [(r.model_id, r.reason) for r in result.refusals] == [("off", "pool_conflict")]
+    assert result.served_model_ids == ("big", "small")
+    assert result.catalog == _catalog()
+
+
+def test_survivors_that_clash_only_together_are_admitted_one_at_a_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the up-front conflict pass disabled, the incremental admission still
+    refuses only the clashing artifact instead of aborting the manifest."""
+    monkeypatch.setattr(catalog_manifest, "_refuse_conflicts", lambda loaded, refuse: None)
+    manifest, blobs = _split(_catalog())
+    loaded = _load_all(blobs)
+    sha, off = _off_chain_naming("small-1")
+    loaded[sha] = off
+    result = assemble_manifest_catalog(_with_entries(manifest, loaded, off=sha), loaded)
+    assert [(r.model_id, r.reason) for r in result.refusals] == [("off", "invalid_artifact")]
+    assert result.served_model_ids == ("big", "small")
+    assert result.catalog == _catalog()

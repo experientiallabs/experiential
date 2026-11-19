@@ -410,9 +410,10 @@ def assemble_manifest_catalog(
     Returns:
         The assembled catalog and the refused entries.
 
-    Raises:
-        ValueError: Survivors that each validate with their dependencies still
-            fail catalog validation together.
+    Assembly never raises: survivors that each validate with their
+    dependencies but still clash together are admitted one at a time in
+    dependency order, and each one that would break the accepted catalog is
+    refused as ``invalid_artifact``.
     """
     entries = sorted(manifest.entries, key=lambda entry: entry.model_id)
     by_model = {entry.model_id: entry.artifact_sha256 for entry in entries}
@@ -475,7 +476,8 @@ def assemble_manifest_catalog(
         survivors = [loaded[model_id] for model_id in sorted(loaded) if model_id not in refused]
         catalog = _catalog_or_error(manifest.catalog_schema_version, survivors)
         if isinstance(catalog, Exception):
-            raise ValueError(f"surviving artifacts fail catalog validation: {catalog}")
+            catalog = _admit_incrementally(manifest.catalog_schema_version, survivors, refuse)
+            survivors = [item for item in survivors if item.model_id not in refused]
     return ManifestCatalog(
         manifest=manifest,
         catalog=catalog,
@@ -598,7 +600,10 @@ def _refuse_conflicts(
 
     A connection may be carried by many artifacts as long as every copy is
     identical. A deployment alias, pool id or chain key belongs to exactly one
-    artifact; when two claim it, both are refused rather than picking one.
+    artifact; when two claim it, both are refused rather than picking one. The
+    pool ids an artifact claims include the singleton pool of every deployment
+    no authored pool names (it is keyed by its alias), and a chain may name only
+    a pool its own artifact claims: one naming another artifact's pool is refused.
     """
     connection_defs: dict[str, dict[str, ConnectionConfig]] = {}
     owners: dict[tuple[str, str], list[str]] = {}
@@ -607,7 +612,7 @@ def _refuse_conflicts(
             connection_defs.setdefault(name, {})[model_id] = connection
         for kind, names in (
             ("deployment", artifact.models),
-            ("pool", artifact.gateway_pools),
+            ("pool", _claimed_pool_ids(artifact)),
             ("chain", artifact.gateway_model_chains),
         ):
             for name in names:
@@ -626,6 +631,77 @@ def _refuse_conflicts(
         if len(model_ids) > 1:
             for model_id in sorted(model_ids):
                 refuse(model_id, reasons[kind], f"{kind} {name!r} is claimed by {len(model_ids)}")
+    for model_id, artifact in sorted(loaded.items()):
+        own = _claimed_pool_ids(artifact)
+        for chain in artifact.gateway_model_chains.values():
+            others = owners.get(("pool", chain.pool_id), [])
+            if chain.pool_id not in own and others:
+                refuse(
+                    model_id,
+                    "pool_conflict",
+                    f"chain names pool {chain.pool_id!r} of {others[0]!r}",
+                )
+
+
+def _claimed_pool_ids(artifact: ModelArtifact) -> set[str]:
+    """Authored pool ids plus the alias of every deployment no authored pool names."""
+    pooled = {
+        alias for pool in artifact.gateway_pools.values() for alias in pool.deployment_aliases
+    }
+    return set(artifact.gateway_pools) | {alias for alias in artifact.models if alias not in pooled}
+
+
+def _admit_incrementally(
+    schema_version: int,
+    survivors: list[ModelArtifact],
+    refuse: Callable[[str, ArtifactRefusalReason, str], None],
+) -> ModelCatalog | None:
+    """Accept survivors one at a time in dependency order, refusing each that breaks the rest.
+
+    Only reached when every survivor validates with its dependencies but the
+    merged set does not. A model is admitted only after its dependencies;
+    otherwise artifacts carrying deployments go before chain-only ones, then by
+    model id, so the result is deterministic. A model whose dependency was
+    refused here is refused too.
+    """
+    by_model = {artifact.model_id: artifact for artifact in survivors}
+    accepted: list[ModelArtifact] = []
+    accepted_ids: set[str] = set()
+    rejected: set[str] = set()
+    catalog: ModelCatalog | None = None
+    # Artifacts that carry deployments go first, so a clash refuses a chain-only
+    # artifact (which serves nothing) before a model that does serve.
+    pending = sorted(by_model, key=lambda model_id: (not by_model[model_id].models, model_id))
+    while pending:
+        progressed = False
+        for model_id in list(pending):
+            deps = [d for d in by_model[model_id].model_dependencies() if d in by_model]
+            if any(d not in accepted_ids and d not in rejected for d in deps):
+                continue
+            pending.remove(model_id)
+            progressed = True
+            blocked = sorted(d for d in deps if d in rejected)
+            if blocked:
+                rejected.add(model_id)
+                refuse(model_id, "dependency_refused", "depends on refused " + ", ".join(blocked))
+                continue
+            trial = _catalog_or_error(schema_version, [*accepted, by_model[model_id]])
+            if isinstance(trial, Exception):
+                rejected.add(model_id)
+                refuse(
+                    model_id,
+                    "invalid_artifact",
+                    f"clashes with the assembled catalog: {trial}"[:1_000],
+                )
+                continue
+            accepted.append(by_model[model_id])
+            accepted_ids.add(model_id)
+            catalog = trial
+        if not progressed:
+            for model_id in pending:
+                refuse(model_id, "dependency_refused", "model dependencies form a cycle")
+            break
+    return catalog
 
 
 def _foreign_model_ids(artifact: ModelArtifact) -> tuple[str, ...]:
