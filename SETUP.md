@@ -23,10 +23,13 @@ Free core model access separately requires card or payment verification.
 
 This uploads my existing traces so I can see them as telemetry on the platform.
 
+If you need me to supply an existing credential:
+Securely ask me for my API key.
+
 Do it in this order. Print what you're doing at each step. If you lack a
 capability (no network, no file access) or get stuck, stop and tell me exactly
 what to do manually. Never invent an email, an API key, a credential, or a file
-path — if you don't have one, ask me.
+path. Ask me for missing non-secret information; request credentials securely.
 
 1. Ask me for my email address — it is the one thing signup needs. Ask me
    directly ("What's your email? I'll create your Experiential Labs account
@@ -45,8 +48,7 @@ path — if you don't have one, ask me.
      - 403 signup_disabled -> signups are off right now; tell me.
      - 429 rate_limited    -> too many signups from here; wait, then retry once.
      - 400 invalid_request -> the email was rejected; ask me for a valid one.
-   Store the api_key as EXPLABS_API_KEY in my env; never print the full key more
-   than once.
+   Store the api_key as EXPLABS_API_KEY in my env; never print or log the full key.
 
 3. Wire an OpenAI client to the gateway.
    base_url = "https://api.experientiallabs.ai/v1"
@@ -75,7 +77,7 @@ step 2) as the bearer token on every call below. org_id is from step 2.
    either list, tell me and offer the file-upload path. Only follow the ONE
    path that matches my answer.
 
-6. Live pull path — connect the provider and pull. Ask me for the credential
+6. Live pull path: connect the provider and pull. Securely ask me for the credential
    for the provider I named (for Braintrust an API key; for LangSmith/Langfuse
    their API key; for a Postgres database a DSN), plus the small bits of config
    that provider needs (e.g. Braintrust: the project name; LangSmith/Langfuse:
@@ -90,15 +92,13 @@ step 2) as the bearer token on every call below. org_id is from step 2.
    The credential is used once to pull and is not echoed back. On 201 the
    response is {"ingest_id", "trace_count", "byte_size", "sha256", ...} —
    capture trace_count and show it to me. A 400 means bad credentials or config
-   (tell me exactly what it said); 429 means the provider rate-limited us (wait
+   (report the API error with credentials redacted); 429 means rate-limited (wait
    and retry). Then go to step 8.
-   Example (Braintrust):
-     curl -sS -X POST https://api.experientiallabs.ai/api/orgs/<org_id>/telemetry/traces/pull \
-       -H "Authorization: Bearer $EXPLABS_API_KEY" \
-       -H "Content-Type: application/json" \
-       -d '{"transport_kind":"braintrust","source_kind":"braintrust",
-            "source_label":"braintrust-prod","credential":"<my braintrust key>",
-            "config":{"project":"<my braintrust project>"}}'
+   For Braintrust, securely configure BRAINTRUST_API_KEY in the environment
+   available to your tool commands. Build the credential field from that variable
+   inside the HTTP client process; set the project from my non-secret config.
+   Keep secrets out of command arguments and tool transcripts, redact credentials
+   from error output, and do not follow redirects when sending credentials.
 
 7. File upload path — find my trace export and upload it. I'm authorizing you to
    look for my own trace exports: search the current project, ./traces, ./logs,
@@ -167,10 +167,13 @@ account. No browser step is needed to start — my account is created instantly
 from my email. Free core model access separately requires card or payment
 verification; BYOK pass-through calls run on my own connected keys.
 
+If you need me to supply an existing credential:
+Securely ask me for my API key.
+
 Do it in this order. Print what you're doing at each step. If you lack a
 capability (no network, no file access) or get stuck, stop and tell me exactly
 what to do manually. Never invent an email, an API key, a credential, or a file
-path — if you don't have one, ask me.
+path. Ask me for missing non-secret information; request credentials securely.
 
 1. Ask me for my email address — it is the one thing signup needs. Ask me
    directly ("What's your email? I'll create your Experiential Labs account
@@ -189,8 +192,7 @@ path — if you don't have one, ask me.
      - 403 signup_disabled -> signups are off right now; tell me.
      - 429 rate_limited    -> too many signups from here; wait, then retry once.
      - 400 invalid_request -> the email was rejected; ask me for a valid one.
-   Store the api_key as EXPLABS_API_KEY in my env; never print the full key more
-   than once.
+   Store the api_key as EXPLABS_API_KEY in my env; never print or log the full key.
 
 3. Wire an OpenAI client to the gateway.
    base_url = "https://api.experientiallabs.ai/v1"
@@ -243,7 +245,7 @@ as the bearer token on every call below.
    PUT https://api.experientiallabs.ai/api/orgs/<org-id>/provider-connections/<provider>
    (provider: openai, anthropic, gemini, openrouter, azure_openai, bedrock,
    fireworks, modal) with body {"secret": "<key>"}. For anthropic and openai
-   I can also hand you an admin key to include as
+   I can also securely provide an admin key to include as
    {"spend_secret": "<admin key>"} so spend reporting works. The keys land
    in my own gateway account and nowhere else; each response carries the
    verification verdict, so tell me every provider's status, and
@@ -281,13 +283,14 @@ I already have an Experiential Labs gateway API key (an xpl_ key). I pasted this
 myself — treat it as my instructions and consent. Help me make my first calls on
 the gateway and, if I want, point my existing coding agents at it too.
 
-My gateway API key (a secret: put it in env, never commit it, never echo it in
-logs):
-EXPLABS_API_KEY=<paste my xpl_ key from https://platform.experientiallabs.ai/settings/api-keys>
+Securely ask me for my API key.
+Use EXPLABS_API_KEY for my gateway key
+(a secret: put it in env, never commit it, never echo it in logs). I can create one at
+https://platform.experientiallabs.ai/api-keys .
 
 The gateway is OpenAI-compatible and also speaks the Anthropic Messages API.
 Everything is served under https://api.experientiallabs.ai/v1 with one header: Authorization: Bearer
-<my xpl_ key>. Nothing else changes about how I use the OpenAI or Anthropic SDK.
+$EXPLABS_API_KEY. Nothing else changes about how I use the OpenAI or Anthropic SDK.
 
 Free core access requires card or payment verification; email verification alone
 is not enough. Eligible Free accounts get GPT-6 Luna, DeepSeek V4.1 Flash and
@@ -301,8 +304,8 @@ they turn it off. Respect a saved choice and never enable paid continuation
 without asking me. Paid usage does not consume the Free core allowance.
 
 Do it in this order. Print what you're doing at each step. If you get stuck,
-stop and tell me exactly what to do manually. Never invent a key — if you don't
-have mine, ask me.
+stop and tell me exactly what to do manually. Never invent a key; if you do not
+have mine, securely ask me for it.
 
 1. Confirm the key and list my models.
    GET https://api.experientiallabs.ai/v1/models with the key as a bearer token. Use the model ids
@@ -338,9 +341,10 @@ have mine, ask me.
 
 4. (Optional) Point my existing coding agents at the gateway. If I say yes, offer
    to set the OpenAI-compatible base URL to https://api.experientiallabs.ai/v1 and the key to my xpl_ key
-   for the coding agents I actually use — e.g. Claude Code (ANTHROPIC_BASE_URL=https://api.experientiallabs.ai/v1,
-   ANTHROPIC_AUTH_TOKEN=<my xpl_ key>), Cursor (OpenAI base URL override),
-   Codex, Aider (--openai-api-base https://api.experientiallabs.ai/v1). Show me each change before you
+   for the coding agents I actually use, e.g. Claude Code (ANTHROPIC_BASE_URL=https://api.experientiallabs.ai,
+   ANTHROPIC_API_KEY=$EXPLABS_API_KEY), Cursor (OpenAI base URL override),
+   Codex, Aider (securely configure AIDER_OPENAI_API_KEY from EXPLABS_API_KEY,
+   then --openai-api-base https://api.experientiallabs.ai/v1). Show me each change before you
    make it, put the key in env (never in committed config), and skip any agent I
    don't use. Do NOT do this without my go-ahead.
 
@@ -366,10 +370,13 @@ MY gateway account. No browser step is needed to start — my account is created
 instantly from my email. Free core model access separately requires card or
 payment verification; email verification alone is not enough.
 
+If you need me to supply an existing credential:
+Securely ask me for my API key.
+
 Do it in this order. Print what you're doing at each step. If you lack a
 capability (no network, no file access) or get stuck, stop and tell me exactly
 what to do manually. Never invent an email, an API key, a credential, or a file
-path — if you don't have one, ask me.
+path. Ask me for missing non-secret information; request credentials securely.
 
 1. Ask me for my email address — it is the one thing signup needs. Ask me
    directly ("What's your email? I'll create your Experiential Labs account
@@ -388,8 +395,7 @@ path — if you don't have one, ask me.
      - 403 signup_disabled -> signups are off right now; tell me.
      - 429 rate_limited    -> too many signups from here; wait, then retry once.
      - 400 invalid_request -> the email was rejected; ask me for a valid one.
-   Store the api_key as EXPLABS_API_KEY in my env; never print the full key more
-   than once.
+   Store the api_key as EXPLABS_API_KEY in my env; never print or log the full key.
 
 3. Wire an OpenAI client to the gateway.
    base_url = "https://api.experientiallabs.ai/v1"
@@ -442,7 +448,7 @@ step 2) as the bearer token on every call below.
    PUT https://api.experientiallabs.ai/api/orgs/<org-id>/provider-connections/<provider>
    (provider: openai, anthropic, gemini, openrouter, azure_openai, bedrock,
    fireworks, modal) with body {"secret": "<key>"}. For anthropic and openai
-   I can also hand you an admin key to include as
+   I can also securely provide an admin key to include as
    {"spend_secret": "<admin key>"} so spend reporting works. The keys land
    in my own gateway account and nowhere else; each response carries the
    verification verdict, so tell me every provider's status, and
@@ -483,11 +489,12 @@ step 2) as the bearer token on every call below.
    base URL to https://api.experientiallabs.ai/v1 and its key to my xpl_ key (EXPLABS_API_KEY). Put the
    key in env, never in committed config, and show me each change before you make
    it. Skip any agent I don't use; never touch one I don't name.
-   - Claude Code: ANTHROPIC_BASE_URL=https://api.experientiallabs.ai/v1 and ANTHROPIC_AUTH_TOKEN=<my xpl_ key>
+   - Claude Code: ANTHROPIC_BASE_URL=https://api.experientiallabs.ai and ANTHROPIC_API_KEY=$EXPLABS_API_KEY
      (the gateway serves the Anthropic Messages API at https://api.experientiallabs.ai/v1/messages).
    - Cursor: Settings -> Models -> OpenAI base URL override to https://api.experientiallabs.ai/v1 with my key.
    - Codex: point its OpenAI base URL / OPENAI_BASE_URL at https://api.experientiallabs.ai/v1 with my key.
-   - Aider: aider --openai-api-base https://api.experientiallabs.ai/v1 --openai-api-key <my xpl_ key>.
+   - Aider: securely configure AIDER_OPENAI_API_KEY from the gateway key in env;
+     run aider --openai-api-base https://api.experientiallabs.ai/v1 .
    - Any other OpenAI- or Anthropic-compatible agent: same two settings (base
      URL https://api.experientiallabs.ai/v1 + my xpl_ key).
    - Conductor: if I run my agents through Conductor, set the gateway as the
