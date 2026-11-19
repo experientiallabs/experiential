@@ -655,11 +655,21 @@ def _refuse_conflicts(
 
 
 def _claimed_pool_ids(artifact: ModelArtifact) -> set[str]:
-    """Authored pool ids plus the alias of every deployment no authored pool names."""
+    """Authored pool ids plus the singleton pool of every gateway deployment no pool names.
+
+    Normalization creates a singleton pool, keyed by the alias, only for a
+    deployment it keeps; excluded-provider records and SFT sampling handles
+    claim no pool id.
+    """
     pooled = {
         alias for pool in artifact.gateway_pools.values() for alias in pool.deployment_aliases
     }
-    return set(artifact.gateway_pools) | {alias for alias in artifact.models if alias not in pooled}
+    singletons = {
+        alias
+        for alias, record in artifact.models.items()
+        if alias not in pooled and _is_gateway_record(artifact, record)
+    }
+    return set(artifact.gateway_pools) | singletons
 
 
 def _admit_incrementally(
@@ -670,48 +680,63 @@ def _admit_incrementally(
     """Accept survivors one at a time in dependency order, refusing each that breaks the rest.
 
     Only reached when every survivor validates with its dependencies but the
-    merged set does not. A model is admitted only after its dependencies;
-    otherwise artifacts carrying deployments go before chain-only ones, then by
-    model id, so the result is deterministic. A model whose dependency was
-    refused here is refused too.
+    merged set does not. A model is admitted only after its dependencies, and
+    each step admits one ready artifact: one carrying deployments first, else a
+    chain-only one a pending serving artifact depends on, then by model id. A
+    clash therefore refuses what serves nothing before what serves, and the
+    result is deterministic. A model whose dependency was refused is refused too.
     """
     by_model = {artifact.model_id: artifact for artifact in survivors}
     accepted: list[ModelArtifact] = []
     accepted_ids: set[str] = set()
     rejected: set[str] = set()
     catalog: ModelCatalog | None = None
-    # Artifacts that carry deployments go first, so a clash refuses a chain-only
-    # artifact (which serves nothing) before a model that does serve.
-    pending = sorted(by_model, key=lambda model_id: (not by_model[model_id].models, model_id))
+    pending = set(by_model)
     while pending:
-        progressed = False
-        for model_id in list(pending):
-            deps = [d for d in by_model[model_id].model_dependencies() if d in by_model]
-            if any(d not in accepted_ids and d not in rejected for d in deps):
-                continue
-            pending.remove(model_id)
-            progressed = True
-            blocked = sorted(d for d in deps if d in rejected)
-            if blocked:
-                rejected.add(model_id)
-                refuse(model_id, "dependency_refused", "depends on refused " + ", ".join(blocked))
-                continue
-            trial = _catalog_or_error(schema_version, [*accepted, by_model[model_id]])
-            if isinstance(trial, Exception):
-                rejected.add(model_id)
-                refuse(
-                    model_id,
-                    "invalid_artifact",
-                    f"clashes with the assembled catalog: {trial}"[:1_000],
-                )
-                continue
-            accepted.append(by_model[model_id])
-            accepted_ids.add(model_id)
-            catalog = trial
-        if not progressed:
-            for model_id in pending:
+        ready = [
+            model_id
+            for model_id in pending
+            if all(
+                d in accepted_ids or d in rejected
+                for d in by_model[model_id].model_dependencies()
+                if d in by_model
+            )
+        ]
+        if not ready:
+            for model_id in sorted(pending):
                 refuse(model_id, "dependency_refused", "model dependencies form a cycle")
             break
+        # One admission per step: a serving artifact first, else a chain-only one
+        # a pending serving artifact needs, so a clash refuses what serves nothing.
+        needed = set().union(
+            *(
+                _dependency_closure(model_id, by_model)
+                for model_id in pending
+                if by_model[model_id].models
+            )
+        )
+        model_id = min(
+            ready,
+            key=lambda item: (not by_model[item].models, item not in needed, item),
+        )
+        pending.discard(model_id)
+        blocked = sorted(d for d in by_model[model_id].model_dependencies() if d in rejected)
+        if blocked:
+            rejected.add(model_id)
+            refuse(model_id, "dependency_refused", "depends on refused " + ", ".join(blocked))
+            continue
+        trial = _catalog_or_error(schema_version, [*accepted, by_model[model_id]])
+        if isinstance(trial, Exception):
+            rejected.add(model_id)
+            refuse(
+                model_id,
+                "invalid_artifact",
+                f"clashes with the assembled catalog: {trial}"[:1_000],
+            )
+            continue
+        accepted.append(by_model[model_id])
+        accepted_ids.add(model_id)
+        catalog = trial
     return catalog
 
 
@@ -744,8 +769,12 @@ def _serves_gateway_content(artifact: ModelArtifact) -> bool:
     handles, so an artifact carrying only those would be acknowledged as served
     with nothing to route to.
     """
-    for record in artifact.models.values():
-        provider = artifact.connections[record.connection].provider
-        if provider not in GATEWAY_EXCLUDED_PROVIDERS and record.sft_provenance is None:
-            return True
+    if any(_is_gateway_record(artifact, record) for record in artifact.models.values()):
+        return True
     return any(not chain.available for chain in artifact.gateway_model_chains.values())
+
+
+def _is_gateway_record(artifact: ModelArtifact, record: ModelRecord) -> bool:
+    """Whether gateway normalization keeps this record as a deployment."""
+    provider = artifact.connections[record.connection].provider
+    return provider not in GATEWAY_EXCLUDED_PROVIDERS and record.sft_provenance is None

@@ -750,3 +750,114 @@ def test_an_artifact_normalization_drops_entirely_is_refused() -> None:
     )
     assert [(r.model_id, r.reason) for r in result.refusals] == [("fine-tuned", "invalid_artifact")]
     assert result.served_model_ids == ("big", "small")
+
+
+def _serving_artifact(model_id: str, *, chain_to: tuple[str, str] | None = None) -> dict[str, Any]:
+    """One deployment of ``model_id`` with its chain, optionally entering another model."""
+    rungs: list[dict[str, str]] = [{"kind": "deployment", "deployment_id": f"{model_id}-1"}]
+    dependencies: list[dict[str, str]] = []
+    if chain_to is not None:
+        rungs.append({"kind": "model", "model_id": chain_to[0]})
+        dependencies.append({"kind": "model", "key": chain_to[0], "sha256": chain_to[1]})
+    return {
+        "artifact_schema_version": 1,
+        "model_id": model_id,
+        "required_to_serve": ["model_chains"],
+        "dependencies": dependencies,
+        "connections": {"openai": {"provider": "openai"}},
+        "models": {
+            f"{model_id}-1": {
+                "connection": "openai",
+                "model": model_id,
+                "billing_source": "customer_managed",
+                "gateway": {"exact_model_id": model_id},
+            }
+        },
+        "gateway_model_chains": {
+            model_id: {
+                "model_id": model_id,
+                "pool_id": f"{model_id}-1",
+                "revision": "r1",
+                "rungs": rungs,
+            }
+        },
+    }
+
+
+def _unavailable_chain(model_id: str, pool_id: str) -> dict[str, Any]:
+    """A chain-only artifact marking ``model_id`` unavailable under ``pool_id``."""
+    return {
+        "artifact_schema_version": 1,
+        "model_id": model_id,
+        "connections": {},
+        "models": {},
+        "gateway_model_chains": {
+            model_id: {
+                "model_id": model_id,
+                "pool_id": pool_id,
+                "revision": "r1",
+                "available": False,
+                "rungs": [],
+            }
+        },
+    }
+
+
+def test_admission_takes_one_artifact_at_a_time_and_keeps_the_serving_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A serving model waiting on a chain-only dependency is admitted before an
+    unrelated chain-only sibling that clashes with it, so the sibling is refused."""
+    monkeypatch.setattr(catalog_manifest, "_refuse_conflicts", lambda loaded, refuse: None)
+    manifest, blobs = _split(_catalog())
+    loaded = _load_all(blobs)
+    gate_sha, gate = _artifact_entry(_unavailable_chain("gate", "pool-gate"))
+    serving_sha, serving = _artifact_entry(_serving_artifact("srv", chain_to=("gate", gate_sha)))
+    sibling_sha, sibling = _artifact_entry(_unavailable_chain("aaa", "srv-1"))
+    loaded.update({gate_sha: gate, serving_sha: serving, sibling_sha: sibling})
+    cut = _with_entries(manifest, loaded, gate=gate_sha, srv=serving_sha, aaa=sibling_sha)
+    result = assemble_manifest_catalog(cut, loaded)
+    assert [(r.model_id, r.reason) for r in result.refusals] == [("aaa", "invalid_artifact")]
+    assert result.served_model_ids == ("big", "gate", "small", "srv")
+
+
+def test_a_training_handle_alias_claims_no_pool_id() -> None:
+    """Normalization makes no singleton pool for an SFT sampling handle, so its
+    alias may equal another model's pool id without a conflict."""
+    whole = _catalog()
+    handle = "tinker://sampling-handle"
+    body = _serving_artifact("mixed")
+    body["connections"]["tinker"] = {"provider": "tinker"}
+    tuned = ModelRecord(
+        connection="tinker",
+        model=handle,
+        billing_source=BillingSource.HOST_MANAGED,
+        sft_provenance=SFTModelProvenance(
+            source_dataset=ArtifactInput(artifact_id="dataset", sha256="a" * 64),
+            optimization_config=ArtifactInput(artifact_id="config", sha256="b" * 64),
+            training_spec_sha256="c" * 64,
+            run_id="run",
+            model_id="model",
+            model_sha256="d" * 64,
+            result_id="result",
+            result_sha256="e" * 64,
+            base_model=ModelSnapshot(
+                provider="tinker",
+                model_id="base-model",
+                billing_source=BillingSource.HOST_MANAGED,
+                capabilities_sha256="f" * 64,
+                connection_sha256="0" * 64,
+            ),
+            connection_config_sha256="1" * 64,
+            sampling_handle_sha256=sha256_json({"sampling_handle": handle}),
+        ),
+        gateway=GatewayDeploymentMetadata(exact_model_id="mixed"),
+    )
+    body["models"]["pool-big"] = tuned.model_dump(mode="json", by_alias=True)
+    manifest, blobs = _split(whole)
+    loaded = _load_all(blobs)
+    sha, mixed = _artifact_entry(body)
+    loaded[sha] = mixed
+    result = assemble_manifest_catalog(_with_entries(manifest, loaded, mixed=sha), loaded)
+    assert result.refusals == ()
+    assert result.served_model_ids == ("big", "mixed", "small")
