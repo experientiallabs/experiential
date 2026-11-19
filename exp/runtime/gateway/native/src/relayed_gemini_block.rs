@@ -25,8 +25,9 @@ const VERDICTS: &[(&str, &str)] = &[
     ("502", "Gemini blocked the response: "),
 ];
 
-/// Gemini block and finish tokens the relay names (`BlockedReason` and the
-/// blocking `FinishReason` values).
+/// Gemini block and finish tokens the relay names: `BlockedReason` and every
+/// blocking `FinishReason` the native lane files as a refusal
+/// (`dialects/gemini.rs`).
 const BLOCK_TOKENS: &[&str] = &[
     "OTHER",
     "PROHIBITED_CONTENT",
@@ -35,6 +36,8 @@ const BLOCK_TOKENS: &[&str] = &[
     "SPII",
     "RECITATION",
     "IMAGE_SAFETY",
+    "IMAGE_PROHIBITED_CONTENT",
+    "IMAGE_RECITATION",
 ];
 
 /// The refusal a relayed Gemini block names, or `None` when the code and raw
@@ -106,6 +109,16 @@ mod tests {
                 "502",
                 "Gemini blocked the response: SPII",
                 RefusalReason::DataInspection,
+            ),
+            (
+                "502",
+                "Gemini blocked the response: IMAGE_RECITATION",
+                RefusalReason::Recitation,
+            ),
+            (
+                "502",
+                "Gemini blocked the response: IMAGE_PROHIBITED_CONTENT",
+                crate::stream_errors::refusal_reason(Some("IMAGE_PROHIBITED_CONTENT"), None),
             ),
             (
                 "403",

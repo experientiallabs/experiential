@@ -790,14 +790,15 @@ failure and not a provider outage.
 - The match is exact: the envelope's own message field must be the whole
   sentence, under the status the relay uses for it, ending in a known token
   (`OTHER`, `PROHIBITED_CONTENT`, `SAFETY`, `BLOCKLIST`, `SPII`, `RECITATION`,
-  `IMAGE_SAFETY`). Quoted or echoed text, `metadata.raw`, a longer sentence,
+  `IMAGE_SAFETY`, `IMAGE_PROHIBITED_CONTENT`, `IMAGE_RECITATION`: every token the
+  native lane files as a refusal). Quoted or echoed text, `metadata.raw`, a longer sentence,
   and an unknown token keep their status class; any other 502 stays
   `provider_internal`. An HTTP 502 body is read only on OpenAI-family relays,
   on the short throttle budget.
 - It is filed as a `refusal` with the same category the native Gemini lane
   gives that token (`SAFETY`, `PROHIBITED_CONTENT`, `BLOCKLIST`, `IMAGE_SAFETY`
-  → `content_policy`; `RECITATION` → `recitation`; `SPII` → `data_inspection`;
-  `OTHER` → `unspecified`). A `content_policy` one is marked as a provider
+  → `content_policy`; `RECITATION`, `IMAGE_RECITATION` → `recitation`; `SPII` →
+  `data_inspection`; `OTHER` and anything else → `unspecified`). A `content_policy` one is marked as a provider
   filter (one untried rung of another provider may take it); the others are
   the request's answer. None is redialed on the same lane, and none feeds lane
   health. Pinned in `relayed_gemini_block.rs`.
