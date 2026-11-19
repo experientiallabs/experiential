@@ -17,6 +17,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
     GuardrailCheckStage,
     GuardrailCompletion,
+    GuardrailOutcome,
     GuardrailPolicy,
     GuardrailRejected,
     OutputGuardrailMode,
@@ -426,6 +427,8 @@ class GuardrailSession:
             if subject == result:
                 continue
             if await self._enforce_input(policy, result) != result:
+                if self._outcomes is not None:
+                    self._outcomes.record(policy, policy.checks[0], GuardrailOutcome.UNAVAILABLE)
                 raise GuardrailRejected(
                     guardrail_failure(
                         action=GuardrailAction.BLOCK, check_id=policy.checks[0].check_id

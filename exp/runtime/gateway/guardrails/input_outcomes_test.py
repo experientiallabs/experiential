@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayMessage
 from exp.runtime.gateway.guardrails.classification_window import (
     ClassificationWindow,
@@ -15,6 +16,7 @@ from exp.runtime.gateway.guardrails.classification_window import (
 )
 from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
+from exp.runtime.gateway.guardrails.config import engine_from_document
 from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
     GuardrailCapabilityKind,
@@ -24,7 +26,10 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailPolicy,
     GuardrailRejected,
 )
-from exp.runtime.gateway.guardrails.deterministic import native_input_request
+from exp.runtime.gateway.guardrails.deterministic import (
+    compile_native_detectors,
+    native_input_request,
+)
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.input_outcomes import (
     InputOutcomes,
@@ -55,6 +60,57 @@ def _policy() -> GuardrailPolicy:
                 timeout_ms=1000,
             ),
         ),
+    )
+
+
+def _modification_engine(second_action: GuardrailAction | None = None) -> GuardrailEngine:
+    """Build a redactor with an optional later blocker or undoing modifier.
+
+    Args:
+        second_action: Optional action applied to the first check's replacement text.
+
+    Returns:
+        An engine supporting the Python and deterministic execution paths.
+    """
+    checks: list[JsonObject] = [
+        {
+            "check_id": "redact",
+            "adapter_id": "redact",
+            "capability": "pii",
+            "stage": "input",
+            "action": "modify",
+            "timeout_ms": 500,
+        }
+    ]
+    if second_action is not None:
+        checks.append(
+            {
+                "check_id": "second",
+                "adapter_id": "second",
+                "capability": "pii",
+                "stage": "input",
+                "action": second_action.value,
+                "timeout_ms": 500,
+            }
+        )
+    return engine_from_document(
+        {
+            "adapters": [
+                {
+                    "kind": "regex",
+                    "adapter_id": "redact",
+                    "patterns": ["secret"],
+                    "replacement": "safe",
+                },
+                {
+                    "kind": "regex",
+                    "adapter_id": "second",
+                    "patterns": ["safe"],
+                    "replacement": "secret",
+                },
+            ],
+            "policies": [{"policy_id": "modification", "protected": True, "checks": checks}],
+        }
     )
 
 
@@ -139,14 +195,84 @@ def test_covered_flagged_subject_does_not_hide_a_later_miss(
     assert result.outcome == ("unsupported" if later is GuardrailOutcome.UNSUPPORTED else "missed")
 
 
-def test_successful_modification_is_covered() -> None:
-    """A fully applied rewrite is an executed, non-blocking result."""
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("denial", [None, "sibling", "provider_bound"])
+def test_successful_modification_is_covered(native: bool, denial: str | None) -> None:
+    """Applied rewrites retain coverage despite later check or request-level rejection."""
+    engine = _modification_engine(GuardrailAction.BLOCK if denial == "sibling" else None)
+    try:
+        session = _session(engine)
+        session.enable_input_outcomes()
+        if native:
+            session.detectors = compile_native_detectors(engine.deterministic_specifications)
+        if denial is None:
+            assert session.inspect_input(_request("secret")) == _request("safe")
+        else:
+            with pytest.raises(GuardrailRejected):
+                if denial == "provider_bound":
+                    session.prepare_dispatch((_request("secret"),), overlap=False)
+                else:
+                    session.inspect_input(_request("secret"))
+        outcomes = session.input_outcomes()
+        expected = ("allow", "block") if denial == "sibling" else ("allow",)
+        assert tuple(result.outcome for result in outcomes) == expected
+        assert all(result.recovery_reason is None for result in outcomes)
+        assert (engine.classifier_calls == 0) is native
+    finally:
+        engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("failure", ["application", "final_validation"])
+def test_failed_modification_is_not_covered(native: bool, failure: str) -> None:
+    """A failed application or final rewrite validation cannot claim a completed allow."""
+    engine = _modification_engine(GuardrailAction.MODIFY if failure == "final_validation" else None)
+    request = _request("secret")
+    if failure == "application":
+        request = request.model_copy(
+            update={
+                "messages": (
+                    GatewayMessage(
+                        role="user",
+                        content="secret",
+                        provider_text_blocks=(
+                            {
+                                "type": "text",
+                                "text": "secret",
+                                "cache_control": {"type": "ephemeral"},
+                            },
+                        ),
+                    ),
+                )
+            }
+        )
+    try:
+        session = _session(engine)
+        session.enable_input_outcomes()
+        if native:
+            session.detectors = compile_native_detectors(engine.deterministic_specifications)
+        with pytest.raises(GuardrailRejected):
+            session.inspect_input(request)
+        outcomes = session.input_outcomes()
+        expected = ("block", "allow") if failure == "final_validation" else ("block",)
+        assert tuple(result.outcome for result in outcomes) == expected
+        assert all(result.recovery_reason is None for result in outcomes)
+        assert (engine.classifier_calls == 0) is native
+    finally:
+        engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_unapplied_modification_does_not_claim_coverage(blocked: bool) -> None:
+    """A flagged verdict alone does not prove its replacement was successfully applied."""
     policy, tracker = _policy(), InputOutcomes()
     check = policy.checks[0].model_copy(update={"action": GuardrailAction.MODIFY})
     policy = policy.model_copy(update={"checks": (check,)})
     tracker.start(policy, _request())
     tracker.record(policy, check, GuardrailOutcome.FLAGGED)
-    assert tracker.freeze((policy,), blocked=False)[0].outcome == "allow"
+    (result,) = tracker.freeze((policy,), blocked=blocked)
+    expected = ("block", None) if blocked else ("missed", "result_unavailable")
+    assert (result.outcome, result.recovery_reason) == expected
 
 
 def test_queued_but_unstarted_checks_do_not_authorize_recovery() -> None:

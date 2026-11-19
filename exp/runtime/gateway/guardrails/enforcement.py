@@ -287,6 +287,7 @@ class GuardrailEngine:
             if verdict is None or policy.mode == "observe":
                 continue
             current = self._apply_input(policy, check, current, verdict)
+            record_input_outcome(policy, check, GuardrailOutcome.ALLOW)
         return current
 
     def observe_input(

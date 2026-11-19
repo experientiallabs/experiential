@@ -161,6 +161,7 @@ def native_input_request(
         record_input_outcome(policy, check, GuardrailOutcome.FLAGGED)
         _record(policy, check, check.action, monotonic() - started)
         current = _applied(policy, check, current, messages, immutable_match=immutable_match)
+        record_input_outcome(policy, check, GuardrailOutcome.ALLOW)
     return current
 
 

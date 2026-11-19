@@ -179,8 +179,6 @@ class InputOutcomes:
             outcome = "unsupported"
         elif blocked:
             outcome = "block"
-        elif result is GuardrailOutcome.FLAGGED and check.action is GuardrailAction.MODIFY:
-            outcome = "allow"
         else:
             outcome = "missed"
             reason = (
