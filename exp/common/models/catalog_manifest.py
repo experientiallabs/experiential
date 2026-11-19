@@ -625,14 +625,16 @@ def _refuse_conflicts(
     no authored pool names (it is keyed by its alias), and a chain may name only
     a pool its own artifact claims: one naming another artifact's pool is refused.
 
-    Each pass counts only artifacts still active after the previous one, so an
-    artifact already refused never takes an unrelated valid artifact down with it.
+    Names are checked one at a time in sorted order, each counting only the
+    artifacts still active at that point, so an artifact already refused never
+    takes an unrelated valid artifact down with it and the result is deterministic.
     """
     connection_defs: dict[str, dict[str, ConnectionConfig]] = {}
     for model_id, artifact in loaded.items():
         for name, connection in artifact.connections.items():
             connection_defs.setdefault(name, {})[model_id] = connection
-    for name, definitions in sorted(connection_defs.items()):
+    for name, all_definitions in sorted(connection_defs.items()):
+        definitions = {m: c for m, c in all_definitions.items() if m not in refused}
         values = list(definitions.values())
         if any(value != values[0] for value in values[1:]):
             for model_id in sorted(definitions):
@@ -642,7 +644,8 @@ def _refuse_conflicts(
         "pool": "pool_conflict",
         "chain": "chain_conflict",
     }
-    for (kind, name), model_ids in sorted(_claims(loaded, refused).items()):
+    for (kind, name), all_model_ids in sorted(_claims(loaded, refused).items()):
+        model_ids = [model_id for model_id in all_model_ids if model_id not in refused]
         if len(model_ids) > 1:
             for model_id in sorted(model_ids):
                 refuse(model_id, reasons[kind], f"{kind} {name!r} is claimed by {len(model_ids)}")

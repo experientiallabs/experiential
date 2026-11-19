@@ -900,3 +900,29 @@ def test_an_already_refused_artifact_does_not_take_a_claimant_down() -> None:
         ("decoy", "connection_conflict"),
     }
     assert result.served_model_ids == ("big", "keeper", "small")
+
+
+def test_connection_conflicts_count_only_still_active_definers() -> None:
+    """Artifact "bad" disagrees with "first" on connection "a-conn" (both refused) and
+    with "third" on "b-conn"; third survives because bad was already refused."""
+    manifest, blobs = _split(_catalog())
+    loaded = _load_all(blobs)
+
+    def on(model_id: str, connections: dict[str, str]) -> dict[str, Any]:
+        """A serving artifact defining ``connections`` (name to provider)."""
+        body = _serving_artifact(model_id)
+        body["connections"] = {name: {"provider": p} for name, p in connections.items()}
+        body["models"][f"{model_id}-1"]["connection"] = sorted(connections)[0]
+        return body
+
+    first_sha, first = _artifact_entry(on("first", {"a-conn": "openai"}))
+    bad_sha, bad = _artifact_entry(on("bad", {"a-conn": "anthropic", "b-conn": "anthropic"}))
+    third_sha, third = _artifact_entry(on("third", {"b-conn": "openai"}))
+    loaded.update({first_sha: first, bad_sha: bad, third_sha: third})
+    cut = _with_entries(manifest, loaded, first=first_sha, bad=bad_sha, third=third_sha)
+    result = assemble_manifest_catalog(cut, loaded)
+    assert {(r.model_id, r.reason) for r in result.refusals} == {
+        ("bad", "connection_conflict"),
+        ("first", "connection_conflict"),
+    }
+    assert "third" in result.served_model_ids
