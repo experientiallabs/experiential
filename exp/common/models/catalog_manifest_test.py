@@ -581,3 +581,75 @@ def test_a_catalog_invalid_artifact_is_refused_and_the_rest_still_serve() -> Non
     assert result.served_model_ids == ("big", "small")
     assert result.catalog == _catalog()
     assert hashes["big"] in loaded
+
+
+def test_micro_usd_prices_and_schema_are_refused_not_served_unpriced() -> None:
+    manifest, blobs = _split(_catalog())
+    hashes = {entry.model_id: entry.artifact_sha256 for entry in manifest.entries}
+    body = json.loads(blobs[hashes["big"]])
+    body["models"]["big-1"]["gateway"]["prices"] = {
+        "input_micro_usd_per_million_tokens": 1,
+        "output_micro_usd_per_million_tokens": 4,
+    }
+    data = canonical_json_bytes(body)
+    with pytest.raises(ModelArtifactError) as raised:
+        read_model_artifact(data, artifact_sha256=model_artifact_sha256(data))
+    assert raised.value.reason == "unreadable"
+    assert "nano-USD" in raised.value.detail
+    document = json.loads(canonical_json_bytes(manifest))
+    document["catalog_schema_version"] = 2
+    with pytest.raises(ValidationError):
+        read_catalog_manifest(json.dumps(document))
+
+
+def test_a_chain_only_artifact_without_a_pool_is_refused_alone() -> None:
+    manifest, blobs = _split(_catalog())
+    loaded = _load_all(blobs)
+    sha, ghost = _artifact_entry(
+        {
+            "artifact_schema_version": 1,
+            "model_id": "ghost",
+            "connections": {},
+            "models": {},
+            "gateway_model_chains": {
+                "ghost": {
+                    "model_id": "ghost",
+                    "pool_id": "pool-ghost",
+                    "revision": "r1",
+                    "rungs": [{"kind": "deployment", "deployment_id": "ghost-1"}],
+                }
+            },
+        }
+    )
+    loaded[sha] = ghost
+    unavailable_sha, unavailable = _artifact_entry(
+        {
+            "artifact_schema_version": 1,
+            "model_id": "off",
+            "connections": {},
+            "models": {},
+            "gateway_model_chains": {
+                "off": {
+                    "model_id": "off",
+                    "pool_id": "pool-off",
+                    "revision": "r1",
+                    "available": False,
+                    "rungs": [],
+                }
+            },
+        }
+    )
+    loaded[unavailable_sha] = unavailable
+    result = assemble_manifest_catalog(
+        _with_entries(manifest, loaded, ghost=sha, off=unavailable_sha), loaded
+    )
+    assert [(r.model_id, r.reason) for r in result.refusals] == [("ghost", "invalid_artifact")]
+    assert result.served_model_ids == ("big", "off", "small")
+
+
+def test_cache_is_bounded_without_retain() -> None:
+    _, blobs = _split(_catalog())
+    cache = ParsedArtifactCache(maximum=1)
+    for sha, data in blobs.items():
+        cache.load(sha, data)
+    assert len(cache) == 1

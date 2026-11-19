@@ -10,7 +10,7 @@ are remembered: a failing artifact is re-verified and refused every time.
 
 import threading
 from collections import OrderedDict
-from collections.abc import Hashable
+from collections.abc import Collection, Hashable
 
 
 class VerifiedCache[KeyT: Hashable, ValueT]:
@@ -52,3 +52,22 @@ class VerifiedCache[KeyT: Hashable, ValueT]:
         """Forget every entry."""
         with self._lock:
             self._entries.clear()
+
+    def retain(self, keys: Collection[KeyT]) -> int:
+        """Forget every entry not named in ``keys``; return how many were forgotten."""
+        keep = set(keys)
+        with self._lock:
+            forgotten = [key for key in self._entries if key not in keep]
+            for key in forgotten:
+                del self._entries[key]
+        return len(forgotten)
+
+    def __len__(self) -> int:
+        """How many entries are remembered."""
+        with self._lock:
+            return len(self._entries)
+
+    def __contains__(self, key: object) -> bool:
+        """Whether ``key`` is remembered, without refreshing its recency."""
+        with self._lock:
+            return key in self._entries

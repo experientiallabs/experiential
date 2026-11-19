@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import threading
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from typing import Literal
@@ -31,10 +30,21 @@ from typing import Literal
 from pydantic import Field, ValidationError, model_validator
 
 from exp.common.core.artifacts import ContractModel, Sha256
-from exp.common.models.catalog import ConnectionConfig, ModelCatalog, ModelRecord
+from exp.common.core.verified_cache import VerifiedCache
+from exp.common.models.catalog import (
+    MODEL_CATALOG_SCHEMA_VERSION,
+    ConnectionConfig,
+    ModelCatalog,
+    ModelRecord,
+)
 from exp.common.models.gateway_catalog import load_forward_compatible, normalize_gateway_catalog
 from exp.common.models.gateway_chains import GatewayModelChain
 from exp.common.models.gateway_pools import GatewayPoolRecord
+from exp.common.models.nano_usd_upgrade import (
+    LAST_MICRO_USD_MODEL_CATALOG_SCHEMA_VERSION,
+    CatalogSnapshotUnitError,
+    upgrade_model_catalog_document,
+)
 
 MANIFEST_READER_VERSION: int = 1
 """The manifest-reader capability this build offers; hosts stamp and feature-detect it."""
@@ -162,7 +172,8 @@ class CatalogManifest(ContractModel):
     Attributes:
         manifest_schema_version: The manifest schema the writer used.
         manifest_version: Monotonic version of this cut.
-        catalog_schema_version: The authored catalog schema the assembly carries.
+        catalog_schema_version: The authored catalog schema the assembly carries;
+            a nano-USD schema, since artifacts carry no micro-USD upgrade path.
         snapshot_schema_version: The writer's normalized snapshot schema.
         catalog_sha256: The whole-document identity this cut reproduces, when it
             reproduces one; ``None`` when it intentionally differs.
@@ -171,7 +182,7 @@ class CatalogManifest(ContractModel):
 
     manifest_schema_version: int = CATALOG_MANIFEST_SCHEMA_VERSION
     manifest_version: int = Field(ge=1)
-    catalog_schema_version: int = Field(ge=2)
+    catalog_schema_version: int = Field(gt=LAST_MICRO_USD_MODEL_CATALOG_SCHEMA_VERSION)
     snapshot_schema_version: int = Field(ge=1)
     catalog_sha256: Sha256 | None = None
     entries: tuple[ManifestEntry, ...] = ()
@@ -271,6 +282,14 @@ def read_model_artifact(data: bytes, *, artifact_sha256: str) -> LoadedModelArti
             f"artifact requires feature(s) this reader does not know: {', '.join(unknown)}",
         )
     try:
+        # Audit the price cards before the tolerant parse: a micro-USD key would
+        # otherwise be dropped as unknown and the deployment served unpriced.
+        upgrade_model_catalog_document(
+            {"schema_version": MODEL_CATALOG_SCHEMA_VERSION, "models": raw.get("models", {})}
+        )
+    except CatalogSnapshotUnitError as error:
+        raise ModelArtifactError("unreadable", f"prices are not nano-USD: {error}") from error
+    try:
         artifact, dropped = load_forward_compatible(ModelArtifact, data)
     except (ValidationError, ValueError) as error:
         raise ModelArtifactError("unreadable", f"artifact does not validate: {error}") from error
@@ -295,29 +314,33 @@ def read_catalog_manifest(data: bytes | str) -> CatalogManifest:
     return manifest
 
 
+PARSED_ARTIFACT_CACHE_MAXIMUM = 16_384
+"""Parsed artifacts a cache keeps by default, far above one catalog's model count."""
+
+
 class ParsedArtifactCache:
     """Parsed artifacts shared across manifest versions, keyed by content hash.
 
     An unchanged model keeps its hash from one manifest to the next, so it is
-    parsed once and every manifest that names it shares the same object.
+    parsed once and every manifest that names it shares the same object. The
+    store is the canonical bounded :class:`VerifiedCache`, so memory stays
+    bounded even when a host never calls :meth:`retain`.
     """
 
-    def __init__(self) -> None:
-        """Start empty."""
-        self._lock = threading.Lock()
-        self._entries: dict[str, LoadedModelArtifact] = {}
+    def __init__(self, maximum: int = PARSED_ARTIFACT_CACHE_MAXIMUM) -> None:
+        """Start empty, keeping at most ``maximum`` parsed artifacts."""
+        self._entries: VerifiedCache[str, LoadedModelArtifact] = VerifiedCache(maximum)
 
     def get(self, artifact_sha256: str) -> LoadedModelArtifact | None:
         """The cached artifact for a hash, if parsed already."""
-        with self._lock:
-            return self._entries.get(artifact_sha256)
+        return self._entries.get(artifact_sha256)
 
     def load(self, artifact_sha256: str, data: bytes) -> LoadedModelArtifact:
         """Verify these bytes, then return the cached parse or parse and cache them.
 
         The bytes in hand are hashed on every call, so changed or corrupted
         bytes for a hash parsed earlier are refused rather than served from the
-        earlier parse.
+        earlier parse. Only successful parses are kept.
 
         Raises:
             ModelArtifactError: As :func:`read_model_artifact`.
@@ -327,31 +350,24 @@ class ParsedArtifactCache:
             raise ModelArtifactError(
                 "digest_mismatch", f"stored bytes hash to {actual}, not {artifact_sha256}"
             )
-        cached = self.get(artifact_sha256)
+        cached = self._entries.get(actual)
         if cached is not None:
             return cached
-        loaded = read_model_artifact(data, artifact_sha256=artifact_sha256)
-        with self._lock:
-            return self._entries.setdefault(artifact_sha256, loaded)
+        loaded = read_model_artifact(data, artifact_sha256=actual)
+        self._entries.put(actual, loaded)
+        return loaded
 
     def retain(self, artifact_sha256s: Collection[str]) -> int:
         """Keep only the named hashes; return how many entries were evicted."""
-        keep = set(artifact_sha256s)
-        with self._lock:
-            evicted = [sha for sha in self._entries if sha not in keep]
-            for sha in evicted:
-                del self._entries[sha]
-        return len(evicted)
+        return self._entries.retain(artifact_sha256s)
 
     def __len__(self) -> int:
         """How many parsed artifacts are held."""
-        with self._lock:
-            return len(self._entries)
+        return len(self._entries)
 
     def __contains__(self, artifact_sha256: object) -> bool:
         """Whether a hash is held."""
-        with self._lock:
-            return artifact_sha256 in self._entries
+        return artifact_sha256 in self._entries
 
 
 @dataclass(frozen=True)
@@ -495,7 +511,10 @@ def _catalog_or_error(
 ) -> ModelCatalog | None | Exception:
     """Merge artifacts into a validated, normalizable catalog, or return why they cannot be.
 
-    Returns ``None`` when no connection survives (nothing to serve).
+    Returns ``None`` when no connection survives and every chain is an
+    explicitly unavailable one with no rungs (nothing to serve, nothing wrong).
+    A chain that is available or has rungs needs a pool and deployments, which
+    need a connection, so without one it is an error.
     """
     connections: dict[str, ConnectionConfig] = {}
     models: dict[str, ModelRecord] = {}
@@ -507,6 +526,8 @@ def _catalog_or_error(
         pools.update(artifact.gateway_pools)
         chains.update(artifact.gateway_model_chains)
     if not connections:
+        if any(chain.available or chain.rungs for chain in chains.values()):
+            return ValueError("a chain names a pool or deployment that no artifact carries")
         return None
     try:
         catalog = ModelCatalog(

@@ -25,6 +25,7 @@ manifests.
 | the bytes are a JSON object | `unreadable` |
 | `artifact_schema_version` is an integer in `SUPPORTED_MODEL_ARTIFACT_SCHEMA_VERSIONS` (the current schema and, once one exists, the previous) | `unsupported_schema` |
 | every name in `required_to_serve` is in `KNOWN_SERVING_FEATURES` | `unknown_required_feature` |
+| every price card is nano-USD (a micro-USD key would otherwise be dropped and the deployment served unpriced) | `unreadable` |
 | the forward-compatible parse validates | `unreadable` |
 
 Unknown optional fields are dropped and reported in
@@ -35,6 +36,8 @@ artifact instead of serving it wrongly.
 
 `read_catalog_manifest` parses a manifest forward-compatibly and refuses a
 manifest schema marker that is not the integer `CATALOG_MANIFEST_SCHEMA_VERSION`.
+A manifest's `catalog_schema_version` must be a nano-USD schema (above the
+micro-USD schema 2): artifacts have no micro-USD upgrade path.
 
 ## Dependencies
 
@@ -76,7 +79,9 @@ the cut reproduces one.
 
 `ParsedArtifactCache` keeps parsed artifacts by hash across manifest versions
 (the bytes in hand are hashed on every `load`, so changed bytes for a cached
-hash are refused as `digest_mismatch`):
+hash are refused as `digest_mismatch`). Its store is the canonical bounded
+`VerifiedCache` (`PARSED_ARTIFACT_CACHE_MAXIMUM` entries by default), so memory
+stays bounded even without `retain`:
 an unchanged model keeps its hash, so it is parsed once and shared, and
 `retain` evicts hashes no held manifest names.
 
