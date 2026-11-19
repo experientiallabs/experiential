@@ -36,6 +36,11 @@ artifact instead of serving it wrongly.
 
 `read_catalog_manifest` parses a manifest forward-compatibly and refuses a
 manifest schema marker that is not the integer `CATALOG_MANIFEST_SCHEMA_VERSION`.
+It, and `assemble_manifest_catalog`, also refuse a manifest whose
+`snapshot_schema_version` is not this build's `SNAPSHOT_SCHEMA_VERSION`: pins
+skip the digest check, so a cut is served only by a build that normalizes
+exactly as its writer did, and during a cross-schema roll the host keeps
+serving the whole document.
 A manifest's `catalog_schema_version` must be a nano-USD schema (above the
 micro-USD schema 2): artifacts have no micro-USD upgrade path.
 
@@ -69,7 +74,7 @@ rows that a host reports (for example as a negative acknowledgement):
 | `model_mismatch` | the artifact's `model_id` is not the entry's, it carries no deployment or chain, or a record, pool or chain in it belongs to another model (a deployment belongs to its pool's exact model, else its `gateway.exact_model_id`, else its own alias) |
 | `dependency_mismatch` | a `model` dependency is absent or at another hash |
 | `connection_conflict` | a connection name is defined differently by several artifacts (every definer is refused; identical copies merge) |
-| `deployment_conflict`, `pool_conflict`, `chain_conflict` | two artifacts claim one deployment alias, pool id or chain key (both are refused; an unpooled deployment claims the singleton pool keyed by its alias), or a chain names a pool another artifact claims (that artifact is refused) |
+| `deployment_conflict`, `pool_conflict`, `chain_conflict` | two still-active artifacts claim one deployment alias, pool id or chain key (both are refused; an artifact already refused for a connection conflict claims nothing; an unpooled deployment claims the singleton pool keyed by its alias), or a chain names a pool another artifact claims (that artifact is refused) |
 | `invalid_artifact` | the artifact would normalize to nothing servable (no gateway deployment survives normalization, which drops excluded providers and SFT sampling handles, and no chain marks the model unavailable), or the artifact, together with the models it depends on, fails catalog validation or normalization (for example a chain naming a pool it does not carry, or a provider that needs explicit capabilities without them) |
 | `dependency_refused` | a model this artifact depends on was refused (closed to a fixpoint) |
 

@@ -39,6 +39,7 @@ from exp.common.models.catalog import (
 )
 from exp.common.models.gateway_catalog import (
     GATEWAY_EXCLUDED_PROVIDERS,
+    SNAPSHOT_SCHEMA_VERSION,
     load_forward_compatible,
     normalize_gateway_catalog,
 )
@@ -306,7 +307,8 @@ def read_catalog_manifest(data: bytes | str) -> CatalogManifest:
     """Parse a manifest forward-compatibly.
 
     Raises:
-        ValueError: The manifest is unreadable or of another manifest schema.
+        ValueError: The manifest is unreadable, of another manifest schema, or
+            written for another normalized snapshot schema.
     """
     raw = json.loads(data)
     if not isinstance(raw, dict):
@@ -315,6 +317,7 @@ def read_catalog_manifest(data: bytes | str) -> CatalogManifest:
     if type(version) is not int or version != CATALOG_MANIFEST_SCHEMA_VERSION:
         raise ValueError(f"catalog manifest schema {version!r} is not readable by this build")
     manifest, _dropped = load_forward_compatible(CatalogManifest, json.dumps(raw))
+    _require_this_snapshot_schema(manifest)
     return manifest
 
 
@@ -407,6 +410,10 @@ def assemble_manifest_catalog(
     with its model dependencies (in dependency order), so only the artifacts
     that cannot be served are refused and the rest still assemble.
 
+    Survivors that each validate with their dependencies but still clash
+    together are admitted one at a time in dependency order, and each one that
+    would break the accepted catalog is refused as ``invalid_artifact``.
+
     Args:
         manifest: The cut to assemble.
         artifacts: Verified artifacts keyed by content hash (extra keys ignored).
@@ -414,11 +421,12 @@ def assemble_manifest_catalog(
     Returns:
         The assembled catalog and the refused entries.
 
-    Assembly never raises: survivors that each validate with their
-    dependencies but still clash together are admitted one at a time in
-    dependency order, and each one that would break the accepted catalog is
-    refused as ``invalid_artifact``.
+    Raises:
+        ValueError: The manifest was written for another normalized snapshot
+            schema; this build would normalize its artifacts differently than
+            the writer did, so none of it may be served.
     """
+    _require_this_snapshot_schema(manifest)
     entries = sorted(manifest.entries, key=lambda entry: entry.model_id)
     by_model = {entry.model_id: entry.artifact_sha256 for entry in entries}
     refused: dict[str, ArtifactRefusal] = {}
@@ -478,7 +486,7 @@ def assemble_manifest_catalog(
             )
             continue
         loaded[entry.model_id] = artifact
-    _refuse_conflicts(loaded, refuse)
+    _refuse_conflicts(loaded, refused, refuse)
     _refuse_dependents(loaded, refused, refuse)
     survivors = [loaded[model_id] for model_id in sorted(loaded) if model_id not in refused]
     catalog = _catalog_or_error(manifest.catalog_schema_version, survivors)
@@ -605,6 +613,7 @@ def _dependency_closure(model_id: str, loaded: Mapping[str, ModelArtifact]) -> s
 
 def _refuse_conflicts(
     loaded: Mapping[str, ModelArtifact],
+    refused: Mapping[str, ArtifactRefusal],
     refuse: Callable[[str, ArtifactRefusalReason, str], None],
 ) -> None:
     """Refuse every artifact that defines a shared name inconsistently or twice.
@@ -615,19 +624,14 @@ def _refuse_conflicts(
     pool ids an artifact claims include the singleton pool of every deployment
     no authored pool names (it is keyed by its alias), and a chain may name only
     a pool its own artifact claims: one naming another artifact's pool is refused.
+
+    Each pass counts only artifacts still active after the previous one, so an
+    artifact already refused never takes an unrelated valid artifact down with it.
     """
     connection_defs: dict[str, dict[str, ConnectionConfig]] = {}
-    owners: dict[tuple[str, str], list[str]] = {}
     for model_id, artifact in loaded.items():
         for name, connection in artifact.connections.items():
             connection_defs.setdefault(name, {})[model_id] = connection
-        for kind, names in (
-            ("deployment", artifact.models),
-            ("pool", _claimed_pool_ids(artifact)),
-            ("chain", artifact.gateway_model_chains),
-        ):
-            for name in names:
-                owners.setdefault((kind, name), []).append(model_id)
     for name, definitions in sorted(connection_defs.items()):
         values = list(definitions.values())
         if any(value != values[0] for value in values[1:]):
@@ -638,11 +642,14 @@ def _refuse_conflicts(
         "pool": "pool_conflict",
         "chain": "chain_conflict",
     }
-    for (kind, name), model_ids in sorted(owners.items()):
+    for (kind, name), model_ids in sorted(_claims(loaded, refused).items()):
         if len(model_ids) > 1:
             for model_id in sorted(model_ids):
                 refuse(model_id, reasons[kind], f"{kind} {name!r} is claimed by {len(model_ids)}")
+    owners = _claims(loaded, refused)
     for model_id, artifact in sorted(loaded.items()):
+        if model_id in refused:
+            continue
         own = _claimed_pool_ids(artifact)
         for chain in artifact.gateway_model_chains.values():
             others = owners.get(("pool", chain.pool_id), [])
@@ -652,6 +659,24 @@ def _refuse_conflicts(
                     "pool_conflict",
                     f"chain names pool {chain.pool_id!r} of {others[0]!r}",
                 )
+
+
+def _claims(
+    loaded: Mapping[str, ModelArtifact], refused: Mapping[str, ArtifactRefusal]
+) -> dict[tuple[str, str], list[str]]:
+    """Active artifacts claiming each deployment alias, pool id and chain key."""
+    owners: dict[tuple[str, str], list[str]] = {}
+    for model_id, artifact in sorted(loaded.items()):
+        if model_id in refused:
+            continue
+        for kind, names in (
+            ("deployment", artifact.models),
+            ("pool", _claimed_pool_ids(artifact)),
+            ("chain", artifact.gateway_model_chains),
+        ):
+            for name in names:
+                owners.setdefault((kind, name), []).append(model_id)
+    return owners
 
 
 def _claimed_pool_ids(artifact: ModelArtifact) -> set[str]:
@@ -778,3 +803,20 @@ def _is_gateway_record(artifact: ModelArtifact, record: ModelRecord) -> bool:
     """Whether gateway normalization keeps this record as a deployment."""
     provider = artifact.connections[record.connection].provider
     return provider not in GATEWAY_EXCLUDED_PROVIDERS and record.sft_provenance is None
+
+
+def _require_this_snapshot_schema(manifest: CatalogManifest) -> None:
+    """Refuse a manifest whose writer normalized under another snapshot schema.
+
+    Manifest pins bypass the digest check, so a cut is served only by a build
+    that normalizes exactly as its writer did; a host keeps serving the whole
+    document (with its tolerant cross-version reader) until the schemas agree.
+
+    Raises:
+        ValueError: The manifest's snapshot schema is not this build's.
+    """
+    if manifest.snapshot_schema_version != SNAPSHOT_SCHEMA_VERSION:
+        raise ValueError(
+            f"catalog manifest snapshot schema {manifest.snapshot_schema_version} is not "
+            f"this build's {SNAPSHOT_SCHEMA_VERSION}; serve the whole catalog document instead"
+        )

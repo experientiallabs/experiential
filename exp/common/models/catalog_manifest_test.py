@@ -694,7 +694,7 @@ def test_survivors_that_clash_only_together_are_admitted_one_at_a_time(
 ) -> None:
     """With the up-front conflict pass disabled, the incremental admission still
     refuses only the clashing artifact instead of aborting the manifest."""
-    monkeypatch.setattr(catalog_manifest, "_refuse_conflicts", lambda loaded, refuse: None)
+    monkeypatch.setattr(catalog_manifest, "_refuse_conflicts", lambda *_: None)
     manifest, blobs = _split(_catalog())
     loaded = _load_all(blobs)
     sha, off = _off_chain_naming("small-1")
@@ -808,7 +808,7 @@ def test_admission_takes_one_artifact_at_a_time_and_keeps_the_serving_one(
 ) -> None:
     """A serving model waiting on a chain-only dependency is admitted before an
     unrelated chain-only sibling that clashes with it, so the sibling is refused."""
-    monkeypatch.setattr(catalog_manifest, "_refuse_conflicts", lambda loaded, refuse: None)
+    monkeypatch.setattr(catalog_manifest, "_refuse_conflicts", lambda *_: None)
     manifest, blobs = _split(_catalog())
     loaded = _load_all(blobs)
     gate_sha, gate = _artifact_entry(_unavailable_chain("gate", "pool-gate"))
@@ -861,3 +861,42 @@ def test_a_training_handle_alias_claims_no_pool_id() -> None:
     result = assemble_manifest_catalog(_with_entries(manifest, loaded, mixed=sha), loaded)
     assert result.refusals == ()
     assert result.served_model_ids == ("big", "mixed", "small")
+
+
+def test_a_manifest_of_another_snapshot_schema_is_refused_whole() -> None:
+    manifest, blobs = _split(_catalog())
+    other = manifest.model_copy(update={"snapshot_schema_version": SNAPSHOT_SCHEMA_VERSION + 1})
+    with pytest.raises(ValueError, match="snapshot schema"):
+        assemble_manifest_catalog(other, _load_all(blobs))
+    with pytest.raises(ValueError, match="snapshot schema"):
+        read_catalog_manifest(canonical_json_bytes(other))
+
+
+def test_an_already_refused_artifact_does_not_take_a_claimant_down() -> None:
+    """Artifact "clash" disagrees with "decoy" on connection "shared" (both refused),
+    and shares "keeper"'s deployment alias; keeper survives because clash can never
+    be served."""
+    manifest, blobs = _split(_catalog())
+    loaded = _load_all(blobs)
+    keeper_sha, keeper = _artifact_entry(_serving_artifact("keeper"))
+    decoy = _serving_artifact("decoy")
+    decoy["connections"] = {"shared": {"provider": "openai"}}
+    decoy["models"]["decoy-1"]["connection"] = "shared"
+    decoy_sha, decoying = _artifact_entry(decoy)
+    clash = _serving_artifact("clash")
+    clash["connections"] = {"shared": {"provider": "anthropic"}}
+    record = clash["models"].pop("clash-1")
+    clash["models"]["keeper-1"] = {**record, "connection": "shared"}
+    clash["gateway_model_chains"]["clash"]["pool_id"] = "keeper-1"
+    clash["gateway_model_chains"]["clash"]["rungs"] = [
+        {"kind": "deployment", "deployment_id": "keeper-1"}
+    ]
+    clash_sha, clashing = _artifact_entry(clash)
+    loaded.update({keeper_sha: keeper, decoy_sha: decoying, clash_sha: clashing})
+    cut = _with_entries(manifest, loaded, keeper=keeper_sha, decoy=decoy_sha, clash=clash_sha)
+    result = assemble_manifest_catalog(cut, loaded)
+    assert {(r.model_id, r.reason) for r in result.refusals} == {
+        ("clash", "connection_conflict"),
+        ("decoy", "connection_conflict"),
+    }
+    assert result.served_model_ids == ("big", "keeper", "small")
