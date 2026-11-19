@@ -432,16 +432,21 @@ def assemble_manifest_catalog(
 ) -> ManifestCatalog:
     """Assemble one manifest's verified artifacts into a single authored catalog.
 
-    Per-artifact problems never raise: they become refusals, and a refused
-    model also refuses every model whose chain depends on it. When the merged
-    artifacts fail catalog validation or claim a name twice, each one is first
-    validated together with its model dependencies (in dependency order), then
-    shared names are checked among the artifacts still active, so only the
-    artifacts that cannot be served are refused and the rest still assemble.
+    Assembly is an explicit fixpoint over the set of accepted artifacts:
 
-    Survivors that each validate with their dependencies but still clash
-    together are admitted one at a time in dependency order, and each one that
-    would break the accepted catalog is refused as ``invalid_artifact``.
+    1. Every entry is judged alone: its bytes were loaded, it serves exactly its
+       own model, normalization keeps something of it, its model dependencies
+       are at the manifest's hashes, and it validates and normalizes together
+       with its dependency closure (visited in dependency order).
+    2. Over the artifacts still accepted, conflicts are recomputed each round
+       and resolved by one rule (see ``_conflict_round``) until the accepted set
+       stops changing; every round also refuses the dependents of a refusal.
+    3. The accepted set is merged. Should it still fail to validate, accepted
+       artifacts are admitted one at a time and each that breaks the rest is
+       refused, so no per-artifact problem ever aborts the manifest.
+
+    The result depends only on the set of entries and artifacts, never on
+    their order.
 
     Args:
         manifest: The cut to assemble.
@@ -456,10 +461,8 @@ def assemble_manifest_catalog(
             the writer did, so none of it may be served.
     """
     _require_this_snapshot_schema(manifest)
-    entries = sorted(manifest.entries, key=lambda entry: entry.model_id)
-    by_model = {entry.model_id: entry.artifact_sha256 for entry in entries}
+    by_model = {entry.model_id: entry.artifact_sha256 for entry in manifest.entries}
     refused: dict[str, ArtifactRefusal] = {}
-    loaded: dict[str, ModelArtifact] = {}
 
     def refuse(model_id: str, reason: ArtifactRefusalReason, detail: str) -> None:
         """Record the first refusal reason for one manifest entry."""
@@ -471,88 +474,73 @@ def assemble_manifest_catalog(
                 detail=detail,
             )
 
-    for entry in entries:
-        item = artifacts.get(entry.artifact_sha256)
-        if item is None or item.artifact_sha256 != entry.artifact_sha256:
-            refuse(entry.model_id, "missing_bytes", "artifact bytes were not loaded")
-            continue
-        artifact = item.artifact
-        if artifact.model_id != entry.model_id:
-            refuse(
-                entry.model_id,
-                "model_mismatch",
-                f"artifact serves model {artifact.model_id!r}",
-            )
-            continue
-        if not artifact.models and not artifact.gateway_model_chains:
-            refuse(entry.model_id, "model_mismatch", "artifact carries no deployment or chain")
-            continue
-        if not _serves_gateway_content(artifact):
-            refuse(
-                entry.model_id,
-                "invalid_artifact",
-                "artifact has no gateway deployment and no explicitly unavailable chain",
-            )
-            continue
-        foreign = _foreign_model_ids(artifact)
-        if foreign:
-            refuse(
-                entry.model_id,
-                "model_mismatch",
-                "artifact carries other models: " + ", ".join(repr(m) for m in foreign),
-            )
-            continue
-        mismatched = sorted(
-            dependency
-            for dependency, sha in artifact.model_dependencies().items()
-            if by_model.get(dependency) != sha
-        )
-        if mismatched:
-            refuse(
-                entry.model_id,
-                "dependency_mismatch",
-                "model dependency not at the manifest's hash: " + ", ".join(mismatched),
-            )
-            continue
-        loaded[entry.model_id] = artifact
-    schema = manifest.catalog_schema_version
-    candidates = [loaded[model_id] for model_id in sorted(loaded)]
-    catalog = _catalog_or_error(schema, candidates)
-    if isinstance(catalog, Exception) or _has_conflicts(loaded):
-        # Slow path: find the artifacts invalid on their own first, so a
-        # malformed artifact never takes a valid one down through a shared name.
-        _refuse_invalid(schema, loaded, refused, refuse)
-        _refuse_conflicts(loaded, refused, refuse)
-        _refuse_dependents(loaded, refused, refuse)
-        survivors = [loaded[model_id] for model_id in sorted(loaded) if model_id not in refused]
-        catalog = _catalog_or_error(schema, survivors)
-        if isinstance(catalog, Exception):
-            catalog = _admit_incrementally(schema, survivors, refuse)
-    survivors = [loaded[model_id] for model_id in sorted(loaded) if model_id not in refused]
+    loaded = _judge_entries(manifest, artifacts, refuse)
+    _refuse_invalid(manifest.catalog_schema_version, loaded, refused, refuse)
+    while _conflict_round({m: a for m, a in loaded.items() if m not in refused}, refused, refuse):
+        pass
+    accepted = [loaded[model_id] for model_id in sorted(loaded) if model_id not in refused]
+    catalog = _catalog_or_error(manifest.catalog_schema_version, accepted)
+    if isinstance(catalog, Exception):
+        catalog = _admit_incrementally(manifest.catalog_schema_version, accepted, refuse)
+        accepted = [item for item in accepted if item.model_id not in refused]
     return ManifestCatalog(
         manifest=manifest,
         catalog=catalog,
-        served_model_ids=tuple(artifact.model_id for artifact in survivors),
+        served_model_ids=tuple(artifact.model_id for artifact in accepted),
         refusals=tuple(refused[model_id] for model_id in sorted(refused)),
     )
 
 
-def _refuse_dependents(
-    loaded: Mapping[str, ModelArtifact],
-    refused: Mapping[str, ArtifactRefusal],
+def _judge_entries(
+    manifest: CatalogManifest,
+    artifacts: Mapping[str, LoadedModelArtifact],
     refuse: Callable[[str, ArtifactRefusalReason, str], None],
-) -> None:
-    """Refuse every loaded model that depends on a refused one, to a fixpoint."""
-    changed = True
-    while changed:
-        changed = False
-        for model_id, artifact in sorted(loaded.items()):
-            if model_id in refused:
-                continue
-            blocked = sorted(dep for dep in artifact.model_dependencies() if dep in refused)
-            if blocked:
-                refuse(model_id, "dependency_refused", "depends on refused " + ", ".join(blocked))
-                changed = True
+) -> dict[str, ModelArtifact]:
+    """Judge each manifest entry on its own facts; return the artifacts that pass."""
+    by_model = {entry.model_id: entry.artifact_sha256 for entry in manifest.entries}
+    loaded: dict[str, ModelArtifact] = {}
+    for model_id in sorted(by_model):
+        sha = by_model[model_id]
+        item = artifacts.get(sha)
+        if item is None or item.artifact_sha256 != sha:
+            refuse(model_id, "missing_bytes", "artifact bytes were not loaded")
+            continue
+        artifact = item.artifact
+        if artifact.model_id != model_id:
+            refuse(model_id, "model_mismatch", f"artifact serves model {artifact.model_id!r}")
+            continue
+        if not artifact.models and not artifact.gateway_model_chains:
+            refuse(model_id, "model_mismatch", "artifact carries no deployment or chain")
+            continue
+        foreign = _foreign_model_ids(artifact)
+        if foreign:
+            refuse(
+                model_id,
+                "model_mismatch",
+                "artifact carries other models: " + ", ".join(repr(m) for m in foreign),
+            )
+            continue
+        if not _serves_gateway_content(artifact):
+            refuse(
+                model_id,
+                "invalid_artifact",
+                "artifact has no gateway deployment and no explicitly unavailable chain",
+            )
+            continue
+        mismatched = sorted(
+            dependency
+            for dependency, dependency_sha in artifact.model_dependencies().items()
+            if by_model.get(dependency) != dependency_sha
+        )
+        if mismatched:
+            refuse(
+                model_id,
+                "dependency_mismatch",
+                "model dependency not at the manifest's hash: " + ", ".join(mismatched),
+            )
+            continue
+        loaded[model_id] = artifact
+    return loaded
 
 
 _CATALOG_ERRORS = (ValueError, KeyError)
@@ -602,10 +590,13 @@ def _refuse_invalid(
     refused: Mapping[str, ArtifactRefusal],
     refuse: Callable[[str, ArtifactRefusalReason, str], None],
 ) -> None:
-    """Refuse each survivor that fails validation together with its model dependencies.
+    """Refuse each artifact that fails validation together with its model dependencies.
 
-    Survivors are visited in dependency order, so a model whose dependency was
+    Artifacts are visited in dependency order, so a model whose dependency was
     refused here is reported as ``dependency_refused`` rather than revalidated.
+    Whether an artifact validates depends only on its bytes and its
+    dependencies' bytes (named by hash), so this is a fact about each artifact
+    alone, never about the rest of the manifest.
     """
     pending = {model_id for model_id in loaded if model_id not in refused}
     while pending:
@@ -643,105 +634,128 @@ def _dependency_closure(model_id: str, loaded: Mapping[str, ModelArtifact]) -> s
     return closure
 
 
-def _refuse_conflicts(
-    loaded: Mapping[str, ModelArtifact],
+@dataclass(frozen=True)
+class _Conflict:
+    """One shared name the accepted artifacts disagree on.
+
+    Attributes:
+        reason: The refusal reason it produces.
+        detail: The display-safe explanation.
+        claimants: The artifacts at fault (refusal candidates).
+    """
+
+    reason: ArtifactRefusalReason
+    detail: str
+    claimants: frozenset[str]
+
+
+def _conflict_round(
+    accepted: Mapping[str, ModelArtifact],
     refused: Mapping[str, ArtifactRefusal],
     refuse: Callable[[str, ArtifactRefusalReason, str], None],
-) -> None:
-    """Refuse every artifact that defines a shared name inconsistently or twice.
+) -> bool:
+    """Run one fixpoint round over the accepted set; return whether anything was refused.
 
-    A connection may be carried by many artifacts as long as every copy is
-    identical. A deployment alias, pool id or chain key belongs to exactly one
-    artifact; when two claim it, both are refused rather than picking one. The
-    pool ids an artifact claims include the singleton pool of every deployment
-    no authored pool names (it is keyed by its alias), and a chain may name only
-    a pool its own artifact claims: one naming another artifact's pool is refused.
+    The one rule, in priority order, each computed afresh over the accepted set:
 
-    Names are checked one at a time in sorted order, each counting only the
-    artifacts still active at that point, so an artifact already refused never
-    takes an unrelated valid artifact down with it and the result is deterministic.
+    1. Dependents: an artifact whose model dependency was refused is refused.
+    2. Shared names: a connection defined differently, or a deployment alias,
+       pool id (an unpooled gateway deployment claims the singleton pool keyed
+       by its alias) or chain key claimed by several artifacts. The claimants
+       in the most such conflicts are refused, all tied ones together; the
+       rest are judged again next round, so an artifact that was only in
+       conflict with a refused one survives.
+    3. Foreign pools: a chain naming a pool another artifact claims refuses
+       its artifact, first where that owner names no foreign pool itself (the
+       owner certainly stays); when every such reference is mutual, all are
+       refused together.
+
+    Every choice is made over sets, so the outcome never depends on the order
+    of entries or artifacts.
     """
-    connection_defs: dict[str, dict[str, ConnectionConfig]] = {}
-    for model_id, artifact in loaded.items():
-        for name, connection in artifact.connections.items():
-            connection_defs.setdefault(name, {})[model_id] = connection
-    for name, all_definitions in sorted(connection_defs.items()):
-        definitions = {m: c for m, c in all_definitions.items() if m not in refused}
-        values = list(definitions.values())
-        if any(value != values[0] for value in values[1:]):
-            for model_id in sorted(definitions):
-                refuse(model_id, "connection_conflict", f"connection {name!r} differs")
-    reasons: dict[str, ArtifactRefusalReason] = {
-        "deployment": "deployment_conflict",
-        "pool": "pool_conflict",
-        "chain": "chain_conflict",
+    blocked = {
+        model_id: sorted(dep for dep in artifact.model_dependencies() if dep in refused)
+        for model_id, artifact in accepted.items()
     }
-    for (kind, name), all_model_ids in sorted(_claims(loaded, refused).items()):
-        model_ids = [model_id for model_id in all_model_ids if model_id not in refused]
-        if len(model_ids) > 1:
-            for model_id in sorted(model_ids):
-                refuse(model_id, reasons[kind], f"{kind} {name!r} is claimed by {len(model_ids)}")
-    _refuse_foreign_pool_chains(loaded, refused, refuse)
-
-
-def _refuse_foreign_pool_chains(
-    loaded: Mapping[str, ModelArtifact],
-    refused: Mapping[str, ArtifactRefusal],
-    refuse: Callable[[str, ArtifactRefusalReason, str], None],
-) -> None:
-    """Refuse each active artifact whose chain names a pool another active artifact claims.
-
-    Resolved to a fixpoint so the result does not depend on model ids: each
-    round refuses only references to an owner that names no foreign pool itself
-    (that owner certainly stays), and a pool whose every owner was refused stops
-    counting. References left only among owners that all point at each other
-    are refused together.
-    """
-    while True:
-        claims = {
-            model_id: _claimed_pool_ids(artifact)
-            for model_id, artifact in loaded.items()
-            if model_id not in refused
-        }
-        pending: dict[str, tuple[str, list[str]]] = {}
-        for model_id in sorted(claims):
-            for chain in loaded[model_id].gateway_model_chains.values():
-                owners = sorted(
-                    owner
-                    for owner, pools in claims.items()
-                    if owner != model_id and chain.pool_id in pools
-                )
-                if chain.pool_id not in claims[model_id] and owners:
-                    pending.setdefault(model_id, (chain.pool_id, owners))
-        if not pending:
-            return
+    blocked = {model_id: deps for model_id, deps in blocked.items() if deps}
+    if blocked:
+        for model_id, deps in sorted(blocked.items()):
+            refuse(model_id, "dependency_refused", "depends on refused " + ", ".join(deps))
+        return True
+    conflicts = _shared_name_conflicts(accepted)
+    if conflicts:
+        degree: dict[str, int] = {}
+        for conflict in conflicts:
+            for model_id in conflict.claimants:
+                degree[model_id] = degree.get(model_id, 0) + 1
+        top = max(degree.values())
+        for model_id in sorted(m for m, count in degree.items() if count == top):
+            first = next(c for c in conflicts if model_id in c.claimants)
+            refuse(model_id, first.reason, first.detail)
+        return True
+    references = _foreign_pool_references(accepted)
+    if references:
         settled = {
-            model_id: (pool_id, owners)
-            for model_id, (pool_id, owners) in pending.items()
-            if any(owner not in pending for owner in owners)
+            model_id: found
+            for model_id, found in references.items()
+            if any(owner not in references for owner in found[1])
         }
-        for model_id, (pool_id, owners) in sorted((settled or pending).items()):
+        for model_id, (pool_id, owners) in sorted((settled or references).items()):
             refuse(model_id, "pool_conflict", f"chain names pool {pool_id!r} of {owners[0]!r}")
-        if not settled:
-            return
+        return True
+    return False
 
 
-def _claims(
-    loaded: Mapping[str, ModelArtifact], refused: Mapping[str, ArtifactRefusal]
-) -> dict[tuple[str, str], list[str]]:
-    """Active artifacts claiming each deployment alias, pool id and chain key."""
-    owners: dict[tuple[str, str], list[str]] = {}
-    for model_id, artifact in sorted(loaded.items()):
-        if model_id in refused:
-            continue
+def _shared_name_conflicts(accepted: Mapping[str, ModelArtifact]) -> list[_Conflict]:
+    """Every shared name the accepted artifacts define differently or claim twice, sorted."""
+    conflicts: list[_Conflict] = []
+    definitions: dict[str, dict[str, ConnectionConfig]] = {}
+    owners: dict[tuple[str, str], set[str]] = {}
+    for model_id, artifact in accepted.items():
+        for name, connection in artifact.connections.items():
+            definitions.setdefault(name, {})[model_id] = connection
         for kind, names in (
             ("deployment", artifact.models),
             ("pool", _claimed_pool_ids(artifact)),
             ("chain", artifact.gateway_model_chains),
         ):
             for name in names:
-                owners.setdefault((kind, name), []).append(model_id)
-    return owners
+                owners.setdefault((kind, name), set()).add(model_id)
+    for name, by_definer in sorted(definitions.items()):
+        values = list(by_definer.values())
+        if any(value != values[0] for value in values[1:]):
+            conflicts.append(
+                _Conflict(
+                    "connection_conflict", f"connection {name!r} differs", frozenset(by_definer)
+                )
+            )
+    reasons: dict[str, ArtifactRefusalReason] = {
+        "deployment": "deployment_conflict",
+        "pool": "pool_conflict",
+        "chain": "chain_conflict",
+    }
+    for (kind, name), claimants in sorted(owners.items()):
+        if len(claimants) > 1:
+            detail = f"{kind} {name!r} is claimed by {len(claimants)}"
+            conflicts.append(_Conflict(reasons[kind], detail, frozenset(claimants)))
+    return conflicts
+
+
+def _foreign_pool_references(
+    accepted: Mapping[str, ModelArtifact],
+) -> dict[str, tuple[str, list[str]]]:
+    """Accepted artifacts whose chain names a pool another accepted artifact claims."""
+    claims = {model_id: _claimed_pool_ids(artifact) for model_id, artifact in accepted.items()}
+    references: dict[str, tuple[str, list[str]]] = {}
+    for model_id in sorted(accepted):
+        for key in sorted(accepted[model_id].gateway_model_chains):
+            pool_id = accepted[model_id].gateway_model_chains[key].pool_id
+            if pool_id in claims[model_id]:
+                continue
+            owners = sorted(o for o, pools in claims.items() if o != model_id and pool_id in pools)
+            if owners:
+                references.setdefault(model_id, (pool_id, owners))
+    return references
 
 
 def _claimed_pool_ids(artifact: ModelArtifact) -> set[str]:
@@ -885,17 +899,3 @@ def _require_this_snapshot_schema(manifest: CatalogManifest) -> None:
             f"catalog manifest snapshot schema {manifest.snapshot_schema_version} is not "
             f"this build's {SNAPSHOT_SCHEMA_VERSION}; serve the whole catalog document instead"
         )
-
-
-def _has_conflicts(loaded: Mapping[str, ModelArtifact]) -> bool:
-    """Whether any shared name is defined inconsistently or claimed twice."""
-    found: dict[str, ArtifactRefusal] = {}
-
-    def note(model_id: str, reason: ArtifactRefusalReason, detail: str) -> None:
-        """Record that a conflict exists."""
-        found[model_id] = ArtifactRefusal(
-            model_id=model_id, artifact_sha256="0" * 64, reason=reason, detail=detail
-        )
-
-    _refuse_conflicts(loaded, found, note)
-    return bool(found)

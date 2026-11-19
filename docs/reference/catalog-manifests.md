@@ -74,27 +74,48 @@ rows that a host reports (for example as a negative acknowledgement):
 | `missing_bytes` | the artifact was not loaded |
 | `model_mismatch` | the artifact's `model_id` is not the entry's, it carries no deployment or chain, or a record, pool or chain in it belongs to another model (a deployment belongs to its pool's exact model, else its `gateway.exact_model_id`, else its own alias) |
 | `dependency_mismatch` | a `model` dependency is absent or at another hash |
-| `connection_conflict` | a connection name is defined differently by several artifacts (every definer is refused; identical copies merge) |
-| `deployment_conflict`, `pool_conflict`, `chain_conflict` | two still-active artifacts claim one deployment alias, pool id or chain key (both are refused; an artifact already refused for a connection conflict claims nothing; an unpooled deployment claims the singleton pool keyed by its alias), or a chain names a pool another artifact claims (that artifact is refused) |
+| `connection_conflict` | a connection name is defined differently by several accepted artifacts (identical copies merge) |
+| `deployment_conflict`, `pool_conflict`, `chain_conflict` | several accepted artifacts claim one deployment alias, pool id (an unpooled gateway deployment claims the singleton pool keyed by its alias) or chain key, or a chain names a pool another accepted artifact claims; which claimants are refused follows the round rule below |
 | `invalid_artifact` | the artifact would normalize to nothing servable (no gateway deployment survives normalization, which drops excluded providers and SFT sampling handles, and no chain marks the model unavailable), or the artifact, together with the models it depends on, fails catalog validation or normalization (for example a chain naming a pool it does not carry, or a provider that needs explicit capabilities without them) |
 | `dependency_refused` | a model this artifact depends on was refused (closed to a fixpoint) |
 
-The merged artifacts are validated and normalized once. Only when that fails,
-or a name is claimed twice, is each artifact first validated with its
-dependency closure, in dependency order; shared names are then checked one at
-a time among the artifacts still active (a chain naming another artifact's pool
-is resolved to a fixpoint, independent of model ids), so a malformed artifact
-is refused alone and never takes a valid one down. Survivors that validate
-alone but still clash together are admitted one at a time (dependencies first,
-artifacts with deployments before chain-only ones, then by model id), and each
-that would break the accepted catalog is refused as `invalid_artifact`. No
+Assembly is an explicit fixpoint over the set of accepted artifacts:
+
+1. **Each entry alone.** Its bytes were loaded, it serves exactly its own
+   model, normalization keeps something of it, its `model` dependencies are at
+   the manifest's hashes, and it validates and normalizes together with its
+   dependency closure (visited in dependency order). These are facts about the
+   artifact and the bytes it names, never about the rest of the manifest.
+2. **Rounds over the accepted set**, recomputed each round until nothing
+   changes, by one rule in priority order: refuse the dependents of a refused
+   model; else, among shared-name conflicts (a connection defined differently,
+   or a deployment alias, pool id or chain key claimed twice), refuse the
+   claimants in the most conflicts, all tied ones together, so an artifact
+   only in conflict with a refused one survives the next round; else refuse a
+   chain naming a pool another artifact claims, first where that owner names
+   no foreign pool itself, and all mutual references together.
+3. **Merge.** If the accepted set still fails to validate, its artifacts are
+   admitted one at a time (dependencies first, artifacts with deployments
+   before chain-only ones, then by model id) and each one that would break the
+   rest is refused as `invalid_artifact`.
+
+The result depends only on the set of entries and artifacts, never on their
+order: every accepted artifact's dependencies are accepted, no two accepted
+artifacts claim one name, and assembling the accepted entries alone yields the
+same catalog with no refusals (a seeded property test checks all four over
+random cuts with overlaps, mutual references and missing bytes). No
 per-artifact problem aborts the manifest.
 
-Results are deterministic (entries are processed by model id). The catalog is
-`None` only when no connection survives. Assembling a manifest written from a
-catalog yields an equal `ModelCatalog`, so its normalized identity equals the
-whole document's; `CatalogManifest.catalog_sha256` records that identity when
-the cut reproduces one.
+The catalog is `None` only when no connection survives.
+
+A manifest is the gateway's serving form, so it carries exactly what
+normalization reads: connections, deployment records, pools and chains. The
+catalog's local `roles` (candidate, judge, teacher and so on) are not part of
+it, and the assembled catalog carries default roles. Assembling a manifest
+written from a catalog therefore yields that catalog with default roles, whose
+normalized identity equals the whole document's (normalization never reads
+roles); `CatalogManifest.catalog_sha256` records that identity when the cut
+reproduces one.
 
 `ParsedArtifactCache` keeps parsed artifacts by hash across manifest versions
 (the bytes in hand are hashed on every `load`, so changed bytes for a cached

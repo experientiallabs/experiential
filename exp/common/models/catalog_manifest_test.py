@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 from datetime import UTC, datetime
 from typing import Any
 
@@ -694,7 +695,7 @@ def test_survivors_that_clash_only_together_are_admitted_one_at_a_time(
 ) -> None:
     """With the up-front conflict pass disabled, the incremental admission still
     refuses only the clashing artifact instead of aborting the manifest."""
-    monkeypatch.setattr(catalog_manifest, "_refuse_conflicts", lambda *_: None)
+    monkeypatch.setattr(catalog_manifest, "_conflict_round", lambda *_: False)
     manifest, blobs = _split(_catalog())
     loaded = _load_all(blobs)
     sha, off = _off_chain_naming("small-1")
@@ -808,7 +809,7 @@ def test_admission_takes_one_artifact_at_a_time_and_keeps_the_serving_one(
 ) -> None:
     """A serving model waiting on a chain-only dependency is admitted before an
     unrelated chain-only sibling that clashes with it, so the sibling is refused."""
-    monkeypatch.setattr(catalog_manifest, "_refuse_conflicts", lambda *_: None)
+    monkeypatch.setattr(catalog_manifest, "_conflict_round", lambda *_: False)
     manifest, blobs = _split(_catalog())
     loaded = _load_all(blobs)
     gate_sha, gate = _artifact_entry(_unavailable_chain("gate", "pool-gate"))
@@ -873,9 +874,9 @@ def test_a_manifest_of_another_snapshot_schema_is_refused_whole() -> None:
 
 
 def test_an_already_refused_artifact_does_not_take_a_claimant_down() -> None:
-    """Artifact "clash" disagrees with "decoy" on connection "shared" (both refused),
-    and shares "keeper"'s deployment alias; keeper survives because clash can never
-    be served."""
+    """Artifact "clash" disagrees with "decoy" on connection "shared" and shares
+    "keeper"'s deployment alias: clash is in the most conflicts, so only it is
+    refused, and decoy and keeper both serve."""
     manifest, blobs = _split(_catalog())
     loaded = _load_all(blobs)
     keeper_sha, keeper = _artifact_entry(_serving_artifact("keeper"))
@@ -895,16 +896,13 @@ def test_an_already_refused_artifact_does_not_take_a_claimant_down() -> None:
     loaded.update({keeper_sha: keeper, decoy_sha: decoying, clash_sha: clashing})
     cut = _with_entries(manifest, loaded, keeper=keeper_sha, decoy=decoy_sha, clash=clash_sha)
     result = assemble_manifest_catalog(cut, loaded)
-    assert {(r.model_id, r.reason) for r in result.refusals} == {
-        ("clash", "connection_conflict"),
-        ("decoy", "connection_conflict"),
-    }
-    assert result.served_model_ids == ("big", "keeper", "small")
+    assert [(r.model_id, r.reason) for r in result.refusals] == [("clash", "connection_conflict")]
+    assert result.served_model_ids == ("big", "decoy", "keeper", "small")
 
 
 def test_connection_conflicts_count_only_still_active_definers() -> None:
-    """Artifact "bad" disagrees with "first" on connection "a-conn" (both refused) and
-    with "third" on "b-conn"; third survives because bad was already refused."""
+    """Artifact "bad" disagrees with "first" on connection "a-conn" and with
+    "third" on "b-conn": bad is in the most conflicts, so only it is refused."""
     manifest, blobs = _split(_catalog())
     loaded = _load_all(blobs)
 
@@ -921,11 +919,8 @@ def test_connection_conflicts_count_only_still_active_definers() -> None:
     loaded.update({first_sha: first, bad_sha: bad, third_sha: third})
     cut = _with_entries(manifest, loaded, first=first_sha, bad=bad_sha, third=third_sha)
     result = assemble_manifest_catalog(cut, loaded)
-    assert {(r.model_id, r.reason) for r in result.refusals} == {
-        ("bad", "connection_conflict"),
-        ("first", "connection_conflict"),
-    }
-    assert "third" in result.served_model_ids
+    assert [(r.model_id, r.reason) for r in result.refusals] == [("bad", "connection_conflict")]
+    assert {"first", "third"} <= set(result.served_model_ids)
 
 
 def test_an_artifact_invalid_alone_is_refused_before_it_can_claim_a_name() -> None:
@@ -979,3 +974,140 @@ def test_manifest_version_fields_must_be_json_integers() -> None:
         for coerced in (True, float(body[field])):
             with pytest.raises(ValidationError, match="must be integers"):
                 read_catalog_manifest(json.dumps({**body, field: coerced}))
+
+
+def _random_cut(seed: int) -> tuple[CatalogManifest, dict[str, LoadedModelArtifact]]:
+    """A random manifest whose artifacts overlap, conflict, reference and refuse.
+
+    Names come from small pools, so deployment aliases, pool ids and connection
+    names collide; chains enter earlier models (pinned by hash), name another
+    model's pool (mutual references form cycles), or point at nothing; some
+    dependency hashes are stale and some bytes are missing.
+    """
+    rng = random.Random(seed)
+    hashes: dict[str, str] = {}
+    loaded: dict[str, LoadedModelArtifact] = {}
+    entries: list[ManifestEntry] = []
+    count = rng.randint(2, 7)
+    models = [f"m{index}" for index in range(count)]
+    aliases = [f"{model}-1" for model in models] + ["shared-a", "shared-b"]
+    for index, model in enumerate(models):
+        alias = rng.choice([f"{model}-1", f"{model}-1", rng.choice(aliases)])
+        connection = rng.choice(["c0", "c1"])
+        provider = rng.choice(["openai", "openai", "anthropic"])
+        body: dict[str, Any] = {
+            "artifact_schema_version": 1,
+            "model_id": model,
+            "dependencies": [],
+            "connections": {connection: {"provider": provider}},
+            "models": {
+                alias: {
+                    "connection": connection,
+                    "model": model,
+                    "billing_source": "customer_managed",
+                    "gateway": {"exact_model_id": model},
+                }
+            },
+            "gateway_model_chains": {},
+        }
+        shape = rng.choice(["plain", "chain", "enter", "foreign", "chain_only"])
+        if shape == "chain_only":
+            body["connections"], body["models"] = {}, {}
+        if shape in {"chain", "enter"}:
+            rungs: list[dict[str, str]] = [{"kind": "deployment", "deployment_id": alias}]
+            body["gateway_model_chains"][model] = {
+                "model_id": model,
+                "pool_id": alias,
+                "revision": "r1",
+                "rungs": rungs,
+            }
+            earlier = [m for m in models[:index] if m in hashes]
+            if shape == "enter" and earlier:
+                target = rng.choice(earlier)
+                stale = rng.random() < 0.15
+                rungs.append({"kind": "model", "model_id": target})
+                body["required_to_serve"] = ["model_chains"]
+                body["dependencies"].append(
+                    {
+                        "kind": "model",
+                        "key": target,
+                        "sha256": "f" * 64 if stale else hashes[target],
+                    }
+                )
+        if shape in {"foreign", "chain_only"}:
+            body["gateway_model_chains"][model] = {
+                "model_id": model,
+                "pool_id": rng.choice(aliases),
+                "revision": "r1",
+                "available": False,
+                "rungs": [],
+            }
+        try:
+            sha, artifact = _artifact_entry(body)
+        except (ModelArtifactError, ValidationError):
+            continue
+        hashes[model] = sha
+        entries.append(ManifestEntry(model_id=model, artifact_sha256=sha))
+        if rng.random() > 0.1:
+            loaded[sha] = artifact
+    manifest = CatalogManifest(
+        manifest_version=1,
+        catalog_schema_version=3,
+        snapshot_schema_version=SNAPSHOT_SCHEMA_VERSION,
+        entries=tuple(entries),
+    )
+    return manifest, loaded
+
+
+def _claimed_names(artifact: ModelArtifact) -> set[tuple[str, str]]:
+    """Every deployment alias, pool id and chain key an artifact claims."""
+    pooled = {a for pool in artifact.gateway_pools.values() for a in pool.deployment_aliases}
+    names = {("deployment", alias) for alias in artifact.models}
+    names |= {("pool", pool_id) for pool_id in artifact.gateway_pools}
+    names |= {("pool", alias) for alias in artifact.models if alias not in pooled}
+    names |= {("chain", key) for key in artifact.gateway_model_chains}
+    return names
+
+
+@pytest.mark.parametrize("seed", range(300))
+def test_assembly_is_an_order_independent_closed_fixpoint(seed: int) -> None:
+    """Random cuts: order-independent, dependency-closed, conflict-free, and stable
+    when the accepted set is assembled alone."""
+    manifest, loaded = _random_cut(seed)
+    result = assemble_manifest_catalog(manifest, loaded)
+    rng = random.Random(seed + 10_000)
+    entries = list(manifest.entries)
+    rng.shuffle(entries)
+    items = list(loaded.items())
+    rng.shuffle(items)
+    shuffled = assemble_manifest_catalog(
+        manifest.model_copy(update={"entries": tuple(entries)}), dict(items)
+    )
+    assert shuffled.refusals == result.refusals
+    assert shuffled.served_model_ids == result.served_model_ids
+    assert shuffled.catalog == result.catalog
+
+    by_hash = {entry.model_id: entry.artifact_sha256 for entry in manifest.entries}
+    accepted = {model: loaded[by_hash[model]].artifact for model in result.served_model_ids}
+    assert set(accepted).isdisjoint(r.model_id for r in result.refusals)
+    assert set(accepted) | {r.model_id for r in result.refusals} == set(by_hash)
+    for artifact in accepted.values():
+        assert set(artifact.model_dependencies()) <= set(accepted)
+    claimed: dict[tuple[str, str], str] = {}
+    connections: dict[str, ConnectionConfig] = {}
+    for model, artifact in accepted.items():
+        for name in _claimed_names(artifact):
+            assert name not in claimed, (name, claimed.get(name), model)
+            claimed[name] = model
+        for name, connection in artifact.connections.items():
+            assert connections.setdefault(name, connection) == connection
+
+    alone = manifest.model_copy(
+        update={
+            "entries": tuple(e for e in manifest.entries if e.model_id in accepted),
+        }
+    )
+    again = assemble_manifest_catalog(alone, loaded)
+    assert again.refusals == ()
+    assert again.served_model_ids == result.served_model_ids
+    assert again.catalog == result.catalog
