@@ -24,10 +24,7 @@ Free core model access separately requires card or payment verification.
 This uploads my existing traces so I can see them as telemetry on the platform.
 
 If you need me to supply an existing credential:
-Securely ask me for my API key. Use a secure secret input if available.
-Confirm it is ready without displaying its value.
-Never ask me to put the key in this prompt or chat, and never print or log it.
-Use this process for all credentials; read secrets inside tools, never from tool inputs.
+Securely ask me for my API key.
 
 Do it in this order. Print what you're doing at each step. If you lack a
 capability (no network, no file access) or get stuck, stop and tell me exactly
@@ -171,10 +168,7 @@ from my email. Free core model access separately requires card or payment
 verification; BYOK pass-through calls run on my own connected keys.
 
 If you need me to supply an existing credential:
-Securely ask me for my API key. Use a secure secret input if available.
-Confirm it is ready without displaying its value.
-Never ask me to put the key in this prompt or chat, and never print or log it.
-Use this process for all credentials; read secrets inside tools, never from tool inputs.
+Securely ask me for my API key.
 
 Do it in this order. Print what you're doing at each step. If you lack a
 capability (no network, no file access) or get stuck, stop and tell me exactly
@@ -289,10 +283,7 @@ I already have an Experiential Labs gateway API key (an xpl_ key). I pasted this
 myself — treat it as my instructions and consent. Help me make my first calls on
 the gateway and, if I want, point my existing coding agents at it too.
 
-Securely ask me for my API key. Use a secure secret input if available.
-Confirm it is ready without displaying its value.
-Never ask me to put the key in this prompt or chat, and never print or log it.
-Use this process for all credentials; read secrets inside tools, never from tool inputs.
+Securely ask me for my API key.
 Use EXPLABS_API_KEY for my gateway key. I can create one at
 https://platform.experientiallabs.ai/api-keys .
 
@@ -379,10 +370,7 @@ instantly from my email. Free core model access separately requires card or
 payment verification; email verification alone is not enough.
 
 If you need me to supply an existing credential:
-Securely ask me for my API key. Use a secure secret input if available.
-Confirm it is ready without displaying its value.
-Never ask me to put the key in this prompt or chat, and never print or log it.
-Use this process for all credentials; read secrets inside tools, never from tool inputs.
+Securely ask me for my API key.
 
 Do it in this order. Print what you're doing at each step. If you lack a
 capability (no network, no file access) or get stuck, stop and tell me exactly
