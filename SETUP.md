@@ -29,7 +29,7 @@ otherwise guide me to set it in a local environment variable available to your
 tool commands. If needed, have me restart the agent with that environment.
 Confirm it is ready without displaying its value.
 Never ask me to put the key in this prompt or chat, and never print or log it.
-Use the same secure process for any other credentials needed.
+Use this process for all credentials; read secrets inside tools, never from tool inputs.
 
 Do it in this order. Print what you're doing at each step. If you lack a
 capability (no network, no file access) or get stuck, stop and tell me exactly
@@ -178,7 +178,7 @@ otherwise guide me to set it in a local environment variable available to your
 tool commands. If needed, have me restart the agent with that environment.
 Confirm it is ready without displaying its value.
 Never ask me to put the key in this prompt or chat, and never print or log it.
-Use the same secure process for any other credentials needed.
+Use this process for all credentials; read secrets inside tools, never from tool inputs.
 
 Do it in this order. Print what you're doing at each step. If you lack a
 capability (no network, no file access) or get stuck, stop and tell me exactly
@@ -298,13 +298,13 @@ otherwise guide me to set it in a local environment variable available to your
 tool commands. If needed, have me restart the agent with that environment.
 Confirm it is ready without displaying its value.
 Never ask me to put the key in this prompt or chat, and never print or log it.
-Use the same secure process for any other credentials needed.
+Use this process for all credentials; read secrets inside tools, never from tool inputs.
 Use EXPLABS_API_KEY for my gateway key. I can create one at
 https://platform.experientiallabs.ai/api-keys .
 
 The gateway is OpenAI-compatible and also speaks the Anthropic Messages API.
 Everything is served under https://api.experientiallabs.ai/v1 with one header: Authorization: Bearer
-<my xpl_ key>. Nothing else changes about how I use the OpenAI or Anthropic SDK.
+$EXPLABS_API_KEY. Nothing else changes about how I use the OpenAI or Anthropic SDK.
 
 Free core access requires card or payment verification; email verification alone
 is not enough. Eligible Free accounts get GPT-6 Luna, DeepSeek V4.1 Flash and
@@ -356,7 +356,7 @@ have mine, securely ask me for it.
 4. (Optional) Point my existing coding agents at the gateway. If I say yes, offer
    to set the OpenAI-compatible base URL to https://api.experientiallabs.ai/v1 and the key to my xpl_ key
    for the coding agents I actually use — e.g. Claude Code (ANTHROPIC_BASE_URL=https://api.experientiallabs.ai/v1,
-   ANTHROPIC_AUTH_TOKEN=<my xpl_ key>), Cursor (OpenAI base URL override),
+   ANTHROPIC_AUTH_TOKEN=$EXPLABS_API_KEY), Cursor (OpenAI base URL override),
    Codex, Aider (--openai-api-base https://api.experientiallabs.ai/v1). Show me each change before you
    make it, put the key in env (never in committed config), and skip any agent I
    don't use. Do NOT do this without my go-ahead.
@@ -389,7 +389,7 @@ otherwise guide me to set it in a local environment variable available to your
 tool commands. If needed, have me restart the agent with that environment.
 Confirm it is ready without displaying its value.
 Never ask me to put the key in this prompt or chat, and never print or log it.
-Use the same secure process for any other credentials needed.
+Use this process for all credentials; read secrets inside tools, never from tool inputs.
 
 Do it in this order. Print what you're doing at each step. If you lack a
 capability (no network, no file access) or get stuck, stop and tell me exactly
@@ -507,11 +507,12 @@ step 2) as the bearer token on every call below.
    base URL to https://api.experientiallabs.ai/v1 and its key to my xpl_ key (EXPLABS_API_KEY). Put the
    key in env, never in committed config, and show me each change before you make
    it. Skip any agent I don't use; never touch one I don't name.
-   - Claude Code: ANTHROPIC_BASE_URL=https://api.experientiallabs.ai/v1 and ANTHROPIC_AUTH_TOKEN=<my xpl_ key>
+   - Claude Code: ANTHROPIC_BASE_URL=https://api.experientiallabs.ai/v1 and ANTHROPIC_AUTH_TOKEN=$EXPLABS_API_KEY
      (the gateway serves the Anthropic Messages API at https://api.experientiallabs.ai/v1/messages).
    - Cursor: Settings -> Models -> OpenAI base URL override to https://api.experientiallabs.ai/v1 with my key.
    - Codex: point its OpenAI base URL / OPENAI_BASE_URL at https://api.experientiallabs.ai/v1 with my key.
-   - Aider: aider --openai-api-base https://api.experientiallabs.ai/v1 --openai-api-key <my xpl_ key>.
+   - Aider: securely configure AIDER_OPENAI_API_KEY from the gateway key in env;
+     run aider --openai-api-base https://api.experientiallabs.ai/v1 .
    - Any other OpenAI- or Anthropic-compatible agent: same two settings (base
      URL https://api.experientiallabs.ai/v1 + my xpl_ key).
    - Conductor: if I run my agents through Conductor, set the gateway as the
