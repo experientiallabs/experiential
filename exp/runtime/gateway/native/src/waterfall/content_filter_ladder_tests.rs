@@ -324,3 +324,75 @@ fn a_rule_rungs_own_opt_in_does_not_spend_the_one_shot_gate() {
         assert_eq!(sibling.accepted.lock().expect("lock").len(), 1);
     });
 }
+
+/// OpenRouter's in-stream answer when Gemini blocks the OUTPUT under `reason`.
+fn gemini_response_block(reason: &str) -> &'static str {
+    Box::leak(
+        format!(r#"{{"error":{{"code":502,"message":"Gemini blocked the response: {reason}"}}}}"#)
+            .into_boxed_str(),
+    )
+}
+
+#[test]
+fn a_relayed_gemini_safety_block_is_served_by_another_providers_rung() {
+    block_on(async {
+        let harness = Harness::new();
+        let frames: &'static [&'static str] =
+            Box::leak(vec![gemini_response_block("SAFETY")].into_boxed_slice());
+        let relay = spawn_rung(vec![Answer::Stream(frames)]).await;
+        let sibling = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
+        let route = [
+            provider_wire("openrouter", &relay.url, "openrouter"),
+            provider_wire("google", &sibling.url, "gemini"),
+        ];
+        let (won, guard) = harness.run(&route, None, Duration::from_secs(30)).await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("a content-policy block fails over once to another provider");
+        };
+        assert_eq!(committed.depth, 1);
+        drop(committed);
+        // Never redialed on the same lane.
+        assert_eq!(relay.accepted.lock().expect("lock").len(), 1);
+        let story = harness.story().await;
+        let failure = &story["starts"][1]["failure"];
+        assert_eq!(failure["failure_class"], "refusal");
+        assert_eq!(failure["refusal_reason"], "content_policy");
+        assert_eq!(failure["provider_content_filter"], true);
+        assert_eq!(failure["retryable_same_deployment"], false);
+    });
+}
+
+#[test]
+fn a_relayed_gemini_other_block_is_the_requests_refusal_not_a_provider_failure() {
+    block_on(async {
+        let harness = Harness::new();
+        let frames: &'static [&'static str] =
+            Box::leak(vec![gemini_response_block("OTHER")].into_boxed_slice());
+        let relay = spawn_rung(vec![Answer::Stream(frames)]).await;
+        let sibling = spawn_rung(vec![Answer::Stream(&[TEXT_FRAME])]).await;
+        let route = [
+            provider_wire("openrouter", &relay.url, "openrouter"),
+            provider_wire("google", &sibling.url, "gemini"),
+        ];
+        let (won, guard) = harness.run(&route, None, Duration::from_secs(30)).await;
+        let Won::Failed(error) = finish(guard, won).await else {
+            panic!("an unspecified refusal is the request's answer, like any other");
+        };
+        assert_eq!(error.status_code, 400);
+        assert_eq!(error.code, "refusal");
+        assert_eq!(error.json_body()["error"]["refusal_reason"], "unspecified");
+        assert!(!error.json_body().to_string().contains("OTHER"));
+        assert_eq!(relay.accepted.lock().expect("lock").len(), 1);
+        assert!(sibling.accepted.lock().expect("lock").is_empty());
+        let story = harness.story().await;
+        let settles = story["settles"].as_array().expect("settles");
+        assert_eq!(settles.len(), 1);
+        assert_eq!(settles[0]["finalize"], true);
+        assert_eq!(settles[0]["failure"]["failure_class"], "refusal");
+        assert_eq!(settles[0]["failure"]["refusal_reason"], "unspecified");
+        assert_eq!(
+            settles[0]["failure"]["provider_detail"],
+            "502: Gemini blocked the response: OTHER"
+        );
+    });
+}

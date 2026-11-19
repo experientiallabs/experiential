@@ -417,10 +417,20 @@ async fn non_success_failure(
         // guessed error class, establishes pre-execution rejection.
         return failure;
     }
+    // A relay answers Gemini's OUTPUT block under 502, a status every other
+    // provider means as its own failure: only an OpenAI-family relay's body
+    // is read for it, on the throttle's short budget so a stalled 502 still
+    // fails over near-immediately.
+    let relayed_block_status = status == 502
+        && matches!(
+            dialect,
+            Dialect::OpenAiCompatible | Dialect::OpenAiResponses
+        );
     if failure.failure_class != FailureClass::InvalidRequest
         && status != 403
         && status != 404
         && status != 429
+        && !relayed_block_status
     {
         return failure;
     }
@@ -432,7 +442,7 @@ async fn non_success_failure(
     // gets only the short budget: the small envelope normally arrives
     // with the headers, and a provider that stalls after a 429 simply
     // fails over content-free as before.
-    let read_timeout = if status == 429 {
+    let read_timeout = if status == 429 || relayed_block_status {
         THROTTLE_BODY_READ_TIMEOUT
     } else {
         ERROR_BODY_READ_TIMEOUT
@@ -442,6 +452,14 @@ async fn non_success_failure(
         Ok(Some(body)) => Some(body),
         _ => None,
     };
+    if relayed_block_status {
+        // Gemini blocked the response: the content's verdict, not the lane's
+        // health. Any other 502 keeps its status class.
+        return match relayed_gemini_refusal(dialect, body.as_deref()) {
+            Some(refusal) => refusal.with_rate_limit_facts(rate_limit.clone(), retry_after),
+            None => failure,
+        };
+    }
     if body
         .as_deref()
         .is_some_and(crate::end_user_block::body_names_end_user_policy_block)
@@ -564,28 +582,8 @@ async fn non_success_failure(
         }
         // A compatible relay can put Gemini's content verdict under 403.
         // Read only the raw error envelope, never sanitized or echoed text.
-        let refusal = body.as_deref().and_then(|body| {
-            if !matches!(
-                dialect,
-                Dialect::OpenAiCompatible | Dialect::OpenAiResponses
-            ) {
-                return None;
-            }
-            let value = crate::error_envelope::parse_error_document(body)?;
-            let envelope = crate::error_envelope::openai_family_envelope(&value)?;
-            let reason = crate::stream_errors::relayed_gemini_refusal(
-                envelope.code.as_deref(),
-                envelope.message,
-            )?;
-            let detail = envelope
-                .message
-                .and_then(|message| sanitized_detail(message, &[]));
-            Some((reason, detail))
-        });
-        if let Some((reason, detail)) = refusal {
-            return crate::content_filter::mark(Failure::refusal(reason))
-                .with_provider_detail(detail)
-                .with_rate_limit_facts(rate_limit.clone(), retry_after);
+        if let Some(refusal) = relayed_gemini_refusal(dialect, body.as_deref()) {
+            return refusal.with_rate_limit_facts(rate_limit.clone(), retry_after);
         }
         return failure;
     }
@@ -864,6 +862,23 @@ pub(crate) fn transport_error_detail(phase: &str, error: &reqwest::Error) -> Str
 /// Longest provider error body read for parameter attribution.
 const ERROR_BODY_READ_LIMIT: usize = 16 * 1024;
 
+/// The refusal for a relay's HTTP body that is exactly Gemini's block
+/// verdict (`relayed_gemini_block`), marked as a provider filter when it is a
+/// content-policy one, with the raw sentence as ledger-only detail.
+fn relayed_gemini_refusal(dialect: Dialect, body: Option<&str>) -> Option<Failure> {
+    if !matches!(
+        dialect,
+        Dialect::OpenAiCompatible | Dialect::OpenAiResponses
+    ) {
+        return None;
+    }
+    let (reason, message) = crate::relayed_gemini_block::relayed_gemini_refusal_body(body?)?;
+    Some(
+        crate::content_filter::mark(Failure::refusal(reason))
+            .with_provider_detail(sanitized_detail(&message, &[])),
+    )
+}
+
 /// Bound on the whole attribution body read; a stalling error stream is
 /// abandoned and the failure stays content-free.
 const ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -885,6 +900,9 @@ async fn bounded_error_body(mut response: reqwest::Response) -> Option<String> {
     String::from_utf8(collected).ok()
 }
 
+#[cfg(test)]
+#[path = "upstream/gemini_block_tests.rs"]
+mod gemini_block_tests;
 #[cfg(test)]
 #[path = "upstream/gemini_decision_tests.rs"]
 mod gemini_decision_tests;

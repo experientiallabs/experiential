@@ -779,6 +779,30 @@ keeps serving every other end user.
 - Every other 401/403 keeps the credential class. Pinned in
   `end_user_block.rs` and `upstream/tests.rs`.
 
+## Gemini blocks relayed by OpenRouter
+
+OpenRouter passes Gemini's own block verdict on as an error sentence: a prompt
+block as `403 "Gemini blocked the request: <blockReason>"` and an output block
+as `502 "Gemini blocked the response: <finishReason>"`, in the HTTP envelope or
+in-stream. Both are Google's verdict on this request's content, not a credential
+failure and not a provider outage.
+
+- The match is exact: the envelope's own message field must be the whole
+  sentence, under the status the relay uses for it, ending in a known token
+  (`OTHER`, `PROHIBITED_CONTENT`, `SAFETY`, `BLOCKLIST`, `SPII`, `RECITATION`,
+  `IMAGE_SAFETY`, `IMAGE_PROHIBITED_CONTENT`, `IMAGE_RECITATION`: every token the
+  native lane files as a refusal). Quoted or echoed text, `metadata.raw`, a longer sentence,
+  and an unknown token keep their status class; any other 502 stays
+  `provider_internal`. An HTTP 502 body is read only on OpenAI-family relays,
+  on the short throttle budget.
+- It is filed as a `refusal` with the same category the native Gemini lane
+  gives that token (`SAFETY`, `PROHIBITED_CONTENT`, `BLOCKLIST`, `IMAGE_SAFETY`
+  → `content_policy`; `RECITATION`, `IMAGE_RECITATION` → `recitation`; `SPII` →
+  `data_inspection`; `OTHER` and anything else → `unspecified`). A `content_policy` one is marked as a provider
+  filter (one untried rung of another provider may take it); the others are
+  the request's answer. None is redialed on the same lane, and none feeds lane
+  health. Pinned in `relayed_gemini_block.rs`.
+
 ## OpenAI Decisions API
 
 `POST /v1/decisions` is the OpenAI Decisions API wire of the decisions surface (ledger
