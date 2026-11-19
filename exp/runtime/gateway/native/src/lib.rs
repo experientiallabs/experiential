@@ -45,6 +45,7 @@ mod reasoning_display;
 mod reasoning_estimate;
 mod rejection_shapes;
 mod relay;
+mod relayed_gemini_block;
 mod replay;
 mod replay_repair;
 mod request_policy;

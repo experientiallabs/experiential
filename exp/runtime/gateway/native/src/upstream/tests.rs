@@ -184,7 +184,7 @@ pub(super) async fn open_against_body(status_line: &str, body: &str, model: &str
     open_dialect_against_body(status_line, body, model, Dialect::OpenAiCompatible).await
 }
 
-async fn open_dialect_against_body(
+pub(super) async fn open_dialect_against_body(
     status_line: &str,
     body: &str,
     model: &str,

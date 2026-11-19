@@ -328,18 +328,6 @@ pub fn refusal_reason(code: Option<&str>, message: Option<&str>) -> RefusalReaso
     RefusalReason::Unspecified
 }
 
-/// Recognize the relay's complete Gemini content verdict, not quoted or
-/// incidental text. Only its 403 code is ambiguous; explicit auth, funding,
-/// and throttle codes retain their own meaning. Read the raw envelope message.
-pub(crate) fn relayed_gemini_refusal(
-    code: Option<&str>,
-    message: Option<&str>,
-) -> Option<RefusalReason> {
-    (code.map(str::trim) == Some("403")
-        && message == Some("Gemini blocked the request: PROHIBITED_CONTENT"))
-    .then_some(RefusalReason::ContentPolicy)
-}
-
 /// Classify one provider-declared error from its raw code and message.
 pub fn classify_stream_error(code: Option<&str>, message: Option<&str>) -> StreamErrorKind {
     classify_stream_error_with_raw_message(code, message, message)
@@ -374,7 +362,7 @@ pub(crate) fn classify_stream_error_with_raw_message(
     if NOT_FOUND_CODES.contains(&code_ref) {
         return StreamErrorKind::ProviderNotFound;
     }
-    if let Some(reason) = relayed_gemini_refusal(code, raw_message) {
+    if let Some(reason) = crate::relayed_gemini_block::relayed_gemini_refusal(code, raw_message) {
         return StreamErrorKind::Refusal(reason);
     }
     let numeric_class = code_ref
