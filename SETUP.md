@@ -97,13 +97,22 @@ step 2) as the bearer token on every call below. org_id is from step 2.
    capture trace_count and show it to me. A 400 means bad credentials or config
    (tell me exactly what it said); 429 means the provider rate-limited us (wait
    and retry). Then go to step 8.
-   Example (Braintrust):
-     curl -sS -X POST https://api.experientiallabs.ai/api/orgs/<org_id>/telemetry/traces/pull \
-       -H "Authorization: Bearer $EXPLABS_API_KEY" \
-       -H "Content-Type: application/json" \
-       -d '{"transport_kind":"braintrust","source_kind":"braintrust",
-            "source_label":"braintrust-prod","credential":"<my braintrust key>",
-            "config":{"project":"<my braintrust project>"}}'
+   Example (Braintrust): securely set BRAINTRUST_API_KEY in the environment;
+   set EXPLABS_ORG_ID and BRAINTRUST_PROJECT to the selected org and project.
+   Keep secrets out of command arguments and tool transcripts:
+     python3 - <<'PY'
+     import json, os, urllib.request
+     url = "https://api.experientiallabs.ai/api/orgs/" + os.environ["EXPLABS_ORG_ID"] + "/telemetry/traces/pull"
+     payload = {"transport_kind": "braintrust", "source_kind": "braintrust",
+                "source_label": "braintrust-prod", "credential": os.environ["BRAINTRUST_API_KEY"],
+                "config": {"project": os.environ["BRAINTRUST_PROJECT"]}}
+     request = urllib.request.Request(url, data=json.dumps(payload).encode(),
+         headers={"Authorization": "Bearer " + os.environ["EXPLABS_API_KEY"],
+                  "Content-Type": "application/json"})
+     with urllib.request.urlopen(request) as response:
+         result = json.load(response)
+     print({key: result[key] for key in ("ingest_id", "trace_count")})
+     PY
 
 7. File upload path — find my trace export and upload it. I'm authorizing you to
    look for my own trace exports: search the current project, ./traces, ./logs,
