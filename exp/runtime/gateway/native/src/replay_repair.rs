@@ -43,9 +43,7 @@ use sha2::{Digest, Sha256};
 
 use crate::errors::{Failure, FailureClass};
 use crate::metrics::METRICS;
-use crate::thought_signature_repair::{
-    thought_signatures, without_thought_signatures_where, GEMINI_DIALECT,
-};
+use crate::thought_signature_repair::{unrepaired_thought_signature, ReplayedState};
 use crate::waterfall::DeploymentWire;
 
 /// Response header disclosing a data-plane repair of the caller's replayed
@@ -260,7 +258,7 @@ fn encrypted_part(part: &Value) -> Option<&str> {
 /// Every replayed `encrypted_content` the strip can remove, in order: each
 /// reasoning item's payload and each encrypted part of an item's `output`
 /// or `content` array.
-fn encrypted_payloads(payload: &Value) -> Vec<&str> {
+pub(crate) fn encrypted_payloads(payload: &Value) -> Vec<&str> {
     let Some(items) = payload.get("input").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -434,65 +432,6 @@ pub fn unrepaired_encrypted_content(failure: &Failure, item: Option<&str>) -> Fa
         .with_tenant_origin(failure.tenant_origin)
 }
 
-/// The replayed provider state one rung's wire carries, and so may strip:
-/// OpenAI-family `encrypted_content`, or Gemini thought signatures
-/// (`thought_signature_repair`), which are Gemini's encrypted reasoning state
-/// and share the repair's header, counters and operator line.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ReplayedState {
-    EncryptedContent,
-    ThoughtSignatures,
-}
-
-impl ReplayedState {
-    fn of(wire: &DeploymentWire) -> Self {
-        if wire.dialect == GEMINI_DIALECT {
-            Self::ThoughtSignatures
-        } else {
-            Self::EncryptedContent
-        }
-    }
-
-    /// Every replayed payload the strip can remove from this payload.
-    fn payloads(self, payload: &Value) -> Vec<&str> {
-        match self {
-            Self::EncryptedContent => encrypted_payloads(payload),
-            Self::ThoughtSignatures => thought_signatures(payload),
-        }
-    }
-
-    /// The payload with the selected replayed payloads stripped, if any.
-    fn strip_where(self, payload: &Value, strip: impl FnMut(&str) -> bool) -> Option<Value> {
-        match self {
-            Self::EncryptedContent => without_encrypted_content_where(payload, strip),
-            Self::ThoughtSignatures => without_thought_signatures_where(payload, strip),
-        }
-    }
-
-    /// The memory key of one refused payload. A thought signature is also
-    /// keyed by the rung that refused it: the backend that minted it still
-    /// verifies it, so a later turn dialing that rung must send it verbatim.
-    fn memory_key(self, scope: &str, wire: &DeploymentWire, content: &str) -> [u8; 32] {
-        match self {
-            Self::EncryptedContent => payload_digest(scope, content),
-            Self::ThoughtSignatures => {
-                payload_digest(&format!("{scope}\0{}", wire.deployment_id), content)
-            }
-        }
-    }
-}
-
-/// The caller's answer when a refused thought signature survives the repair.
-fn unrepaired_thought_signature(failure: &Failure) -> Failure {
-    Failure::new(
-        FailureClass::InvalidRequest,
-        "The conversation replays a Gemini thought signature this model's provider could not verify (it was issued by another Google backend). Resend the request without the thought_signature fields, or start a new conversation",
-    )
-    .with_provider_detail(failure.provider_detail.clone())
-    .with_rate_limit_facts(failure.rate_limit_headers.as_deref().cloned(), None)
-    .with_tenant_origin(failure.tenant_origin)
-}
-
 /// The repair state of one physical attempt on one rung.
 ///
 /// `begin` applies what is already known: the payload this request stripped
@@ -503,6 +442,9 @@ fn unrepaired_thought_signature(failure: &Failure) -> Failure {
 /// fate is decided.
 pub(crate) struct AttemptRepair<'a> {
     wire: &'a DeploymentWire,
+    /// The rung's plain wire, which the strip reads: a Google cache overlay
+    /// (`wire`) holds part of the history in its cached prefix.
+    plain: &'a DeploymentWire,
     state: ReplayedState,
     scope: Option<&'a str>,
     request_id: &'a str,
@@ -524,6 +466,7 @@ impl<'a> AttemptRepair<'a> {
     /// Prepare the first dial of this attempt.
     pub(crate) fn begin(
         wire: &'a DeploymentWire,
+        plain: &'a DeploymentWire,
         scope: Option<&'a str>,
         repaired: &'a mut Option<Value>,
         request_id: &'a str,
@@ -531,6 +474,7 @@ impl<'a> AttemptRepair<'a> {
         let state = ReplayedState::of(wire);
         let mut repair = Self {
             wire,
+            plain,
             state,
             scope,
             request_id,
@@ -545,10 +489,11 @@ impl<'a> AttemptRepair<'a> {
         if repair.repaired.is_some() {
             repair.stripped = true;
         } else if let (None, Some(scope)) = (&wire.upstream_body, scope) {
-            let remembered = |content: &str| MEMORY.recall(&state.memory_key(scope, wire, content));
-            if let Some(stripped) = state.strip_where(&wire.upstream_payload, remembered) {
+            let remembered =
+                |content: &str| MEMORY.recall(&state.memory_key(scope, plain, content));
+            if let Some(stripped) = state.strip_where(&plain.upstream_payload, remembered) {
                 repair.proactive_strips =
-                    state.payloads(&wire.upstream_payload).len() - state.payloads(&stripped).len();
+                    state.payloads(&plain.upstream_payload).len() - state.payloads(&stripped).len();
                 *repair.repaired = Some(stripped);
                 repair.stripped = true;
                 repair.proactive = true;
@@ -591,11 +536,17 @@ impl<'a> AttemptRepair<'a> {
         {
             return false;
         }
-        let Some(stripped) = self.state.strip_where(self.payload(), |_| true) else {
+        // Strip the whole history, never a cache overlay's live suffix: the
+        // repaired successor dials plain (it never prepares a cache).
+        let source = self
+            .repaired
+            .as_ref()
+            .unwrap_or(&self.plain.upstream_payload);
+        let Some(stripped) = self.state.strip_where(source, |_| true) else {
             return false;
         };
         let (present_count, digests) = {
-            let present = self.state.payloads(self.payload());
+            let present = self.state.payloads(source);
             let hint = failure
                 .provider_detail
                 .as_deref()
@@ -612,7 +563,7 @@ impl<'a> AttemptRepair<'a> {
             let digests: Vec<[u8; 32]> = match self.scope {
                 Some(scope) => refused
                     .iter()
-                    .map(|content| self.state.memory_key(scope, self.wire, content))
+                    .map(|content| self.state.memory_key(scope, self.plain, content))
                     .collect(),
                 None => Vec::new(),
             };

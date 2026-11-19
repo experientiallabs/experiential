@@ -181,3 +181,46 @@ fn a_refusal_the_bypass_cannot_clear_is_the_callers_named_error() {
         assert_eq!(bodies.lock().unwrap().len(), 1);
     });
 }
+
+#[test]
+fn a_cache_overlay_refusal_strips_the_whole_history_and_later_dials_plain() {
+    let signature = "cached-prefix-signature-from-the-gemini-api==";
+    let scope = "org:gemini-signature-overlay";
+    let plain = google_wire(
+        "vertex",
+        "vertex-overlay",
+        "http://127.0.0.1:9/x",
+        signature,
+    );
+    // The overlay moved the signed history into a cached prefix; only the
+    // live suffix rides the dialed payload.
+    let mut overlay = plain.clone();
+    overlay.automatic_cache = true;
+    overlay.upstream_payload = json!({
+        "cachedContent": "cachedContents/prefix",
+        "contents": [plain.upstream_payload["contents"][2].clone()],
+    });
+    let mut repaired = None;
+    let mut repair = crate::replay_repair::AttemptRepair::begin(
+        &overlay,
+        &plain,
+        Some(scope),
+        &mut repaired,
+        "r",
+    );
+    let refusal = crate::errors::Failure::new(FailureClass::InvalidRequest, "refused")
+        .with_encrypted_reasoning_rejected(true);
+    assert!(repair.repair_after(&refusal));
+    drop(repair);
+    let stripped = repaired.expect("the plain history, stripped");
+    assert!(stripped.get("cachedContent").is_none());
+    assert_eq!(
+        sent_signature(&stripped.to_string()),
+        THOUGHT_SIGNATURE_BYPASS
+    );
+    // The next turn on that rung skips the cache, so the repair reaches it.
+    assert!(crate::thought_signature_repair::remembers_refused_signature(&plain, Some(scope)));
+    let mut minted = plain.clone();
+    minted.deployment_id = "gemini-api-overlay".to_string();
+    assert!(!crate::thought_signature_repair::remembers_refused_signature(&minted, Some(scope)));
+}

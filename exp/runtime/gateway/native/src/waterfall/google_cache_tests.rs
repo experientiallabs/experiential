@@ -255,8 +255,13 @@ async fn reused_payload_is_a_private_overlay_and_repair_sees_it() {
     assert_eq!(overlaid.url, original.url);
     assert_eq!(overlaid.timeout_seconds, original.timeout_seconds);
     let mut repaired = None;
-    let repair =
-        crate::replay_repair::AttemptRepair::begin(&overlaid, None, &mut repaired, "request");
+    let repair = crate::replay_repair::AttemptRepair::begin(
+        &overlaid,
+        &original,
+        None,
+        &mut repaired,
+        "request",
+    );
     assert_eq!(repair.payload()["cachedContent"], "cachedContents/reused");
     assert_eq!(host.calls().len(), 1);
 

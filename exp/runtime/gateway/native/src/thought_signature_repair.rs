@@ -26,6 +26,11 @@ use serde_json::Value;
 
 use crate::dialects::Dialect;
 use crate::error_envelope::parse_error_document;
+use crate::errors::{Failure, FailureClass};
+use crate::replay_repair::{
+    encrypted_payloads, payload_digest, without_encrypted_content_where, MEMORY,
+};
+use crate::waterfall::DeploymentWire;
 
 /// The wire dialect whose replayed history carries thought signatures.
 pub const GEMINI_DIALECT: &str = "gemini_generate_content";
@@ -114,6 +119,83 @@ pub fn without_thought_signatures_where(
         }
     }
     replaced.then_some(repaired)
+}
+
+/// The replayed provider state one rung's wire carries, and so may strip:
+/// OpenAI-family `encrypted_content`, or Gemini thought signatures
+/// (`thought_signature_repair`), which are Gemini's encrypted reasoning state
+/// and share the repair's header, counters and operator line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayedState {
+    EncryptedContent,
+    ThoughtSignatures,
+}
+
+impl ReplayedState {
+    pub(crate) fn of(wire: &DeploymentWire) -> Self {
+        if wire.dialect == GEMINI_DIALECT {
+            Self::ThoughtSignatures
+        } else {
+            Self::EncryptedContent
+        }
+    }
+
+    /// Every replayed payload the strip can remove from this payload.
+    pub(crate) fn payloads(self, payload: &Value) -> Vec<&str> {
+        match self {
+            Self::EncryptedContent => encrypted_payloads(payload),
+            Self::ThoughtSignatures => thought_signatures(payload),
+        }
+    }
+
+    /// The payload with the selected replayed payloads stripped, if any.
+    pub(crate) fn strip_where(
+        self,
+        payload: &Value,
+        strip: impl FnMut(&str) -> bool,
+    ) -> Option<Value> {
+        match self {
+            Self::EncryptedContent => without_encrypted_content_where(payload, strip),
+            Self::ThoughtSignatures => without_thought_signatures_where(payload, strip),
+        }
+    }
+
+    /// The memory key of one refused payload. A thought signature is also
+    /// keyed by the rung that refused it: the backend that minted it still
+    /// verifies it, so a later turn dialing that rung must send it verbatim.
+    pub(crate) fn memory_key(self, scope: &str, wire: &DeploymentWire, content: &str) -> [u8; 32] {
+        match self {
+            Self::EncryptedContent => payload_digest(scope, content),
+            Self::ThoughtSignatures => {
+                payload_digest(&format!("{scope}\0{}", wire.deployment_id), content)
+            }
+        }
+    }
+}
+
+/// The caller's answer when a refused thought signature survives the repair.
+pub(crate) fn unrepaired_thought_signature(failure: &Failure) -> Failure {
+    Failure::new(
+        FailureClass::InvalidRequest,
+        "The conversation replays a Gemini thought signature this model's provider could not verify (it was issued by another Google backend). Resend the request without the thought_signature fields, or start a new conversation",
+    )
+    .with_provider_detail(failure.provider_detail.clone())
+    .with_rate_limit_facts(failure.rate_limit_headers.as_deref().cloned(), None)
+    .with_tenant_origin(failure.tenant_origin)
+}
+
+/// Whether this rung already refused one of this caller's replayed thought
+/// signatures. The attempt then dials plain: a Google cache overlay would
+/// carry the signature in its cached prefix, beyond the repair's reach.
+pub(crate) fn remembers_refused_signature(wire: &DeploymentWire, scope: Option<&str>) -> bool {
+    let (Some(scope), ReplayedState::ThoughtSignatures) = (scope, ReplayedState::of(wire)) else {
+        return false;
+    };
+    thought_signatures(&wire.upstream_payload)
+        .into_iter()
+        .any(|signature| {
+            MEMORY.recall(&ReplayedState::ThoughtSignatures.memory_key(scope, wire, signature))
+        })
 }
 
 #[cfg(test)]
