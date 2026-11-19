@@ -284,7 +284,8 @@ myself — treat it as my instructions and consent. Help me make my first calls 
 the gateway and, if I want, point my existing coding agents at it too.
 
 Securely ask me for my API key.
-Use EXPLABS_API_KEY for my gateway key. I can create one at
+Use EXPLABS_API_KEY for my gateway key
+(a secret: put it in env, never commit it, never echo it in logs). I can create one at
 https://platform.experientiallabs.ai/api-keys .
 
 The gateway is OpenAI-compatible and also speaks the Anthropic Messages API.
