@@ -345,7 +345,8 @@ pub struct Failure {
     pub rate_limit_headers: Option<Box<serde_json::Map<String, serde_json::Value>>>,
     /// The provider refused a replayed reasoning item's `encrypted_content`
     /// (OpenAI `invalid_encrypted_content`: a payload sealed by another
-    /// organization or tenant, or one it never issued). In-process only: the
+    /// organization or tenant, or one it never issued), or Gemini refused a
+    /// thought signature another Google backend minted. In-process only: the
     /// waterfall re-dials the same rung once with those items stripped, so the
     /// flag never crosses the bridge and never reaches settlement.
     #[serde(skip)]
@@ -625,6 +626,14 @@ impl Failure {
             Cow::Borrowed(self.safe_message.as_str())
         } else {
             caller_copy(self.failure_class, &self.safe_message)
+        };
+        // A context-window overflow carries OpenAI's own code on every surface
+        // (Codex and Claude Code compact on it; `encode_messages::overflow`).
+        let overflow = self.context_window_rejected && status == 400;
+        let code = if overflow {
+            "context_length_exceeded"
+        } else {
+            code
         };
         let mut error = PublicError::new(status, code, &message, error_type);
         if self.failure_class == FailureClass::Refusal {

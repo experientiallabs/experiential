@@ -98,7 +98,13 @@ serve less than the window the model advertises. The data plane files it with
 it, and keeps it failover-eligible once per request; the control plane advances only to an untried
 rung whose advertised window exceeds the stated one (else the failed rung's advertised window), or
 whose window the catalog does not state (`native_context_window.py`). With no such rung, or on a
-second refusal, the caller receives the provider's 400 unchanged.
+second refusal, the caller receives the provider's 400 with its sentence. Every context overflow,
+that verdict or the gateway's own pre-dispatch estimate, carries OpenAI's code
+`context_length_exceeded` on every surface (Codex compacts on it), and on the Messages surface its
+message opens the way Anthropic's does: "prompt is too long: N tokens > M maximum", or "input
+length and `max_tokens` exceed context limit: N + R > M" when the prompt fits but the output budget
+does not, followed by the gateway's own sentence. Claude Code compacts the conversation on that
+wording (`encode_messages/overflow.rs`).
 
 ## Malformed tool calls
 
@@ -122,6 +128,11 @@ the pre-first-byte budget the held turn has already been generating in. Settleme
 to the failed attempt row. A second malformed call in the same request is its answer. A buffered
 surface (non-streaming, or a guardrail-buffered stream) follows the same one-retry rule. A malformed
 call in a turn that already streamed to the caller keeps the protocol's terminal error event.
+
+DeepSeek DSML tool-call markup that a self-hosted lane relays as answer text and the DSML guard
+cannot turn into calls (`dialects/openai/dsml.rs`) is the same failure: the guard holds the markup
+and never relays it, so when it is the turn's first output the failure is marked
+`malformed_tool_call` and takes the same one retry.
 
 ## Provider content filters
 

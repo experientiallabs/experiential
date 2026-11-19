@@ -69,6 +69,7 @@ mod settlement;
 mod sse;
 mod stop_sequences;
 mod stream_errors;
+mod thought_signature_repair;
 mod throttle_backoff;
 mod tool_search;
 mod tool_serialization;

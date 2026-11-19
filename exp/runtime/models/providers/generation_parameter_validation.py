@@ -329,6 +329,21 @@ def require_route_numeric_parameter(
 REASONING_SUMMARY_DIALECTS = frozenset({"openai_responses", "anthropic_messages"})
 
 
+def serves_reasoning_context(profile: GatewayWireProfile) -> bool:
+    """Return whether one rung forwards the Responses ``reasoning.context`` selector.
+
+    Only OpenAI's own Responses wire, on a reasoning deployment, reads which
+    turns' reasoning the model may see; every other wire has no such field.
+
+    Args:
+        profile: One certified deployment wire profile from the route.
+
+    Returns:
+        Whether this deployment carries a requested ``reasoning.context``.
+    """
+    return profile.dialect == "openai_responses" and profile.supports_reasoning
+
+
 def serves_reasoning_summary(profile: GatewayWireProfile) -> bool:
     """Return whether one rung's reasoning reaches Responses summary parts.
 

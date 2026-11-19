@@ -67,6 +67,7 @@ from exp.runtime.models.providers.generation_parameter_validation import (
     require_route_reasoning_effort,
     require_tool_names_supported,
     resolve_level_less_enable,
+    serves_reasoning_context,
     serves_reasoning_summary,
 )
 from exp.runtime.models.providers.generation_parameter_validation import (
@@ -134,6 +135,9 @@ wire receives the flag as a fixed text prefix on the result (see
 on every failed tool call, so a rejection wedges the whole session, and a
 silent drop would misstate that the invocation failed.
 """
+
+REASONING_CONTEXT_DROPPED = "reasoning.context->dropped(unsupported_by_provider)"
+"""Disclosure recorded when a rung that cannot read ``reasoning.context`` serves without it."""
 
 OPENAI_MINIMUM_OUTPUT_TOKENS = 16
 """Smallest ``max_output_tokens`` the OpenAI Responses wire accepts.
@@ -430,17 +434,16 @@ def route_generation_parameter_requests(
         for path in request.reasoning_summary_parameters or ("reasoning.summary",):
             ignore("reasoning_summary", f"{path}->dropped(unsupported_by_provider)")
         provider_updates["reasoning_summary_parameters"] = ()
+    # ``reasoning.context`` (Codex sends it on every Responses turn) selects
+    # which turns' reasoning a native Responses model may read. A Chat-wire rung
+    # has no such field and keeps its own reasoning handling, so the selector is
+    # dropped and disclosed there like a summary, never a 400 that fails every
+    # Codex turn on the route; per-rung narrowing still prefers a rung that
+    # carries it (``generation_route_compat``).
     if request.reasoning_context is not None and not all(
-        profile.dialect == "openai_responses" and profile.supports_reasoning for profile in profiles
+        serves_reasoning_context(profile) for profile in profiles
     ):
-        raise ProviderParameterError(
-            message=(
-                "The parameter 'reasoning.context' is not supported by this model route. "
-                "Remove the field or choose a different model."
-            ),
-            param="reasoning.context",
-            code="unsupported_parameter",
-        )
+        ignore("reasoning_context", REASONING_CONTEXT_DROPPED)
 
     if (
         request.structured_text is not None

@@ -5,7 +5,8 @@
 use serde_json::Value;
 
 use super::super::{
-    finish_open_tools_relay, finish_open_tools_truncated, malformed, parse_object, Normalizer,
+    finish_open_tools_relay, finish_open_tools_truncated, malformed, malformed_tool_call,
+    parse_object, Normalizer,
 };
 use crate::errors::Failure;
 use crate::events::{require_u64, Event, ToolAccumulator};
@@ -481,9 +482,12 @@ impl Normalizer {
     /// Route one answer-text fragment through the DSML guard (`super::dsml`):
     /// text that cannot be tool-call markup becomes `TextDelta`, a complete
     /// DSML block becomes ordinary tool calls, and markup that does not parse
-    /// fails the stream as malformed without ever reaching the caller.
+    /// fails the stream as malformed without ever reaching the caller. That
+    /// failure is a malformed tool call like a JSON-argument one: a turn
+    /// whose first output it was is retried once (`Failure::malformed_tool_call`),
+    /// so a lane with no sibling still gets one redial.
     fn push_content(&mut self, text: &str, events: &mut Vec<Event>) -> Result<(), Failure> {
-        let released = self.dsml.push(text).map_err(malformed)?;
+        let released = self.dsml.push(text).map_err(malformed_tool_call)?;
         self.release_dsml(released, events)
     }
 
@@ -535,7 +539,7 @@ impl Normalizer {
     pub(in crate::dialects) fn finish_dsml(&mut self) -> Result<Vec<Event>, Failure> {
         let mut events = Vec::new();
         if self.dsml.holding() {
-            let released = self.dsml.finish().map_err(malformed)?;
+            let released = self.dsml.finish().map_err(malformed_tool_call)?;
             self.release_dsml(released, &mut events)?;
         }
         Ok(events)

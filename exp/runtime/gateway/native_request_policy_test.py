@@ -488,7 +488,8 @@ def test_no_fallback_freezes_route_before_effectful_search_growth(
             plane.admit(argument)
         error = json.loads(caught.value.public_error_json)
         assert error["status_code"] == 400
-        assert error["code"] == "invalid_request"
+        # A context overflow carries OpenAI's own code on every surface.
+        assert error["code"] == "context_length_exceeded"
         assert "context" in error["message"].lower()
     assert backend.queries == ["hi"]
     with sqlite3.connect(manager.database_path) as connection:

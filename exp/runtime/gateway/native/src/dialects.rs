@@ -290,8 +290,12 @@ impl Normalizer {
         // A Responses relay that refuses replayed encrypted reasoning INSIDE
         // the stream (200, then `response.failed`) carries the same repair
         // mark as the pre-stream 4xx, so the waterfall can strip and re-dial.
-        let encrypted_reasoning_rejected = dialect == "openai_responses"
-            && crate::rejection_shapes::refuses_encrypted_reasoning(code, message);
+        // Gemini refusing a replayed thought signature in a stream frame takes
+        // the same repair (`thought_signature_repair`).
+        let encrypted_reasoning_rejected = (dialect == "openai_responses"
+            && crate::rejection_shapes::refuses_encrypted_reasoning(code, message))
+            || (dialect == crate::thought_signature_repair::GEMINI_DIALECT
+                && message.is_some_and(crate::thought_signature_repair::refuses_thought_signature));
         // A typed content-policy code (or the relayed Gemini verdict) is the
         // provider's filter; a refusal read only from the sentence, or one
         // ending a turn the model already refused in its own words, is not.

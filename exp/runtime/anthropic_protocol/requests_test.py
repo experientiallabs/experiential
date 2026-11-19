@@ -4082,3 +4082,35 @@ def test_a_tool_read_pdf_larger_than_bedrocks_document_cap_decodes() -> None:
     tool_message = next(m for m in decoded.request.messages if m.role == "tool")
     assert tool_message.documents[0].data == data
     assert decoded.request.ignored_parameters == ()
+
+
+def test_an_mcp_connector_block_is_refused_naming_the_fix() -> None:
+    """Claude Code's echoed MCP connector blocks name the connector and how to resend."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "list my issues"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "Checking."},
+                            {
+                                "type": "mcp_tool_use",
+                                "id": "mcptoolu_1",
+                                "name": "list_issues",
+                                "server_name": "linear",
+                                "input": {},
+                            },
+                        ],
+                    },
+                    {"role": "user", "content": "thanks"},
+                ]
+            )
+        )
+    detail = excinfo.value.detail
+    assert detail.param == "messages.1.content.1"
+    assert detail.message.startswith("mcp_tool_use blocks are not supported")
+    assert "MCP connector (mcp_servers)" in detail.message
+    assert "Remove the mcp_tool_use and mcp_tool_result blocks" in detail.message
+    assert "—" not in detail.message and "–" not in detail.message

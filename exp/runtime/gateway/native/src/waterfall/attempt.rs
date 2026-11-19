@@ -72,21 +72,30 @@ pub(super) async fn run_attempt(
             };
         }
     };
-    let cached_wire =
-        match google_cache::prepare(ctx, wire, reactive_repair || repaired.is_some()).await {
-            Ok(wire) => wire,
-            Err(failure) => {
-                return AttemptEnd::Ladder {
-                    failure,
-                    refusal_eligible: false,
-                    exhaustion_flush: Vec::new(),
-                    usage: None,
-                    tool_names: Vec::new(),
-                    opened: false,
-                    encrypted_reasoning_stripped: false,
-                };
-            }
-        };
+    let caller_scope = ctx.bridge.replay_repair_scope(ctx.caller_scope);
+    // A conversation whose thought signatures this rung already refused dials
+    // plain, so the repair can reach its whole history.
+    let plain_only = reactive_repair
+        || repaired.is_some()
+        || crate::thought_signature_repair::remembers_refused_signature(
+            wire,
+            caller_scope.as_deref(),
+        );
+    let plain_wire = wire;
+    let cached_wire = match google_cache::prepare(ctx, wire, plain_only).await {
+        Ok(wire) => wire,
+        Err(failure) => {
+            return AttemptEnd::Ladder {
+                failure,
+                refusal_eligible: false,
+                exhaustion_flush: Vec::new(),
+                usage: None,
+                tool_names: Vec::new(),
+                opened: false,
+                encrypted_reasoning_stripped: false,
+            };
+        }
+    };
     // A gateway-chosen cache the provider refuses (expired early, evicted, a
     // stale resource) re-dials the same rung on its plain wire: the successor
     // is a reactive repair, which never prepares a cache.
@@ -145,8 +154,13 @@ pub(super) async fn run_attempt(
     // What is already known repairs the first dial: the payload this request
     // stripped on an earlier dial of the rung, else the payloads this worker
     // remembers the caller's provider refusing.
-    let caller_scope = ctx.bridge.replay_repair_scope(ctx.caller_scope);
-    let mut repair = AttemptRepair::begin(wire, caller_scope.as_deref(), repaired, ctx.request_id);
+    let mut repair = AttemptRepair::begin(
+        wire,
+        plain_wire,
+        caller_scope.as_deref(),
+        repaired,
+        ctx.request_id,
+    );
     if reactive_repair {
         repair.mark_reactive_successor();
     }
@@ -228,7 +242,11 @@ pub(super) async fn run_attempt(
                 }
                 return AttemptEnd::Ladder {
                     failure: customer_owned(
-                        attribute_header_timeout(ctx, failure, allowance_deadline),
+                        attribute_header_timeout(
+                            ctx,
+                            repair.unrepaired(failure),
+                            allowance_deadline,
+                        ),
                         wire,
                     ),
                     refusal_eligible: false,
@@ -542,6 +560,7 @@ pub(super) async fn run_attempt(
                             tool_names,
                         };
                     }
+                    let failure = &repair.unrepaired(failure.clone());
                     let typed_refusal = failure.failure_class == FailureClass::Refusal;
                     let exhaustion_flush = if withheld.iter().any(crate::logprobs::is_refusal_text)
                         && !typed_refusal

@@ -266,6 +266,21 @@ the order the model produced.
 - `chat_template_kwargs.preserve_thinking` is accepted and disclosed as
   `chat_template_kwargs.preserve_thinking->ignored(not_forwarded)`: no wire receives
   `chat_template_kwargs` verbatim.
+- Other clients' Chat shapes are rewritten into the Chat spelling, each disclosed
+  (`chat_client_shapes.py`): a literal `extra_body` object is merged into the body the way the
+  OpenAI SDKs merge it (`extra_body->flattened(top_level)`; a field that disagrees with the
+  top-level one is a 400 naming `extra_body.<field>`); a Responses-shaped function tool
+  (`{"type": "function", "name": ...}`) and `tool_choice` become the Chat `function` object
+  (`tools.function->reshaped(chat_function_tool)`,
+  `tool_choice.name->reshaped(tool_choice.function.name)`); and the vLLM template switches
+  `chat_template_kwargs.reasoning_effort` and `chat_template_kwargs.thinking` become
+  `reasoning_effort` and `chat_template_kwargs.enable_thinking` (a value that contradicts the
+  canonical field is a 400 naming the template field).
+- A Responses `reasoning.context` selector reaches only native Responses reasoning rungs; a route
+  with none serves without it, disclosed as `reasoning.context->dropped(unsupported_by_provider)`,
+  and per-rung narrowing prefers a rung that carries it.
+- An empty string where a non-empty one is required (an empty `model`) is named as empty:
+  "expected a non-empty string, but got an empty string instead".
 - DeepSeek's reasoning switch, `thinking: {"type": "enabled" | "disabled"}` (Anthropic's
   `adaptive` included), is folded into the Responses reasoning control as Chat already folds it
   into `reasoning_effort`: `disabled` becomes `reasoning.effort: "none"`, `enabled` and

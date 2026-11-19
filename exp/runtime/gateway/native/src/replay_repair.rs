@@ -41,8 +41,9 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::errors::Failure;
+use crate::errors::{Failure, FailureClass};
 use crate::metrics::METRICS;
+use crate::thought_signature_repair::{unrepaired_thought_signature, ReplayedState};
 use crate::waterfall::DeploymentWire;
 
 /// Response header disclosing a data-plane repair of the caller's replayed
@@ -236,47 +237,140 @@ fn matches_hint(encrypted_content: &str, (head, tail): &(String, String)) -> boo
         && encrypted_content.ends_with(tail)
 }
 
-/// Every replayed `encrypted_content` in the payload's input, in order.
-fn encrypted_payloads(payload: &Value) -> Vec<&str> {
+/// The text that stands in for an encrypted content part the strip removed
+/// when nothing else of the item's content remains (a tool result or agent
+/// message must keep its slot, and its call pairing, in the history).
+pub const ENCRYPTED_PART_PLACEHOLDER: &str =
+    "[Encrypted content omitted: it was produced by another provider account and cannot be read here.]";
+
+/// The array fields of an input item that may hold `encrypted_content` parts:
+/// a tool result's `output` (Codex function and custom tool outputs) and a
+/// message's `content` (Codex agent messages).
+const PART_FIELDS: [&str; 2] = ["output", "content"];
+
+/// The opaque payload of one `{"type": "encrypted_content", ...}` part.
+fn encrypted_part(part: &Value) -> Option<&str> {
+    (part.get("type").and_then(Value::as_str) == Some("encrypted_content"))
+        .then(|| part.get("encrypted_content").and_then(Value::as_str))
+        .flatten()
+}
+
+/// Every replayed `encrypted_content` the strip can remove, in order: each
+/// reasoning item's payload and each encrypted part of an item's `output`
+/// or `content` array.
+pub(crate) fn encrypted_payloads(payload: &Value) -> Vec<&str> {
+    let Some(items) = payload.get("input").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut payloads = Vec::new();
+    for item in items {
+        if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+            payloads.extend(item.get("encrypted_content").and_then(Value::as_str));
+            continue;
+        }
+        for field in PART_FIELDS {
+            if let Some(parts) = item.get(field).and_then(Value::as_array) {
+                payloads.extend(parts.iter().filter_map(encrypted_part));
+            }
+        }
+    }
+    payloads
+}
+
+/// The type of the first replayed item whose own `encrypted_content` the
+/// strip cannot remove without losing the conversation (a Codex `compaction`
+/// item IS the compacted history), or `None` when every encrypted payload in
+/// the input is strippable.
+pub fn unstrippable_encrypted_item(payload: &Value) -> Option<String> {
     payload
-        .get("input")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
-                .filter_map(|item| item.get("encrypted_content").and_then(Value::as_str))
-                .collect()
+        .get("input")?
+        .as_array()?
+        .iter()
+        .find(|item| {
+            item.get("type").and_then(Value::as_str) != Some("reasoning")
+                && item
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .is_some()
         })
-        .unwrap_or_default()
+        .map(|item| {
+            item.get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("input")
+                .to_string()
+        })
 }
 
-/// The Responses payload with every replayed reasoning item that carries
-/// `encrypted_content` removed, or `None` when there is nothing to strip.
-pub fn without_encrypted_reasoning(payload: &Value) -> Option<Value> {
-    without_encrypted_reasoning_where(payload, |_| true)
+/// Remove the encrypted parts `strip` selects from one item's `output` or
+/// `content` array; returns whether anything was removed. An array left empty
+/// keeps its slot with [`ENCRYPTED_PART_PLACEHOLDER`]: a tool result's
+/// `output` becomes that string, a message's `content` that one text part.
+fn strip_encrypted_parts(item: &mut Value, strip: &mut impl FnMut(&str) -> bool) -> bool {
+    let assistant = item.get("role").and_then(Value::as_str) == Some("assistant");
+    let Some(object) = item.as_object_mut() else {
+        return false;
+    };
+    let mut removed = false;
+    for field in PART_FIELDS {
+        let Some(parts) = object.get_mut(field).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let before = parts.len();
+        parts.retain(|part| !encrypted_part(part).is_some_and(&mut *strip));
+        if parts.len() == before {
+            continue;
+        }
+        removed = true;
+        if parts.is_empty() {
+            let placeholder = if field == "output" {
+                json!(ENCRYPTED_PART_PLACEHOLDER)
+            } else {
+                let kind = if assistant {
+                    "output_text"
+                } else {
+                    "input_text"
+                };
+                json!([{"type": kind, "text": ENCRYPTED_PART_PLACEHOLDER}])
+            };
+            object.insert(field.to_string(), placeholder);
+        }
+    }
+    if removed {
+        // The provider ties a replayed item id to the content it issued.
+        object.remove("id");
+    }
+    removed
 }
 
-/// The Responses payload with the replayed reasoning items whose
-/// `encrypted_content` `strip` selects removed, or `None` when it selects
-/// nothing.
+/// The Responses payload with the replayed `encrypted_content` payloads
+/// `strip` selects removed, or `None` when it selects nothing.
 ///
-/// OpenAI binds an encrypted reasoning payload to the organization (Azure:
-/// the tenant) that sealed it and refuses every other with
-/// `invalid_encrypted_content`, so a conversation whose earlier turn another
-/// lane served, or whose history the caller assembled from another account,
-/// cannot replay those items here. The item is optional on replay: the model
-/// resumes from the visible message, tool-call, and tool-result items, so
-/// dropping it trades hidden reasoning continuity for a served turn.
+/// OpenAI binds an encrypted payload to the organization (Azure: the tenant)
+/// that sealed it and refuses every other with `invalid_encrypted_content`,
+/// so a conversation whose earlier turn another lane served, or whose history
+/// the caller assembled from another account, cannot replay those payloads
+/// here. Two shapes carry one:
 ///
-/// The assistant items a stripped reasoning item governed (the function and
-/// custom tool calls and the assistant message of that same provider turn,
-/// up to the next user or tool-result item) lose their provider `id` as
-/// well: OpenAI ties a replayed item id to the reasoning item of its turn
-/// and refuses the id without it ("was provided without its required
-/// 'reasoning' item"), while an id-less item is accepted as caller-authored.
-/// Every kept item keeps its position; nothing outside `input` changes.
-pub fn without_encrypted_reasoning_where(
+/// - A reasoning item is optional on replay: the model resumes from the
+///   visible message, tool-call, and tool-result items, so dropping it trades
+///   hidden reasoning continuity for a served turn. The assistant items a
+///   stripped reasoning item governed (the function and custom tool calls and
+///   the assistant message of that same provider turn, up to the next user or
+///   tool-result item) lose their provider `id` as well: OpenAI ties a
+///   replayed item id to the reasoning item of its turn and refuses the id
+///   without it ("was provided without its required 'reasoning' item"), while
+///   an id-less item is accepted as caller-authored.
+/// - An `encrypted_content` PART of a tool result's `output` or a message's
+///   `content` (Codex function outputs and agent messages; "Encrypted function
+///   output content could not be decrypted") is removed from its array and
+///   the item keeps its slot, its call pairing and any other part; an array
+///   left empty carries [`ENCRYPTED_PART_PLACEHOLDER`] instead, and the
+///   degraded item loses its provider `id`.
+///
+/// An item whose OWN `encrypted_content` is the item (a `compaction`) is never
+/// stripped here; see [`unstrippable_encrypted_item`]. Every kept item keeps
+/// its position; nothing outside `input` changes.
+pub fn without_encrypted_content_where(
     payload: &Value,
     mut strip: impl FnMut(&str) -> bool,
 ) -> Option<Value> {
@@ -284,6 +378,7 @@ pub fn without_encrypted_reasoning_where(
     let items = repaired.get_mut("input")?.as_array_mut()?;
     let mut keep: Vec<bool> = Vec::with_capacity(items.len());
     let mut governed = false;
+    let mut degraded = false;
     for item in items.iter_mut() {
         let kind = item.get("type").and_then(Value::as_str);
         let role = item.get("role").and_then(Value::as_str);
@@ -305,9 +400,10 @@ pub fn without_encrypted_reasoning_where(
         } else {
             governed = false;
         }
+        degraded |= strip_encrypted_parts(item, &mut strip);
         keep.push(true);
     }
-    if keep.iter().all(|kept| *kept) {
+    if !degraded && keep.iter().all(|kept| *kept) {
         return None;
     }
     let mut index = 0;
@@ -317,6 +413,23 @@ pub fn without_encrypted_reasoning_where(
         kept
     });
     Some(repaired)
+}
+
+/// The caller's answer when a refusal of replayed encrypted content survives
+/// every repair this attempt may make: an `invalid_request` naming the
+/// problem and the fix, never a provider failure a client retries forever.
+/// `item` names an item the strip may not remove, when one is replayed.
+pub fn unrepaired_encrypted_content(failure: &Failure, item: Option<&str>) -> Failure {
+    let message = match item {
+        Some(item) => format!(
+            "The input replays a '{item}' item whose encrypted content this model's provider cannot decrypt (it was produced by another provider account or model). Resend the request without that item, or start a new conversation"
+        ),
+        None => "The input replays encrypted content this model's provider cannot decrypt (it was produced by another provider account or model). Resend the request without the items that carry encrypted_content, or start a new conversation".to_string(),
+    };
+    Failure::new(FailureClass::InvalidRequest, &message)
+        .with_provider_detail(failure.provider_detail.clone())
+        .with_rate_limit_facts(failure.rate_limit_headers.as_deref().cloned(), None)
+        .with_tenant_origin(failure.tenant_origin)
 }
 
 /// The repair state of one physical attempt on one rung.
@@ -329,6 +442,10 @@ pub fn without_encrypted_reasoning_where(
 /// fate is decided.
 pub(crate) struct AttemptRepair<'a> {
     wire: &'a DeploymentWire,
+    /// The rung's plain wire, which the strip reads: a Google cache overlay
+    /// (`wire`) holds part of the history in its cached prefix.
+    plain: &'a DeploymentWire,
+    state: ReplayedState,
     scope: Option<&'a str>,
     request_id: &'a str,
     repaired: &'a mut Option<Value>,
@@ -349,12 +466,16 @@ impl<'a> AttemptRepair<'a> {
     /// Prepare the first dial of this attempt.
     pub(crate) fn begin(
         wire: &'a DeploymentWire,
+        plain: &'a DeploymentWire,
         scope: Option<&'a str>,
         repaired: &'a mut Option<Value>,
         request_id: &'a str,
     ) -> Self {
+        let state = ReplayedState::of(wire);
         let mut repair = Self {
             wire,
+            plain,
+            state,
             scope,
             request_id,
             repaired,
@@ -368,12 +489,11 @@ impl<'a> AttemptRepair<'a> {
         if repair.repaired.is_some() {
             repair.stripped = true;
         } else if let (None, Some(scope)) = (&wire.upstream_body, scope) {
-            let remembered = |content: &str| MEMORY.recall(&payload_digest(scope, content));
-            if let Some(stripped) =
-                without_encrypted_reasoning_where(&wire.upstream_payload, remembered)
-            {
-                repair.proactive_strips = encrypted_payloads(&wire.upstream_payload).len()
-                    - encrypted_payloads(&stripped).len();
+            let remembered =
+                |content: &str| MEMORY.recall(&state.memory_key(scope, plain, content));
+            if let Some(stripped) = state.strip_where(&plain.upstream_payload, remembered) {
+                repair.proactive_strips =
+                    state.payloads(&plain.upstream_payload).len() - state.payloads(&stripped).len();
                 *repair.repaired = Some(stripped);
                 repair.stripped = true;
                 repair.proactive = true;
@@ -405,7 +525,7 @@ impl<'a> AttemptRepair<'a> {
     }
 
     /// Decide the reactive re-dial after a refused open: `true` when the
-    /// provider refused replayed encrypted reasoning, this attempt has not
+    /// provider refused replayed encrypted content, this attempt has not
     /// repaired reactively yet, and the payload still carried something to
     /// strip. The refused payloads (the one OpenAI quoted, else every one
     /// still present) are remembered for later requests of this caller.
@@ -416,11 +536,17 @@ impl<'a> AttemptRepair<'a> {
         {
             return false;
         }
-        let Some(stripped) = without_encrypted_reasoning(self.payload()) else {
+        // Strip the whole history, never a cache overlay's live suffix: the
+        // repaired successor dials plain (it never prepares a cache).
+        let source = self
+            .repaired
+            .as_ref()
+            .unwrap_or(&self.plain.upstream_payload);
+        let Some(stripped) = self.state.strip_where(source, |_| true) else {
             return false;
         };
         let (present_count, digests) = {
-            let present = encrypted_payloads(self.payload());
+            let present = self.state.payloads(source);
             let hint = failure
                 .provider_detail
                 .as_deref()
@@ -437,7 +563,7 @@ impl<'a> AttemptRepair<'a> {
             let digests: Vec<[u8; 32]> = match self.scope {
                 Some(scope) => refused
                     .iter()
-                    .map(|content| payload_digest(scope, content))
+                    .map(|content| self.state.memory_key(scope, self.plain, content))
                     .collect(),
                 None => Vec::new(),
             };
@@ -454,12 +580,29 @@ impl<'a> AttemptRepair<'a> {
         true
     }
 
+    /// The failure to surface once [`Self::repair_after`] declined: a refusal
+    /// of replayed encrypted content becomes the caller's `invalid_request`
+    /// naming the item to drop (the in-stream refusal otherwise files as a
+    /// provider failure); every other failure is returned unchanged.
+    pub(crate) fn unrepaired(&self, failure: Failure) -> Failure {
+        if !failure.encrypted_reasoning_rejected {
+            return failure;
+        }
+        if self.state == ReplayedState::ThoughtSignatures {
+            return unrepaired_thought_signature(&failure);
+        }
+        let item = unstrippable_encrypted_item(self.payload());
+        unrepaired_encrypted_content(&failure, item.as_deref())
+    }
+
     /// Keep a repaired successor's disclosure attached to its own physical attempt.
     pub(crate) fn mark_reactive_successor(&mut self) {
         self.reactive = true;
-        self.reactive_strips = encrypted_payloads(&self.wire.upstream_payload)
+        self.reactive_strips = self
+            .state
+            .payloads(&self.wire.upstream_payload)
             .len()
-            .saturating_sub(encrypted_payloads(self.payload()).len());
+            .saturating_sub(self.state.payloads(self.payload()).len());
     }
 
     /// Note that the current dial opened (the provider answered 2xx).
@@ -507,6 +650,11 @@ impl Drop for AttemptRepair<'_> {
 mod tests {
     use super::*;
 
+    /// Every strippable replayed `encrypted_content` removed (the reactive strip).
+    fn without_encrypted_content(payload: &Value) -> Option<Value> {
+        without_encrypted_content_where(payload, |_| true)
+    }
+
     #[test]
     fn stripping_encrypted_reasoning_removes_only_those_items_and_keeps_order() {
         let payload = json!({
@@ -531,7 +679,7 @@ mod tests {
             ],
             "include": ["reasoning.encrypted_content"],
         });
-        let repaired = without_encrypted_reasoning(&payload).expect("two items to strip");
+        let repaired = without_encrypted_content(&payload).expect("two items to strip");
         let kept: Vec<&Value> = repaired["input"]
             .as_array()
             .expect("input")
@@ -564,9 +712,100 @@ mod tests {
         assert_eq!(repaired["store"], false);
 
         // Nothing to strip: no repair, so the provider's verdict surfaces.
-        assert!(without_encrypted_reasoning(&repaired).is_none());
-        assert!(without_encrypted_reasoning(&json!({"model": "m", "input": "text"})).is_none());
-        assert!(without_encrypted_reasoning(&json!({"model": "m", "messages": []})).is_none());
+        assert!(without_encrypted_content(&repaired).is_none());
+        assert!(without_encrypted_content(&json!({"model": "m", "input": "text"})).is_none());
+        assert!(without_encrypted_content(&json!({"model": "m", "messages": []})).is_none());
+    }
+
+    #[test]
+    fn encrypted_parts_are_removed_and_their_items_keep_their_slots() {
+        let payload = json!({
+            "model": "gpt-test",
+            "input": [
+                {"role": "user", "content": "plan"},
+                {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "spawn", "arguments": "{}"},
+                {"type": "function_call_output", "id": "fco_1", "call_id": "call_1", "output": [
+                    {"type": "encrypted_content", "encrypted_content": "gAAA_out=="}
+                ]},
+                {"type": "custom_tool_call_output", "call_id": "call_2", "output": [
+                    {"type": "input_text", "text": "kept"},
+                    {"type": "encrypted_content", "encrypted_content": "gAAA_mixed=="}
+                ]},
+                {"type": "agent_message", "id": "am_1", "author": "/root/a", "recipient": "/root", "content": [
+                    {"type": "encrypted_content", "encrypted_content": "gAAA_agent=="}
+                ]},
+                {"type": "function_call_output", "call_id": "call_3", "output": "plain"},
+            ],
+        });
+        assert_eq!(
+            encrypted_payloads(&payload),
+            vec!["gAAA_out==", "gAAA_mixed==", "gAAA_agent=="]
+        );
+        assert!(unstrippable_encrypted_item(&payload).is_none());
+        let repaired = without_encrypted_content(&payload).expect("three parts to strip");
+        let items = repaired["input"].as_array().expect("input");
+        assert_eq!(items.len(), 6, "every item keeps its slot");
+        assert!(encrypted_payloads(&repaired).is_empty());
+        assert_eq!(items[1]["id"], "fc_1", "the call keeps its id");
+        assert_eq!(items[2]["call_id"], "call_1");
+        assert_eq!(items[2]["output"], json!(ENCRYPTED_PART_PLACEHOLDER));
+        assert!(items[2].get("id").is_none());
+        assert_eq!(
+            items[3]["output"],
+            json!([{"type": "input_text", "text": "kept"}])
+        );
+        assert_eq!(
+            items[4]["content"],
+            json!([{"type": "input_text", "text": ENCRYPTED_PART_PLACEHOLDER}])
+        );
+        assert!(items[4].get("id").is_none());
+        assert_eq!(items[5], payload["input"][5]);
+        // Selective: only the remembered part goes.
+        let selective =
+            without_encrypted_content_where(&payload, |content| content == "gAAA_mixed==")
+                .expect("one part");
+        assert_eq!(
+            encrypted_payloads(&selective),
+            vec!["gAAA_out==", "gAAA_agent=="]
+        );
+        assert!(without_encrypted_content(&repaired).is_none());
+    }
+
+    #[test]
+    fn a_compaction_item_is_never_stripped_and_is_named_instead() {
+        let payload = json!({
+            "model": "gpt-test",
+            "input": [
+                {"type": "compaction", "id": "cmp_1", "encrypted_content": "gAAA_history=="},
+                {"role": "user", "content": "continue"},
+            ],
+        });
+        assert!(without_encrypted_content(&payload).is_none());
+        assert_eq!(
+            unstrippable_encrypted_item(&payload).as_deref(),
+            Some("compaction")
+        );
+        let refused = Failure::new(FailureClass::ProviderInternal, "provider stream failed")
+            .with_provider_detail(Some(
+                "invalid_encrypted_content: Encrypted content could not be decrypted.".into(),
+            ))
+            .with_encrypted_reasoning_rejected(true);
+        let answer = unrepaired_encrypted_content(&refused, Some("compaction"));
+        assert_eq!(answer.failure_class, FailureClass::InvalidRequest);
+        assert!(!answer.failover_eligible);
+        let public = answer.public_error();
+        assert_eq!(public.status_code, 400);
+        assert!(public
+            .message
+            .starts_with("The input replays a 'compaction' item"));
+        assert!(public
+            .message
+            .contains("Resend the request without that item"));
+        assert!(!public.message.contains('\u{2014}') && !public.message.contains('\u{2013}'));
+        let generic = unrepaired_encrypted_content(&refused, None).public_error();
+        assert!(generic
+            .message
+            .contains("without the items that carry encrypted_content"));
     }
 
     #[test]
@@ -602,7 +841,7 @@ mod tests {
             ],
         });
         let repaired =
-            without_encrypted_reasoning_where(&payload, |content| content.starts_with("rsn_"))
+            without_encrypted_content_where(&payload, |content| content.starts_with("rsn_"))
                 .expect("one item to strip");
         let kept = repaired["input"].as_array().expect("input");
         assert_eq!(kept.len(), 5);
@@ -615,7 +854,7 @@ mod tests {
             kept[4]["id"], "fc_2",
             "a turn whose reasoning stayed keeps its ids"
         );
-        assert!(without_encrypted_reasoning_where(&payload, |_| false).is_none());
+        assert!(without_encrypted_content_where(&payload, |_| false).is_none());
     }
 
     #[test]

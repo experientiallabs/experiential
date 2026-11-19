@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from exp.runtime.gateway import prompt_size
 from exp.runtime.gateway.contracts import (
     GatewayFailure,
     GatewayFailureClass,
@@ -17,6 +18,7 @@ from exp.runtime.models.providers.errors import (
     normalized_provider_failure,
 )
 from exp.runtime.openai_protocol.errors import (
+    CONTEXT_LENGTH_EXCEEDED_CODE,
     THROTTLED_RETRY_AFTER_SECONDS,
     UNAVAILABLE_RETRY_AFTER_SECONDS,
     OpenAIProtocolError,
@@ -321,3 +323,39 @@ def test_a_rate_limit_error_type_renders_for_a_wait_for_reset_refusal() -> None:
     assert body["type"] == "rate_limit_error"
     assert body["code"] == "rate_limit_exceeded"
     assert error.headers() == {"Retry-After": "60"}
+
+
+def test_a_context_window_overflow_carries_openais_code_on_every_path() -> None:
+    """The gateway's estimate and a provider's verdict both read context_length_exceeded."""
+    assert CONTEXT_LENGTH_EXCEEDED_CODE == prompt_size.CONTEXT_LENGTH_EXCEEDED_CODE
+    estimate = ProviderParameterError(
+        message=(
+            "The prompt is at least 1,049,847 tokens (4,199,388 bytes of text), but the "
+            "largest context window on this model route is 1,048,576 tokens."
+        ),
+        param="messages",
+        code="context_length_exceeded",
+    )
+    error = public_failure_error(normalized_provider_failure(estimate), param=estimate.param)
+    assert error.status_code == 400
+    assert error.detail.code == "context_length_exceeded"
+    assert error.detail.param == "messages"
+    verdict = GatewayFailure(
+        failure_class=GatewayFailureClass.INVALID_REQUEST,
+        safe_message=(
+            "provider rejected the request; verify the request fields against "
+            "the model alias capabilities"
+        ),
+        provider_detail="This model's maximum context length is 1048576 tokens.",
+        context_window_rejected=True,
+        context_window_limit_tokens=1_048_576,
+    )
+    provider = public_failure_error(verdict)
+    assert provider.detail.code == "context_length_exceeded"
+    assert provider.detail.message.startswith("provider rejected the request: This model's")
+    # Any other client error keeps its own code.
+    other = GatewayFailure(
+        failure_class=GatewayFailureClass.INVALID_REQUEST,
+        safe_message="provider rejected the request",
+    )
+    assert public_failure_error(other).detail.code == "invalid_request"

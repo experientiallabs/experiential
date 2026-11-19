@@ -96,3 +96,19 @@ granted alias as `models/<alias>` with the three generation methods; an ungrante
 the shared no-oracle 404.
 
 Google defines no idempotency header, so this surface never joins the keyed replay stores.
+
+## Thought signatures across Google backends
+
+A replayed `thoughtSignature` reaches the Gemini wire on every surface (Chat and Responses
+carry it as `extra_content.google.thought_signature`, generateContent as the part's own field).
+The Gemini API and Vertex AI each verify only the signatures they issued, so a conversation
+whose earlier turn one backend served and whose later turn routes to the other is refused with
+HTTP 400 "Invalid thought signature." before any output. The data plane treats that refusal as
+a replay repair, like a refused OpenAI `encrypted_content` (`gateway-architecture.md`): it
+re-dials the same rung once with every replayed signature replaced by Google's documented
+bypass value `skip_thought_signature_validator` (each part keeps its position and call
+pairing), discloses the served repair with `x-gateway-replay-repair: encrypted_reasoning_stripped`
+and the same counters, and remembers the refused signatures per caller AND per refusing rung,
+so a later turn on that rung replaces them before its first dial while the backend that minted
+them still receives them verbatim. A refusal the bypass cannot clear is the caller's
+`invalid_request` naming the thought signature.
