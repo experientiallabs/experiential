@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, cast
 from unittest import mock
+from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
@@ -53,10 +54,18 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
-from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry
+from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry, ScriptedClassifier
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
-from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy
+from exp.runtime.gateway.guardrails.contracts import (
+    ClassifierVerdict,
+    GuardrailAction,
+    GuardrailCapabilityKind,
+    GuardrailCheck,
+    GuardrailCheckStage,
+    GuardrailPolicy,
+)
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle import (
@@ -81,7 +90,7 @@ from exp.runtime.gateway.native_reasoning import (
 from exp.runtime.gateway.native_recovery import session_cache_key
 from exp.runtime.gateway.native_stage_admission_test import Host
 from exp.runtime.gateway.replay_identity import canonical_request_sha256
-from exp.runtime.gateway.routing import GatewayRoutingError
+from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 from exp.runtime.gateway.tests.chain_authority_fixture_test import (
     chain_components,
@@ -3815,10 +3824,13 @@ def test_encrypted_reasoning_pins_winning_fallback_and_rejects_credential_drift(
         failure: GatewayFailure,
         *,
         web_search_requests: int = 0,
+        guardrails: GuardrailSession | None = None,
     ) -> bool:
         """Record the verdict while preserving the complete current meter contract."""
         recorded.append(failure)
-        return original_finish(authorization, failure, web_search_requests=web_search_requests)
+        return original_finish(
+            authorization, failure, web_search_requests=web_search_requests, guardrails=guardrails
+        )
 
     monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture_finish)  # noqa: SLF001
     with pytest.raises(NativeBridgeError) as rejected:
@@ -3857,10 +3869,13 @@ def test_admission_maps_a_route_build_failure_to_a_retryable_unavailable(
         failure: GatewayFailure,
         *,
         web_search_requests: int = 0,
+        guardrails: GuardrailSession | None = None,
     ) -> bool:
         """Record the verdict while preserving the complete current meter contract."""
         recorded.append(failure)
-        return original_finish(authorization, failure, web_search_requests=web_search_requests)
+        return original_finish(
+            authorization, failure, web_search_requests=web_search_requests, guardrails=guardrails
+        )
 
     monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture)  # noqa: SLF001
 
@@ -3940,10 +3955,13 @@ def test_admit_escalates_when_every_rung_is_dead(
         failure: GatewayFailure,
         *,
         web_search_requests: int = 0,
+        guardrails: GuardrailSession | None = None,
     ) -> bool:
         """Record the verdict while preserving the complete current meter contract."""
         recorded.append(failure)
-        return original_finish(authorization, failure, web_search_requests=web_search_requests)
+        return original_finish(
+            authorization, failure, web_search_requests=web_search_requests, guardrails=guardrails
+        )
 
     monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture)  # noqa: SLF001
 
@@ -6238,10 +6256,13 @@ def test_capability_rejection_names_the_public_request_field(
         failure: GatewayFailure,
         *,
         web_search_requests: int = 0,
+        guardrails: GuardrailSession | None = None,
     ) -> bool:
         """Record the verdict while preserving the complete current meter contract."""
         recorded.append(failure)
-        return original_finish(authorization, failure, web_search_requests=web_search_requests)
+        return original_finish(
+            authorization, failure, web_search_requests=web_search_requests, guardrails=guardrails
+        )
 
     monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture_finish)  # noqa: SLF001
     body = json.dumps(
@@ -8758,3 +8779,116 @@ def test_count_tokens_counts_a_tool_change_turn(tmp_path: Path) -> None:
     )
     assert isinstance(counted["input_tokens"], int)
     assert counted["input_tokens"] > 0
+
+
+@pytest.mark.parametrize(
+    ("failure_point", "parallel"),
+    [
+        ("route", False),
+        ("capture", False),
+        ("escalation", False),
+        ("route", True),
+        ("escalation", True),
+    ],
+)
+@pytest.mark.parametrize("retry", [False, True])
+def test_admission_failure_retains_input_evidence_before_accounting_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_point: str, retry: bool, parallel: bool
+) -> None:
+    """An accepted request retains its checked input even when it never registers an attempt."""
+    control, raw_key = _control_plane(tmp_path)
+    # Drive retries explicitly so the assertion does not race a background sweep.
+    control._accounting.close()  # noqa: SLF001
+    policy = GuardrailPolicy(
+        policy_id="input-policy",
+        protected=True,
+        fail_open=True,
+        input_execution="parallel" if parallel else "before_dispatch",
+        checks=(
+            GuardrailCheck(
+                check_id="input",
+                adapter_id="classifier",
+                stage=GuardrailCheckStage.INPUT,
+                capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+                action=GuardrailAction.BLOCK,
+                timeout_ms=1000,
+            ),
+        ),
+    )
+    control._guardrails = GuardrailEngine(  # noqa: SLF001
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(
+            ClassifierRegistry(
+                {"classifier": ScriptedClassifier(input_verdict=ClassifierVerdict(flagged=False))}
+            )
+        ),
+        monotonic=time.monotonic,
+    )
+    seen: list[tuple[JsonObject, ...]] = []
+    owners: list[AuthorizationSnapshot] = []
+    ledger = control._write_ledger  # noqa: SLF001
+    original_finish = ledger.finish_request
+
+    def write(
+        *,
+        authorization: AuthorizationSnapshot,
+        failure: GatewayFailure,
+        certify_no_effects: bool,
+        web_search_requests: int,
+        input_guardrail_outcomes: tuple[JsonObject, ...] = (),
+    ) -> bool:
+        """Record the extension alongside the real SQLite terminal write, failing once if asked."""
+        assert control._accounting.entry(authorization.request_id) is None  # noqa: SLF001
+        owners.append(authorization)
+        seen.append(input_guardrail_outcomes)
+        if retry and len(seen) == 1:
+            raise OSError("synthetic terminal interruption")
+        return original_finish(
+            authorization=authorization,
+            failure=failure,
+            certify_no_effects=certify_no_effects,
+            web_search_requests=web_search_requests,
+        )
+
+    monkeypatch.setattr(ledger, "finish_request", write)
+
+    def refuse_route(*_args: object, **_kwargs: object) -> GatewayRoute:
+        """Fail after input inspection and durable acceptance, before registration."""
+        raise OpenAIProtocolError(
+            status_code=400, code="invalid_request", message="synthetic route refusal"
+        )
+
+    match failure_point:
+        case "route":
+            monkeypatch.setattr(control, "_resolve_route", refuse_route)
+        case "capture":
+            monkeypatch.setattr(control, "_capture", Mock())
+            monkeypatch.setattr(
+                "exp.runtime.gateway.guardrails.native.begin_capture", lambda *_a, **_k: False
+            )
+        case "escalation":
+            monkeypatch.setattr(control, "_native_route_eligible", lambda *_args: False)
+        case _:
+            raise AssertionError(failure_point)
+    if failure_point == "escalation":
+        assert "escalate" in _admit(control, raw_key, _chat_body())
+    else:
+        with pytest.raises(NativeBridgeError) as raised:
+            _admit(control, raw_key, _chat_body())
+        error = json.loads(raised.value.public_error_json)
+        assert error["code"] == (
+            "capture_unavailable" if failure_point == "capture" else "invalid_request"
+        )
+    assert len(seen) == 1
+    (document,) = seen[0]
+    assert document["outcome"] == ("not_started" if parallel else "allow")
+    assert document["request_id"] == owners[0].request_id
+    assert document["organization_id"] == owners[0].organization_id
+    if retry:
+        control._accounting.request_settlements.retry(limit=1)  # noqa: SLF001
+        assert len(seen) == 2
+        assert seen[1] is seen[0]
+    report = json.loads(control.usage_json("{}"))
+    assert report["totals"]["requests"] == 1
+    assert report["totals"]["attempts"] == 0
+    assert report["totals"]["known_estimated_cost_nano_usd"] == 0

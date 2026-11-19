@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable
 
 from exp.common.core.artifacts import JsonObject
+from exp.runtime.gateway import native_guardrail_outcomes as input_evidence
 from exp.runtime.gateway.attempt_tokens import counted_input_tokens
 from exp.runtime.gateway.class_throttles import admission_priority_class, tier_authorization
 from exp.runtime.gateway.client_apps import with_client_identity
@@ -34,6 +35,7 @@ from exp.runtime.gateway.guardrails.native import (
     require_capture,
     validate_guardrail_engine,
 )
+from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
@@ -350,7 +352,6 @@ class NativeControlPlane(
                 )
             except OpenAIProtocolError as exc:
                 raise NativeBridgeError(exc) from exc
-
         pinned_reasoning_route: GatewayRoute | None = None
         try:
             request, pinned_reasoning_route = authenticate_reasoning_history(
@@ -367,13 +368,13 @@ class NativeControlPlane(
                 carrier, f"'{carrier}' must be an authentic continuation for this route."
             )
             raise NativeBridgeError(error) from exc
-
         original_subject = request
         guardrails = open_admission_guardrails(
             self._guardrails, authorization, request, data, deadline_monotonic=deadline
         )
         if guardrails is not None:
             guardrails.detectors = self._guardrail_detectors
+            input_evidence.enable_input_outcomes(guardrails, self._write_ledger)
         parallel_guardrail = isinstance(authorization.target, DirectTarget) and (
             guardrails is not None and guardrails.can_overlap_input(request)
         )
@@ -440,7 +441,13 @@ class NativeControlPlane(
             else None
         )
         if not parallel_guardrail:
-            require_capture(self._capture, self._accounting, authorization, pending_capture)
+            require_capture(
+                self._capture,
+                self._accounting,
+                authorization,
+                pending_capture,
+                guardrails=guardrails,
+            )
             pending_capture = None
         # Escalation is accounted without content or billing; probe routing
         # failures are raised against the accepted request below.
@@ -483,7 +490,9 @@ class NativeControlPlane(
                 ):
                     raise _continuation_binding_error()
                 # No dispatchable rung remains; finalize the accepted request closed.
-                return self._escalate_accepted(authorization, UNAVAILABLE_AT_ADMISSION)
+                return self._escalate_accepted(
+                    authorization, UNAVAILABLE_AT_ADMISSION, guardrails=guardrails
+                )
             route = select_route_deployments(route, dispatchable.indexes)
             resolved_wires = dispatchable.resolved_wires
             route, resolved_wires, selected_placement = select_single_route_before_search(
@@ -515,6 +524,7 @@ class NativeControlPlane(
                         authorization,
                         exc.failure,
                         web_search_requests=1 if web_search_admission is not None else 0,
+                        guardrails=guardrails,
                     )
                     raise NativeBridgeError(public_failure_error(exc.failure)) from None
             _require_bound_wire_authority(
@@ -528,7 +538,10 @@ class NativeControlPlane(
             raise
         except NativeDialectUnavailableError as exc:
             return self._escalate_accepted(
-                authorization, str(exc), web_search_requests=int(web_search_admission is not None)
+                authorization,
+                str(exc),
+                web_search_requests=int(web_search_admission is not None),
+                guardrails=guardrails,
             )
         except OpenAIProtocolError as exc:
             # Preserve client failures as non-internal and retain any completed search.
@@ -543,6 +556,7 @@ class NativeControlPlane(
                     safe_message=exc.detail.message,
                 ),
                 web_search_requests=int(web_search_admission is not None),
+                guardrails=guardrails,
             )
             raise NativeBridgeError(exc) from exc
         except Exception as exc:  # noqa: BLE001 - raised after route packaging below.
@@ -557,6 +571,7 @@ class NativeControlPlane(
                     authorization,
                     "host policy does not permit native execution of this route",
                     web_search_requests=int(web_search_admission is not None),
+                    guardrails=guardrails,
                 )
 
         # Admission returns the full ordered route; no attempt row before `start_attempt`.
@@ -648,6 +663,7 @@ class NativeControlPlane(
                 authorization,
                 admission_boundary_failure(exc),
                 web_search_requests=int(web_search_admission is not None),
+                guardrails=guardrails,
             )
             raise
         except (ProviderParameterError, ProviderCapabilityError) as exc:
@@ -665,13 +681,8 @@ class NativeControlPlane(
                     developer_messages_param=decoded.developer_messages_param,
                     structured_text_param=provider_request.structured_text_parameter,
                 )
-                # The ledger keeps the generic sentence, but a bare "cannot
-                # preserve a requested capability" is untriageable from an
-                # alert, and the field alone is ambiguous (every attachment
-                # kind is "messages"). Append the PUBLIC field and the refused
-                # capability in plain words (never the internal literal), so
-                # operators read "(field: messages; this model route does not
-                # support image input)" without opening the request.
+                # Name the public field and refused capability in the ledger:
+                # "messages" alone cannot identify an unsupported attachment.
                 failure = failure.model_copy(
                     update={
                         "safe_message": ledger_capability_message(
@@ -684,7 +695,10 @@ class NativeControlPlane(
             else:
                 public_error = public_failure_error(failure, param=exc.param)
             self._accounting.finish_request_quietly(
-                authorization, failure, web_search_requests=int(web_search_admission is not None)
+                authorization,
+                failure,
+                web_search_requests=int(web_search_admission is not None),
+                guardrails=guardrails,
             )
             raise NativeBridgeError(public_error) from exc
         except GatewayRoutingError as exc:
@@ -692,7 +706,10 @@ class NativeControlPlane(
             # retryable, never paged as INTERNAL. The public error is already a 503.
             failure = gateway_updating_failure()
             self._accounting.finish_request_quietly(
-                authorization, failure, web_search_requests=int(web_search_admission is not None)
+                authorization,
+                failure,
+                web_search_requests=int(web_search_admission is not None),
+                guardrails=guardrails,
             )
             raise _authority_error(exc) from exc
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
@@ -713,7 +730,10 @@ class NativeControlPlane(
                 },
             )
             self._accounting.finish_request_quietly(
-                authorization, failure, web_search_requests=int(web_search_admission is not None)
+                authorization,
+                failure,
+                web_search_requests=int(web_search_admission is not None),
+                guardrails=guardrails,
             )
             raise error from exc
 
@@ -734,12 +754,19 @@ class NativeControlPlane(
                     authorization,
                     exc.failure,
                     web_search_requests=1 if web_search_admission is not None else 0,
+                    guardrails=guardrails,
                 )
                 raise NativeBridgeError(public_failure_error(exc.failure)) from None
         if pending_capture is not None and not (
             guardrails is not None and guardrails.input_pending
         ):
-            require_capture(self._capture, self._accounting, authorization, pending_capture)
+            require_capture(
+                self._capture,
+                self._accounting,
+                authorization,
+                pending_capture,
+                guardrails=guardrails,
+            )
             pending_capture = None
         plan = None if guardrails is None else guardrails.output_plan()
         self._accounting.register(
@@ -835,31 +862,11 @@ class NativeControlPlane(
         return json.dumps(response, separators=(",", ":"))
 
     def start_attempt(self, argument: str) -> str:
-        """Reserve one physical dispatch through the accounting registry.
-
-        Args:
-            argument: JSON payload for ``NativeAttemptAccounting.start_attempt``.
-
-        Returns:
-            The registry's reservation or exhaustion disposition.
-
-        Raises:
-            NativeBridgeError: Reservation failed after finalizing the request.
-        """
+        """Reserve dispatch; see ``NativeAttemptAccounting.start_attempt``."""
         return self._accounting.start_attempt(argument)
 
     def settle(self, argument: str) -> str:
-        """Durably settle one reserved attempt through the accounting registry.
-
-        Args:
-            argument: JSON payload for ``NativeAttemptAccounting.settle``.
-
-        Returns:
-            An empty JSON object; repeated settlement is a no-op.
-
-        Raises:
-            NativeBridgeError: Write failed; the entry remains available for retry.
-        """
+        """Durably settle dispatch; see ``NativeAttemptAccounting.settle``."""
         return self._accounting.settle(argument)
 
     def price(self, argument: str) -> str:
@@ -885,18 +892,12 @@ class NativeControlPlane(
         return seal_reasoning_carrier_content(self._accounting, argument)
 
     def claim_scope(self, argument: str) -> str:
-        """Authorize a keyed request and freeze its replay identity.
-
-        The content-free scope includes caller, operation, request digest and guardrail
-        revision. Admission must retain this revision; a policy reload refuses the owner
-        before paid work. Unsupported direct routes escalate before claiming replay.
+        """Freeze replay identity and policy revision before paid admission work.
 
         Args:
-            argument: JSON with raw_key, body, optional surface and standard request headers.
-
+            argument: JSON request with raw_key, body and standard request headers.
         Returns:
-            JSON replay scope or a native escalation disposition.
-
+            JSON replay scope or escalation for an unsupported direct route.
         Raises:
             NativeBridgeError: Decoding or authorization failed.
         """
@@ -950,19 +951,14 @@ class NativeControlPlane(
         )
 
     def remember(self, argument: str) -> str:
-        """Retain one finished Responses continuation within strict bounds.
+        """Retain bounded Responses history; see ``remember_continuation``.
 
         Args:
-            argument: JSON with ``request_id``, aggregated ``text``, ``refusal`` and
-                completed ``tool_calls``. Empty output retains the conversation so far.
-
+            argument: JSON with request_id, text, refusal and completed tool_calls.
         Returns:
-            An empty JSON object; retention that does not apply (a
-            ``store: false`` caller, a refusal) is a no-op.
-
+            An empty JSON object, including when retention does not apply.
         Raises:
-            NativeBridgeError: The continuation exceeds the bounded store or
-                a completed tool call carried malformed fields.
+            NativeBridgeError: Malformed tool calls or continuation storage exhaustion.
         """
         try:
             return remember_continuation(self._accounting, self._continuations, argument)
@@ -977,12 +973,14 @@ class NativeControlPlane(
         reason: str,
         *,
         web_search_requests: int = 0,
+        guardrails: GuardrailSession | None = None,
     ) -> str:
-        """Close an accepted request with its prework meter and return its disposition."""
+        """Terminalize accepted admission with its prework and optional inspection evidence."""
         self._accounting.finish_request_quietly(
             authorization,
             escalation_failure(authorization, reason),
             web_search_requests=web_search_requests,
+            guardrails=guardrails,
         )
         return _escalation(reason)
 
