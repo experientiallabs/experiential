@@ -17,3 +17,14 @@ def test_entries_are_bounded_and_refreshed_by_use() -> None:
     assert cache.get("a") is None
     with pytest.raises(ValueError, match="at least one"):
         VerifiedCache(0)
+
+
+def test_retain_forgets_every_unnamed_entry() -> None:
+    """Retain keeps exactly the named entries and reports how many it forgot."""
+    cache: VerifiedCache[str, int] = VerifiedCache(4)
+    for key, value in (("a", 1), ("b", 2), ("c", 3)):
+        cache.put(key, value)
+    assert cache.retain(["a", "c", "z"]) == 1
+    assert len(cache) == 2
+    assert "a" in cache
+    assert "b" not in cache
