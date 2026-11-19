@@ -355,9 +355,10 @@ have mine, securely ask me for it.
 
 4. (Optional) Point my existing coding agents at the gateway. If I say yes, offer
    to set the OpenAI-compatible base URL to https://api.experientiallabs.ai/v1 and the key to my xpl_ key
-   for the coding agents I actually use — e.g. Claude Code (ANTHROPIC_BASE_URL=https://api.experientiallabs.ai/v1,
-   ANTHROPIC_AUTH_TOKEN=$EXPLABS_API_KEY), Cursor (OpenAI base URL override),
-   Codex, Aider (--openai-api-base https://api.experientiallabs.ai/v1). Show me each change before you
+   for the coding agents I actually use, e.g. Claude Code (ANTHROPIC_BASE_URL=https://api.experientiallabs.ai,
+   ANTHROPIC_API_KEY=$EXPLABS_API_KEY), Cursor (OpenAI base URL override),
+   Codex, Aider (securely configure AIDER_OPENAI_API_KEY from EXPLABS_API_KEY,
+   then --openai-api-base https://api.experientiallabs.ai/v1). Show me each change before you
    make it, put the key in env (never in committed config), and skip any agent I
    don't use. Do NOT do this without my go-ahead.
 
@@ -507,7 +508,7 @@ step 2) as the bearer token on every call below.
    base URL to https://api.experientiallabs.ai/v1 and its key to my xpl_ key (EXPLABS_API_KEY). Put the
    key in env, never in committed config, and show me each change before you make
    it. Skip any agent I don't use; never touch one I don't name.
-   - Claude Code: ANTHROPIC_BASE_URL=https://api.experientiallabs.ai/v1 and ANTHROPIC_AUTH_TOKEN=$EXPLABS_API_KEY
+   - Claude Code: ANTHROPIC_BASE_URL=https://api.experientiallabs.ai and ANTHROPIC_API_KEY=$EXPLABS_API_KEY
      (the gateway serves the Anthropic Messages API at https://api.experientiallabs.ai/v1/messages).
    - Cursor: Settings -> Models -> OpenAI base URL override to https://api.experientiallabs.ai/v1 with my key.
    - Codex: point its OpenAI base URL / OPENAI_BASE_URL at https://api.experientiallabs.ai/v1 with my key.
