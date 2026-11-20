@@ -380,6 +380,11 @@ pub struct Failure {
     /// once while nothing reached the caller (docs: "Malformed tool calls").
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub malformed_tool_call: bool,
+    /// Gemini ended the turn with MALFORMED_FUNCTION_CALL (or
+    /// MALFORMED_RESPONSE): every later dial of this request asks for
+    /// schema-validated function calling (`waterfall/validated_tools.rs`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub validated_tool_redial: bool,
 }
 
 impl Failure {
@@ -404,6 +409,7 @@ impl Failure {
             context_window_limit_tokens: None,
             provider_content_filter: false,
             malformed_tool_call: false,
+            validated_tool_redial: false,
         }
     }
 
