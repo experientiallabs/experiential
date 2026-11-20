@@ -32,8 +32,9 @@ _NEVER_FAILOVER_CLASSES = frozenset(
 
 
 def _rust_wire_names(enum_name: str) -> tuple[str, ...]:
-    """Read one Rust enum's ``as_str`` wire names from ``errors.rs`` in source order."""
-    source = (_ERRORS_RS / "errors.rs").read_text(encoding="utf-8")
+    """Read one Rust enum's ``as_str`` wire names from ``errors.rs`` or its submodules."""
+    files = [_ERRORS_RS / "errors.rs", *sorted((_ERRORS_RS / "errors").glob("*.rs"))]
+    source = "\n".join(path.read_text(encoding="utf-8") for path in files)
     body = re.search(rf"impl {enum_name} \{{.*?fn as_str.*?match self \{{(.*?)\}}", source, re.S)
     assert body is not None, f"{enum_name}::as_str not found"
     return tuple(re.findall(rf'{enum_name}::\w+ => "([a-z_]+)"', body.group(1)))
