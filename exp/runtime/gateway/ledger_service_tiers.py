@@ -9,7 +9,11 @@ from exp.common.models.catalog_prices import GatewayTokenPrices
 from exp.runtime.gateway.budgets import settle_attempt_budgets
 from exp.runtime.gateway.contracts import GatewayEvent, GatewayUsage
 from exp.runtime.gateway.ledger_errors import GatewayLedgerError
-from exp.runtime.gateway.ledger_valuation import estimated_cost_nano_usd, usage_source_label
+from exp.runtime.gateway.ledger_valuation import (
+    estimated_cost_nano_usd,
+    image_input_rates,
+    usage_source_label,
+)
 from exp.runtime.gateway.service_tiers import (
     GatewayServiceTierAdmission,
     GatewayServiceTierSettlement,
@@ -53,7 +57,8 @@ def settle_tier(
             "long_context_input_rate = ?, long_context_cached_input_rate = ?, "
             "long_context_cache_creation_input_rate = ?, "
             "long_context_cache_creation_1h_input_rate = ?, "
-            "long_context_output_rate = ?, long_context_reasoning_rate = ? WHERE attempt_id = ?",
+            "long_context_output_rate = ?, long_context_reasoning_rate = ?, "
+            "image_input_rate = ?, long_context_image_input_rate = ? WHERE attempt_id = ?",
             (
                 prices.input_nano_usd_per_million_tokens,
                 prices.cached_input_nano_usd_per_million_tokens,
@@ -62,6 +67,7 @@ def settle_tier(
                 prices.output_nano_usd_per_million_tokens,
                 prices.reasoning_nano_usd_per_million_tokens,
                 *long_context_values(prices),
+                *image_input_rates(prices),
                 attempt_id,
             ),
         )
@@ -222,4 +228,5 @@ def card_usage_cost(prices: GatewayTokenPrices, usage: GatewayUsage | None) -> i
         cache_creation_1h_input_rate=schedule.cache_creation_1h_input_nano_usd_per_million_tokens,
         output_rate=schedule.output_nano_usd_per_million_tokens,
         reasoning_rate=schedule.reasoning_nano_usd_per_million_tokens,
+        image_input_rate=schedule.image_input_nano_usd_per_million_tokens,
     )

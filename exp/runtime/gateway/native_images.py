@@ -22,8 +22,23 @@ request that dispatches one buffered POST per attempt. Two image wires exist:
   billed per image. Generation models serve ``/v1/images/generations``; every
   model that takes an input image serves ``/v1/images/edits``.
 
-Deliberately absent: OpenAI-wire image edits and variations, streaming
-partial images, and keyed replay.
+``/v1/images/edits`` is also served on two OpenAI-wire families
+(:mod:`exp.runtime.models.providers.image_edits`):
+
+- GPT image models on OpenAI and on Azure's OpenAI Image API wire, as the
+  provider's own ``multipart/form-data`` edit (the data plane keeps the image
+  bytes and encodes the parts at dispatch). The answer bills tokens, its
+  source images as image-input tokens, so a token-priced rung is admitted for
+  an edit only when its card sets
+  ``image_input_nano_usd_per_million_tokens``; image input is never priced at
+  the text rate.
+- xAI Grok Imagine image models, as xAI's JSON edit with data-URI sources.
+  xAI bills every edited image and every source image, so such a rung is
+  admitted for an edit only on a per-image card carrying an ``edit`` rate and
+  an ``input_rates`` entry for it; the attempt settles both legs.
+
+Deliberately absent: image variations, streaming partial images, and keyed
+replay.
 """
 
 from __future__ import annotations
@@ -46,7 +61,13 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import require_unguarded_surface
-from exp.runtime.gateway.images_contracts import ImagesRequest, image_variant, per_image_rate
+from exp.runtime.gateway.images_contracts import (
+    ImagesRequest,
+    edit_unit_card_complete,
+    image_variant,
+    per_image_rate,
+    unit_variant,
+)
 from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
@@ -87,6 +108,13 @@ from exp.runtime.models.providers.bedrock_stability import (
     StabilityParameterError,
     stability_body,
     stability_model,
+)
+from exp.runtime.models.providers.image_edits import (
+    ImageEditParameterError,
+    edits_xai_images,
+    images_edits_url,
+    openai_image_edit_fields,
+    xai_image_edit_request,
 )
 from exp.runtime.models.providers.openai_compatible import (
     openai_images_request,
@@ -193,6 +221,21 @@ def unbillable_wire_error() -> OpenAIProtocolError:
     )
 
 
+def unpriced_edit_error() -> OpenAIProtocolError:
+    """Build the public 400 for an edit rung whose card cannot price every billed leg."""
+    return OpenAIProtocolError(
+        status_code=400,
+        code="unsupported_capability",
+        message=(
+            "This model's provider bills an edit's source images, and its lane has no "
+            "image-input price (or, on a per-image lane, no edit price), so it cannot bill an "
+            "edit. Ask the organization admin to set those prices on the lane, or choose "
+            "another image-editing model."
+        ),
+        param="model",
+    )
+
+
 def _azure_model_id(deployment: ExactModelDeployment) -> str | None:
     """The catalog model id that classifies an Azure image rung, else None.
 
@@ -225,7 +268,11 @@ _STABILITY_UNSUPPORTED_CONTROLS = (
     "background",
     "moderation",
     "output_compression",
+    "input_fidelity",
 )
+
+_RefusedRung = StabilityParameterError | ImageEditParameterError
+"""A rung refusal naming the public parameter its wire cannot carry."""
 
 
 @dataclass(frozen=True)
@@ -233,22 +280,88 @@ class _RungWire:
     """One serving rung's provider body and answer shape.
 
     Attributes:
-        payload: The structured provider body.
+        payload: The structured provider body (for a multipart edit, its text
+            fields; the data plane appends the image parts).
         stability: Whether the rung speaks Stability's Bedrock InvokeModel wire.
+        url: The endpoint to dispatch to when it differs from the rung's
+            generations endpoint (an edit), else None.
+        multipart: Whether the data plane sends the payload as an OpenAI
+            ``multipart/form-data`` edit with the uploaded images.
+        bills_source_images: Whether the provider bills an edit's source images
+            beside its output on a per-image card (xAI).
     """
 
     payload: JsonObject
     stability: bool
+    url: str | None = None
+    multipart: bool = False
+    bills_source_images: bool = False
+
+
+def _openai_edit_wire(
+    profile: GatewayWireProfile,
+    request: ImagesRequest,
+    provider: str,
+    exact_model_id: str | None,
+) -> _RungWire:
+    """Build one OpenAI-wire rung's edit: xAI JSON, or the OpenAI multipart edit.
+
+    Args:
+        profile: The rung's resolved wire profile (``images_url`` present).
+        request: The canonical edit request.
+        provider: The rung's gateway provider.
+        exact_model_id: On Azure, the lane's catalog model id; otherwise None.
+
+    Returns:
+        The rung's edit body and wire shape.
+
+    Raises:
+        ImageEditParameterError: The rung does not edit images, or its wire
+            cannot carry a control of the request.
+    """
+    images_url = profile.images_url or ""
+    edits_url = images_edits_url(images_url)
+    if edits_url is not None and is_xai_images_url(images_url):
+        if not edits_xai_images(profile.model_id):
+            raise ImageEditParameterError("model", "This xAI model does not edit images.")
+        return _RungWire(
+            payload=xai_image_edit_request(profile.model_id, request),
+            stability=False,
+            url=edits_url,
+            bills_source_images=True,
+        )
+    openai_wire = provider == "openai" or (
+        provider == "azure"
+        and not _azure_usage_free_wire(exact_model_id or profile.model_id, profile.model_id)
+    )
+    if not openai_wire or not returns_base64_images_only(profile.model_id, exact_model_id):
+        raise ImageEditParameterError(
+            "model", "Image edits are served by GPT image, Grok Imagine and Stability models."
+        )
+    # Azure resolves its endpoint per wire at dispatch; every other rung edits
+    # beside its generations endpoint.
+    if provider != "azure" and edits_url is None:
+        raise ImageEditParameterError("model", "This connection has no image-edit endpoint.")
+    return _RungWire(
+        payload=openai_image_edit_fields(profile.model_id, request),
+        stability=False,
+        url=edits_url,
+        multipart=True,
+    )
 
 
 def _rung_wire(
-    profile: GatewayWireProfile, request: ImagesRequest, exact_model_id: str | None
+    profile: GatewayWireProfile,
+    request: ImagesRequest,
+    provider: str,
+    exact_model_id: str | None,
 ) -> _RungWire:
     """Build one rung's provider body for the request.
 
     Args:
         profile: The rung's resolved wire profile (``images_url`` present).
         request: The canonical image request.
+        provider: The rung's gateway provider.
         exact_model_id: On Azure, the lane's catalog model id (the deployment
             name in ``profile.model_id`` need not spell the model); otherwise None.
 
@@ -256,14 +369,12 @@ def _rung_wire(
         The rung's body and wire shape.
 
     Raises:
-        StabilityParameterError: The rung's wire cannot carry the request (an
-            OpenAI-wire rung asked to edit, or a Stability control mismatch).
+        StabilityParameterError: A Stability control mismatch.
+        ImageEditParameterError: An OpenAI-wire rung that cannot serve the edit.
     """
     if profile.images_wire == "openai":
         if request.edit is not None:
-            raise StabilityParameterError(
-                "model", "Image edits are served by Bedrock Stability image models only."
-            )
+            return _openai_edit_wire(profile, request, provider, exact_model_id)
         images_url = profile.images_url or ""
         return _RungWire(
             payload=openai_images_request(
@@ -283,6 +394,8 @@ def _rung_wire(
     if request.n != 1:
         raise StabilityParameterError("n", "Stability image models return one image per request.")
     edit = request.edit
+    if edit is not None and edit.additional_images:
+        raise StabilityParameterError("image", "Stability image models edit one image.")
     if edit is not None and request.size is not None:
         raise StabilityParameterError(
             "size", "A Stability edit keeps the input image's size; omit size."
@@ -301,6 +414,58 @@ def _rung_wire(
         ),
         stability=True,
     )
+
+
+def _edit_priced(prices: GatewayTokenPrices, request: ImagesRequest, wire: _RungWire) -> bool:
+    """Whether one OpenAI-wire edit rung's card prices every leg the provider bills.
+
+    A per-image card must price the edited images and the source images by
+    name (:func:`edit_unit_card_complete`); a token card must carry input,
+    output and image-input rates, so source images are never priced at the
+    text rate. Fail-closed: anything else is excluded.
+
+    Args:
+        prices: The rung's price card.
+        request: The canonical edit request.
+        wire: The rung's edit wire.
+
+    Returns:
+        True when the rung may be admitted for the edit.
+    """
+    if _per_image(prices):
+        return edit_unit_card_complete(prices, request)
+    if wire.bills_source_images:
+        # xAI reports no token usage; only a per-image card can bill it.
+        return False
+    return None not in (
+        prices.input_nano_usd_per_million_tokens,
+        prices.output_nano_usd_per_million_tokens,
+        prices.image_input_nano_usd_per_million_tokens,
+    )
+
+
+def _unit_billing(
+    prices: GatewayTokenPrices, request: ImagesRequest, wire: _RungWire
+) -> JsonObject | None:
+    """The data plane's per-image billing for one rung, or None for token billing.
+
+    Args:
+        prices: The rung's price card.
+        request: The canonical request.
+        wire: The rung's wire.
+
+    Returns:
+        ``{"variant": ...}`` plus, for an edit whose provider bills its source
+        images, ``"input_images"`` (the count billed at the card's input rate).
+    """
+    if not _per_image(prices):
+        return None
+    billing: JsonObject = {"variant": unit_variant(prices, request)}
+    edit = request.edit
+    if edit is not None and not wire.stability and prices.units is not None:
+        if prices.units.input_rates is not None:
+            billing["input_images"] = edit.input_image_parts
+    return billing
 
 
 class NativeImagesMixin:
@@ -388,7 +553,7 @@ def _no_serving_rung_error(
     request: ImagesRequest,
     *,
     unpriced: bool,
-    refused: StabilityParameterError | None,
+    refused: _RefusedRung | None,
 ) -> OpenAIProtocolError:
     """The public 400 when no rung of the alias can serve this image request.
 
@@ -457,7 +622,8 @@ def _admit_accepted(
     base64_only = False
     unbillable = False
     unsupported: AzureImagesUnsupportedError | None = None
-    refused: StabilityParameterError | None = None
+    unpriced_edit = False
+    refused: _RefusedRung | None = None
     for index, (profile, client) in zip(
         dispatchable.indexes, dispatchable.resolved_wires, strict=True
     ):
@@ -466,24 +632,27 @@ def _admit_accepted(
         supports = None if capabilities is None else capabilities.supports_image_generation
         if not _images_rung(profile.images_url, supports):
             continue
-        if (
-            request.edit is None
-            and request.response_format == "url"
-            and returns_base64_images_only(profile.model_id, _azure_model_id(deployment))
+        if request.response_format == "url" and returns_base64_images_only(
+            profile.model_id, _azure_model_id(deployment)
         ):
             # A GPT image model answers base64 only and the gateway hosts no
             # images to link to, so the rung cannot honor ``url`` (fail-closed).
-            # An edit is left to ``_rung_wire``: no OpenAI-wire rung edits.
             base64_only = True
             continue
         try:
-            wire = _rung_wire(profile, request, _azure_model_id(deployment))
-        except StabilityParameterError as exc:
+            wire = _rung_wire(profile, request, deployment.provider, _azure_model_id(deployment))
+        except (StabilityParameterError, ImageEditParameterError) as exc:
             # The first refusal names the parameter if no other rung serves.
             refused = refused or exc
             continue
         prices = deployment.gateway.prices
-        if (wire.stability or _per_image(prices)) and (
+        if request.edit is not None and not wire.stability:
+            if not _edit_priced(prices, request, wire):
+                # The provider bills legs this card cannot price; never at
+                # the text or generation rate (fail-closed).
+                unpriced_edit = True
+                continue
+        elif (wire.stability or _per_image(prices)) and (
             not _per_image(prices) or per_image_rate(prices, request) is None
         ):
             # A Stability rung bills per image only; a per-image card with no
@@ -521,6 +690,8 @@ def _admit_accepted(
             raise NativeBridgeError(
                 unsupported_request_error(unsupported.param, unsupported.message)
             )
+        if unpriced_edit and not unpriced and refused is None:
+            raise NativeBridgeError(unpriced_edit_error())
         if unbillable and not unpriced and refused is None:
             raise NativeBridgeError(unbillable_wire_error())
         raise NativeBridgeError(
@@ -531,6 +702,7 @@ def _admit_accepted(
     signers: list[GatewayDispatchSigner | None] = []
     bindings: list[FrozenDispatchBinding | None] = []
     shapes: list[JsonObject] = []
+    unit_billing: list[JsonObject | None] = []
     try:
         for deployment, index in zip(route.deployments, serving, strict=True):
             require_gateway_provider(deployment.provider)
@@ -547,10 +719,16 @@ def _admit_accepted(
                     request=request,
                     openai_body=wire.payload,
                 )
-                dispatch_profile = replace(profile, url=dispatch.url, headers=dispatch.headers)
+                url = dispatch.url
+                if wire.multipart:
+                    # A GPT image edit goes beside the Image API's generations path.
+                    url = images_edits_url(dispatch.url)
+                    if url is None:  # pragma: no cover - the Image API path always matches.
+                        raise GatewayRoutingError("Azure image rung has no edit endpoint")
+                dispatch_profile = replace(profile, url=url, headers=dispatch.headers)
                 payload = dispatch.body
             else:
-                dispatch_profile = replace(profile, url=images_url)
+                dispatch_profile = replace(profile, url=wire.url or images_url)
                 payload = wire.payload
             upstream_body, signer = frozen_dispatch(dispatch_profile, client, payload)
             wire_route.append(
@@ -564,11 +742,17 @@ def _admit_accepted(
                     url=images_url, body_sha256=sha256_bytes(upstream_body.encode("utf-8"))
                 )
             )
-            shapes.append(
-                {"shape": "stability", "output_format": request.output_format or "png"}
-                if wire.stability
-                else {"shape": "openai"}
-            )
+            if wire.stability:
+                shapes.append(
+                    {"shape": "stability", "output_format": request.output_format or "png"}
+                )
+            elif wire.multipart:
+                # The data plane sends ``payload`` as the text fields of an
+                # OpenAI multipart edit, beside the uploaded image parts.
+                shapes.append({"shape": "openai", "multipart": True})
+            else:
+                shapes.append({"shape": "openai"})
+            unit_billing.append(_unit_billing(deployment.gateway.prices, request, wire))
     except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
         error = authority_error(exc)
         plane._accounting.finish_request_quietly(  # noqa: SLF001
@@ -601,11 +785,9 @@ def _admit_accepted(
         "route_reason": route.route_reason,
         "route": wire_route,
         "image_count": request.n,
-        # Aligned with ``route``: a per-image rung settles image units at this variant.
-        "unit_billing": [
-            {"variant": image_variant(request)} if _per_image(deployment.gateway.prices) else None
-            for deployment in route.deployments
-        ],
+        # Aligned with ``route``: a per-image rung settles image units at this
+        # variant (and an edit's billed source images at the card's input rate).
+        "unit_billing": unit_billing,
         # Aligned with ``route``: the answer shape each rung's provider returns.
         "wire_shapes": shapes,
         "maximum_total_attempts": MAXIMUM_TOTAL_ATTEMPTS,

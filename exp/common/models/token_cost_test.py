@@ -316,3 +316,73 @@ def test_an_unset_twelve_hour_rate_leaves_the_card_identity_unchanged() -> None:
         priority=GatewayServiceTierPrices(cache_creation_12h_input_nano_usd_per_million_tokens=9)
     ).for_service_tier("priority")
     assert priority.cache_creation_12h_input_nano_usd_per_million_tokens == 9
+
+
+def _image_input_cost(image_input_tokens: int | None, image_input_rate: int | None) -> int | None:
+    """Price a gpt-image-2.5-sunburst edit: 1,554 input (1,536 image) and 196 output."""
+    return token_cost_nano_usd(
+        input_tokens=1_554,
+        output_tokens=196,
+        cached_input_tokens=0,
+        cache_write_input_tokens=0,
+        cache_write_1h_input_tokens=0,
+        reasoning_tokens=0,
+        input_rate=5_000_000_000,
+        cached_input_rate=2_000_000_000,
+        cache_creation_input_rate=5_000_000_000,
+        cache_creation_1h_input_rate=5_000_000_000,
+        output_rate=30_000_000_000,
+        reasoning_rate=30_000_000_000,
+        image_input_tokens=image_input_tokens,
+        image_input_rate=image_input_rate,
+    )
+
+
+def test_source_image_tokens_price_at_the_image_input_rate() -> None:
+    """The image subset meets its own rate; the text remainder keeps the input rate."""
+    assert (
+        _image_input_cost(1_536, 8_000_000_000)
+        == (1_536 * 8_000_000_000 + 18 * 5_000_000_000 + 196 * 30_000_000_000 + 500_000)
+        // 1_000_000
+    )
+
+
+def test_an_image_input_subset_past_the_input_is_held_inside_it() -> None:
+    """``min(image, input)`` prices at the image rate, never more tokens than were read."""
+    assert (
+        _image_input_cost(9_999, 8_000_000_000)
+        == (1_554 * 8_000_000_000 + 196 * 30_000_000_000 + 500_000) // 1_000_000
+    )
+
+
+def test_without_an_image_input_rate_image_tokens_stay_ordinary_input() -> None:
+    """A card without the rate prices exactly as before it existed."""
+    expected = (1_554 * 5_000_000_000 + 196 * 30_000_000_000 + 500_000) // 1_000_000
+    assert _image_input_cost(1_536, None) == expected
+    assert _image_input_cost(None, None) == expected
+
+
+def test_an_unreported_image_input_count_with_a_distinct_rate_is_unknown() -> None:
+    """Every text/image split of the input prices differently, so cost is unknown."""
+    assert _image_input_cost(None, 8_000_000_000) is None
+    # A reported zero is a measurement: all input is text.
+    assert (
+        _image_input_cost(0, 8_000_000_000)
+        == (1_554 * 5_000_000_000 + 196 * 30_000_000_000 + 500_000) // 1_000_000
+    )
+
+
+def test_image_input_rate_joins_every_card_and_the_input_maximum() -> None:
+    """Tier cards carry the rate, an unset one is omitted, and reservations take it."""
+    card = GatewayTokenPrices(input_nano_usd_per_million_tokens=5)
+    assert "image_input_nano_usd_per_million_tokens" not in card.model_dump(exclude_defaults=True)
+    flex = GatewayTokenPrices(
+        flex=GatewayServiceTierPrices(image_input_nano_usd_per_million_tokens=7)
+    ).for_service_tier("flex")
+    assert flex.image_input_nano_usd_per_million_tokens == 7
+    priced = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=5, image_input_nano_usd_per_million_tokens=8
+    )
+    assert schedule_maximum_cost_nano_usd(priced, input_tokens=1_000_000, output_tokens=0) == 8
+    usage = Usage(input_tokens=1, output_tokens=0, cached_input_tokens=0, reasoning_tokens=0)
+    assert schedule_usage_cost_nano_usd(priced, usage) is None

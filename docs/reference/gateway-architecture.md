@@ -530,8 +530,7 @@ When the write ledger can price settlements (`SettlementPricer.price_attempt`: n
 A ledger without that capability (the local engine) or a failed quote keeps the stricter order (settlement lands before any terminal frame, else the stream ends without them); non-streaming bodies are always returned only after their settlement landed.
 Settlement replaces the reservation with observed integer nano-USD usage. A dispatched failure, cancellation, or crash without trustworthy usage retains its conservative reservation because it may be billable. Retries and fallbacks therefore consume one allocation entry per physical attempt, while keyed replay creates no new reservation. A period is the immutable UTC bucket beginning at `YYYY-MM-01T00:00:00+00:00`; rollover selects a new bucket and never clears or rewrites an earlier month. Management and remaining-allocation reports are CLI surfaces only. There is no budgets dashboard.
 
-Media priced per character, second, or image settles its billed units on the unit card frozen
-at reservation ([gateway-media-surfaces.md](gateway-media-surfaces.md)).
+Media priced per character, second, or image settles its billed units (and any consumed `input_quantity_milli` leg, at the card's `input_rates`) on the unit card frozen at reservation; see [gateway-media-surfaces.md](gateway-media-surfaces.md), which also defines `image_input_tokens`.
 
 Normalized usage follows OpenAI subset semantics on every wire: `reasoning_tokens` counts a subset
 of `output_tokens`; cache reads and writes are disjoint subsets of `input_tokens`. A report whose

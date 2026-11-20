@@ -119,7 +119,7 @@ Generations: `size` becomes the nearest Stability `aspect_ratio` (`1792x1024` is
 before any provider call. An edit-only tool on this surface answers a 400 pointing to
 `/v1/images/edits`.
 
-Edits take the official SDKs' `multipart/form-data`: the `image` part (or a one-entry `image[]`),
+Edits take the official SDKs' `multipart/form-data`: the `image` part (or one `image[]` part),
 an optional `mask` (inpaint and erase object), and `style_image` (style transfer, where `image`
 travels as Stability's `init_image`); each part at most 20 MB. Text fields: `model`, `prompt`
 (required by every tool except outpaint, erase object, remove background, fast upscale and
@@ -130,9 +130,48 @@ tool that accepts it and otherwise refused by name: `negative_prompt`, `seed` (0
 required), `left`, `right`, `up`, `down` (outpaint margins, 0 to 2000, at least one above 0),
 `creativity`, `control_strength`, `fidelity`, `composition_fidelity`, `style_strength`,
 `change_strength`, and `strength` (SD 3.5 Large and Ultra image-to-image, default 0.7). `size`
-is refused (an edit keeps the input size), as are `stream`, `partial_images` and
-`input_fidelity`. Edits are served by Stability rungs only: an OpenAI-wire alias answers a 400 on
-`model`.
+is refused (an edit keeps the input size), as are `stream`, `partial_images`,
+`input_fidelity`, and more than one source image. Stability, GPT image, and Grok Imagine rungs
+edit (below); any other alias answers a 400 on `model`.
+
+### Image edits on GPT image models and xAI Grok Imagine
+
+`/v1/images/edits` also serves OpenAI's GPT image models (`gpt-image-*`, `chatgpt-image-*`) on an
+`openai` connection and on an Azure connection's OpenAI Image API wire, and xAI's Grok Imagine
+image models (`grok-imagine-image*`) on an xAI connection. The caller sends the same multipart
+upload; the source images are the `image` part or up to 16 repeated `image[]` parts, in order.
+Each part is at most 20 MB and the whole upload at most about 62 MB (a 413 otherwise). Both
+providers require a prompt, so a promptless edit (which a Stability tool may take) excludes these
+rungs with a 400 on `prompt` when no other rung remains.
+
+- **GPT image models**: the gateway sends the provider's own `multipart/form-data` edit to the
+  rung's `/images/edits` (beside its `/images/generations`, query kept): the source images as
+  `image` (one) or repeated `image[]` (several), any `mask`, and the text fields `model` (the
+  rung's wire id), `prompt`, `n`, `size`, `quality`, `background`, `input_fidelity`,
+  `output_format`, `output_compression`, and `moderation`. `response_format` is never sent; a
+  `url` request excludes the rung (a 400 on `response_format` when none remains). `style_image`,
+  `style`, and every Stability control are refused by name. A model that does not accept a
+  control (`gpt-image-2.5-sunburst` refuses `input_fidelity`) answers the provider's 400. The
+  answer bills tokens and reports `usage.input_tokens_details.image_tokens`: the image-modality
+  subset of the input, carried to settlement as `image_input_tokens` (absent breakdown is unknown,
+  a reported 0 is 0) and priced at the card's `image_input_nano_usd_per_million_tokens`, the rest
+  of the input at the input rate. A token card without that rate is not admitted for edits (it
+  still generates): a 400 `unsupported_capability` naming the missing image-input price when no
+  rung remains. Source images are never priced at the text rate. The reservation adds 8,192
+  image-input tokens per source image and mask at the higher of the input and image-input rates.
+- **xAI Grok Imagine**: the upload becomes xAI's JSON edit at `{root}/images/edits`: the source
+  images as data URIs in `image` (one) or `images` (two to five), `prompt`, `n`, and
+  `response_format: "b64_json"`. A mask, more than five images, an image that is not PNG, JPEG or
+  WebP, and `size`, `quality`, `background`, `input_fidelity`, `output_format`,
+  `output_compression`, `moderation`, `style` or a Stability control are refused by name. xAI bills
+  each edited image and each source image, so an xAI rung is admitted for an edit only on an
+  `image` unit card that authors an `edit` rate in `rates` and a consumed-image rate in
+  `input_rates` (`{"kind": "image", "rates": {"": 40000000, "edit": 60000000}, "input_rates":
+  {"": 10000000}}` for Grok Imagine Image 2.0). The attempt settles `n` units at the `edit` rate
+  plus one consumed unit per source image at the input rate; a card missing either is excluded,
+  never billed at the generation rate. Measured on `grok-imagine-image-2.0` (2026-11-19, xAI's
+  `usage.cost_in_usd_ticks` at 1e10 ticks per dollar): a generation $0.04, an edit $0.06 per
+  edited image plus $0.01 per source image, whatever the source image's size.
 
 Fireworks retired serverless image generation (FLUX) on 2026-06-10, so no Fireworks image lane
 exists.

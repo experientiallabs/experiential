@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from exp.common.models.catalog_prices import GatewayUnitPrices
+from exp.common.models.catalog_prices import GatewayTokenPrices, GatewayUnitPrices
 from exp.common.models.token_cost import token_cost_nano_usd
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
@@ -68,6 +68,7 @@ def estimated_cost_nano_usd(
     reasoning_rate: int | None,
     image_output_rate: int | None = None,
     cache_creation_12h_input_rate: int | None = None,
+    image_input_rate: int | None = None,
 ) -> int | None:
     """Compute attributed integer nano-USD or preserve unknown pricing.
 
@@ -95,6 +96,8 @@ def estimated_cost_nano_usd(
             None to keep them priced as ordinary output.
         cache_creation_12h_input_rate: Nano-USD per million observed OpenAI 12-hour
             writes, or None to price them at 2.5 times ``input_rate``.
+        image_input_rate: Nano-USD per million image-modality input tokens, or
+            None to keep them priced as ordinary input.
 
     Returns:
         Rounded nano-USD, or None when usage, TTL evidence, or a required rate is missing.
@@ -123,6 +126,8 @@ def estimated_cost_nano_usd(
         image_output_rate=image_output_rate,
         cache_write_12h_input_tokens=usage.cache_creation_12h_input_tokens,
         cache_creation_12h_input_rate=cache_creation_12h_input_rate,
+        image_input_tokens=usage.image_input_tokens,
+        image_input_rate=image_input_rate,
     )
     return None if cost is None else require_representable_nano_usd(cost, what="attempt cost")
 
@@ -164,6 +169,35 @@ def unit_cost_nano_usd(billed: BilledUnits, rate: int | None) -> int | None:
     return require_representable_nano_usd(cost, what="unit cost")
 
 
+def billed_units_cost_nano_usd(billed: BilledUnits, card: GatewayUnitPrices | None) -> int | None:
+    """Price both legs of billed units on a frozen unit card.
+
+    The produced leg prices at :func:`unit_rate_nano_usd`; a consumed leg
+    (``input_quantity_milli``, an image edit's source images) prices at the
+    card's input rate for the same variant. Either leg unpriced leaves the
+    whole cost unknown, never the other leg alone.
+
+    Args:
+        billed: The units one attempt consumed or produced.
+        card: The unit card frozen at reservation, or None.
+
+    Returns:
+        Rounded nano-USD, or None when a billed leg has no rate.
+
+    Raises:
+        NanoUsdOverflowError: The cost does not fit the signed 64-bit ledger column.
+    """
+    produced = unit_cost_nano_usd(billed, unit_rate_nano_usd(billed, card))
+    if produced is None or billed.input_quantity_milli is None:
+        return produced
+    assert card is not None  # A priced produced leg proves the card exists.
+    input_rate = card.input_rate_for(billed.variant)
+    if input_rate is None:
+        return None
+    consumed = (billed.input_quantity_milli * input_rate + 500) // 1000
+    return require_representable_nano_usd(produced + consumed, what="unit cost")
+
+
 def frozen_unit_card(row: sqlite3.Row) -> GatewayUnitPrices | None:
     """Read the unit card an attempt froze at reservation, if any."""
     raw = row["unit_prices"]
@@ -172,21 +206,28 @@ def frozen_unit_card(row: sqlite3.Row) -> GatewayUnitPrices | None:
 
 def billed_unit_columns(
     row: sqlite3.Row, usage: GatewayUsage | None
-) -> tuple[str | None, str | None, int | None, int | None]:
-    """The billed-unit kind, variant, quantity, and pricing rate an attempt persists.
+) -> tuple[str | None, str | None, int | None, int | None, int | None]:
+    """The billed-unit kind, variant, quantity, pricing rate, and consumed quantity.
 
     Args:
         row: Attempt row carrying the unit card frozen at reservation.
         usage: Settled usage, or None.
 
     Returns:
-        All four as None for a token-priced or unmetered attempt.
+        All five as None for a token-priced or unmetered attempt; the consumed
+        quantity is None on an attempt that bills no consumed units.
     """
     billed = None if usage is None else usage.billed_units
     if billed is None:
-        return None, None, None, None
+        return None, None, None, None, None
     rate = unit_rate_nano_usd(billed, frozen_unit_card(row))
-    return billed.kind.value, billed.variant, billed.quantity_milli, rate
+    return (
+        billed.kind.value,
+        billed.variant,
+        billed.quantity_milli,
+        rate,
+        billed.input_quantity_milli,
+    )
 
 
 def terminal_values(
@@ -292,6 +333,22 @@ def optional_int(value: int | None) -> int | None:
     return None if value is None else int(value)
 
 
+def image_input_rates(prices: GatewayTokenPrices) -> tuple[int | None, int | None]:
+    """Freeze the base and long-context image-input rates beside the other attempt rates.
+
+    Args:
+        prices: The schedule the attempt was reserved on.
+
+    Returns:
+        The base and long-context image-input rates (None where unset).
+    """
+    tier = prices.long_context
+    return (
+        prices.image_input_nano_usd_per_million_tokens,
+        None if tier is None else tier.image_input_nano_usd_per_million_tokens,
+    )
+
+
 def frozen_usage_cost(
     row: sqlite3.Row, usage: GatewayUsage | None, *, prefix: str = ""
 ) -> int | None:
@@ -317,16 +374,21 @@ def frozen_usage_cost(
         cache_creation_1h_input_rate=optional_int(row[f"{prefix}cache_creation_1h_input_rate"]),
         output_rate=optional_int(row[f"{prefix}output_rate"]),
         reasoning_rate=optional_int(row[f"{prefix}reasoning_rate"]),
+        image_input_rate=(
+            None if prefix == "preferred_" else optional_int(row[f"{prefix}image_input_rate"])
+        ),
     )
+    if prefix == "preferred_" and usage is not None and usage.image_input_tokens:
+        # The preferred rung's image-input rate is not frozen; its
+        # counterfactual price for image input stays unknown, never the text rate.
+        return None
     if usage is None or usage.billed_units is None:
         return token_cost
     if prefix == "preferred_":
         # Only the dispatched rung's unit card is frozen; a counterfactual
         # price for units stays unknown rather than borrowing that card.
         return None
-    unit_cost = unit_cost_nano_usd(
-        usage.billed_units, unit_rate_nano_usd(usage.billed_units, frozen_unit_card(row))
-    )
+    unit_cost = billed_units_cost_nano_usd(usage.billed_units, frozen_unit_card(row))
     if unit_cost is None:
         return None
     if usage.input_tokens is None and usage.output_tokens is None:

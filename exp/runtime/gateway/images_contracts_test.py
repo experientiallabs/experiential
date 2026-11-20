@@ -8,12 +8,17 @@ from pydantic import ValidationError
 from exp.common.models import BilledUnitKind, GatewayTokenPrices, GatewayUnitPrices
 from exp.runtime.gateway.contracts import GatewayApiSurface
 from exp.runtime.gateway.images_contracts import (
+    EDIT_VARIANT,
+    MAXIMUM_EDIT_INPUT_IMAGE_TOKENS,
     MAXIMUM_IMAGE_OUTPUT_TOKENS,
     ImageEditInput,
     ImagesRequest,
+    edit_unit_card_complete,
     image_variant,
     images_ceiling_nano_usd,
     per_image_rate,
+    per_input_image_rate,
+    unit_variant,
 )
 from exp.runtime.gateway.ledger_valuation import NanoUsdOverflowError
 
@@ -113,3 +118,81 @@ def test_edit_options_require_an_edit() -> None:
         edit=ImageEditInput(image="aW1hZ2U=", mask="bWFzaw=="), edit_options={"seed": 1}
     )
     assert request.edit_options == {"seed": 1}
+
+
+_GROK_EDIT_CARD = GatewayTokenPrices(
+    units=GatewayUnitPrices(
+        kind=BilledUnitKind.IMAGE,
+        rates={"": 40_000_000, EDIT_VARIANT: 60_000_000},
+        input_rates={"": 10_000_000},
+    )
+)
+
+
+def _edit(images: int = 1, *, mask: bool = False, n: int = 1) -> ImagesRequest:
+    """One edit of ``images`` source images (and an optional mask)."""
+    return ImagesRequest(
+        prompt="combine",
+        n=n,
+        edit=ImageEditInput(
+            image="aW1n",
+            additional_images=("aW1n",) * (images - 1),
+            mask="bWFzaw==" if mask else None,
+        ),
+    )
+
+
+def test_an_edit_carries_up_to_sixteen_source_images_and_counts_its_parts() -> None:
+    """Every source image and the mask are image parts a provider reads."""
+    edit = _edit(3, mask=True).edit
+    assert edit is not None and edit.input_image_parts == 4 and len(edit.images) == 3
+    with pytest.raises(ValidationError):
+        _edit(17)
+    with pytest.raises(ValidationError, match="input_fidelity"):
+        ImagesRequest(prompt="a cat", input_fidelity="high")
+
+
+def test_an_edit_is_priced_at_the_edit_variant_never_the_generation_rate() -> None:
+    """An authored ``edit`` rate prices edits; generations keep the flat rate."""
+    assert unit_variant(_GROK_EDIT_CARD, _edit()) == EDIT_VARIANT
+    assert per_image_rate(_GROK_EDIT_CARD, _edit()) == 60_000_000
+    assert per_image_rate(_GROK_EDIT_CARD, ImagesRequest(prompt="a cat")) == 40_000_000
+    assert per_input_image_rate(_GROK_EDIT_CARD, _edit()) == 10_000_000
+    assert edit_unit_card_complete(_GROK_EDIT_CARD, _edit())
+    flat_only = GatewayTokenPrices(
+        units=GatewayUnitPrices(kind=BilledUnitKind.IMAGE, rates={"": 40_000_000})
+    )
+    assert unit_variant(flat_only, _edit()) == image_variant(_edit())
+    assert not edit_unit_card_complete(flat_only, _edit())
+
+
+def test_a_per_image_edit_reserves_both_legs() -> None:
+    """Two edited images at $0.06 and three source images at $0.01."""
+    request = _edit(3, n=2)
+    ceiling = images_ceiling_nano_usd(
+        request,
+        input_tokens=0,
+        input_rate=None,
+        output_rate=None,
+        image_rate=per_image_rate(_GROK_EDIT_CARD, request),
+        input_image_rate=per_input_image_rate(_GROK_EDIT_CARD, request),
+    )
+    assert ceiling == 2 * 60_000_000 + 3 * 10_000_000
+
+
+def test_a_token_edit_reserves_each_source_image_at_the_image_input_rate() -> None:
+    """Each image part adds the per-image token bound at the higher input rate."""
+    request = _edit(2, mask=True)
+    ceiling = images_ceiling_nano_usd(
+        request,
+        input_tokens=10,
+        input_rate=5_000_000_000,
+        output_rate=30_000_000_000,
+        image_input_rate=8_000_000_000,
+    )
+    numerator = (
+        10 * 5_000_000_000
+        + 3 * MAXIMUM_EDIT_INPUT_IMAGE_TOKENS * 8_000_000_000
+        + MAXIMUM_IMAGE_OUTPUT_TOKENS * 30_000_000_000
+    )
+    assert ceiling == (numerator + 999_999) // 1_000_000

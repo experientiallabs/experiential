@@ -44,6 +44,7 @@ class GatewayLongContextTier(ContractModel):
     output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     image_output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    image_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
 
 
 class GatewayServiceTierPrices(ContractModel):
@@ -64,6 +65,7 @@ class GatewayServiceTierPrices(ContractModel):
     output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     image_output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    image_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     long_context: GatewayLongContextTier | None = None
 
 
@@ -103,18 +105,30 @@ class GatewayUnitPrices(ContractModel):
     whose variant has no rate falls back to the flat rate when one exists and
     is otherwise unpriced (fail-closed: never billed at an invented rate).
 
+    A provider that also bills what a request CONSUMES of the same kind (xAI
+    bills every source image of an image edit beside each image it returns)
+    prices those units in ``input_rates``, keyed and resolved exactly like
+    ``rates``. ``input_rates`` defaults to None (excluded from identity while
+    None): the lane bills no consumed units, and a request a provider would
+    bill consumed units for is never admitted on it (fail-closed).
+
     Attributes:
         kind: What one billed unit measures.
-        rates: Variant to integer nano-USD per unit; at least one entry.
+        rates: Variant to integer nano-USD per unit produced; at least one entry.
+        input_rates: Variant to integer nano-USD per unit consumed (an image
+            edit's source image), or None when the lane bills no consumed units.
     """
 
     kind: BilledUnitKind
     rates: dict[str, int] = Field(min_length=1)
+    input_rates: dict[str, int] | None = Field(default=None, min_length=1)
 
-    @field_validator("rates")
+    @field_validator("rates", "input_rates")
     @classmethod
-    def _bounded_rates(cls, value: dict[str, int]) -> dict[str, int]:
+    def _bounded_rates(cls, value: dict[str, int] | None) -> dict[str, int] | None:
         """Reject an out-of-range rate or an unbounded variant name."""
+        if value is None:
+            return value
         for variant, rate in value.items():
             if len(variant) > MAXIMUM_UNIT_VARIANT_CHARACTERS:
                 msg = (
@@ -144,6 +158,22 @@ class GatewayUnitPrices(ContractModel):
             return self.rates[variant]
         return self.rates.get("")
 
+    def input_rate_for(self, variant: str) -> int | None:
+        """Return the consumed-unit rate for one variant, falling back to its flat rate.
+
+        Args:
+            variant: The request's priced variant; ``""`` asks for the flat rate.
+
+        Returns:
+            Integer nano-USD per consumed unit, or None when the card prices no
+            consumed units for the variant.
+        """
+        if self.input_rates is None:
+            return None
+        if variant in self.input_rates:
+            return self.input_rates[variant]
+        return self.input_rates.get("")
+
 
 MINUTES_PER_DAY = 24 * 60
 MAXIMUM_PEAK_WINDOWS = 32
@@ -169,6 +199,7 @@ _TOKEN_RATE_FIELDS = (
     "output_nano_usd_per_million_tokens",
     "reasoning_nano_usd_per_million_tokens",
     "image_output_nano_usd_per_million_tokens",
+    "image_input_nano_usd_per_million_tokens",
 )
 """Every per-million token rate shared by base, tier, long-context, and off-peak cards."""
 
@@ -311,6 +342,12 @@ class GatewayTokenPrices(ContractModel):
         image_output_nano_usd_per_million_tokens: Generated-image tokens inside the
             output. None (the default) prices them at the output rate, the behavior of
             every card without it; it is excluded from identity while None.
+        image_input_nano_usd_per_million_tokens: Image-modality tokens inside the
+            input (an image edit's source images, OpenAI's
+            ``input_tokens_details.image_tokens``). None (the default) prices them
+            at the input rate, the behavior of every card without it; it is
+            excluded from identity while None. A token-billed image-edit rung is
+            admitted only when its card sets it.
         long_context: Whole-request premium schedule for long-context input, or None.
         flex: Pass-through rates for ``service_tier='flex'``, or None.
         priority: Pass-through rates for ``service_tier='priority'``, or None.
@@ -329,6 +366,7 @@ class GatewayTokenPrices(ContractModel):
     output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     image_output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    image_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     long_context: GatewayLongContextTier | None = None
     """Whole-request premium schedule for long-context input, when one exists.
 
@@ -402,6 +440,7 @@ class GatewayTokenPrices(ContractModel):
             output_nano_usd_per_million_tokens=card.output_nano_usd_per_million_tokens,
             reasoning_nano_usd_per_million_tokens=card.reasoning_nano_usd_per_million_tokens,
             image_output_nano_usd_per_million_tokens=card.image_output_nano_usd_per_million_tokens,
+            image_input_nano_usd_per_million_tokens=card.image_input_nano_usd_per_million_tokens,
             long_context=card.long_context,
         )
 
@@ -442,6 +481,7 @@ class GatewayTokenPrices(ContractModel):
             output_nano_usd_per_million_tokens=card.output_nano_usd_per_million_tokens,
             reasoning_nano_usd_per_million_tokens=card.reasoning_nano_usd_per_million_tokens,
             image_output_nano_usd_per_million_tokens=card.image_output_nano_usd_per_million_tokens,
+            image_input_nano_usd_per_million_tokens=card.image_input_nano_usd_per_million_tokens,
             long_context=card.long_context,
             # Processing tiers reprice tokens only; a unit card is tier-independent.
             units=self.units,

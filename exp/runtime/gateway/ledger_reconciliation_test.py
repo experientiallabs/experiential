@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from exp.common.models.catalog import GatewayDeploymentMetadata, GatewayTokenPrices
 from exp.common.models.catalog_prices import BilledUnitKind, GatewayUnitPrices
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.sqlite.connection import close_idle_connections
 from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind, SQLiteBudgetStore
 from exp.runtime.gateway.contracts import (
     GatewayEvent,
@@ -1069,21 +1070,27 @@ def test_customer_waiver_cannot_acknowledge_an_ordinary_unresolved_provider_term
             assert budgets.remaining(organization_id="org-one", period="2026-08") == allocations
 
 
-def test_schema32_preserves_legacy_failure_without_inventing_recovery(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_schema32_preserves_legacy_failure_without_inventing_recovery(tmp_path: Path) -> None:
     """The additive migration defaults old terminal rows to immutable and preserves money."""
-    with monkeypatch.context() as prior:
-        prior.setattr(migrations, "SCHEMA_VERSION", 31)
-        _, store, ledger, budgets, attempt = _started(tmp_path)
-        failure = GatewayFailure(
-            failure_class=GatewayFailureClass.INTERNAL,
-            safe_message="previous failure",
-        )
-        terminal = GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=0, failure=failure)
-        ledger.finish_attempt(attempt_id=attempt, terminal_event=terminal, failure=failure)
-        before = dict(_attempt_row(tmp_path, attempt))
+    _, store, ledger, budgets, attempt = _started(tmp_path)
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.INTERNAL,
+        safe_message="previous failure",
+    )
+    terminal = GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=0, failure=failure)
+    ledger.finish_attempt(attempt_id=attempt, terminal_event=terminal, failure=failure)
+    close_idle_connections()
+    # Rewind the file to schema 31: drop the columns v32 and later add.
+    with sqlite3.connect(store.database_path) as connection:
+        for column in (
+            "accounting_recovery",
+            "billed_input_quantity_milli",
+            "image_input_rate",
+            "long_context_image_input_rate",
+        ):
+            connection.execute(f"ALTER TABLE gateway_attempts DROP COLUMN {column}")
+        connection.execute("PRAGMA user_version = 31")
+    before = dict(_attempt_row(tmp_path, attempt))
     assert "accounting_recovery" not in before
     backup = migrations.initialize_database(store.database_path)
     assert backup is not None
@@ -1094,6 +1101,9 @@ def test_schema32_preserves_legacy_failure_without_inventing_recovery(
         }
     after = dict(_attempt_row(tmp_path, attempt))
     assert after.pop("accounting_recovery") == 0
+    for column in ("billed_input_quantity_milli", "image_input_rate"):
+        assert after.pop(column) is None
+    assert after.pop("long_context_image_input_rate") is None
     assert after == before
     with pytest.raises(GatewayLedgerError, match="differs from durable accounting evidence"):
         ledger.finish_attempt(attempt_id=attempt, terminal_event=_observed(), failure=None)

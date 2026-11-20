@@ -23,6 +23,7 @@ fn seconds_meter(seconds: f64) -> Result<Usage, Failure> {
             kind: "audio_second".to_string(),
             variant: String::new(),
             quantity_milli: (seconds * 1000.0).ceil() as u64,
+            input_quantity_milli: None,
         }),
         ..Usage::default()
     })

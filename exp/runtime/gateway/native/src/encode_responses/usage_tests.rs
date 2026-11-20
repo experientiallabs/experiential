@@ -44,6 +44,7 @@ fn responses_cache_ttl_survives_two_gateway_hops_without_inventing_zero() {
             billed_units: None,
             cache_writes_read_back: false,
             image_output_tokens: None,
+            image_input_tokens: None,
         };
         for _ in 0..2 {
             let wire = responses_usage(Some(&usage));

@@ -11,7 +11,12 @@
 //! - the OpenAI Images API: one image per requested `n` and a reported token
 //!   usage, settled on the provider's prompt and image token counts; a rung
 //!   whose lane prices images per image (dall-e, xAI Grok Imagine) settles
-//!   billed `image` units instead, one per image returned, never its tokens;
+//!   billed `image` units instead, one per image returned, never its tokens
+//!   (plus, on an edit whose provider bills its source images, one consumed
+//!   unit per source image). An OpenAI Images edit is sent as the provider's
+//!   `multipart/form-data` body built from admission's text fields and the
+//!   caller's uploaded parts; its usage carries the source images'
+//!   `input_tokens_details.image_tokens`;
 //! - Stability AI's Bedrock InvokeModel answer (`images`, `seeds`,
 //!   `finish_reasons`): one base64 image, always billed per image. Its body
 //!   is frozen at admission and signed (SigV4) immediately before each
@@ -42,9 +47,10 @@ use crate::respond::{
     bearer_key, error_response, escalation_error, json_response, latin1_header, read_body,
     with_app_identity,
 };
+use crate::route_image_edits::{encode_edit_multipart, EditPart};
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
-use crate::upstream::open_stream;
+use crate::upstream::{open_stream, open_upload};
 use crate::waterfall::{
     customer_owned, dispatch_headers, successor_possible, DeploymentWire, RoutePolicy,
     StartResponse,
@@ -85,11 +91,15 @@ impl ImagesAdmission {
     }
 }
 
-/// One per-image priced rung's billing: the variant its unit card prices.
+/// One per-image priced rung's billing: the variant its unit card prices,
+/// and the source images an edit bills at the card's input rate (xAI bills
+/// each one it reads), absent when the rung bills none.
 #[derive(Debug, Clone, Deserialize)]
 struct ImageUnitBilling {
     #[serde(default)]
     variant: String,
+    #[serde(default)]
+    input_images: Option<u64>,
 }
 
 /// The answer shape one rung's provider returns.
@@ -100,6 +110,10 @@ struct WireShape {
     /// The encoded format a Stability rung returns (`png`, `jpeg`, `webp`).
     #[serde(default)]
     output_format: Option<String>,
+    /// An OpenAI Images edit: the rung's payload is the text fields of a
+    /// `multipart/form-data` body that carries the uploaded image parts.
+    #[serde(default)]
+    multipart: bool,
 }
 
 impl WireShape {
@@ -149,6 +163,7 @@ pub(crate) async fn images(
         "admit_images",
         admit_value,
         None,
+        None,
     )
     .await
 }
@@ -165,6 +180,7 @@ pub(crate) async fn serve_images(
     admit_method: &'static str,
     mut admit_value: Value,
     upload_permit: Option<DispatchPermit>,
+    edit_parts: Option<&[EditPart]>,
 ) -> Response {
     let client_request_id = latin1_header(headers, "x-client-request-id");
     with_app_identity(&mut admit_value, headers);
@@ -198,7 +214,7 @@ pub(crate) async fn serve_images(
     };
     let _permit = permit;
 
-    match run_ladder(state, &admission, raw_key, &mut guard, deadline).await {
+    match run_ladder(state, &admission, raw_key, &mut guard, deadline, edit_parts).await {
         Err(error) => error_response(&error),
         Ok(served) => {
             if !guard
@@ -222,6 +238,7 @@ async fn run_ladder(
     raw_key: &str,
     guard: &mut AttemptGuard,
     deadline: Instant,
+    edit_parts: Option<&[EditPart]>,
 ) -> Result<Served, PublicError> {
     let policy = admission.policy();
     let mut total_attempts: u32 = 0;
@@ -308,6 +325,7 @@ async fn run_ladder(
             request_id: &admission.request_id,
             wire,
             shape,
+            edit_parts,
         };
         match dispatch(http, &target, deadline, admission, units.as_ref()).await {
             Ok((body, usage)) => return Ok(Served { depth, body, usage }),
@@ -352,6 +370,8 @@ struct DispatchTarget<'a> {
     request_id: &'a str,
     wire: &'a DeploymentWire,
     shape: Option<&'a WireShape>,
+    /// The caller's uploaded image parts, present on the edits route.
+    edit_parts: Option<&'a [EditPart]>,
 }
 
 /// POST one admitted payload and validate the buffered answer; the error
@@ -386,18 +406,46 @@ async fn dispatch(
     };
     let phase_timeout = Duration::from_secs_f64(wire.timeout_seconds.max(0.001));
     let bound = remaining(deadline).min(phase_timeout);
-    let response = open_stream(
-        http,
-        &wire.url,
-        &headers,
-        &wire.idempotency_key,
-        &wire.upstream_payload,
-        wire.upstream_body.as_deref(),
-        bound,
-        dialect,
-    )
-    .await
-    .map_err(|failure| (customer_owned(failure, wire), false))?;
+    let opened = if target.shape.is_some_and(|shape| shape.multipart) {
+        // Admission names the multipart wire only for an edit, whose parts
+        // this route kept; their absence is a wire-contract fault.
+        let parts = target.edit_parts.ok_or_else(|| {
+            (
+                Failure::new(FailureClass::Internal, "image edit parts are missing"),
+                false,
+            )
+        })?;
+        let boundary = format!(
+            "exp-gateway-{}",
+            admission
+                .request_id
+                .replace(|c: char| !c.is_ascii_alphanumeric(), "")
+        );
+        open_upload(
+            http,
+            &wire.url,
+            &headers,
+            &wire.idempotency_key,
+            encode_edit_multipart(&boundary, &wire.upstream_payload, parts),
+            &format!("multipart/form-data; boundary={boundary}"),
+            &wire.upstream_payload,
+            bound,
+        )
+        .await
+    } else {
+        open_stream(
+            http,
+            &wire.url,
+            &headers,
+            &wire.idempotency_key,
+            &wire.upstream_payload,
+            wire.upstream_body.as_deref(),
+            bound,
+            dialect,
+        )
+        .await
+    };
+    let response = opened.map_err(|failure| (customer_owned(failure, wire), false))?;
     if response
         .content_length()
         .is_some_and(|length| length > MAXIMUM_RETAINED_OUTPUT_BYTES as u64)
@@ -530,6 +578,7 @@ fn public_images(
                 kind: "image".to_string(),
                 variant: units.variant.clone(),
                 quantity_milli: count.saturating_mul(1000),
+                input_quantity_milli: units.input_images.map(|images| images.saturating_mul(1000)),
             }),
             ..Usage::default()
         };
@@ -549,8 +598,18 @@ fn public_images(
         .get("output_tokens")
         .and_then(Value::as_u64)
         .ok_or_else(|| malformed("images response omitted usage.output_tokens"))?;
+    // The image-modality subset of the input (an edit's source images):
+    // absent without a breakdown, a reported 0 kept as 0, and never more than
+    // the input total it is a subset of.
+    let image_input_tokens = usage
+        .get("input_tokens_details")
+        .and_then(Value::as_object)
+        .and_then(|details| details.get("image_tokens"))
+        .and_then(Value::as_u64)
+        .map(|image| image.min(input_tokens));
     public.insert("usage".to_string(), Value::Object(usage.clone()));
     let usage = Usage {
+        image_input_tokens,
         input_tokens: Some(input_tokens),
         output_tokens: Some(output_tokens),
         cached_input_tokens: None,
@@ -633,6 +692,7 @@ fn public_stability_images(
             kind: "image".to_string(),
             variant: units.variant.clone(),
             quantity_milli: count.saturating_mul(1000),
+            input_quantity_milli: None,
         }),
         ..Usage::default()
     };
@@ -684,6 +744,10 @@ fn served_headers(
     }
     headers
 }
+
+#[cfg(test)]
+#[path = "route_images_edit_tests.rs"]
+mod edit_tests;
 
 #[cfg(test)]
 mod tests {
@@ -759,6 +823,7 @@ mod tests {
         });
         let units = ImageUnitBilling {
             variant: "hd/1024x1024".to_string(),
+            input_images: None,
         };
         let (body, usage) =
             public_images(payload.clone(), &admission(2), Some(&units)).expect("valid answer");
@@ -780,12 +845,14 @@ mod tests {
         WireShape {
             shape: "stability".to_string(),
             output_format: Some("jpeg".to_string()),
+            multipart: false,
         }
     }
 
     fn flat_units() -> ImageUnitBilling {
         ImageUnitBilling {
             variant: String::new(),
+            input_images: None,
         }
     }
 

@@ -79,15 +79,23 @@ class BilledUnits(ContractModel):
     the deployment's :class:`~exp.common.models.catalog_prices.GatewayUnitPrices`
     (``""`` for the flat rate).
 
+    ``input_quantity_milli`` is a second leg of the same kind for a provider
+    that bills what the request consumed beside what it produced (an xAI image
+    edit's source images), priced at the card's ``input_rates``; None on every
+    attempt without one.
+
     Attributes:
         kind: What one billed unit measures.
         variant: The priced SKU on the deployment's unit card.
         quantity_milli: Thousandths of a unit consumed or produced.
+        input_quantity_milli: Thousandths of a consumed unit billed at the
+            card's input rate, or None when the attempt bills none.
     """
 
     kind: BilledUnitKind
     variant: str = Field(default="", max_length=MAXIMUM_UNIT_VARIANT_CHARACTERS)
     quantity_milli: int = Field(ge=0)
+    input_quantity_milli: int | None = Field(default=None, ge=0)
 
 
 class GatewayUsage(ContractModel):
@@ -120,6 +128,9 @@ class GatewayUsage(ContractModel):
         reasoning_tokens: Reasoning subset of the output.
         image_output_tokens: Generated-image subset of the output (Gemini's IMAGE
             modality count, OpenRouter's ``image_tokens``), or None when unreported.
+        image_input_tokens: Image-modality subset of the input (OpenAI Images'
+            ``input_tokens_details.image_tokens``: an edit's source images), or
+            None when the provider reported no input breakdown; a reported 0 is 0.
         tool_names: Invoked tool names in first-use order.
         web_search_requests: Gateway-executed web searches billed to the attempt.
         web_search_results: Results those searches returned (each billed by the
@@ -145,6 +156,7 @@ class GatewayUsage(ContractModel):
     cache_creation_12h_input_tokens: int | None = Field(default=None, ge=0)
     reasoning_tokens: int | None = Field(default=None, ge=0)
     image_output_tokens: int | None = Field(default=None, ge=0)
+    image_input_tokens: int | None = Field(default=None, ge=0)
     tool_names: tuple[str, ...] = ()
     """Invoked tool names in first-use order, names only and never arguments."""
     web_search_requests: int = Field(default=0, ge=0)
@@ -195,6 +207,10 @@ class GatewayUsage(ContractModel):
             self.output_tokens is None or self.image_output_tokens > self.output_tokens
         ):
             raise ValueError("image output tokens require a covering output total")
+        if self.image_input_tokens is not None and (
+            self.input_tokens is None or self.image_input_tokens > self.input_tokens
+        ):
+            raise ValueError("image input tokens require a covering input total")
         return self
 
     @property

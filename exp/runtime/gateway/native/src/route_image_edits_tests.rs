@@ -156,3 +156,110 @@ fn slow_image_uploads_are_scoped_deadlined_and_do_not_reacquire_capacity() {
             assert_eq!(base.pending_settlements.load(Ordering::SeqCst), 0);
         });
 }
+
+fn png(marker: u8) -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.push(marker);
+    bytes
+}
+
+fn part(name: &str, filename: &str, bytes: &[u8]) -> Vec<u8> {
+    let mut body = format!(
+        "--B\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+    )
+    .into_bytes();
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(b"\r\n");
+    body
+}
+
+fn text(name: &str, value: &str) -> Vec<u8> {
+    format!("--B\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+        .into_bytes()
+}
+
+fn upload(parts: &[Vec<u8>]) -> axum::extract::Request {
+    let mut body = parts.concat();
+    body.extend_from_slice(b"--B--\r\n");
+    request(Body::from(body))
+}
+
+#[test]
+fn repeated_image_parts_keep_their_order_and_sniffed_types() {
+    let state = state();
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let jpeg = [0xff, 0xd8, 0xff, 0x00];
+        let request = upload(&[
+            text("model", "gpt-image-2.5-sunburst"),
+            part("image[]", "a.bin", &png(1)),
+            part("image[]", "b.bin", &jpeg),
+            part("mask", "m.png", &png(3)),
+        ]);
+        let (fields, files, parts) = parse_edit_upload(&state, request).await.expect("parsed");
+        assert_eq!(fields["model"], "gpt-image-2.5-sunburst");
+        let images = files["image[]"].as_array().expect("a list in upload order");
+        assert_eq!(images.len(), 2);
+        assert!(files["mask"].is_string());
+        let names: Vec<&str> = parts.iter().map(|part| part.name.as_str()).collect();
+        assert_eq!(names, ["image[]", "image[]", "mask"]);
+        assert_eq!(parts[0].content_type, "image/png");
+        assert_eq!(parts[1].content_type, "image/jpeg");
+    });
+}
+
+#[test]
+fn too_many_source_images_and_a_repeated_mask_are_refused_by_name() {
+    let state = state();
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let many: Vec<Vec<u8>> = (0..=MAXIMUM_EDIT_IMAGES)
+            .map(|index| part("image[]", "x.png", &png(index as u8)))
+            .collect();
+        let error = parse_edit_upload(&state, upload(&many)).await.unwrap_err();
+        assert_eq!(error.param.as_deref(), Some("image"));
+        let masks = [
+            part("image", "x.png", &png(0)),
+            part("mask", "m.png", &png(1)),
+            part("mask", "m.png", &png(2)),
+        ];
+        let error = parse_edit_upload(&state, upload(&masks)).await.unwrap_err();
+        assert_eq!(error.param.as_deref(), Some("mask"));
+    });
+}
+
+#[test]
+fn the_openai_edit_body_carries_fields_then_images_then_the_mask() {
+    let part = |name: &str, marker: u8| EditPart {
+        name: name.to_string(),
+        bytes: png(marker),
+        content_type: "image/png".to_string(),
+    };
+    let fields = json!({"model": "gpt-image-2.5-sunburst", "n": 2, "prompt": "watercolor"});
+    let several = encode_edit_multipart(
+        "B",
+        &fields,
+        &[
+            part("image[]", 1),
+            part("mask", 9),
+            part("image[]", 2),
+            part("style_image", 7),
+        ],
+    );
+    let text = String::from_utf8_lossy(&several);
+    assert!(text.contains("name=\"n\"\r\n\r\n2\r\n"));
+    assert!(text.contains("name=\"prompt\"\r\n\r\nwatercolor\r\n"));
+    assert_eq!(
+        text.matches("name=\"image[]\"; filename=\"image-").count(),
+        2
+    );
+    assert!(text.find("image-0.png").unwrap() < text.find("image-1.png").unwrap());
+    assert!(text.find("image-1.png").unwrap() < text.find("name=\"mask\"").unwrap());
+    assert!(
+        !text.contains("style_image"),
+        "a style image never rides this wire"
+    );
+    assert!(text.ends_with("--B--\r\n"));
+    let one = encode_edit_multipart("B", &fields, &[part("image[]", 1)]);
+    let text = String::from_utf8_lossy(&one);
+    assert!(text.contains("name=\"image\"; filename=\"image-0.png\"\r\nContent-Type: image/png"));
+    assert!(!text.contains("image[]"));
+}

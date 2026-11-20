@@ -27,6 +27,7 @@ from exp.runtime.gateway.images_contracts import (
     ImagesRequest,
     images_ceiling_nano_usd,
     per_image_rate,
+    per_input_image_rate,
 )
 from exp.runtime.gateway.ledger_valuation import require_representable_nano_usd
 from exp.runtime.gateway.video.contracts import (
@@ -73,12 +74,16 @@ def maximum_attempt_cost_nano_usd(
                 input_rate=deployment.gateway.prices.input_nano_usd_per_million_tokens,
             )
         case ImagesRequest():
+            prices = deployment.gateway.prices
             return images_ceiling_nano_usd(
                 request,
                 input_tokens=input_tokens,
-                input_rate=deployment.gateway.prices.input_nano_usd_per_million_tokens,
-                output_rate=deployment.gateway.prices.output_nano_usd_per_million_tokens,
-                image_rate=per_image_rate(deployment.gateway.prices, request),
+                input_rate=prices.input_nano_usd_per_million_tokens,
+                output_rate=prices.output_nano_usd_per_million_tokens,
+                image_rate=per_image_rate(prices, request),
+                image_input_rate=prices.image_input_nano_usd_per_million_tokens,
+                image_output_rate=prices.image_output_nano_usd_per_million_tokens,
+                input_image_rate=per_input_image_rate(prices, request),
             )
         case SpeechRequest():
             prices = deployment.gateway.prices

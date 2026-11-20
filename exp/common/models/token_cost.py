@@ -48,6 +48,8 @@ def token_cost_nano_usd(
     image_output_rate: int | None = None,
     cache_write_12h_input_tokens: int | None = None,
     cache_creation_12h_input_rate: int | None = None,
+    image_input_tokens: int | None = None,
+    image_input_rate: int | None = None,
 ) -> int | None:
     """Price disjoint input/output subsets with half-up nano-USD rounding.
 
@@ -66,6 +68,12 @@ def token_cost_nano_usd(
     Pro Image counts its image inside its thoughts). Without one, image tokens
     stay in the output exactly as before the rate existed. A rate that differs
     from the output rate with no reported image count leaves cost unknown.
+
+    Input images mirror that rule: with an image-input rate, the reported
+    image-modality subset of the input (clamped to the fresh input, after cache
+    reads and writes) prices at it and the rest at the input rate. Without one,
+    image input stays ordinary input. A rate that differs from the input rate
+    with no reported image-input count leaves cost unknown.
     """
     cached = min(cached_input_tokens or 0, input_tokens)
     written = min(cache_write_input_tokens or 0, input_tokens - cached)
@@ -89,9 +97,20 @@ def token_cost_nano_usd(
         # Every split of the output between text and image prices differently.
         return None
     image = min(image_output_tokens or 0, output_tokens) if image_output_rate is not None else 0
+    fresh = input_tokens - cached - written
+    if (
+        image_input_tokens is None
+        and fresh > 0
+        and image_input_rate is not None
+        and image_input_rate != input_rate
+    ):
+        # Every split of the input between text and image prices differently.
+        return None
+    image_input = min(image_input_tokens or 0, fresh) if image_input_rate is not None else 0
     reasoning = min(reasoning_tokens or 0, output_tokens - image)
     dimensions = (
-        (input_tokens - cached - written, input_rate),
+        (fresh - image_input, input_rate),
+        (image_input, image_input_rate),
         (cached, cached_input_rate),
         (written - hour - half_day, cache_creation_input_rate),
         (hour, cache_creation_1h_input_rate),
@@ -168,6 +187,15 @@ def schedule_usage_cost_nano_usd(prices: GatewayTokenPrices, usage: Usage) -> in
         != schedule.output_nano_usd_per_million_tokens
     ):
         return None
+    # Nor does it carry an image-input subset: a card pricing input images
+    # apart from text cannot value any input.
+    if (
+        usage.input_tokens > 0
+        and schedule.image_input_nano_usd_per_million_tokens is not None
+        and schedule.image_input_nano_usd_per_million_tokens
+        != schedule.input_nano_usd_per_million_tokens
+    ):
+        return None
     return token_cost_nano_usd(
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,
@@ -216,6 +244,7 @@ def schedule_maximum_cost_nano_usd(
                     schedule.cached_input_nano_usd_per_million_tokens,
                     schedule.cache_creation_input_nano_usd_per_million_tokens,
                     schedule.cache_creation_1h_input_nano_usd_per_million_tokens,
+                    schedule.image_input_nano_usd_per_million_tokens,
                 )
                 if rate is not None
             ),

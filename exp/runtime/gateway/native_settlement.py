@@ -801,6 +801,7 @@ def _usage_from_payload(
         ),
         reasoning_tokens=_optional_count(payload.get("reasoning_tokens")),
         image_output_tokens=_optional_count(payload.get("image_output_tokens")),
+        image_input_tokens=_optional_count(payload.get("image_input_tokens")),
         tool_names=names,
         web_search_requests=web_search_requests,
         web_search_results=web_search_results,
