@@ -70,6 +70,7 @@ mod settlement;
 mod sse;
 mod stop_sequences;
 mod stream_errors;
+mod thought_signature_issuers;
 mod thought_signature_repair;
 mod throttle_backoff;
 mod tool_search;
@@ -187,6 +188,14 @@ fn collect_detectors(detectors: Option<&Bound<'_, PyDict>>) -> PyResult<Detector
         compiled.insert(adapter_id, detector.compiled());
     }
     Ok(compiled)
+}
+
+/// The deployment that minted one replayed Gemini thought signature, when
+/// this worker relayed it recently (`thought_signature_issuers`). Admission
+/// prefers that rung so the signature reaches the backend that can verify it.
+#[pyfunction]
+fn thought_signature_issuer(signature: &str) -> Option<String> {
+    thought_signature_issuers::ISSUERS.issuer(signature)
 }
 
 /// Create one stop handle to pass to `serve`.
@@ -712,6 +721,7 @@ fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<capture::python::CaptureCollector>()?;
     module.add_class::<capture::python::CaptureResponse>()?;
     module.add_function(wrap_pyfunction!(shutdown_handle, module)?)?;
+    module.add_function(wrap_pyfunction!(thought_signature_issuer, module)?)?;
     module.add_function(wrap_pyfunction!(serve, module)?)?;
     module.add_function(wrap_pyfunction!(metrics_snapshot_json, module)?)?;
     module.add_function(wrap_pyfunction!(encode_chat_fixture, module)?)?;

@@ -224,3 +224,38 @@ fn a_cache_overlay_refusal_strips_the_whole_history_and_later_dials_plain() {
     minted.deployment_id = "gemini-api-overlay".to_string();
     assert!(!crate::thought_signature_repair::remembers_refused_signature(&minted, Some(scope)));
 }
+
+#[test]
+fn a_relayed_signature_is_remembered_under_the_rung_that_minted_it() {
+    block_on(async {
+        let harness = Harness::new();
+        let minted = "bWludGVkLWJ5LXZlcnRleC1sYWRkZXItdGVzdA==";
+        let frame = format!(
+            "{{\"candidates\":[{{\"content\":{{\"parts\":[{{\"functionCall\":{{\"name\":\"lookup\",\
+             \"args\":{{}}}},\"thoughtSignature\":\"{minted}\"}}],\"role\":\"model\"}},\
+             \"finishReason\":\"STOP\"}}],\"usageMetadata\":{{\"promptTokenCount\":9,\
+             \"candidatesTokenCount\":1,\"totalTokenCount\":10}}}}"
+        );
+        let body = format!("data: {frame}\n\n");
+        let answer = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len(),
+        );
+        let (url, _bodies) = spawn_google_rung(vec![answer]).await;
+        let rung = google_wire("vertex", "vertex-neon-issuer", &url, "c2lnLW9sZA==");
+        let (won, guard) = harness
+            .run_as("key", None, &[rung], None, Duration::from_secs(10))
+            .await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("the rung serves the turn");
+        };
+        drop(committed);
+        assert_eq!(
+            crate::thought_signature_issuers::ISSUERS
+                .issuer(minted)
+                .as_deref(),
+            Some("vertex-neon-issuer")
+        );
+    });
+}

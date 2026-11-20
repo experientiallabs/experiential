@@ -360,7 +360,12 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
             // The control plane already finalized the request with this
             // failure; answer the caller with its public form.
             guard.disarm_finalized("failed");
-            let failure = started.failure.or(last_failure).unwrap_or_else(|| {
+            // The echo models no broken-tool-call fact; restore it so a model
+            // that kept breaking its call answers the non-retryable 400.
+            let echoed = started
+                .failure
+                .map(|echoed| echoed.with_broken_tool_call_facts(last_failure.as_ref()));
+            let failure = echoed.or(last_failure).unwrap_or_else(|| {
                 Failure::new(
                     FailureClass::ProviderInternal,
                     "all exact-model deployments are unavailable",

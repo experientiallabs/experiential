@@ -9,6 +9,7 @@ from collections.abc import Callable
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway import native_guardrail_outcomes as input_evidence
+from exp.runtime.gateway import signature_affinity
 from exp.runtime.gateway.attempt_tokens import counted_input_tokens
 from exp.runtime.gateway.class_throttles import admission_priority_class, tier_authorization
 from exp.runtime.gateway.client_apps import with_client_identity
@@ -130,9 +131,7 @@ from exp.runtime.gateway.native_tool_search import NativeToolSearchMixin
 from exp.runtime.gateway.native_videos import NativeVideosMixin
 from exp.runtime.gateway.provider_preferences import reorder_admitted_route as _reorder
 from exp.runtime.gateway.provider_preferences import route_by_provider_preferences
-from exp.runtime.gateway.reasoning_carrier import (
-    ReasoningCarrierAuthority,
-)
+from exp.runtime.gateway.reasoning_carrier import ReasoningCarrierAuthority
 from exp.runtime.gateway.recovery import RecoveryHost
 from exp.runtime.gateway.recovery_binding import validated_recovery_binding
 from exp.runtime.gateway.request_policy import attempt_policy
@@ -352,6 +351,7 @@ class NativeControlPlane(
                 )
             except OpenAIProtocolError as exc:
                 raise NativeBridgeError(exc) from exc
+        request = signature_affinity.with_thought_signature_issuer(request)
         pinned_reasoning_route: GatewayRoute | None = None
         try:
             request, pinned_reasoning_route = authenticate_reasoning_history(
@@ -592,6 +592,7 @@ class NativeControlPlane(
             )
             placement = selected_placement or placement
             rung_authorization = tier_authorization(authorization, provider_request)
+            route, resolved_wires = signature_affinity.lead(route, resolved_wires, request)
             route, resolved_wires = _reorder(route, resolved_wires, request, self._components)
             require_route_authority(authorization, request, route)
             require_unmodified_probability_output(

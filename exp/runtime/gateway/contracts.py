@@ -664,13 +664,13 @@ class GatewayRequest(ContractModel):
     provider_session_id: str | None = Field(default=None, max_length=128, exclude=True)
     """Tenant-namespaced per-conversation id for providers that pin by session.
 
-    Derived at admission (``prompt_cache_affinity.provider_session_id``) from
-    the caller's ``prompt_cache_key`` or the conversation's opening, and sent
-    only as Novita's ``x-session-id``. Routing state, never request identity.
-    """
+    Derived at admission (``prompt_cache_affinity.provider_session_id``) from the caller's
+    ``prompt_cache_key`` or the conversation's opening, and sent only as Novita's
+    ``x-session-id``. Routing state, never request identity."""
+    thought_signature_issuer: str | None = Field(default=None, max_length=256, exclude=True)
+    """Rung that minted the newest replayed Gemini thought signature (``signature_affinity``)."""
     prompt_cache_ttl: Literal["12h"] | None = Field(default=None, exclude=True)
     """OpenAI's 12-hour minimum prompt-cache lifetime (Responses ``prompt_cache_options.ttl``).
-
     Routed only to rungs declaring ``supports_prompt_cache_ttl_12h`` and refused when none
     does. Like ``provider_cache_control`` it changes cache-write cost, never semantics, so
     it joins neither serialization nor replay identity."""

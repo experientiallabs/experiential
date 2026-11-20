@@ -18,6 +18,8 @@ from exp.runtime.models.providers.errors import (
     normalized_provider_failure,
 )
 from exp.runtime.openai_protocol.errors import (
+    BROKEN_TOOL_CALL_CODE,
+    BROKEN_TOOL_CALL_MESSAGE,
     CONTEXT_LENGTH_EXCEEDED_CODE,
     THROTTLED_RETRY_AFTER_SECONDS,
     UNAVAILABLE_RETRY_AFTER_SECONDS,
@@ -359,3 +361,24 @@ def test_a_context_window_overflow_carries_openais_code_on_every_path() -> None:
         safe_message="provider rejected the request",
     )
     assert public_failure_error(other).detail.code == "invalid_request"
+
+
+def test_a_repeatedly_broken_tool_call_is_a_400_no_sdk_retries() -> None:
+    broken = public_failure_error(
+        GatewayFailure(
+            failure_class=GatewayFailureClass.MALFORMED_RESPONSE,
+            safe_message="provider returned a malformed response; retry the request",
+            malformed_tool_call=True,
+        )
+    )
+    assert broken.status_code == 400
+    assert broken.detail.code == BROKEN_TOOL_CALL_CODE
+    assert broken.detail.type == "invalid_request_error"
+    assert broken.detail.message == BROKEN_TOOL_CALL_MESSAGE
+    garbled = public_failure_error(
+        GatewayFailure(
+            failure_class=GatewayFailureClass.MALFORMED_RESPONSE,
+            safe_message="provider returned a malformed response; retry the request",
+        )
+    )
+    assert (garbled.status_code, garbled.detail.code) == (502, "all_routes_failed")

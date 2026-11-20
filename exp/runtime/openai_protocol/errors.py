@@ -118,6 +118,17 @@ class OpenAIProtocolError(ValueError):
         return {"Retry-After": str(self.retry_after_seconds)}
 
 
+BROKEN_TOOL_CALL_CODE = "malformed_tool_call"
+"""Public code when the model kept producing a broken tool call (native ``broken_tool_call``)."""
+
+BROKEN_TOOL_CALL_MESSAGE = (
+    "The model produced an invalid tool call for this conversation repeatedly. "
+    "Retrying the same request will likely fail again; shorten or restructure "
+    "the conversation, or try another model."
+)
+"""Caller sentence of :data:`BROKEN_TOOL_CALL_CODE`."""
+
+
 def invalid_field(param: str, message: str | None = None) -> OpenAIProtocolError:
     """Build one field-specific invalid-request error.
 
@@ -239,6 +250,13 @@ def public_failure_error(
     # The caller wording of the durable sentence; a relayed provider detail
     # rebuilds the message from the durable head below instead.
     message = caller_copy(failure.failure_class, failure.safe_message)
+    if (
+        failure.failure_class is GatewayFailureClass.MALFORMED_RESPONSE
+        and failure.malformed_tool_call
+    ):
+        # The model kept breaking its tool call: a 4xx no SDK retries, as above.
+        status, code, error_type = 400, BROKEN_TOOL_CALL_CODE, "invalid_request_error"
+        message = BROKEN_TOOL_CALL_MESSAGE
     if (
         failure.failure_class is GatewayFailureClass.INVALID_REQUEST
         and failure.provider_detail is not None

@@ -260,7 +260,10 @@ fn a_second_malformed_tool_call_is_the_requests_answer() {
         let Won::Failed(error) = won else {
             panic!("the one retry is spent: the second malformed call is the answer");
         };
-        assert_eq!(error.status_code, 502);
+        // A 4xx no SDK retries: the same conversation would break again.
+        assert_eq!(error.status_code, 400);
+        assert_eq!(error.code, crate::errors::BROKEN_TOOL_CALL_CODE);
+        assert_eq!(error.error_type, "invalid_request_error");
         assert_eq!(lane.accepted.lock().expect("lock").len(), 2);
         let story = harness.story().await;
         assert_eq!(story["starts"].as_array().expect("starts").len(), 2);

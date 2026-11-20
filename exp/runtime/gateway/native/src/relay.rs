@@ -172,6 +172,9 @@ pub struct UpstreamRelay {
     customer_managed_provider: Option<String>,
     /// A tenant origin: every failure this stream yields answers opaquely.
     tenant_origin: bool,
+    /// The Gemini-dialect deployment whose relayed thought signatures this
+    /// worker remembers (`thought_signature_issuers`); `None` elsewhere.
+    signature_issuer: Option<String>,
     eof: bool,
     /// Whether any body byte has arrived: stamps the time-to-first-byte
     /// histogram once. It does NOT satisfy the stall bound below: a provider
@@ -273,6 +276,7 @@ impl UpstreamRelay {
             tool_serializer: None,
             customer_managed_provider: None,
             tenant_origin: false,
+            signature_issuer: None,
             eof: false,
             first_byte_recorded: false,
             stall_bound_armed: true,
@@ -369,6 +373,11 @@ impl UpstreamRelay {
             }
             if self.normalizer.unreported_stop_read_as_length() {
                 observation.mark_unreported_truncation();
+            }
+        }
+        if let Some(deployment_id) = &self.signature_issuer {
+            for event in &events {
+                crate::thought_signature_issuers::ISSUERS.observe(event, deployment_id);
             }
         }
         self.pending.extend(events);
@@ -512,6 +521,12 @@ impl UpstreamRelay {
     /// Mark this relay's origin as a tenant's, so every failure it yields is opaque.
     pub fn set_tenant_origin(&mut self, tenant: bool) {
         self.tenant_origin = tenant;
+    }
+
+    /// Remember which deployment minted each thought signature this stream
+    /// relays, so a later turn replaying it can be routed back there.
+    pub fn set_signature_issuer(&mut self, deployment_id: Option<String>) {
+        self.signature_issuer = deployment_id;
     }
 
     /// Attribute one yielded failure: a customer-managed provider owns its

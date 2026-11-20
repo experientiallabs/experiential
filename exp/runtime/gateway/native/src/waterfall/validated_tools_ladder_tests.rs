@@ -134,3 +134,40 @@ fn the_sibling_backend_after_a_malformed_function_call_dials_validated() {
         assert_eq!(sent_mode(&vertex_bodies[0]), json!("VALIDATED"));
     });
 }
+
+#[test]
+fn a_ladder_exhausted_on_malformed_function_calls_answers_a_non_retryable_400() {
+    block_on(async {
+        let harness = Harness::new();
+        harness
+            .configure(json!({"rules": [null, null], "same_redial": 2}))
+            .await;
+        let (gemini_url, gemini_bodies) =
+            spawn_google_rung(vec![streamed(MALFORMED_FRAME), streamed(MALFORMED_FRAME)]).await;
+        let (vertex_url, vertex_bodies) =
+            spawn_google_rung(vec![streamed(MALFORMED_FRAME), streamed(MALFORMED_FRAME)]).await;
+        let route = [
+            google_wire("gemini", "gemini-neon", &gemini_url),
+            google_wire("vertex", "vertex-neon", &vertex_url),
+        ];
+        let (won, guard) = harness
+            .run_as("key", None, &route, None, Duration::from_secs(10))
+            .await;
+        let Won::Failed(error) = finish(guard, won).await else {
+            panic!("every dial broke its call: the ladder is exhausted");
+        };
+        assert!(!gemini_bodies.lock().unwrap().is_empty());
+        assert!(!vertex_bodies.lock().unwrap().is_empty());
+        // The control plane's echo of the exhausting failure carries no
+        // Gemini fact, and the caller still gets the 4xx no SDK retries.
+        let story = harness.story().await;
+        let starts = story["starts"].as_array().expect("starts");
+        let echoed = &starts.last().expect("a start")["failure"];
+        assert_eq!(echoed["failure_class"], "malformed_response");
+        assert!(echoed.get("validated_tool_redial").is_none());
+        assert_eq!(error.status_code, 400);
+        assert_eq!(error.code, crate::errors::BROKEN_TOOL_CALL_CODE);
+        assert_eq!(error.error_type, "invalid_request_error");
+        assert_eq!(error.message, crate::errors::BROKEN_TOOL_CALL_MESSAGE);
+    });
+}
