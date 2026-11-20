@@ -23,11 +23,14 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable
+from dataclasses import replace
 from functools import cache
 
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.native_execution import reorder_route_deployments
+from exp.runtime.gateway.native_fallback_rules import rung_rules
 from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.sticky_affinity import AffinityPlacement
 
 THOUGHT_SIGNATURE_BYPASS = "skip_thought_signature_validator"
 """Google's placeholder signature; it names no issuer."""
@@ -82,20 +85,25 @@ def lead[WireT](
     route: GatewayRoute,
     wires: tuple[WireT, ...],
     request: GatewayRequest,
-) -> tuple[GatewayRoute, tuple[WireT, ...]]:
+    placement: AffinityPlacement,
+) -> tuple[GatewayRoute, tuple[WireT, ...], AffinityPlacement]:
     """Move the signature's issuing rung to the front of the admitted route.
 
     Only within the leading model stage, and never against the caller's own
     routing (a named route, ``provider.order``) or a reasoning-pinned route.
-    The moved route discloses ``thought_signature_issuer``.
+    A ``failover_only_on`` rung is never moved: it may not take a first dial.
+    The moved route discloses ``thought_signature_issuer``, and the placement
+    no longer claims a sticky binding leads (``sticky_deployment_id`` still
+    names the warm rung as cache evidence).
 
     Args:
         route: Admitted route after the engine's own scheduling.
         wires: Resolved wires in route order; reordered in step.
         request: Request carrying ``thought_signature_issuer``.
+        placement: The admission's affinity placement facts.
 
     Returns:
-        The route and wires, led by the issuing rung when it is present.
+        The route, wires and placement, led by the issuing rung when it applies.
     """
     issuer = request.thought_signature_issuer
     if (
@@ -104,16 +112,17 @@ def lead[WireT](
         or route.reasoning_pinned_deployment_id is not None
         or (request.provider_preferences or {}).get("order")
     ):
-        return route, wires
+        return route, wires, placement
     ids = [deployment.deployment_id for deployment in route.deployments]
     if issuer not in ids or ids.index(issuer) == 0:
-        return route, wires
+        return route, wires, placement
     depth = ids.index(issuer)
     snapshot = route.snapshot
-    if snapshot.model_stages and (
-        snapshot.stage_for_depth(depth).stage_index != snapshot.stage_for_depth(0).stage_index
+    if rung_rules(route.deployments[depth]) is not None or (
+        snapshot.model_stages
+        and snapshot.stage_for_depth(depth).stage_index != snapshot.stage_for_depth(0).stage_index
     ):
-        return route, wires
+        return route, wires, placement
     order = (depth, *(index for index in range(len(ids)) if index != depth))
     reordered = reorder_route_deployments(route, order)
     disclosed = ",".join(
@@ -122,4 +131,5 @@ def lead[WireT](
     return (
         reordered.model_copy(update={"fallback_reason": disclosed}),
         tuple(wires[index] for index in order),
+        replace(placement, sticky_preferred=False),
     )

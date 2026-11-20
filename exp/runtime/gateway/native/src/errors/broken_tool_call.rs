@@ -4,7 +4,7 @@
 //! `MALFORMED_FUNCTION_CALL` (`validated_tool_redial`), or a streamed client
 //! tool call never became one valid call (`malformed_tool_call`). The ladder
 //! still redials and fails over, because a fresh sample often parses. Once
-//! it is exhausted on such a failure, though, the same conversation tends to
+//! it is exhausted after at least two such failures, though, the same conversation tends to
 //! fail the same way on every sample, and the generic 502 `all_routes_failed`
 //! is an answer every OpenAI and Anthropic SDK retries automatically (both
 //! retry 408/409/429/5xx), so agent clients re-sent the identical long
@@ -30,6 +30,15 @@ impl Failure {
     pub fn broken_tool_call(&self) -> bool {
         self.failure_class == FailureClass::MalformedResponse
             && (self.malformed_tool_call || self.validated_tool_redial)
+    }
+
+    /// This failure without its broken-tool-call facts: the ladder saw only
+    /// one broken call (no redial or failover was possible), so a client
+    /// retry is still the conversation's next fresh sample.
+    pub fn without_broken_tool_call_facts(mut self) -> Self {
+        self.malformed_tool_call = false;
+        self.validated_tool_redial = false;
+        self
     }
 
     /// The control plane's echo of the failure that exhausted the ladder,

@@ -171,3 +171,24 @@ fn a_ladder_exhausted_on_malformed_function_calls_answers_a_non_retryable_400() 
         assert_eq!(error.message, crate::errors::BROKEN_TOOL_CALL_MESSAGE);
     });
 }
+
+#[test]
+fn a_single_malformed_function_call_with_no_retry_left_keeps_the_retryable_502() {
+    block_on(async {
+        let harness = Harness::new();
+        // One rung and no same-rung redial: the first broken call is the end.
+        harness.configure(json!({"rules": [null]})).await;
+        let (url, bodies) = spawn_google_rung(vec![streamed(MALFORMED_FRAME)]).await;
+        let rung = google_wire("gemini", "gemini-neon", &url);
+        let (won, guard) = harness
+            .run_as("key", None, &[rung], None, Duration::from_secs(10))
+            .await;
+        let Won::Failed(error) = finish(guard, won).await else {
+            panic!("the only dial broke its call");
+        };
+        assert_eq!(bodies.lock().unwrap().len(), 1);
+        // One sample proves nothing about the conversation: the client may retry.
+        assert_eq!(error.status_code, 502);
+        assert_eq!(error.code, "all_routes_failed");
+    });
+}

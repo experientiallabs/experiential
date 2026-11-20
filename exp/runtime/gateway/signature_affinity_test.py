@@ -27,6 +27,7 @@ from exp.runtime.gateway.signature_affinity import (
     newest_thought_signature,
     with_thought_signature_issuer,
 )
+from exp.runtime.gateway.sticky_affinity import AffinityPlacement
 
 
 def _deployment(deployment_id: str, provider: str) -> ExactModelDeployment:
@@ -129,8 +130,11 @@ def test_admission_records_the_remembered_issuer_only() -> None:
 def test_the_issuing_rung_leads_a_route_speed_demotion_moved() -> None:
     route = _route("gemini-0", "openrouter-1", "vertex-2", fallback_reason="lane_latency_degraded")
     wires = ("w-gemini", "w-openrouter", "w-vertex")
-    led, led_wires = lead(route, wires, _request("sig", issuer="vertex-2"))
+    sticky = AffinityPlacement(sticky_preferred=True, sticky_deployment_id="gemini-0")
+    led, led_wires, placement = lead(route, wires, _request("sig", issuer="vertex-2"), sticky)
     assert _ids(led) == ["vertex-2", "gemini-0", "openrouter-1"]
+    # The sticky binding no longer leads; its warm rung stays named as cache evidence.
+    assert placement == AffinityPlacement(sticky_preferred=False, sticky_deployment_id="gemini-0")
     assert led_wires == ("w-vertex", "w-gemini", "w-openrouter")
     assert led.fallback_reason == f"lane_latency_degraded,{SIGNATURE_AFFINITY_DISCLOSURE}"
     assert led.snapshot.deployment_ids == ("vertex-2", "gemini-0", "openrouter-1")
@@ -147,17 +151,40 @@ def test_the_issuing_rung_leads_a_route_speed_demotion_moved() -> None:
             lambda: _request("sig", issuer="vertex-1"),
             {"reasoning_pinned_deployment_id": "gemini-0"},
         ),
+        (lambda: _request("sig", issuer="vertex-1"), {"failover_only": True}),
     ],
-    ids=["already-first", "not-in-route", "unknown", "caller-order", "reasoning-pinned"],
+    ids=[
+        "already-first",
+        "not-in-route",
+        "unknown",
+        "caller-order",
+        "reasoning-pinned",
+        "failover-only-issuer",
+    ],
 )
 def test_the_route_is_left_alone_when_affinity_does_not_apply(
     request_factory: Callable[[], GatewayRequest], route_update: JsonObject
 ) -> None:
-    route = _route("gemini-0", "vertex-1").model_copy(update=route_update)
+    route = _route("gemini-0", "vertex-1")
+    if route_update.pop("failover_only", False):
+        conditional = route.fallback_deployments[0]
+        gateway = conditional.gateway.model_copy(
+            update={
+                "capabilities": conditional.gateway.capabilities.model_copy(
+                    update={"failover_only_on": ("throttled",)}
+                )
+            }
+        )
+        route = route.model_copy(
+            update={"fallback_deployments": (conditional.model_copy(update={"gateway": gateway}),)}
+        )
+    route = route.model_copy(update=route_update)
     wires = ("w-gemini", "w-vertex")
-    led, led_wires = lead(route, wires, request_factory())
+    placement = AffinityPlacement(sticky_preferred=True, sticky_deployment_id="gemini-0")
+    led, led_wires, kept = lead(route, wires, request_factory(), placement)
     assert led is route
     assert led_wires is wires
+    assert kept is placement
 
 
 def test_the_data_plane_memory_answers_none_for_a_signature_it_never_relayed() -> None:

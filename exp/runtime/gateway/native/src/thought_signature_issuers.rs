@@ -34,6 +34,10 @@ const ISSUER_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 /// Signatures remembered per worker; the oldest insertion goes first.
 const ISSUER_CAPACITY: usize = 100_000;
 
+/// Distinct deployment ids shared before the share table is rebuilt; entries
+/// keep their own handle, so a rebuild only drops ids no longer remembered.
+const SHARED_DEPLOYMENTS_CAPACITY: usize = 1_024;
+
 pub static ISSUERS: LazyLock<SignatureIssuers> = LazyLock::new(SignatureIssuers::default);
 
 /// Signature digest to the deployment that minted it.
@@ -75,6 +79,11 @@ impl SignatureIssuers {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.deployments.len() >= SHARED_DEPLOYMENTS_CAPACITY
+            && !state.deployments.contains_key(deployment_id)
+        {
+            state.deployments.clear();
+        }
         let deployment = match state.deployments.get(deployment_id) {
             Some(shared) => shared.clone(),
             None => {
@@ -194,6 +203,18 @@ mod tests {
         // A later turn minted elsewhere moves the signature's issuer.
         issuers.remember("c2lnLWE=", "vertex");
         assert_eq!(issuers.issuer("c2lnLWE=").as_deref(), Some("vertex"));
+    }
+
+    #[test]
+    fn deployment_churn_never_grows_the_shared_id_table_past_its_bound() {
+        let issuers = SignatureIssuers::default();
+        for index in 0..(3 * SHARED_DEPLOYMENTS_CAPACITY) {
+            issuers.remember(&format!("sig-{index}"), &format!("deployment-{index}"));
+        }
+        let shared = issuers.state.lock().unwrap().deployments.len();
+        assert!(shared <= SHARED_DEPLOYMENTS_CAPACITY);
+        // Entries keep their issuer across a rebuild.
+        assert_eq!(issuers.issuer("sig-0").as_deref(), Some("deployment-0"));
     }
 
     #[test]

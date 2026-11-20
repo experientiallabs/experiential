@@ -449,8 +449,7 @@ class NativeControlPlane(
                 guardrails=guardrails,
             )
             pending_capture = None
-        # Escalation is accounted without content or billing; probe routing
-        # failures are raised against the accepted request below.
+        # Escalation is accounted contentless and unbilled; probe failures raise below.
         probe_failure: Exception | None = None
         web_search_admission: JsonObject | None = None
         tool_search_admission: JsonObject | None = None
@@ -592,7 +591,9 @@ class NativeControlPlane(
             )
             placement = selected_placement or placement
             rung_authorization = tier_authorization(authorization, provider_request)
-            route, resolved_wires = signature_affinity.lead(route, resolved_wires, request)
+            route, resolved_wires, placement = signature_affinity.lead(
+                route, resolved_wires, request, placement
+            )
             route, resolved_wires = _reorder(route, resolved_wires, request, self._components)
             require_route_authority(authorization, request, route)
             require_unmodified_probability_output(
