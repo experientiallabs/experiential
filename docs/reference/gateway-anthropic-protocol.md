@@ -155,6 +155,12 @@ Completions for generation and counts the same Chat tool list on `count_tokens`.
 no Messages tool type, so the fold never reinterprets a valid Messages declaration, and an entry
 that is not exactly one of the two OpenAI shapes keeps its named 400.
 
+The same client sends Chat's top-level `reasoning_effort` (and the related Chat-only `verbosity`
+and `service_tier`) on `count_tokens`. None of them can change how many tokens the prompt holds,
+so `/v1/messages/count_tokens` removes each before validation and discloses
+`<field>->ignored(count_tokens)` (a null value is removed silently). `/v1/messages` keeps its named
+400 for all three, because on generation they would change what the call does.
+
 ## Stream usage
 
 On the Messages stream, `message_start.message.usage` is a PRE-DISPATCH figure and

@@ -39,6 +39,7 @@ from exp.common.models.content import (
 )
 from exp.common.models.model import ToolCall
 from exp.runtime.anthropic_protocol import passthrough_fields, per_message_effort
+from exp.runtime.anthropic_protocol.count_neutral_fields import drop_count_neutral_fields
 from exp.runtime.anthropic_protocol.gateway_reasoning import (
     EMPTY_GATEWAY_BLOCK,
     gateway_reasoning_block,
@@ -432,9 +433,9 @@ def decode_messages_count_tokens(
     """Decode one Anthropic ``count_tokens`` body for prompt counting.
 
     Identical to :func:`decode_messages` except that ``max_tokens`` is
-    optional: Anthropic's count request carries only prompt-side fields, so
-    the canonical request has no output budget (``maximum_output_tokens`` is
-    ``None``) and is never dispatched, only counted.
+    optional and Chat-only generation controls are ignored with disclosure
+    (:mod:`count_neutral_fields`): the canonical request has no output budget
+    and is never dispatched, only counted.
 
     Args:
         payload: Parsed JSON request body.
@@ -448,8 +449,9 @@ def decode_messages_count_tokens(
     """
     if "gateway" in payload:
         raise unsupported_field("gateway")
+    payload, dropped = drop_count_neutral_fields(payload)
     try:
-        return _decode(payload, _CountTokensRequest, anthropic_beta=anthropic_beta, streams=False)
+        return _decode(payload, _CountTokensRequest, anthropic_beta=anthropic_beta, dropped=dropped)
     except ProviderParameterError as error:
         raise invalid_field("messages.content.cache_control", str(error)) from error
 
@@ -459,12 +461,14 @@ def _decode(
     wire: type[_MessagesRequest],
     *,
     anthropic_beta: str | None,
-    streams: bool,
+    streams: bool = False,
+    dropped: tuple[str, ...] = (),
 ) -> DecodedGatewayRequest:
     """Validate ``payload`` against ``wire`` and build the canonical request.
 
     ``streams`` says whether the call answers with a stream; ``count_tokens``
-    never does, whatever its ``stream`` field says.
+    never does, whatever its ``stream`` field says; ``dropped`` discloses
+    fields the caller already removed.
     """
     # Clients stamp their own bookkeeping on the turns they replay; a key no
     # turn defines is removed with disclosure rather than failing the whole
@@ -474,11 +478,9 @@ def _decode(
     # Media the gateway cannot forward fails every replay of a history that
     # carries it, so history copies degrade to disclosed placeholders.
     payload, media_disclosures = degrade_history_media(payload)
-    # Clients with OpenAI-style extra body fields attach Chat's stream_options;
-    # usage always streams on this surface.
+    # OpenAI-style clients attach Chat's stream_options; Messages usage always streams.
     payload, stream_disclosures = accept_messages_stream_options(payload, streams=streams)
-    # Clients that speak Chat for generation reuse Chat's tool list on Messages
-    # (count_tokens above all); the OpenAI shapes are a lossless rename apart.
+    # Chat clients reuse Chat's tool list (count_tokens above all): a lossless rename.
     payload, tool_shape_disclosures = fold_openai_tool_shapes(payload)
     validate_manifest(payload, MESSAGES_MANIFEST)
     request = validate_wire(payload, wire)
@@ -589,6 +591,7 @@ def _decode(
                 *turn_disclosures,
                 *stream_disclosures,
                 *tool_shape_disclosures,
+                *dropped,
                 *dropped_beta_disclosures,
                 *tool_change_disclosures,
                 *channels.disclosures,
@@ -858,9 +861,8 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                     )
                 )
                 continue
-            # An empty citations array (the SDK accumulator's uncited shape)
-            # carries no information and drops; a cache marker on the block
-            # survives through the marked-run carrier.
+            # An empty citations array (the SDK accumulator's uncited shape) carries no
+            # information and drops; a cache marker survives via the marked-run carrier.
             text_parts.append(block)
             # Keep empty checkpoints until the complete media order is known;
             # flush relocates the marker before dropping the unsupported text.
