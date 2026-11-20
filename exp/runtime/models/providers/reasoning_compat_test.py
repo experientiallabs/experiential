@@ -495,6 +495,23 @@ def test_gemini_thinking_levels_follow_exact_model_tables() -> None:
         gemini_thinking_level("gemini-4-argon", "minimal")
     with pytest.raises(UnsupportedReasoningEffortError):
         gemini_thinking_level("gemini-4-argon", "xhigh")
+    # Gemini 4 Neon and Hydrogen: low/medium/high/xhigh; Carbon: low/medium/high.
+    # None of them takes MINIMAL or a thinking budget (so no "none").
+    for model_id in (
+        "gemini-4-neon",
+        "models/gemini-4-hydrogen",
+        "publishers/google/models/gemini-4-neon",
+    ):
+        for effort in ("low", "medium", "high", "xhigh"):
+            assert gemini_thinking_level(model_id, effort) == effort, (model_id, effort)
+        for refused in ("none", "minimal", "max"):
+            with pytest.raises(UnsupportedReasoningEffortError):
+                gemini_thinking_level(model_id, refused)
+    for effort in ("low", "medium", "high"):
+        assert gemini_thinking_level("gemini-4-carbon", effort) == effort
+    for refused in ("none", "minimal", "xhigh"):
+        with pytest.raises(UnsupportedReasoningEffortError):
+            gemini_thinking_level("gemini-4-carbon", refused)
     assert (
         gemini_thinking_level(
             "publishers/google/models/gemini-2.5-pro",
@@ -664,6 +681,24 @@ def test_exact_effort_support_covers_each_reasoning_wire_family() -> None:
         "medium",
         "high",
     )
+    for model_id in ("gemini-4-neon", "gemini-4-hydrogen"):
+        assert supported_reasoning_efforts(model_id, "gemini_thinking") == (
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+        )
+    assert supported_reasoning_efforts("google/gemini-4-neon", "reasoning") == (
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    )
+    assert supported_reasoning_efforts("gemini-4-carbon", "gemini_thinking") == (
+        "low",
+        "medium",
+        "high",
+    )
     assert supported_reasoning_efforts("openai/gpt-5-pro", "reasoning") == ("high",)
     assert supported_reasoning_efforts("anthropic/claude-opus-5", "reasoning") == (
         "low",
@@ -696,6 +731,11 @@ def test_default_effort_is_always_valid_for_the_exact_model() -> None:
     assert default_reasoning_effort("gpt-5-pro", "openai_responses") == "high"
     assert default_reasoning_effort("gemini-3-pro-preview", "gemini_thinking") == "high"
     assert default_reasoning_effort("gemini-4-argon", "gemini_thinking") == "medium"
+    # Neon and Hydrogen think at HIGH unconfigured; Carbon at MEDIUM.
+    assert default_reasoning_effort("gemini-4-neon", "gemini_thinking") == "high"
+    assert default_reasoning_effort("models/gemini-4-hydrogen", "gemini_thinking") == "high"
+    assert default_reasoning_effort("google/gemini-4-neon", "reasoning") == "high"
+    assert default_reasoning_effort("gemini-4-carbon", "gemini_thinking") == "medium"
     assert default_reasoning_effort("vendor/reasoner", "reasoning") == "medium"
 
 

@@ -70,11 +70,24 @@ def default_reasoning_effort(
         and "high" in supported
     ):
         return "high"
+    if wire_format in {"gemini_thinking", "reasoning"} and _gemini_defaults_to_high(model_id):
+        return "high"
     if "medium" in supported:
         return "medium"
     if "high" in supported:
         return "high"
     return cast("ReasoningEffort", supported[0]) if supported else None
+
+
+def _gemini_defaults_to_high(model_id: str) -> bool:
+    """Whether a Gemini family's own default thinking level is HIGH, not MEDIUM.
+
+    Gemini 4 Neon and Hydrogen default to HIGH (Google's thinking docs and
+    the Neon launch notes), so a MEDIUM catalog default would quietly think
+    less than the model does unconfigured.
+    """
+    family = _gemini_family(model_id.rsplit("/", 1)[-1])
+    return family.startswith(("gemini-4-neon", "gemini-4-hydrogen"))
 
 
 def efforts_by_nearness(
@@ -427,12 +440,22 @@ def _gemini_family(model_id: str) -> str:
 def _gemini_supported_efforts(model_id: str) -> Collection[str]:
     """Return documented native thinking levels for one Gemini family."""
     normalized = _gemini_family(model_id)
-    if "gemini-4-argon" in normalized:
+    if "gemini-4-neon" in normalized or "gemini-4-hydrogen" in normalized:
+        # Google's thinking docs (AI Studio and Vertex, 2026-11-20): LOW,
+        # MEDIUM, HIGH and XHIGH, default HIGH; MINIMAL answers an error and
+        # a thinkingBudget on a Gemini 4 model is 400 INVALID_ARGUMENT, so
+        # there is no "none" (it would ride a zero budget).
+        supported: Collection[str] = ("low", "medium", "high", "xhigh")
+    elif "gemini-4-carbon" in normalized:
+        # Same docs: LOW, MEDIUM and HIGH, default MEDIUM; no MINIMAL, no
+        # XHIGH and no thinkingBudget.
+        supported = ("low", "medium", "high")
+    elif "gemini-4-argon" in normalized:
         # Live on AI Studio 2026-10-13: LOW, MEDIUM and HIGH are accepted and
         # think measurably differently (0 / ~150-400 / ~1000-1350 thought
         # tokens on one prompt); MINIMAL and XHIGH answer 400. "none" rides
         # thinkingBudget 0, which this model accepts with zero thoughts.
-        supported: Collection[str] = ("none", "low", "medium", "high")
+        supported = ("none", "low", "medium", "high")
     elif "gemini-3-8-flash" in normalized:
         # Probed live 2026-10-20 on Vertex (global generateContent) and AI
         # Studio: LOW, MEDIUM and HIGH are accepted and think measurably more

@@ -503,6 +503,17 @@ def _thinking_config(model_id: str, effort: str | None) -> object:
         ("gemini-3-flash-preview", "low", {"thinkingLevel": "LOW", "includeThoughts": True}),
         ("gemini-3-flash-preview", None, {"includeThoughts": True}),
         ("gemini-4-argon", "none", {"thinkingBudget": 0}),
+        # Gemini 4 Neon/Hydrogen take XHIGH as a level; no Gemini 4 model
+        # takes a thinkingBudget, so every effort rides thinkingLevel.
+        ("gemini-4-neon", "xhigh", {"thinkingLevel": "XHIGH", "includeThoughts": True}),
+        ("gemini-4-neon", "low", {"thinkingLevel": "LOW", "includeThoughts": True}),
+        (
+            "publishers/google/models/gemini-4-hydrogen",
+            "xhigh",
+            {"thinkingLevel": "XHIGH", "includeThoughts": True},
+        ),
+        ("gemini-4-carbon", "medium", {"thinkingLevel": "MEDIUM", "includeThoughts": True}),
+        ("gemini-4-carbon", None, {"includeThoughts": True}),
     ],
 )
 def test_gemini_thinking_controls_follow_each_family(
