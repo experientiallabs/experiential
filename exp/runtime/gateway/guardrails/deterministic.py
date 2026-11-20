@@ -29,14 +29,12 @@ from exp.runtime.gateway.guardrails.contracts import (
     ClassifierCoverageError,
     GuardrailAction,
     GuardrailCheck,
-    GuardrailOutcome,
     GuardrailPolicy,
     GuardrailRejected,
     coverage_failure,
     guardrail_failure,
     request_exceeds_inspection_limit,
 )
-from exp.runtime.gateway.guardrails.input_outcomes import record_input_outcome
 from exp.runtime.gateway.guardrails.redaction import restored_provider_authority
 from exp.runtime.gateway.guardrails.text_coverage import text_input_context
 
@@ -123,7 +121,6 @@ def native_input_request(
     if any(check.adapter_id not in detectors for check in policy.input_checks):
         return None
     if request_exceeds_inspection_limit(request, policy.max_request_bytes):
-        record_input_outcome(policy, None, GuardrailOutcome.UNSUPPORTED)
         _record(policy, None, GuardrailAction.ERROR)
         raise GuardrailRejected(coverage_failure())
     current = request
@@ -134,34 +131,27 @@ def native_input_request(
         # remaining request deadline, exactly as the engine bounds it.
         budget = min(check.timeout_ms / 1000.0, remaining)
         if budget <= 0:
-            record_input_outcome(policy, check, GuardrailOutcome.TIMEOUT)
             _uncertain(policy, check)
             continue
         started = monotonic()
         try:
             messages, flagged, immutable_match = _redacted_messages(detector, current)
         except ClassifierCoverageError:
-            record_input_outcome(policy, check, GuardrailOutcome.UNSUPPORTED)
             _record(policy, check, GuardrailAction.ERROR)
             raise GuardrailRejected(coverage_failure(check_id=check.check_id)) from None
         except ValueError:
-            record_input_outcome(policy, check, GuardrailOutcome.UNAVAILABLE)
             _uncertain(policy, check)
             continue
         # A scan that overran its budget is uncertain: an inspection the
         # engine would have abandoned never returns a verdict here.
         if monotonic() - started > budget:
-            record_input_outcome(policy, check, GuardrailOutcome.TIMEOUT)
             _uncertain(policy, check)
             continue
         if not flagged:
-            record_input_outcome(policy, check, GuardrailOutcome.ALLOW)
             _record(policy, check, GuardrailAction.ALLOW, monotonic() - started)
             continue
-        record_input_outcome(policy, check, GuardrailOutcome.FLAGGED)
         _record(policy, check, check.action, monotonic() - started)
         current = _applied(policy, check, current, messages, immutable_match=immutable_match)
-        record_input_outcome(policy, check, GuardrailOutcome.ALLOW)
     return current
 
 
