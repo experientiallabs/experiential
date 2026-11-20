@@ -1,4 +1,4 @@
-"""OpenAI-shaped tools on Messages ``count_tokens`` traverse the served native gateway."""
+"""OpenAI tools and Chat-only fields on Messages ``count_tokens`` traverse the served gateway."""
 
 from __future__ import annotations
 
@@ -51,3 +51,29 @@ def test_count_tokens_counts_a_chat_tool_list(engine: _ServingEngine) -> None:
     assert without_tools.status_code == 200, without_tools.text
     # The folded declaration is counted, not dropped.
     assert answer["input_tokens"] > without_tools.json()["input_tokens"]
+
+
+def test_count_tokens_ignores_chat_reasoning_effort(engine: _ServingEngine) -> None:
+    """Claude Desktop 3p's Chat ``reasoning_effort`` is ignored by the count, with disclosure."""
+    body = {"model": "coding", "messages": [{"role": "user", "content": "foo"}]}
+    counted = httpx.post(
+        f"{engine.base}/v1/messages/count_tokens",
+        headers={"x-api-key": engine.raw_key},
+        json={**body, "reasoning_effort": "high", "verbosity": "low"},
+        timeout=10.0,
+    )
+    assert counted.status_code == 200, counted.text
+    answer = counted.json()
+    assert answer["x-experiential-ignored-parameters"] == [
+        "reasoning_effort->ignored(count_tokens)",
+        "verbosity->ignored(count_tokens)",
+        "input_tokens->estimated(gateway_tokenizer)",
+    ]
+    plain = httpx.post(
+        f"{engine.base}/v1/messages/count_tokens",
+        headers={"x-api-key": engine.raw_key},
+        json=body,
+        timeout=10.0,
+    )
+    assert plain.status_code == 200, plain.text
+    assert answer["input_tokens"] == plain.json()["input_tokens"]
