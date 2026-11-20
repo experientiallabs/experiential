@@ -146,15 +146,17 @@ are sent unchanged. A body that names a `cachedContent` is also sent unchanged, 
 `toolConfig` next to a cache. A validated dial skips the gateway's automatic cache overlay, as a
 repaired dial does.
 
-When the ladder is exhausted on a broken function call (a Gemini `MALFORMED_FUNCTION_CALL` or
-`MALFORMED_RESPONSE` finish, or a second `malformed_tool_call`), the caller receives a 400
+When the ladder ends after at least two broken function calls in the request (a Gemini
+`MALFORMED_FUNCTION_CALL` finish, or a `malformed_tool_call`), the caller receives a 400
 `malformed_tool_call` of type `invalid_request_error`, not the 502 `all_routes_failed` that every
 OpenAI and Anthropic SDK retries automatically: the same conversation would most likely break again,
 and agent clients re-sent it dozens of times. This follows `empty_completion`. The message names the
 remedy (shorten or restructure the conversation, or try another model). The ledger still records
 `malformed_response`. The control plane's echo of the exhausting failure does not model these facts,
 so the data plane restores them from its own last failure while the echo is still that malformed
-answer (`errors/broken_tool_call.rs`). A malformed stream that is not a tool call keeps the 502.
+answer (`errors/broken_tool_call.rs`), and a request deadline reached after those calls answers the
+same 400. One broken call with nothing left to try, a Gemini `MALFORMED_RESPONSE` finish, and any
+other malformed stream keep the retryable 502.
 
 ## Provider content filters
 

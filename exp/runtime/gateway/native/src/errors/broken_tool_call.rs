@@ -1,7 +1,7 @@
 //! A request whose model kept producing a broken function call.
 //!
 //! The model, not the provider, failed: Gemini finished the turn with
-//! `MALFORMED_FUNCTION_CALL` (`validated_tool_redial`), or a streamed client
+//! `MALFORMED_FUNCTION_CALL` (`malformed_function_call`), or a streamed client
 //! tool call never became one valid call (`malformed_tool_call`). The ladder
 //! still redials and fails over, because a fresh sample often parses. Once
 //! it is exhausted after at least two such failures, though, the same conversation tends to
@@ -29,7 +29,7 @@ impl Failure {
     /// Whether this failure is the model producing a broken function call.
     pub fn broken_tool_call(&self) -> bool {
         self.failure_class == FailureClass::MalformedResponse
-            && (self.malformed_tool_call || self.validated_tool_redial)
+            && (self.malformed_tool_call || self.malformed_function_call)
     }
 
     /// This failure without its broken-tool-call facts: the ladder saw only
@@ -37,7 +37,7 @@ impl Failure {
     /// retry is still the conversation's next fresh sample.
     pub fn without_broken_tool_call_facts(mut self) -> Self {
         self.malformed_tool_call = false;
-        self.validated_tool_redial = false;
+        self.malformed_function_call = false;
         self
     }
 
@@ -52,7 +52,7 @@ impl Failure {
         if let Some(last) = last.filter(|last| last.broken_tool_call()) {
             if self.failure_class == FailureClass::MalformedResponse {
                 self.malformed_tool_call |= last.malformed_tool_call;
-                self.validated_tool_redial |= last.validated_tool_redial;
+                self.malformed_function_call |= last.malformed_function_call;
             }
         }
         self
@@ -70,6 +70,7 @@ mod tests {
         )
         .with_retry(true, true);
         failure.validated_tool_redial = true;
+        failure.malformed_function_call = true;
         failure
     }
 
@@ -98,12 +99,16 @@ mod tests {
             .public_error();
         assert_eq!(error.status_code, 502);
         assert_eq!(error.code, "all_routes_failed");
+        // A Gemini MALFORMED_RESPONSE finish redials validated but names no call.
+        let mut answer = gemini_malformed();
+        answer.malformed_function_call = false;
+        assert_eq!(answer.boundary().public_error().status_code, 502);
     }
 
     #[test]
     fn the_boundary_keeps_the_gemini_fact_and_the_ledger_class() {
         let bounded = gemini_malformed().boundary();
-        assert!(bounded.validated_tool_redial);
+        assert!(bounded.validated_tool_redial && bounded.malformed_function_call);
         assert_eq!(bounded.failure_class, FailureClass::MalformedResponse);
     }
 
@@ -126,7 +131,7 @@ mod tests {
             "all exact-model deployments are unavailable",
         )
         .with_broken_tool_call_facts(Some(&last));
-        assert!(!replaced.validated_tool_redial);
+        assert!(!replaced.malformed_function_call);
         assert_eq!(replaced.public_error().status_code, 502);
         // No broken call last: nothing to restore.
         let plain = Failure::new(FailureClass::MalformedResponse, "bad frame");

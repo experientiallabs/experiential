@@ -334,6 +334,9 @@ pub struct Failure {
     /// Gemini finished MALFORMED_FUNCTION_CALL: later dials ask for VALIDATED calling (`validated_tools`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub validated_tool_redial: bool,
+    /// The finish named the function call itself (`broken_tool_call`), not any malformed answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub malformed_function_call: bool,
 }
 
 impl Failure {
@@ -359,6 +362,7 @@ impl Failure {
             provider_content_filter: false,
             malformed_tool_call: false,
             validated_tool_redial: false,
+            malformed_function_call: false,
         }
     }
 
@@ -514,6 +518,7 @@ impl Failure {
                 .with_provider_detail(Some(self.safe_message))
                 .with_malformed_tool_call(self.malformed_tool_call)
                 .with_validated_tool_redial(self.validated_tool_redial)
+                .with_malformed_function_call(self.malformed_function_call)
             }
             _ => self,
         }

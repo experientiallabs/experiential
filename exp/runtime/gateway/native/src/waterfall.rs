@@ -342,8 +342,15 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
             Err(error) => {
                 // The control plane finalized the request (budget quota, a
                 // pre-dispatch reservation failure, or an expired deadline)
-                // before raising; the public error is authoritative.
+                // before raising; the public error is authoritative, except
+                // that a deadline reached after repeated broken calls still
+                // answers the non-retryable 400 those calls earned.
                 guard.disarm_finalized("failed");
+                if error.code == "deadline_exceeded" && broken_tool_calls >= 2 {
+                    if let Some(last) = last_failure.filter(Failure::broken_tool_call) {
+                        return Won::Failed(collection_public_error(&last.boundary()));
+                    }
+                }
                 return Won::Failed(error);
             }
         };
