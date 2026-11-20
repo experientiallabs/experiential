@@ -18,6 +18,11 @@ Bedrock Converse rung (``automatic_prompt_caching``), unless the request is
 routed under zero data retention or the organization, the operator or the rung
 turned it off.
 
+A Claude plan rung (``prepends_claude_code_billing_header``) leads its system
+prompt with Claude Code's billing-header block after every other shaping, so a
+Chat, Responses or Messages caller is served on the plan with its own system
+content kept in order after the block (``claude_plan_billing``).
+
 A rung whose authored dispatch policy sets ``upstream_priority`` (a self-hosted
 vLLM lane) carries the caller's admission level as vLLM's ``priority`` field.
 
@@ -70,6 +75,7 @@ from exp.runtime.models.providers import (
 )
 from exp.runtime.models.providers.anthropic import safeguards_for_upstream
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.claude_plan_billing import with_claude_code_billing_header
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.generation_parameter_validation import bounded_output_request
 from exp.runtime.models.providers.history_tool_arguments import (
@@ -276,6 +282,10 @@ def build_rung_dispatch(
             **upstream_payload,
             "access_programs": dict(dispatch_policy.access_programs),
         }
+    if profile.dialect == "anthropic_messages" and profile.prepends_claude_code_billing_header:
+        # A Claude plan serves only payloads led by Claude Code's billing-header
+        # block; last, so every caller shaping above keeps its order after it.
+        upstream_payload = with_claude_code_billing_header(upstream_payload)
     request_headers = (
         anthropic_request_headers(dict(profile.headers), rung_request)
         if profile.dialect == "anthropic_messages"
