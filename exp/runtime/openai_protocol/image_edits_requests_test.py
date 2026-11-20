@@ -11,7 +11,7 @@ from exp.runtime.openai_protocol.image_edits_requests import decode_image_edits
 _IMAGE = "aW1hZ2U="
 
 
-def _upload(fields: dict[str, str], files: dict[str, str] | None = None) -> JsonObject:
+def _upload(fields: dict[str, str], files: dict[str, str | list[str]] | None = None) -> JsonObject:
     """Build one parsed upload as the data plane sends it."""
     return {"fields": dict(fields), "files": dict({"image": _IMAGE} if files is None else files)}
 
@@ -72,7 +72,8 @@ def test_the_sdk_list_spelling_of_image_is_accepted() -> None:
         (_upload({}), "model", "invalid_request"),
         (_upload({"model": "m", "stream": "true"}), "stream", "unsupported_parameter"),
         (_upload({"model": "m", "partial_images": "2"}), "partial_images", None),
-        (_upload({"model": "m", "input_fidelity": "high"}), "input_fidelity", None),
+        (_upload({"model": "m", "input_fidelity": "exact"}), "input_fidelity", None),
+        (_upload({"model": "m", "moderation": "strict"}), "moderation", None),
         (_upload({"model": "m", "frobnicate": "1"}), "frobnicate", "invalid_request"),
         (_upload({"model": "m", "seed": "-1"}), "seed", "invalid_request"),
         (_upload({"model": "m", "seed": "seven"}), "seed", "invalid_request"),
@@ -110,3 +111,34 @@ def test_a_malformed_upload_object_is_refused() -> None:
         decode_image_edits({"fields": {"model": 7}, "files": {"image": _IMAGE}})
     with pytest.raises(OpenAIProtocolError):
         decode_image_edits({"fields": [], "files": {"image": _IMAGE}})
+
+
+def test_repeated_image_parts_become_ordered_source_images() -> None:
+    """``image[]`` as a list keeps upload order; the first is the primary image."""
+    decoded = decode_image_edits(
+        _upload(
+            {"model": "gpt-image-2.5-sunburst", "input_fidelity": "high", "moderation": "low"},
+            {"image[]": [_IMAGE, "c2Vjb25k", "dGhpcmQ="], "mask": "bWFzaw=="},
+        )
+    )
+    edit = decoded.request.edit
+    assert edit is not None
+    assert edit.images == (_IMAGE, "c2Vjb25k", "dGhpcmQ=")
+    assert edit.mask == "bWFzaw=="
+    assert decoded.request.input_fidelity == "high"
+    assert decoded.request.moderation == "low"
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {"image[]": [_IMAGE] * 17},
+        {"image[]": []},
+        {"image": [_IMAGE, _IMAGE]},
+        {"image[]": [_IMAGE, 7]},
+    ],
+)
+def test_too_many_or_malformed_image_lists_are_refused(files: JsonObject) -> None:
+    """Only ``image[]`` may be a list, of 1 to 16 base64 strings."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_image_edits({"fields": {"model": "m"}, "files": files})

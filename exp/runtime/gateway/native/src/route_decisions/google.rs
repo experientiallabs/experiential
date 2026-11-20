@@ -298,5 +298,6 @@ pub(super) fn google_decision_usage(payload: &Value) -> Result<Usage, Failure> {
         billed_units: None,
         cache_writes_read_back: false,
         image_output_tokens: None,
+        image_input_tokens: None,
     })
 }

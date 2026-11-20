@@ -1129,7 +1129,7 @@ def test_project_certified_pool_is_unavailable_when_any_sibling_cannot_resolve(
 def _configured_gateway(
     root: Path,
     *,
-    base_url: str = "http://127.0.0.1:9/v1",
+    base_url: str | None = "http://127.0.0.1:9/v1",
     capabilities: ModelCapabilities | None = None,
     gateway_capabilities: GatewayDeploymentCapabilities | None = None,
     provider: str = "openai-compatible",

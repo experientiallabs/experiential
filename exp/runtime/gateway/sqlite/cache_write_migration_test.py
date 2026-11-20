@@ -105,6 +105,8 @@ def test_both_published_v22_layouts_preserve_attempt_evidence(
             "billed_unit_variant",
             "billed_quantity_milli",
             "billed_unit_rate",
+            # v34: the consumed-unit leg (an image edit's source images).
+            "billed_input_quantity_milli",
         }
         assert after.keys() - before.keys() == added | {"accounting_recovery"}
         assert all(after[column] is None for column in added)

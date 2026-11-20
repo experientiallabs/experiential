@@ -2,7 +2,9 @@
 
 The data plane parses the ``/v1/images/edits`` multipart body itself: its text
 fields arrive as strings and its image parts as base64 strings, in one JSON
-object ``{"fields": {name: text}, "files": {name: base64}}``. The OpenAI edit
+object ``{"fields": {name: text}, "files": {name: base64}}``. The repeatable
+``image[]`` part (GPT image models edit up to 16 source images at once) arrives
+as a list of base64 strings in upload order. The OpenAI edit
 fields map onto :class:`~exp.runtime.gateway.images_contracts.ImagesRequest`
 with an :class:`~exp.runtime.gateway.images_contracts.ImageEditInput`; the
 image-tool controls Stability AI's Bedrock models take (``seed``,
@@ -19,13 +21,17 @@ from typing import Final
 from pydantic import ValidationError
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.images_contracts import EditOptionValue, ImagesRequest
+from exp.runtime.gateway.images_contracts import (
+    MAXIMUM_EDIT_IMAGES,
+    EditOptionValue,
+    ImagesRequest,
+)
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.images_requests import DecodedImagesRequest
 from exp.runtime.openai_protocol.validation_errors import validation_protocol_error
 
 # The image parts an edit may carry; ``image[]`` is the SDK's list spelling of
-# ``image`` and must name exactly one image (every served edit model takes one).
+# ``image`` and may repeat. Each rung refuses more source images than it takes.
 _FILE_PARTS: Final[frozenset[str]] = frozenset({"image", "image[]", "mask", "style_image"})
 
 # OpenAI edit fields carried on the canonical request.
@@ -39,6 +45,8 @@ _OPENAI_FIELDS: Final[frozenset[str]] = frozenset(
         "background",
         "output_format",
         "output_compression",
+        "moderation",
+        "input_fidelity",
         "response_format",
         "user",
     }
@@ -48,7 +56,6 @@ _OPENAI_FIELDS: Final[frozenset[str]] = frozenset(
 _UNSUPPORTED_FIELDS: Final[dict[str, str]] = {
     "stream": "Streaming image edits are not supported; omit stream.",
     "partial_images": "Streaming partial images are not supported; omit partial_images.",
-    "input_fidelity": "input_fidelity is not supported by any served edit model; omit it.",
 }
 
 _STYLE_PRESETS: Final[frozenset[str]] = frozenset(
@@ -265,6 +272,30 @@ def _string_map(payload: JsonObject, key: str) -> dict[str, str]:
     return {str(name): str(item) for name, item in value.items()}
 
 
+def _file_map(payload: JsonObject) -> dict[str, list[str]]:
+    """Read the upload's image parts, each as its base64 parts in upload order.
+
+    Args:
+        payload: The parsed upload.
+
+    Returns:
+        Part name to its base64 strings; only ``image[]`` may hold several.
+
+    Raises:
+        OpenAIProtocolError: The member is malformed.
+    """
+    value = payload.get("files", {})
+    if not isinstance(value, dict):
+        raise _invalid("files", "The image edit upload is malformed.")
+    files: dict[str, list[str]] = {}
+    for name, item in value.items():
+        parts = item if isinstance(item, list) and name == "image[]" else [item]
+        if not parts or not all(isinstance(part, str) for part in parts):
+            raise _invalid("files", "The image edit upload is malformed.")
+        files[str(name)] = [str(part) for part in parts]
+    return files
+
+
 def decode_image_edits(payload: JsonObject) -> DecodedImagesRequest:
     """Decode one parsed ``/v1/images/edits`` upload.
 
@@ -279,15 +310,17 @@ def decode_image_edits(payload: JsonObject) -> DecodedImagesRequest:
             the image part is missing.
     """
     fields = _string_map(payload, "fields")
-    files = _string_map(payload, "files")
+    files = _file_map(payload)
     for name in files:
         if name not in _FILE_PARTS:
             raise _invalid(name, f"Unknown image part {name!r}; send image, mask or style_image.")
     if "image" in files and "image[]" in files:
-        raise _invalid("image", "Send the image to edit once, as image.")
-    image = files.get("image") or files.get("image[]")
-    if image is None:
+        raise _invalid("image", "Send the source images either as image or as image[], not both.")
+    images = files.get("image") or files.get("image[]")
+    if images is None:
         raise _invalid("image", "An image edit must carry an image part.")
+    if len(images) > MAXIMUM_EDIT_IMAGES:
+        raise _invalid("image", f"An image edit carries at most {MAXIMUM_EDIT_IMAGES} images.")
     options: dict[str, EditOptionValue] = {}
     for name, raw in fields.items():
         if name in _UNSUPPORTED_FIELDS:
@@ -311,7 +344,16 @@ def decode_image_edits(payload: JsonObject) -> DecodedImagesRequest:
         raise _invalid("model", "An image edit must name a model (1 to 256 characters).")
     request: JsonObject = {
         name: fields[name]
-        for name in ("prompt", "size", "quality", "background", "output_format", "response_format")
+        for name in (
+            "prompt",
+            "size",
+            "quality",
+            "background",
+            "output_format",
+            "moderation",
+            "input_fidelity",
+            "response_format",
+        )
         if name in fields
     }
     for name in ("n", "output_compression"):
@@ -322,10 +364,10 @@ def decode_image_edits(payload: JsonObject) -> DecodedImagesRequest:
                 raise _invalid(name, f"{name} must be an integer.") from None
     if "user" in fields:
         request["user"] = fields["user"]
-    edit: JsonObject = {"image": image}
+    edit: JsonObject = {"image": images[0], "additional_images": list(images[1:])}
     for part in ("mask", "style_image"):
         if part in files:
-            edit[part] = files[part]
+            edit[part] = files[part][0]
     request["edit"] = edit
     if options:
         request["edit_options"] = dict(options)

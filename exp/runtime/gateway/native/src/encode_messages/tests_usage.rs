@@ -20,6 +20,7 @@ fn usage_reports_cached_reads_out_of_the_input_total() {
         billed_units: None,
         cache_writes_read_back: false,
         image_output_tokens: None,
+        image_input_tokens: None,
     };
     assert_eq!(
         messages_usage(Some(&usage)),
@@ -58,6 +59,7 @@ fn usage_carries_both_cache_legs_as_zero_when_the_provider_reports_none() {
         billed_units: None,
         cache_writes_read_back: false,
         image_output_tokens: None,
+        image_input_tokens: None,
     };
     assert_eq!(
         messages_usage(Some(&usage)),
@@ -87,6 +89,7 @@ fn usage_reports_openai_wire_cached_tokens_as_cache_reads() {
         billed_units: None,
         cache_writes_read_back: false,
         image_output_tokens: None,
+        image_input_tokens: None,
     };
     assert_eq!(
         messages_usage(Some(&usage)),
@@ -115,6 +118,7 @@ fn usage_reports_both_cache_legs_out_of_the_folded_input_total() {
         billed_units: None,
         cache_writes_read_back: false,
         image_output_tokens: None,
+        image_input_tokens: None,
     };
     assert_eq!(
         messages_usage(Some(&usage)),
@@ -139,6 +143,7 @@ fn written(creation: Option<u64>, hour: Option<u64>, half_day: Option<u64>) -> U
         billed_units: None,
         cache_writes_read_back: false,
         image_output_tokens: None,
+        image_input_tokens: None,
     }
 }
 

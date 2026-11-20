@@ -942,6 +942,20 @@ def test_settlement_usage_carries_the_image_output_subset() -> None:
     assert plain is not None and plain.image_output_tokens is None
 
 
+def test_settlement_usage_carries_the_image_input_subset() -> None:
+    """An edit's source-image tokens reach the typed usage; 0 stays 0, absent stays None."""
+    usage = _usage_from_payload(
+        {"input_tokens": 1554, "output_tokens": 196, "image_input_tokens": 1536}, []
+    )
+    assert usage is not None and usage.image_input_tokens == 1536
+    zero = _usage_from_payload(
+        {"input_tokens": 11, "output_tokens": 272, "image_input_tokens": 0}, []
+    )
+    assert zero is not None and zero.image_input_tokens == 0
+    plain = _usage_from_payload({"input_tokens": 11, "output_tokens": 272}, [])
+    assert plain is not None and plain.image_input_tokens is None
+
+
 def test_a_reported_zero_image_count_survives_settlement_parsing() -> None:
     """A provider's explicit 0 stays 0 (text-rate output), distinct from unknown."""
     usage = _usage_from_payload(

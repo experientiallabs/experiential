@@ -397,6 +397,7 @@ def usage_record(row: sqlite3.Row) -> GatewayUsage | None:
             kind=BilledUnitKind(str(row["billed_unit_kind"])),
             variant=str(row["billed_unit_variant"] or ""),
             quantity_milli=int(row["billed_quantity_milli"]),
+            input_quantity_milli=optional_int(row["billed_input_quantity_milli"]),
         )
     )
     if row["input_tokens"] is None and row["output_tokens"] is None and billed is None:

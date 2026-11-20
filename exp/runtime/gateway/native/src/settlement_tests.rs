@@ -547,6 +547,7 @@ fn settle_argument_preserves_upstream_provider_and_cache_ttl_usage_together() {
         billed_units: None,
         cache_writes_read_back: false,
         image_output_tokens: None,
+        image_input_tokens: None,
     };
     let named = settle_argument(
         "req",
@@ -807,6 +808,8 @@ fn settle_argument_keeps_a_reported_zero_image_count_and_omits_an_unreported_one
             input_tokens: Some(10),
             output_tokens: Some(3),
             image_output_tokens: image,
+            // An edit's source-image subset rides the same way.
+            image_input_tokens: image,
             ..Usage::default()
         };
         let argument = settle_argument(
@@ -832,6 +835,9 @@ fn settle_argument_keeps_a_reported_zero_image_count_and_omits_an_unreported_one
         json!(1_120)
     );
     assert!(settle(None)["usage"].get("image_output_tokens").is_none());
+    assert_eq!(settle(Some(0))["usage"]["image_input_tokens"], json!(0));
+    assert_eq!(settle(Some(9))["usage"]["image_input_tokens"], json!(9));
+    assert!(settle(None)["usage"].get("image_input_tokens").is_none());
 }
 
 #[test]

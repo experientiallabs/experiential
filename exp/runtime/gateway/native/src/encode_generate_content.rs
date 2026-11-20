@@ -630,6 +630,7 @@ mod tests {
             cache_creation_12h_input_tokens: None,
             reasoning_tokens: reasoning,
             image_output_tokens: None,
+            image_input_tokens: None,
             billed_units: None,
             cache_writes_read_back: false,
         }

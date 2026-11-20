@@ -509,6 +509,7 @@ async fn dispatch_speech(
             kind: "character".to_string(),
             variant: String::new(),
             quantity_milli: characters.saturating_mul(1000),
+            input_quantity_milli: None,
         }),
         ..Usage::default()
     };
@@ -852,6 +853,7 @@ fn metered_seconds(seconds: f64, admission: &AudioAdmission) -> Result<Usage, Fa
             kind: "audio_second".to_string(),
             variant: String::new(),
             quantity_milli,
+            input_quantity_milli: None,
         }),
         ..Usage::default()
     })

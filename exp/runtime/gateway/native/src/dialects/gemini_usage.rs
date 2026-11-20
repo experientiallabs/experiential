@@ -125,6 +125,7 @@ impl Normalizer {
             billed_units: None,
             cache_writes_read_back: writes.is_some(),
             image_output_tokens: fields.image,
+            image_input_tokens: None,
         });
         Ok(())
     }

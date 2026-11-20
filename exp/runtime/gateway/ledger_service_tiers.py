@@ -222,4 +222,5 @@ def card_usage_cost(prices: GatewayTokenPrices, usage: GatewayUsage | None) -> i
         cache_creation_1h_input_rate=schedule.cache_creation_1h_input_nano_usd_per_million_tokens,
         output_rate=schedule.output_nano_usd_per_million_tokens,
         reasoning_rate=schedule.reasoning_nano_usd_per_million_tokens,
+        image_input_rate=schedule.image_input_nano_usd_per_million_tokens,
     )

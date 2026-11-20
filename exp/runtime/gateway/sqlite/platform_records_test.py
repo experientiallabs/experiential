@@ -237,11 +237,14 @@ def test_usage_record_restores_unit_only_media_usage() -> None:
         "SELECT NULL AS input_tokens, NULL AS output_tokens, NULL AS cached_input_tokens, "
         "NULL AS cache_creation_input_tokens, NULL AS cache_creation_1h_input_tokens, "
         "NULL AS reasoning_tokens, 'character' AS billed_unit_kind, '' AS billed_unit_variant, "
-        "1200000 AS billed_quantity_milli"
+        "1200000 AS billed_quantity_milli, 2000 AS billed_input_quantity_milli"
     ).fetchone()
     usage = usage_record(row)
     assert usage is not None
     assert usage.billed_units == BilledUnits(
-        kind=BilledUnitKind.CHARACTER, variant="", quantity_milli=1_200_000
+        kind=BilledUnitKind.CHARACTER,
+        variant="",
+        quantity_milli=1_200_000,
+        input_quantity_milli=2_000,
     )
     assert usage.input_tokens is None

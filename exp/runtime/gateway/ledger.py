@@ -691,7 +691,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 ratelimit_remaining_requests = ?, ratelimit_limit_tokens = ?,
                 ratelimit_remaining_tokens = ?, upstream_provider = ?,
                 billed_unit_kind = ?, billed_unit_variant = ?, billed_quantity_milli = ?,
-                billed_unit_rate = ?
+                billed_unit_rate = ?, billed_input_quantity_milli = ?
             WHERE attempt_id = ? AND state = 'dispatched'
             """,
             (

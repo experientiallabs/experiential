@@ -441,6 +441,7 @@ fn public_embeddings(
         billed_units: None,
         cache_writes_read_back: false,
         image_output_tokens: None,
+        image_input_tokens: None,
     };
     Ok((Value::Object(public), usage))
 }

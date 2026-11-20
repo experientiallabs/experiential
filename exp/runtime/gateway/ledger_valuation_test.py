@@ -17,6 +17,7 @@ from exp.runtime.gateway.ledger_errors import GatewayLedgerError
 from exp.runtime.gateway.ledger_valuation import (
     MAXIMUM_NANO_USD,
     NanoUsdOverflowError,
+    billed_units_cost_nano_usd,
     budget_settlement_nano_usd,
     estimated_cost_nano_usd,
     frozen_usage_cost,
@@ -526,3 +527,57 @@ def test_settled_image_tokens_price_at_the_image_rate_when_one_is_given() -> Non
         estimated_cost_nano_usd(usage, **rates, image_output_rate=120_000_000_000)
         == (1_120 * 120_000_000_000 + 6 * 12 + 500_000) // 1_000_000
     )
+
+
+def test_settled_source_image_tokens_price_at_the_image_input_rate() -> None:
+    """An edit's image-input subset meets its rate; text input keeps the input rate."""
+    usage = GatewayUsage(input_tokens=1_554, output_tokens=196, image_input_tokens=1_536)
+    rates = {
+        "input_rate": 5_000_000_000,
+        "cached_input_rate": 2_000_000_000,
+        "output_rate": 30_000_000_000,
+        "reasoning_rate": 30_000_000_000,
+    }
+    assert (
+        estimated_cost_nano_usd(usage, **rates, image_input_rate=8_000_000_000)
+        == (1_536 * 8_000_000_000 + 18 * 5_000_000_000 + 196 * 30_000_000_000 + 500_000)
+        // 1_000_000
+    )
+
+
+def test_image_input_needs_a_covering_input_total() -> None:
+    """The subset can never exceed the input it is part of."""
+    with pytest.raises(ValueError, match="image input tokens"):
+        GatewayUsage(input_tokens=5, output_tokens=0, image_input_tokens=6)
+
+
+def test_a_consumed_leg_prices_at_the_input_rate_beside_the_produced_leg() -> None:
+    """An xAI edit: two edited images at $0.06 and three source images at $0.01."""
+    card = GatewayUnitPrices(
+        kind=BilledUnitKind.IMAGE,
+        rates={"": 40_000_000, "edit": 60_000_000},
+        input_rates={"": 10_000_000},
+    )
+    billed = BilledUnits(
+        kind=BilledUnitKind.IMAGE, variant="edit", quantity_milli=2_000, input_quantity_milli=3_000
+    )
+    assert billed_units_cost_nano_usd(billed, card) == 150_000_000
+    unpriced = card.model_copy(update={"input_rates": None})
+    assert billed_units_cost_nano_usd(billed, unpriced) is None
+    produced_only = billed.model_copy(update={"input_quantity_milli": None})
+    assert billed_units_cost_nano_usd(produced_only, unpriced) == 120_000_000
+
+
+def test_frozen_rates_cannot_price_image_input_apart_from_text() -> None:
+    """The frozen schedule has no image-input column: such usage is unknown, never text."""
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    row = connection.execute(
+        "SELECT 1 AS input_rate, NULL AS cached_input_rate, NULL AS cache_creation_input_rate, "
+        "NULL AS cache_creation_1h_input_rate, 1 AS output_rate, NULL AS reasoning_rate, "
+        "NULL AS unit_prices"
+    ).fetchone()
+    edit = GatewayUsage(input_tokens=10, output_tokens=1, image_input_tokens=8)
+    assert frozen_usage_cost(row, edit) is None
+    text = GatewayUsage(input_tokens=10, output_tokens=1, image_input_tokens=0)
+    assert frozen_usage_cost(row, text) == 0

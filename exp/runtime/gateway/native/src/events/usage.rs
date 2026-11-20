@@ -66,6 +66,7 @@ impl Usage {
             .max(newer.cache_creation_input_tokens);
         self.reasoning_tokens = self.reasoning_tokens.max(newer.reasoning_tokens);
         self.image_output_tokens = self.image_output_tokens.max(newer.image_output_tokens);
+        self.image_input_tokens = self.image_input_tokens.max(newer.image_input_tokens);
         self.cache_writes_read_back |= newer.cache_writes_read_back;
     }
 
@@ -387,6 +388,7 @@ impl OpenAiUsageAccumulator {
             billed_units: None,
             cache_writes_read_back: false,
             image_output_tokens,
+            image_input_tokens: None,
         });
         // Initial split fragments support a provisional mode until counters
         // change. A coherent raw output/reasoning/total sample may correct it;
@@ -548,6 +550,7 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
         billed_units: None,
         cache_writes_read_back: false,
         image_output_tokens,
+        image_input_tokens: None,
     })
 }
 
@@ -591,6 +594,7 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
         billed_units: None,
         cache_writes_read_back: false,
         image_output_tokens: None,
+        image_input_tokens: None,
     })
 }
 

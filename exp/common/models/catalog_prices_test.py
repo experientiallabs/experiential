@@ -103,6 +103,22 @@ def test_unit_card_is_tier_independent_and_absent_by_default() -> None:
     assert "units" not in GatewayTokenPrices().model_dump(exclude_defaults=True)
 
 
+def test_unit_card_input_rates_resolve_like_rates_and_stay_out_of_identity() -> None:
+    """Consumed units price per variant with a flat fallback; unset is omitted."""
+    card = GatewayUnitPrices(
+        kind=BilledUnitKind.IMAGE,
+        rates={"": 40_000_000, "edit": 60_000_000},
+        input_rates={"": 10_000_000},
+    )
+    assert card.input_rate_for("edit") == 10_000_000
+    produced_only = GatewayUnitPrices(kind=BilledUnitKind.IMAGE, rates={"": 40_000_000})
+    assert produced_only.input_rate_for("edit") is None
+    assert "input_rates" not in produced_only.model_dump(exclude_defaults=True)
+    for invalid in ({}, {"": -1}, {"": MAXIMUM_RATE_NANO_USD_PER_UNIT + 1}):
+        with pytest.raises(ValidationError):
+            GatewayUnitPrices(kind=BilledUnitKind.IMAGE, rates={"": 1}, input_rates=invalid)
+
+
 # DeepSeek's published schedule (api-docs.deepseek.com/quick_start/pricing, 2026-10-19):
 # peak 01:00-04:00 and 06:00-10:00 UTC Monday to Friday, every other hour half price.
 _DEEPSEEK_PEAK = (

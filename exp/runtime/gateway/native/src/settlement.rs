@@ -118,6 +118,10 @@ fn settle_argument(
             if let Some(image) = usage.image_output_tokens {
                 wire["image_output_tokens"] = json!(image);
             }
+            // So does the source-image subset of the input (an image edit).
+            if let Some(image) = usage.image_input_tokens {
+                wire["image_input_tokens"] = json!(image);
+            }
             if let Some(half_day) = usage.cache_creation_12h_input_tokens {
                 wire["cache_creation_12h_input_tokens"] = json!(half_day);
             }

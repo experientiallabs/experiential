@@ -44,6 +44,7 @@ _UNIT_FIELDS = (
     "billed_unit_variant",
     "billed_quantity_milli",
     "billed_unit_rate",
+    "billed_input_quantity_milli",
 )
 _REPLAY_CONFLICT = (
     "attempt settlement replay differs from durable accounting evidence (durable usage or cost)"
@@ -293,7 +294,7 @@ def _upgrade_observed(
         "reasoning_tokens = ?, usage_source = 'observed', estimated_cost_nano_usd = ?, "
         "counterfactual_cost_nano_usd = ?, budget_settled_nano_usd = ?, "
         "billed_unit_kind = ?, billed_unit_variant = ?, "
-        "billed_quantity_milli = ?, billed_unit_rate = ? "
+        "billed_quantity_milli = ?, billed_unit_rate = ?, billed_input_quantity_milli = ? "
         "WHERE attempt_id = ?",
         (
             *(getattr(usage, field) for field in _TOKEN_FIELDS),

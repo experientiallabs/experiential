@@ -47,6 +47,7 @@ fn chat_cache_ttl_survives_two_gateway_hops_without_inventing_zero() {
             billed_units: None,
             cache_writes_read_back: false,
             image_output_tokens: None,
+            image_input_tokens: None,
         };
         for streaming in [false, true] {
             let mut current = usage.clone();
