@@ -9,8 +9,10 @@ from atexit import register
 from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from posthog import Posthog
@@ -233,8 +235,8 @@ def _capture_sanitized(
     api_key = os.getenv("EXP_POSTHOG_PROJECT_API_KEY", POSTHOG_PROJECT_API_KEY).strip()
     if not api_key:
         return False
-    host = os.getenv("EXP_POSTHOG_HOST", POSTHOG_HOST).rstrip("/")
     try:
+        host = _validated_posthog_host(os.getenv("EXP_POSTHOG_HOST", POSTHOG_HOST))
         distinct_id = ensure_telemetry_anonymous_id(root)
         event_properties = {
             "$process_person_profile": False,
@@ -258,6 +260,48 @@ def _capture_sanitized(
             )
         return message_id is not None
     except Exception:  # noqa: BLE001
+        return False
+
+
+def _validated_posthog_host(value: str) -> str:
+    """Return a safe PostHog origin, allowing plaintext only on loopback."""
+    if (
+        not value
+        or "\\" in value
+        or "%" in value
+        or any(
+            character.isspace() or ord(character) < 32 or ord(character) == 127
+            for character in value
+        )
+    ):
+        raise ValueError("PostHog host must be a web origin")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("PostHog host must be a credential-free web origin")
+    port = parsed.port
+    hostname = parsed.hostname.lower()
+    if parsed.scheme == "http" and not _is_loopback_host(hostname):
+        raise ValueError("PostHog host must use HTTPS outside loopback")
+    rendered_host = f"[{hostname}]" if ":" in hostname else hostname
+    rendered_port = "" if port is None else f":{port}"
+    return f"{parsed.scheme}://{rendered_host}{rendered_port}"
+
+
+def _is_loopback_host(hostname: str) -> bool:
+    """Return whether a hostname identifies an explicit loopback endpoint."""
+    if hostname.rstrip(".") == "localhost":
+        return True
+    try:
+        return ip_address(hostname).is_loopback
+    except ValueError:
         return False
 
 
