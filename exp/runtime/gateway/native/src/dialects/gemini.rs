@@ -245,6 +245,9 @@ impl Normalizer {
                 )
                 .with_retry(true, true);
                 failure.validated_tool_redial = true;
+                // Only a broken call, not any malformed answer, can answer
+                // the non-retryable 400 (`errors::broken_tool_call`).
+                failure.malformed_function_call = finish_reason == "MALFORMED_FUNCTION_CALL";
                 Event::Failed(failure)
             }
             _ => Event::Failed(Failure::new(

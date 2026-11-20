@@ -62,6 +62,7 @@ from exp.runtime.gateway.prompt_caching import (
 )
 from exp.runtime.gateway.recovery_binding import bind_recovery_profiles
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
+from exp.runtime.gateway.signature_affinity import lead as lead_with_issuer
 from exp.runtime.gateway.sticky_affinity import AffinityPlacement, sticky_first_order
 from exp.runtime.gateway.surfaces import GatewayApiSurface, prompt_parameter
 from exp.runtime.gateway.tool_search.plan import plan_tool_search
@@ -179,8 +180,7 @@ def admitted_route_requests(
                 )
             }
         )
-    # Every surviving rung failover-only would leave nothing to dial first:
-    # fail closed here, named, instead of exhausting a ladder that dialed nothing.
+    # All rungs failover-only leaves nothing to dial first: fail closed, named.
     require_unrestricted_rung(route)
     public_request = disclose_best_effort_caching(
         public_request, route.deployments, [profile for profile, _ in resolved_wires], authorization
@@ -202,8 +202,8 @@ def select_single_route_before_search(
     A pure preview removes web-search carriers and shapes emulated tool discovery
     solely for capability eligibility. Its disclosures never escape and it calls no
     backend. After filtering and the normal route ordering, only the winner reaches
-    effectful search planning with the original request. Final admission runs once
-    on that singleton, recording only its actual coercions.
+    effectful search planning with the original request (led by a signature's issuer,
+    ``signature_affinity``). Final admission runs once on that singleton.
     """
     routing = None if request.gateway is None else request.gateway.routing
     if routing is None or routing.allow_fallbacks:
@@ -235,6 +235,7 @@ def select_single_route_before_search(
         authorization=authorization,
         continuation=continuation,
     )
+    route, resolved_wires, placement = lead_with_issuer(route, resolved_wires, request, placement)
     require_unrestricted_rung(route)
     restricted = restrict_fallbacks(request, route)
     index = route.deployments.index(restricted.deployment)

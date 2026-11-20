@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable
 
 from exp.common.core.artifacts import JsonObject
+from exp.runtime.gateway import signature_affinity
 from exp.runtime.gateway.attempt_tokens import counted_input_tokens
 from exp.runtime.gateway.class_throttles import admission_priority_class, tier_authorization
 from exp.runtime.gateway.client_apps import with_client_identity
@@ -128,9 +129,7 @@ from exp.runtime.gateway.native_tool_search import NativeToolSearchMixin
 from exp.runtime.gateway.native_videos import NativeVideosMixin
 from exp.runtime.gateway.provider_preferences import reorder_admitted_route as _reorder
 from exp.runtime.gateway.provider_preferences import route_by_provider_preferences
-from exp.runtime.gateway.reasoning_carrier import (
-    ReasoningCarrierAuthority,
-)
+from exp.runtime.gateway.reasoning_carrier import ReasoningCarrierAuthority
 from exp.runtime.gateway.recovery import RecoveryHost
 from exp.runtime.gateway.recovery_binding import validated_recovery_binding
 from exp.runtime.gateway.request_policy import attempt_policy
@@ -350,7 +349,7 @@ class NativeControlPlane(
                 )
             except OpenAIProtocolError as exc:
                 raise NativeBridgeError(exc) from exc
-
+        request = signature_affinity.with_thought_signature_issuer(request)
         pinned_reasoning_route: GatewayRoute | None = None
         try:
             request, pinned_reasoning_route = authenticate_reasoning_history(
@@ -424,8 +423,7 @@ class NativeControlPlane(
         if pinned_reasoning_route is not None and not has_active_reasoning_content(request):
             pinned_reasoning_route = None
         if continuation_context is not None:
-            # Execution receives authenticated plaintext, but the bounded
-            # continuation store keeps the post-guardrail history sealed.
+            # Execution gets plaintext; the continuation store keeps history sealed.
             continuation_context.messages = retention_request.messages
 
         # Reject replay conflicts before routing can run embeddings or other provider work.
@@ -442,8 +440,7 @@ class NativeControlPlane(
         if not parallel_guardrail:
             require_capture(self._capture, self._accounting, authorization, pending_capture)
             pending_capture = None
-        # Escalation is accounted without content or billing; probe routing
-        # failures are raised against the accepted request below.
+        # Escalation is accounted contentless and unbilled; probe failures raise below.
         probe_failure: Exception | None = None
         web_search_admission: JsonObject | None = None
         tool_search_admission: JsonObject | None = None
@@ -577,6 +574,9 @@ class NativeControlPlane(
             )
             placement = selected_placement or placement
             rung_authorization = tier_authorization(authorization, provider_request)
+            route, resolved_wires, placement = signature_affinity.lead(
+                route, resolved_wires, request, placement
+            )
             route, resolved_wires = _reorder(route, resolved_wires, request, self._components)
             require_route_authority(authorization, request, route)
             require_unmodified_probability_output(

@@ -310,6 +310,9 @@ pub(super) async fn run_attempt(
             relay.set_customer_managed_provider(Some(wire.provider.clone()));
         }
         relay.set_tenant_origin(wire.tenant_origin);
+        relay.set_signature_issuer(
+            (dialect == Dialect::GeminiGenerateContent).then(|| wire.deployment_id.clone()),
+        );
         // Refusal deltas are withheld when the alias revision opted into
         // refusal failover, or when a failover-only rung downstream accepts
         // an unnamed refusal (`fallback_rules`); the ladder decision below

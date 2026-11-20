@@ -3360,6 +3360,45 @@ def test_admit_returns_the_full_ordered_route_without_starting_attempts(
     assert rows == [(0, 0, "dispatched")]
 
 
+@pytest.mark.parametrize("no_fallback", [False, True])
+def test_admit_leads_with_the_rung_that_minted_the_replayed_signature(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_fallback: bool
+) -> None:
+    """A continuation whose newest thought signature this worker relayed leads on its issuer."""
+    from exp.runtime.gateway import signature_affinity
+
+    declared = GatewayDeploymentCapabilities(
+        supports_streaming=True, supports_streaming_tool_arguments=True
+    )
+    control, raw_key = _pool_control_plane(tmp_path, gateway_capabilities=(declared, declared))
+    plain = _admit(control, raw_key, _chat_body())
+    issuer = cast("JsonObject", cast("list[JsonValue]", plain["route"])[1])["deployment_id"]
+    assert isinstance(issuer, str)
+    monkeypatch.setattr(
+        signature_affinity, "native_issuer_lookup", lambda: {"c2lnLW5ldw==": issuer}.get
+    )
+    body = json.loads(_chat_body())
+    call = {
+        "id": "call-1",
+        "type": "function",
+        "function": {"name": "read", "arguments": "{}"},
+        "extra_content": {"google": {"thought_signature": "c2lnLW5ldw=="}},
+    }
+    body["messages"] += [
+        {"role": "assistant", "content": None, "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+    ]
+    body["tools"] = [{"type": "function", "function": {"name": "read", "parameters": {}}}]
+    if no_fallback:
+        body["gateway"] = {"routing": {"allow_fallbacks": False}}
+    admission = _admit(control, raw_key, json.dumps(body))
+    route = cast("list[JsonObject]", admission["route"])
+    first = cast("JsonObject", cast("list[JsonValue]", plain["route"])[0])["deployment_id"]
+    # A no-fallback request narrows to the issuer, not the scheduled lead.
+    expected = [issuer] if no_fallback else [issuer, first]
+    assert [entry["deployment_id"] for entry in route] == expected
+
+
 def test_admit_removes_protocol_incompatible_fallbacks(tmp_path: Path) -> None:
     """A supported stop request keeps the compatible rung instead of failing the pool."""
     control, raw_key = _pool_control_plane(

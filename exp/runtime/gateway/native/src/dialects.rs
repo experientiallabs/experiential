@@ -124,6 +124,18 @@ impl Failure {
         self.malformed_tool_call = malformed_tool_call;
         self
     }
+
+    /// Mark a Gemini `MALFORMED_FUNCTION_CALL` finish (`validated_tools`).
+    pub fn with_validated_tool_redial(mut self, validated_tool_redial: bool) -> Self {
+        self.validated_tool_redial = validated_tool_redial;
+        self
+    }
+
+    /// Mark a Gemini `MALFORMED_FUNCTION_CALL` finish (`errors::broken_tool_call`).
+    pub fn with_malformed_function_call(mut self, malformed_function_call: bool) -> Self {
+        self.malformed_function_call = malformed_function_call;
+        self
+    }
 }
 
 /// One provider-supplied discriminator (an item or event type) reduced to a

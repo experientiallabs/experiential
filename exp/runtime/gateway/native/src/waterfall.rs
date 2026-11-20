@@ -278,6 +278,9 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
     // Once a Gemini dial ended on a malformed function call, every later
     // dial asks for schema-validated function calling (`validated_tools`).
     let mut validated_tool_redial = false;
+    // Broken function calls this request's dials produced: only a repeat
+    // answers the non-retryable 400 (`errors::broken_tool_call`).
+    let mut broken_tool_calls: u32 = 0;
     // Once a buffered answer broke mid-body, the caller's first byte is no
     // longer a pre-commit matter: the shared pre-first-byte budget (often
     // spent by then) stops bounding the restart, and the request deadline
@@ -339,8 +342,15 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
             Err(error) => {
                 // The control plane finalized the request (budget quota, a
                 // pre-dispatch reservation failure, or an expired deadline)
-                // before raising; the public error is authoritative.
+                // before raising; the public error is authoritative, except
+                // that a deadline reached after repeated broken calls still
+                // answers the non-retryable 400 those calls earned.
                 guard.disarm_finalized("failed");
+                if error.code == "deadline_exceeded" && broken_tool_calls >= 2 {
+                    if let Some(last) = last_failure.filter(Failure::broken_tool_call) {
+                        return Won::Failed(collection_public_error(&last.boundary()));
+                    }
+                }
                 return Won::Failed(error);
             }
         };
@@ -360,7 +370,19 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
             // The control plane already finalized the request with this
             // failure; answer the caller with its public form.
             guard.disarm_finalized("failed");
-            let failure = started.failure.or(last_failure).unwrap_or_else(|| {
+            // The echo models no broken-tool-call fact; restore it so a model
+            // that kept breaking its call answers the non-retryable 400.
+            let echoed = started
+                .failure
+                .map(|echoed| echoed.with_broken_tool_call_facts(last_failure.as_ref()));
+            let failure = echoed.or(last_failure).map(|failure| {
+                if broken_tool_calls < 2 {
+                    failure.without_broken_tool_call_facts()
+                } else {
+                    failure
+                }
+            });
+            let failure = failure.unwrap_or_else(|| {
                 Failure::new(
                     FailureClass::ProviderInternal,
                     "all exact-model deployments are unavailable",
@@ -631,6 +653,7 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
                 }
                 let mut failure = failure;
                 validated_tool_redial |= failure.validated_tool_redial;
+                broken_tool_calls += u32::from(failure.broken_tool_call());
                 if failure.context_window_rejected {
                     failure.failover_eligible &= !context_window_failover_spent;
                     context_window_failover_spent = true;
@@ -837,6 +860,11 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
                     });
                 }
                 let boundary = with_largest_retry_after(boundary, largest_retry_after);
+                let boundary = if broken_tool_calls < 2 {
+                    boundary.without_broken_tool_call_facts()
+                } else {
+                    boundary
+                };
                 return Won::Failed(collection_public_error(&boundary));
             }
         }

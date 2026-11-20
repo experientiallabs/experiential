@@ -112,3 +112,17 @@ and the same counters, and remembers the refused signatures per caller AND per r
 so a later turn on that rung replaces them before its first dial while the backend that minted
 them still receives them verbatim. A refusal the bypass cannot clear is the caller's
 `invalid_request` naming the thought signature.
+
+The repair keeps a turn alive, but the bypass drops the model's signed reasoning state, and a long
+agent conversation repaired that way ends on a malformed function call noticeably more often than
+one kept on a single backend. So admission first tries to avoid the crossing. The data plane
+remembers, per worker and in memory only, a digest of each signature a Gemini-dialect rung relayed
+and the deployment that minted it (`thought_signature_issuers.rs`, two hours from last use,
+100,000 entries). Admission looks up the newest replayed signature
+(`exp/runtime/gateway/signature_affinity.py`), records the issuer as
+`GatewayRequest.thought_signature_issuer` so a host resolver can keep that rung through its own speed
+demotion, and leads the admitted route with that rung (disclosed `fallback_reason` token
+`thought_signature_issuer`). The caller's routing wins: a named route, `provider.order` and a
+reasoning-pinned continuation are left alone, and the move stays inside the leading model stage.
+When no issuer is remembered (another worker relayed the signature) or the issuer is no longer on the
+route, routing and the repair work as described above.

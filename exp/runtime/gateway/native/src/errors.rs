@@ -9,6 +9,10 @@ use crate::caller_copy::caller_copy;
 
 mod header_timeout;
 pub use header_timeout::HeaderTimeout;
+mod refusal_reason;
+pub use refusal_reason::RefusalReason;
+mod broken_tool_call;
+pub use broken_tool_call::{BROKEN_TOOL_CALL_CODE, BROKEN_TOOL_CALL_MESSAGE};
 
 /// One sanitized public protocol error carrying its HTTP representation.
 ///
@@ -198,58 +202,6 @@ impl FailureClass {
     }
 }
 
-/// The bounded category of a provider refusal, derived from the provider's
-/// own code and sentence (`stream_errors::refusal_reason`) and shared with
-/// the python `GatewayRefusalReason`.
-///
-/// The caller sees WHICH policy declined the content as a fixed phrase,
-/// never the provider's prose: the vocabulary is closed so a client can
-/// branch on it, and the raw token keeps riding `provider_detail` into the
-/// ledger only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RefusalReason {
-    /// A cyber-safety verdict (OpenAI `cyber_policy`).
-    CyberPolicy,
-    /// A biological, chemical, radiological, or nuclear weapons verdict.
-    Cbrn,
-    /// A general content-policy or safety-system verdict.
-    ContentPolicy,
-    /// The output would recite copyrighted material (Gemini `RECITATION`).
-    Recitation,
-    /// The provider's data-inspection layer blocked the content (Gemini
-    /// `SPII`, Qwen `data_inspection_failed`).
-    DataInspection,
-    /// The provider refused without naming a reason.
-    Unspecified,
-}
-
-impl RefusalReason {
-    /// The wire name shared with the python enum and the public error field.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            RefusalReason::CyberPolicy => "cyber_policy",
-            RefusalReason::Cbrn => "cbrn",
-            RefusalReason::ContentPolicy => "content_policy",
-            RefusalReason::Recitation => "recitation",
-            RefusalReason::DataInspection => "data_inspection",
-            RefusalReason::Unspecified => "unspecified",
-        }
-    }
-
-    /// The fixed caller-facing phrase, or none for an unnamed refusal.
-    pub fn phrase(&self) -> Option<&'static str> {
-        match self {
-            RefusalReason::CyberPolicy => Some("cybersecurity policy"),
-            RefusalReason::Cbrn => Some("biological/chemical safety policy"),
-            RefusalReason::ContentPolicy => Some("content policy"),
-            RefusalReason::Recitation => Some("recitation of copyrighted material"),
-            RefusalReason::DataInspection => Some("data inspection"),
-            RefusalReason::Unspecified => None,
-        }
-    }
-}
-
 /// The generic refusal sentence every refusal message starts from.
 const REFUSAL_MESSAGE: &str = "provider refused the request";
 
@@ -382,6 +334,9 @@ pub struct Failure {
     /// Gemini finished MALFORMED_FUNCTION_CALL: later dials ask for VALIDATED calling (`validated_tools`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub validated_tool_redial: bool,
+    /// The finish named the function call itself (`broken_tool_call`), not any malformed answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub malformed_function_call: bool,
 }
 
 impl Failure {
@@ -407,6 +362,7 @@ impl Failure {
             provider_content_filter: false,
             malformed_tool_call: false,
             validated_tool_redial: false,
+            malformed_function_call: false,
         }
     }
 
@@ -561,6 +517,8 @@ impl Failure {
                 .with_tenant_origin(self.tenant_origin)
                 .with_provider_detail(Some(self.safe_message))
                 .with_malformed_tool_call(self.malformed_tool_call)
+                .with_validated_tool_redial(self.validated_tool_redial)
+                .with_malformed_function_call(self.malformed_function_call)
             }
             _ => self,
         }
@@ -590,6 +548,16 @@ impl Failure {
                 _ => "provider_credential_rejected",
             };
             return PublicError::new(400, code, &self.safe_message, "invalid_request_error");
+        }
+        // The model kept producing a broken function call: a 4xx, like an
+        // empty completion, so no SDK re-sends the conversation (`broken_tool_call`).
+        if self.broken_tool_call() {
+            return PublicError::new(
+                400,
+                BROKEN_TOOL_CALL_CODE,
+                BROKEN_TOOL_CALL_MESSAGE,
+                "invalid_request_error",
+            );
         }
         let (status, code, error_type) = match self.failure_class {
             FailureClass::InvalidRequest => (400, "invalid_request", "invalid_request_error"),
