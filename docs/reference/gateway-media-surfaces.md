@@ -140,6 +140,9 @@ edit (below); any other alias answers a 400 on `model`.
 `openai` connection and on an Azure connection's OpenAI Image API wire, and xAI's Grok Imagine
 image models (`grok-imagine-image*`) on an xAI connection. The caller sends the same multipart
 upload; the source images are the `image` part or up to 16 repeated `image[]` parts, in order.
+Each part is at most 20 MB and the whole upload at most about 62 MB (a 413 otherwise). Both
+providers require a prompt, so a promptless edit (which a Stability tool may take) excludes these
+rungs with a 400 on `prompt` when no other rung remains.
 
 - **GPT image models**: the gateway sends the provider's own `multipart/form-data` edit to the
   rung's `/images/edits` (beside its `/images/generations`, query kept): the source images as

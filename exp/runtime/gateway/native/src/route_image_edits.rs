@@ -62,6 +62,9 @@ const MAXIMUM_TEXT_FIELD_BYTES: usize = 128 * 1024;
 const MAXIMUM_TEXT_FIELDS: usize = 40;
 
 /// The edit route's body limit: three full-size image parts plus framing.
+/// It bounds the whole upload, not each part: the parts are held in memory
+/// and cross the bridge base64-encoded, so a 16-image edit fits when its
+/// images together stay under about 62 MB (a larger upload answers 413).
 pub(crate) fn image_edits_body_limit() -> DefaultBodyLimit {
     DefaultBodyLimit::max(3 * MAXIMUM_EDIT_IMAGE_BYTES + 2 * 1024 * 1024)
 }

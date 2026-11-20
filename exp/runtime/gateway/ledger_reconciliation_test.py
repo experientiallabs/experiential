@@ -1082,7 +1082,12 @@ def test_schema32_preserves_legacy_failure_without_inventing_recovery(tmp_path: 
     close_idle_connections()
     # Rewind the file to schema 31: drop the columns v32 and later add.
     with sqlite3.connect(store.database_path) as connection:
-        for column in ("accounting_recovery", "billed_input_quantity_milli"):
+        for column in (
+            "accounting_recovery",
+            "billed_input_quantity_milli",
+            "image_input_rate",
+            "long_context_image_input_rate",
+        ):
             connection.execute(f"ALTER TABLE gateway_attempts DROP COLUMN {column}")
         connection.execute("PRAGMA user_version = 31")
     before = dict(_attempt_row(tmp_path, attempt))
@@ -1096,7 +1101,9 @@ def test_schema32_preserves_legacy_failure_without_inventing_recovery(tmp_path: 
         }
     after = dict(_attempt_row(tmp_path, attempt))
     assert after.pop("accounting_recovery") == 0
-    assert after.pop("billed_input_quantity_milli") is None
+    for column in ("billed_input_quantity_milli", "image_input_rate"):
+        assert after.pop(column) is None
+    assert after.pop("long_context_image_input_rate") is None
     assert after == before
     with pytest.raises(GatewayLedgerError, match="differs from durable accounting evidence"):
         ledger.finish_attempt(attempt_id=attempt, terminal_event=_observed(), failure=None)

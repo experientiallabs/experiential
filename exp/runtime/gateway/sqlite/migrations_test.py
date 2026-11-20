@@ -1234,11 +1234,13 @@ def test_surface_migration_preserves_requests_attempts_and_constraints(
                 0,
             )
             # Frozen media units (v29), default-false recovery provenance (v32),
-            # and no consumed-unit leg (v34).
+            # and no consumed-unit leg or image-input rates (v34).
             assert tuple(migrated.execute("SELECT * FROM gateway_attempts").fetchone()) == (
                 *before_attempt,
                 *(None for _ in range(16)),
                 0,
+                None,
+                None,
                 None,
             )
         surviving = migrated.execute(

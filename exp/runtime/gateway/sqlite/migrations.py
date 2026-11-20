@@ -814,9 +814,13 @@ _MIGRATIONS: dict[int, tuple[MigrationStep, ...]] = {
         "CREATE TABLE gateway_schema_refresh_v33 (noop INTEGER) STRICT",
         "DROP TABLE gateway_schema_refresh_v33",
     ),
-    34: (  # consumed units beside produced ones (an image edit's source images)
+    34: (  # image edits: consumed units and the frozen image-input token rates
         "ALTER TABLE gateway_attempts ADD COLUMN billed_input_quantity_milli INTEGER CHECK ("
         "billed_input_quantity_milli IS NULL OR billed_input_quantity_milli >= 0)",
+        "ALTER TABLE gateway_attempts ADD COLUMN image_input_rate INTEGER CHECK ("
+        "image_input_rate IS NULL OR image_input_rate >= 0)",
+        "ALTER TABLE gateway_attempts ADD COLUMN long_context_image_input_rate INTEGER CHECK ("
+        "long_context_image_input_rate IS NULL OR long_context_image_input_rate >= 0)",
     ),
     24: (  # plan sign-in kind: part of the connection identity digest, so it rides the revision
         "ALTER TABLE provider_connection_revisions ADD COLUMN subscription TEXT "

@@ -68,6 +68,7 @@ from exp.runtime.gateway.ledger_valuation import (
     billed_unit_columns,
     budget_settlement_nano_usd,
     frozen_usage_cost,
+    image_input_rates,
     observed_usage_cost,
     optional_int,
     usage_source_label,
@@ -451,10 +452,11 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 preferred_input_rate, preferred_cached_input_rate,
                 preferred_cache_creation_input_rate, preferred_cache_creation_1h_input_rate,
                 preferred_output_rate, preferred_reasoning_rate, unit_prices,
+                image_input_rate, long_context_image_input_rate,
                 state, started_at, budget_period_start, budget_reserved_nano_usd
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 'dispatched', ?, ?, ?
             )
             """,
@@ -506,6 +508,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 if preferred_prices is None
                 else preferred_prices.reasoning_nano_usd_per_million_tokens,
                 None if prices.units is None else prices.units.model_dump_json(),
+                *image_input_rates(prices),
                 utc_text(now),
                 period_start,
                 maximum_cost_nano_usd,
@@ -636,7 +639,8 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                    preferred_deployment_id, preferred_input_rate,
                    preferred_cached_input_rate, preferred_output_rate,
                    preferred_cache_creation_input_rate, preferred_cache_creation_1h_input_rate,
-                   preferred_reasoning_rate, unit_prices,
+                   preferred_reasoning_rate, unit_prices, image_input_rate,
+                   long_context_image_input_rate,
                    (SELECT api_surface FROM gateway_requests
                     WHERE request_id = gateway_attempts.request_id) AS api_surface
             FROM gateway_attempts WHERE attempt_id = ?

@@ -75,12 +75,13 @@ def test_openai_edit_fields_carry_every_gpt_image_control_but_response_format() 
     [
         ({"edit": ImageEditInput(image=_PNG, style_image=_PNG)}, "style_image"),
         ({"edit_options": {"seed": 7}}, "seed"),
+        ({"prompt": ""}, "prompt"),
     ],
 )
 def test_openai_edits_refuse_stability_controls_by_name(
     request_fields: dict[str, object], param: str
 ) -> None:
-    """A Stability-only control excludes the rung instead of being dropped."""
+    """A promptless edit or a Stability-only control excludes the rung, never dropped."""
     with pytest.raises(ImageEditParameterError) as raised:
         openai_image_edit_fields("gpt-image-1.5", _edit(**request_fields))
     assert raised.value.param == param
@@ -121,6 +122,7 @@ def test_one_xai_source_rides_as_image_and_several_as_images() -> None:
         ({"output_format": "png"}, "output_format"),
         ({"moderation": "low"}, "moderation"),
         ({"edit_options": {"seed": 7}}, "seed"),
+        ({"prompt": ""}, "prompt"),
     ],
 )
 def test_xai_edits_refuse_what_the_wire_cannot_carry(

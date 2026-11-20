@@ -351,6 +351,14 @@ def test_a_gpt_image_edit_admits_the_multipart_wire_and_settles_image_tokens(
     )
     assert settled == "{}"
     assert _request_row(control, request_id) == ("images", "completed")
+    ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
+    with sqlite3.connect(ledger.database_path) as connection:
+        row = connection.execute(
+            "select estimated_cost_nano_usd from gateway_attempts where request_id = ?",
+            (request_id,),
+        ).fetchone()
+    # Image input at $8/M, text input at $5/M, image output at $30/M.
+    assert row == ((1536 * 8_000_000_000 + 18 * 5_000_000_000 + 392 * 30_000_000_000) // 1_000_000,)
 
 
 def test_a_token_edit_rung_without_an_image_input_rate_is_not_admitted(

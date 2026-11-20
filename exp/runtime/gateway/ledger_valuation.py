@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from exp.common.models.catalog_prices import GatewayUnitPrices
+from exp.common.models.catalog_prices import GatewayTokenPrices, GatewayUnitPrices
 from exp.common.models.token_cost import token_cost_nano_usd
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
@@ -333,6 +333,22 @@ def optional_int(value: int | None) -> int | None:
     return None if value is None else int(value)
 
 
+def image_input_rates(prices: GatewayTokenPrices) -> tuple[int | None, int | None]:
+    """Freeze the base and long-context image-input rates beside the other attempt rates.
+
+    Args:
+        prices: The schedule the attempt was reserved on.
+
+    Returns:
+        The base and long-context image-input rates (None where unset).
+    """
+    tier = prices.long_context
+    return (
+        prices.image_input_nano_usd_per_million_tokens,
+        None if tier is None else tier.image_input_nano_usd_per_million_tokens,
+    )
+
+
 def frozen_usage_cost(
     row: sqlite3.Row, usage: GatewayUsage | None, *, prefix: str = ""
 ) -> int | None:
@@ -358,11 +374,13 @@ def frozen_usage_cost(
         cache_creation_1h_input_rate=optional_int(row[f"{prefix}cache_creation_1h_input_rate"]),
         output_rate=optional_int(row[f"{prefix}output_rate"]),
         reasoning_rate=optional_int(row[f"{prefix}reasoning_rate"]),
+        image_input_rate=(
+            None if prefix == "preferred_" else optional_int(row[f"{prefix}image_input_rate"])
+        ),
     )
-    if usage is not None and usage.image_input_tokens:
-        # The frozen schedule carries no image-input rate column, so image
-        # input cannot be priced apart from text here; unknown, never the
-        # text rate.
+    if prefix == "preferred_" and usage is not None and usage.image_input_tokens:
+        # The preferred rung's image-input rate is not frozen; its
+        # counterfactual price for image input stays unknown, never the text rate.
         return None
     if usage is None or usage.billed_units is None:
         return token_cost

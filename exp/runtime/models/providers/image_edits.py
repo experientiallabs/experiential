@@ -140,7 +140,14 @@ def image_media_type(encoded: str) -> str | None:
 
 
 def _refuse_foreign_edit_controls(request: ImagesRequest) -> None:
-    """Refuse the Stability-only edit controls on an OpenAI-wire edit rung."""
+    """Refuse a promptless edit and the Stability-only controls on an OpenAI-wire rung.
+
+    Both OpenAI and xAI require an edit prompt, while a Stability tool (background
+    removal, fast upscale) needs none, so a promptless edit excludes these rungs
+    instead of reaching a provider that refuses it without failover.
+    """
+    if not request.prompt:
+        raise ImageEditParameterError("prompt", "This model edits only with a prompt; send one.")
     edit = request.edit
     if edit is not None and edit.style_image is not None:
         raise ImageEditParameterError("style_image", "This model takes no style_image.")
@@ -162,15 +169,14 @@ def openai_image_edit_fields(model_id: str, request: ImagesRequest) -> JsonObjec
         The text fields, by name.
 
     Raises:
-        ImageEditParameterError: The request carries a control this wire
-            cannot carry (a style image or a Stability edit option).
+        ImageEditParameterError: The request has no prompt, or carries a
+            control this wire cannot carry (a style image or a Stability edit
+            option).
     """
     _refuse_foreign_edit_controls(request)
     if request.style is not None:
         raise ImageEditParameterError("style", "GPT image models take no style.")
-    fields: JsonObject = {"model": model_id, "n": request.n}
-    if request.prompt:
-        fields["prompt"] = request.prompt
+    fields: JsonObject = {"model": model_id, "n": request.n, "prompt": request.prompt}
     for name in _OPENAI_EDIT_FIELDS:
         value = getattr(request, name)
         if value is not None:
@@ -191,7 +197,7 @@ def xai_image_edit_request(model_id: str, request: ImagesRequest) -> JsonObject:
 
     Raises:
         ImageEditParameterError: The request carries something xAI's edit
-            cannot carry: a mask, more than five images, an image that is not
+            cannot carry: no prompt, a mask, more than five images, an image that is not
             PNG, JPEG or WebP, or an OpenAI-only control.
     """
     edit = request.edit

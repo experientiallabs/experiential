@@ -507,6 +507,7 @@ def test_units_beside_a_partial_token_report_leave_the_cost_unknown() -> None:
     row = connection.execute(
         "SELECT 1 AS input_rate, NULL AS cached_input_rate, NULL AS cache_creation_input_rate, "
         "NULL AS cache_creation_1h_input_rate, 1 AS output_rate, NULL AS reasoning_rate, "
+        "NULL AS image_input_rate, "
         '\'{"kind":"character","rates":{"":1000}}\' AS unit_prices'
     ).fetchone()
     units = BilledUnits(kind=BilledUnitKind.CHARACTER, quantity_milli=2_000)
@@ -568,16 +569,28 @@ def test_a_consumed_leg_prices_at_the_input_rate_beside_the_produced_leg() -> No
     assert billed_units_cost_nano_usd(produced_only, unpriced) == 120_000_000
 
 
-def test_frozen_rates_cannot_price_image_input_apart_from_text() -> None:
-    """The frozen schedule has no image-input column: such usage is unknown, never text."""
+def test_frozen_rates_price_image_input_at_the_frozen_image_input_rate() -> None:
+    """The attempt freezes its image-input rate; the preferred rung's stays unknown."""
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
     row = connection.execute(
-        "SELECT 1 AS input_rate, NULL AS cached_input_rate, NULL AS cache_creation_input_rate, "
-        "NULL AS cache_creation_1h_input_rate, 1 AS output_rate, NULL AS reasoning_rate, "
-        "NULL AS unit_prices"
+        "SELECT 5000000000 AS input_rate, NULL AS cached_input_rate, "
+        "NULL AS cache_creation_input_rate, NULL AS cache_creation_1h_input_rate, "
+        "30000000000 AS output_rate, NULL AS reasoning_rate, 8000000000 AS image_input_rate, "
+        "5000000000 AS preferred_input_rate, NULL AS preferred_cached_input_rate, "
+        "NULL AS preferred_cache_creation_input_rate, "
+        "NULL AS preferred_cache_creation_1h_input_rate, 30000000000 AS preferred_output_rate, "
+        "NULL AS preferred_reasoning_rate, NULL AS unit_prices"
     ).fetchone()
-    edit = GatewayUsage(input_tokens=10, output_tokens=1, image_input_tokens=8)
-    assert frozen_usage_cost(row, edit) is None
-    text = GatewayUsage(input_tokens=10, output_tokens=1, image_input_tokens=0)
-    assert frozen_usage_cost(row, text) == 0
+    edit = GatewayUsage(input_tokens=1_554, output_tokens=196, image_input_tokens=1_536)
+    assert (
+        frozen_usage_cost(row, edit)
+        == (1_536 * 8_000_000_000 + 18 * 5_000_000_000 + 196 * 30_000_000_000 + 500_000)
+        // 1_000_000
+    )
+    assert frozen_usage_cost(row, edit, prefix="preferred_") is None
+    text = edit.model_copy(update={"image_input_tokens": 0})
+    assert (
+        frozen_usage_cost(row, text, prefix="preferred_")
+        == (1_554 * 5_000_000_000 + 196 * 30_000_000_000 + 500_000) // 1_000_000
+    )
