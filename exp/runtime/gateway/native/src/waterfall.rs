@@ -275,6 +275,9 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
     let mut malformed_tool_call_retry_spent = false;
     // Per depth, whether its dials now carry the resample's own key.
     let mut resampled: Vec<bool> = vec![false; ctx.route.len()];
+    // Once a Gemini dial ended on a malformed function call, every later
+    // dial asks for schema-validated function calling (`validated_tools`).
+    let mut validated_tool_redial = false;
     // Once a buffered answer broke mid-body, the caller's first byte is no
     // longer a pre-commit matter: the shared pre-first-byte budget (often
     // spent by then) stops bounding the restart, and the request deadline
@@ -439,6 +442,10 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
             ..dial_wire.clone()
         });
         let dial_wire = resample_wire.as_ref().unwrap_or(dial_wire);
+        let validated_wire = validated_tool_redial
+            .then(|| validated_tools::validated(dial_wire))
+            .flatten();
+        let dial_wire = validated_wire.as_ref().unwrap_or(dial_wire);
         // Whether a timeout of this dial would leave the ladder anywhere to
         // go; when it would not, the dial waits out the request's budget
         // rather than its own allowance (`run_attempt`).
@@ -623,6 +630,7 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
                     guard.mark_opened();
                 }
                 let mut failure = failure;
+                validated_tool_redial |= failure.validated_tool_redial;
                 if failure.context_window_rejected {
                     failure.failover_eligible &= !context_window_failover_spent;
                     context_window_failover_spent = true;
@@ -864,6 +872,8 @@ mod successor;
 pub(crate) use successor::successor_possible;
 use successor::throttle_backoff_delay;
 
+mod validated_tools;
+
 mod search_round;
 
 #[cfg(test)]
@@ -888,3 +898,5 @@ mod tenant_ladder_tests;
 mod tests;
 #[cfg(test)]
 mod tool_search_ladder_tests;
+#[cfg(test)]
+mod validated_tools_ladder_tests;

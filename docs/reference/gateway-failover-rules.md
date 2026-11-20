@@ -134,6 +134,18 @@ cannot turn into calls (`dialects/openai/dsml.rs`) is the same failure: the guar
 and never relays it, so when it is the turn's first output the failure is marked
 `malformed_tool_call` and takes the same one retry.
 
+Gemini reports its own parse failure as the turn's finish, `MALFORMED_FUNCTION_CALL` (or
+`MALFORMED_RESPONSE`), before any output: filed `malformed_response` and retried under the ordinary
+redial and failover rules. A fresh sample usually fixes a short prompt, but a long agent conversation
+can fail the same way on every sample and on both Google backends (Gemini 4 Neon, production
+2026-11-20). So every later dial in that request asks Google for
+`toolConfig.functionCallingConfig.mode = "VALIDATED"`, which constrains a call to its declared schema
+while still letting the model answer in text (`waterfall/validated_tools.rs`). It applies only when the
+body declares functions and the caller's mode is absent, `AUTO` or `MODE_UNSPECIFIED`. `ANY` and `NONE`
+are sent unchanged. A body that names a `cachedContent` is also sent unchanged, because Google refuses
+`toolConfig` next to a cache. A validated dial skips the gateway's automatic cache overlay, as a
+repaired dial does.
+
 ## Provider content filters
 
 A provider's own content filter (Azure's content management system, an account-side moderation

@@ -232,14 +232,21 @@ impl Normalizer {
             // sampling failure, not a verdict on the request: Gemini 3.1 Pro
             // ends about half of fresh tool prompts this way when called
             // directly (live 2026-10-18), and the same request succeeds on a
-            // fresh sample. So it re-dials the rung, then fails over.
-            "MALFORMED_FUNCTION_CALL" | "MALFORMED_RESPONSE" => Event::Failed(
-                Failure::new(
+            // fresh sample. So it re-dials the rung, then fails over. A long
+            // agent conversation can instead fail the same way on every
+            // sample (Gemini 4 Neon, production 2026-11-20: 4 of 4 dials
+            // across both Google backends, each thinking the same length
+            // before the broken call), so every later dial asks for
+            // schema-validated function calling (`validated_tool_redial`).
+            "MALFORMED_FUNCTION_CALL" | "MALFORMED_RESPONSE" => {
+                let mut failure = Failure::new(
                     FailureClass::MalformedResponse,
                     "provider ended the stream with a malformed answer",
                 )
-                .with_retry(true, true),
-            ),
+                .with_retry(true, true);
+                failure.validated_tool_redial = true;
+                Event::Failed(failure)
+            }
             _ => Event::Failed(Failure::new(
                 FailureClass::ProviderInternal,
                 "provider ended the stream unexpectedly",

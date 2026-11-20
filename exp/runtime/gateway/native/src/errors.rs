@@ -376,10 +376,12 @@ pub struct Failure {
     /// rung of another provider (`content_filter.rs`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub provider_content_filter: bool,
-    /// A streamed client tool call that never became one valid call: retried
-    /// once while nothing reached the caller (docs: "Malformed tool calls").
+    /// A streamed client tool call that never parsed; retried once pre-commit (docs: "Malformed tool calls").
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub malformed_tool_call: bool,
+    /// Gemini finished MALFORMED_FUNCTION_CALL: later dials ask for VALIDATED calling (`validated_tools`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub validated_tool_redial: bool,
 }
 
 impl Failure {
@@ -404,6 +406,7 @@ impl Failure {
             context_window_limit_tokens: None,
             provider_content_filter: false,
             malformed_tool_call: false,
+            validated_tool_redial: false,
         }
     }
 
