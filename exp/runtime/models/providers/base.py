@@ -371,6 +371,14 @@ class GatewayWireProfile:
     carries one narrows the plan rung out at admission (the route keeps any
     API-key rung that honors it) and the payload never carries the field."""
 
+    prepends_claude_code_billing_header: bool = False
+    """Whether this ``anthropic_messages`` rung's payload must lead its system prompt with
+    Claude Code's billing-header block (``claude_plan_billing``).
+
+    Set only by a Claude plan connection: Anthropic answers a plan bearer 429 unless the
+    first system block is that header, whatever the caller's prompt. API-key and host rungs
+    never set it, so their payloads are untouched."""
+
     embeddings_url: str | None = None
     """Full OpenAI-wire ``/embeddings`` endpoint for this connection, sharing
     ``headers``; ``None`` when the connection speaks no embeddings wire, so the

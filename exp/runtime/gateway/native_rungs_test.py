@@ -1116,3 +1116,170 @@ def test_a_request_without_extras_dispatches_unchanged() -> None:
     assert isinstance(payload, dict)
     assert not {"repetition_penalty", "min_p", "top_a"} & set(payload)
     assert dispatch.disclosures == ()
+
+
+def _plan_client(tmp_path: Path) -> NativeWireClient:
+    """A real Claude plan client over a stored sign-in."""
+    from exp.runtime.models.providers.anthropic_subscription_test import TestClient
+
+    return TestClient()._client(tmp_path)
+
+
+def _plan_dispatch(client: NativeWireClient, request: GatewayRequest) -> JsonObject:
+    """Freeze one Anthropic rung for ``request`` and return the exact dispatched body."""
+    deployment = _deployment("plan", "anthropic")
+    result = build_rung_dispatch(
+        _route((deployment,)),
+        deployment,
+        client.gateway_wire_profile(),
+        client,
+        provider_request=request,
+        public_request=request,
+        authorization=_AUTHORIZATION,
+    )
+    body = result.wire_entry["upstream_body"]
+    if body is None:
+        payload = result.wire_entry["upstream_payload"]
+        assert isinstance(payload, dict)
+        return payload
+    assert isinstance(body, str)
+    decoded = json.loads(body)
+    assert isinstance(decoded, dict)
+    return decoded
+
+
+def _is_billing_block(block: object) -> bool:
+    """Whether ``block`` is a Claude Code billing-header text block with no marker."""
+    return (
+        isinstance(block, dict)
+        and block.get("type") == "text"
+        and str(block.get("text", "")).startswith("x-anthropic-billing-header: cc_version=")
+        and "cache_control" not in block
+    )
+
+
+def test_a_chat_translated_request_on_a_plan_rung_leads_with_the_billing_block(
+    tmp_path: Path,
+) -> None:
+    """A Chat caller's system prompt follows the block on the frozen plan body."""
+    request = decode_chat(
+        {
+            "model": "public-model",
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": "You are OpenCode."},
+                {"role": "user", "content": "hello"},
+            ],
+        }
+    ).request
+
+    system = _plan_dispatch(_plan_client(tmp_path), request)["system"]
+
+    assert isinstance(system, list)
+    assert _is_billing_block(system[0])
+    assert system[1:] == [{"type": "text", "text": "You are OpenCode."}]
+
+
+def test_a_messages_request_without_system_on_a_plan_rung_gets_the_block_alone(
+    tmp_path: Path,
+) -> None:
+    """No caller prompt: the plan body's system is the block alone."""
+    request = decode_messages(
+        {
+            "model": "public-model",
+            "max_tokens": 32,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+    ).request
+
+    system = _plan_dispatch(_plan_client(tmp_path), request)["system"]
+
+    assert isinstance(system, list) and len(system) == 1
+    assert _is_billing_block(system[0])
+
+
+def test_a_messages_system_keeps_its_cache_markers_after_the_block(tmp_path: Path) -> None:
+    """The caller's breakpoints ride their own blocks; the block adds none."""
+    request = decode_messages(
+        {
+            "model": "public-model",
+            "max_tokens": 32,
+            "stream": True,
+            "system": [
+                {"type": "text", "text": "You are Pi."},
+                {"type": "text", "text": "Rules.", "cache_control": {"type": "ephemeral"}},
+            ],
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+    ).request
+
+    system = _plan_dispatch(_plan_client(tmp_path), request)["system"]
+
+    assert isinstance(system, list) and len(system) == 3
+    assert _is_billing_block(system[0])
+    assert system[1] == {"type": "text", "text": "You are Pi."}
+    second = system[2]
+    assert isinstance(second, dict)
+    assert second["cache_control"] == {"type": "ephemeral"}
+    assert str(second["text"]).endswith("Rules.")
+
+
+def test_real_claude_code_reaches_a_plan_rung_with_its_own_block_unchanged(
+    tmp_path: Path,
+) -> None:
+    """Claude Code's own billing block stays the only one, byte for byte."""
+    header = "x-anthropic-billing-header: cc_version=2.1.329.e8c; cc_entrypoint=sdk-cli;"
+    request = decode_messages(
+        {
+            "model": "public-model",
+            "max_tokens": 32,
+            "stream": True,
+            "system": [
+                {"type": "text", "text": header},
+                {
+                    "type": "text",
+                    "text": "You are a Claude agent.",
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
+            "messages": [{"role": "user", "content": "say ok"}],
+        }
+    ).request
+
+    system = _plan_dispatch(_plan_client(tmp_path), request)["system"]
+
+    assert isinstance(system, list) and len(system) == 2
+    assert system[0] == {"type": "text", "text": header}
+    assert sum(1 for block in system if _is_billing_block(block)) == 1
+
+
+def test_an_api_key_anthropic_rung_never_gets_the_block() -> None:
+    """Only a plan profile sets the flag; an API-key rung's system is untouched."""
+    request = decode_chat(
+        {
+            "model": "public-model",
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": "You are OpenCode."},
+                {"role": "user", "content": "hello"},
+            ],
+        }
+    ).request
+
+    payload = _plan_dispatch(_AnthropicKeyClient(), request)
+
+    assert payload["system"] == "You are OpenCode."
+
+
+class _AnthropicKeyClient:
+    """An Anthropic API-key client: static headers, no signing, no plan flag."""
+
+    def gateway_wire_profile(self) -> GatewayWireProfile:
+        """An Anthropic Messages profile on a static API key."""
+        return GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": "k", "anthropic-version": "2023-06-01"},
+            model_id="claude-sonnet-5",
+        )

@@ -187,11 +187,16 @@ refresh token rotates on every use, so sign Codex in again afterwards. The gatew
 OPERATOR of the gateway, configured with `EXP_ANTHROPIC_OAUTH_CLIENT_ID` and
 `EXP_ANTHROPIC_OAUTH_REDIRECT_URI` (optional: `_AUTHORIZE_URL`, `_TOKEN_URL`, `_SCOPES`, and
 `_BETA`, sent as `anthropic-beta` when the approval names one). Without that app a Claude plan
-connection refuses to resolve. The gateway never presents another client's identity: the app
-refuses Claude Code's public client ID and any `claude-code`/`claude-cli` identity header.
+connection refuses to resolve. The app refuses Claude Code's public client ID and any
+`claude-code`/`claude-cli` identity header unless the shared-client mode is selected.
 
 Plan backends differ from the API-key origins. The ChatGPT backend streams only, requires provider
 storage off, and rejects `max_output_tokens`, so its wire profile drops the ceiling structurally.
+The Claude plan backend serves a request only when its first system block is Claude Code's
+billing header (`x-anthropic-billing-header: cc_version=...; cc_entrypoint=...;`) and answers
+429 otherwise, so a Claude plan rung prepends that block when the payload does not already lead
+with one, keeping the caller's system prompt and cache markers after it. Chat Completions,
+Responses and Messages callers are served alike; Claude Code's own requests pass unchanged.
 A plan rung pre-serializes its body for the per-dispatch bearer, so the engine's
 encrypted-reasoning replay repair does not run on it. Plan connections serve the gateway only;
 `exp config providers`, build, and optimize keep using API keys.

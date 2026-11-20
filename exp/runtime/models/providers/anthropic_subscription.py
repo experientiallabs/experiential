@@ -17,6 +17,11 @@ header. In that mode the client ID must be Claude Code's (any other foreign ID i
 refused) and the dispatch headers may carry that client's beta value, but credentials remain
 refused.
 
+Every plan payload leads its system prompt with Claude Code's billing-header block
+(:mod:`exp.runtime.models.providers.claude_plan_billing`): Anthropic answers a plan bearer 429
+for any other first system block, so this is what lets every harness, not only Claude Code,
+serve on a plan. The caller's own system prompt follows the block unchanged.
+
 Bearers are minted per physical dispatch through the body-signing seam (the same timing as
 ChatGPT plans and Bedrock SigV4), refreshed ahead of expiry by the connection's token source.
 """
@@ -31,10 +36,11 @@ from pydantic import Field, field_validator, model_validator
 
 from exp.common.auth import StoredOAuthTokens
 from exp.common.core.artifacts import ContractModel, JsonObject
-from exp.common.models import ModelSnapshot, ReasoningEffort
+from exp.common.models import ModelRequest, ModelSnapshot, ReasoningEffort
 from exp.runtime.models.providers.anthropic import ANTHROPIC_BASE_URL, AnthropicClient
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from exp.runtime.models.providers.base import DEFAULT_TIMEOUT_SECONDS, GatewayWireProfile
+from exp.runtime.models.providers.claude_plan_billing import with_claude_code_billing_header
 from exp.runtime.models.providers.subscription_tokens import (
     SubscriptionSignInError,
     SubscriptionTokenSource,
@@ -399,6 +405,10 @@ class AnthropicSubscriptionClient(AnthropicClient):
         del url, body
         return {"Authorization": f"Bearer {self._tokens.current().access_token}"}
 
+    def _build_request(self, request: ModelRequest) -> JsonObject:
+        """Build the Messages payload led by Claude Code's billing-header system block."""
+        return with_claude_code_billing_header(super()._build_request(request))
+
     def gateway_wire_profile(self) -> GatewayWireProfile:
         """Return the Messages wire profile on a per-dispatch bearer."""
         base = super().gateway_wire_profile()
@@ -416,4 +426,5 @@ class AnthropicSubscriptionClient(AnthropicClient):
             reasoning_wire_format=base.reasoning_wire_format,
             reasoning_effort=base.reasoning_effort,
             signs_request_body=True,
+            prepends_claude_code_billing_header=True,
         )
