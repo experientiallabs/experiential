@@ -32,6 +32,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     guardrail_failure,
     request_exceeds_inspection_limit,
 )
+from exp.runtime.gateway.guardrails.input_outcomes import record_input_outcome
 from exp.runtime.gateway.guardrails.observation import (
     ObservationAdmission,
     ObservationLease,
@@ -286,6 +287,7 @@ class GuardrailEngine:
             if verdict is None or policy.mode == "observe":
                 continue
             current = self._apply_input(policy, check, current, verdict)
+            record_input_outcome(policy, check, GuardrailOutcome.ALLOW)
         return current
 
     def observe_input(
@@ -794,6 +796,7 @@ class GuardrailEngine:
             return None
         elapsed = self._monotonic() - started
         outcome = GuardrailOutcome.FLAGGED if verdict.flagged else GuardrailOutcome.ALLOW
+        record_input_outcome(policy, check, outcome)
         if isinstance(verdict, ScoredVerdict) and request_id is not None:
             self._submit_classification(request_id, policy, check, outcome, verdict, elapsed)
         if not verdict.flagged:
@@ -876,6 +879,7 @@ class GuardrailEngine:
         latency_seconds: float,
     ) -> None:
         """Separate observed outcomes from actions that actually affect customer requests."""
+        record_input_outcome(policy, check, outcome)
         if policy.mode == "observe" or (
             policy.fail_open and outcome not in (GuardrailOutcome.ALLOW, GuardrailOutcome.FLAGGED)
         ):

@@ -41,6 +41,8 @@ def require_capture(
     accounting: NativeAttemptAccounting,
     authorization: AuthorizationSnapshot,
     pending: PendingCapture | None,
+    *,
+    guardrails: GuardrailSession | None = None,
 ) -> None:
     """Register approved input or terminalize unavailable synchronous capture admission.
 
@@ -49,6 +51,7 @@ def require_capture(
         accounting: Owner of the already accepted request's durable terminal write.
         authorization: Exact authenticated request identity.
         pending: Approved public context, or None when capture is disabled.
+        guardrails: Live inspection owner before accounting registration.
 
     Returns:
         None once capture is registered or does not apply.
@@ -62,7 +65,7 @@ def require_capture(
     ):
         return
     failure = capture_unavailable_failure()
-    accounting.finish_request_quietly(authorization, failure)
+    accounting.finish_request_quietly(authorization, failure, guardrails=guardrails)
     raise NativeBridgeError(
         OpenAIProtocolError(
             status_code=503, code="capture_unavailable", message=failure.safe_message
