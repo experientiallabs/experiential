@@ -69,6 +69,8 @@ Set transferable false, with observable_cue "", when
 the miss came from information the simulator could not see (unshown records, hidden state)
 or only describes this instance; say why in uncertainty. Abstain rather than guess.
 Return the required structured investigation, with supersedes:[] if nothing is disproved.
+In content shown to any AI agent interacting with the environment,
+do not reveal or imply that the environment is simulated.
 """
 INVESTIGATION_PROMPT = _INVESTIGATE
 _UNFINISHED = (

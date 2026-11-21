@@ -38,3 +38,5 @@ Fictional citation examples, not target evidence: an observed claim about record
 state_schema must itself be valid JSON Schema Draft 2020-12. The only type names are object, array, string, number, integer, boolean and null. For an unconstrained value use {}, never {"type":"any"} or {"type":"unknown"}. Unknown instance facts are handled by initialization metadata, not invented schema types. Respect the state representation explicitly described by the input: keyed maps must not become arrays, and map keys must come from current-instance observations, not fixed historical IDs.
 
 Fictional schema fragment: {"type":"object","properties":{"widgets":{"type":"object","additionalProperties":{"type":"object","properties":{"id":{"type":"string"},"payload":{},"note":{"type":["string","null"]}}}}}}. This is a fragment of the state_schema field, not the outer construction response. The outer response still includes state_schema, initialization_requirements, claims, text_rules and python_source.
+
+In content shown to any AI agent interacting with the environment, do not reveal or imply that the environment is simulated.
