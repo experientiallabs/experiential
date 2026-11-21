@@ -607,19 +607,37 @@ fn public_images(
         .and_then(|details| details.get("image_tokens"))
         .and_then(Value::as_u64)
         .map(|image| image.min(input_tokens));
+    // The image-modality subset of the output (the generated images). OpenAI
+    // bills it at the image-output rate and any text output at the text
+    // rate, so settlement needs the split: absent without a breakdown, a
+    // reported 0 kept as 0, never more than the output total.
+    let image_output_tokens = usage
+        .get("output_tokens_details")
+        .and_then(Value::as_object)
+        .and_then(|details| details.get("image_tokens"))
+        .and_then(Value::as_u64)
+        .map(|image| image.min(output_tokens));
+    // Cache reads inside the input, when the provider reports them, settle at
+    // the cached rate; absent stays unknown.
+    let cached_input_tokens = usage
+        .get("input_tokens_details")
+        .and_then(Value::as_object)
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .map(|cached| cached.min(input_tokens));
     public.insert("usage".to_string(), Value::Object(usage.clone()));
     let usage = Usage {
         image_input_tokens,
         input_tokens: Some(input_tokens),
         output_tokens: Some(output_tokens),
-        cached_input_tokens: None,
+        cached_input_tokens,
         cache_creation_input_tokens: None,
         cache_creation_1h_input_tokens: None,
         cache_creation_12h_input_tokens: None,
         reasoning_tokens: None,
         billed_units: None,
         cache_writes_read_back: false,
-        image_output_tokens: None,
+        image_output_tokens,
     };
     Ok((Value::Object(public), usage))
 }
@@ -796,6 +814,48 @@ mod tests {
         assert_eq!(body["quality"], json!("low"));
         assert_eq!(usage.input_tokens, Some(11));
         assert_eq!(usage.output_tokens, Some(272));
+    }
+
+    #[test]
+    fn provider_answer_carries_the_image_output_and_cache_read_subsets() {
+        // gpt-image-1.5 answer shape (live, 2026-11-21): generated images and
+        // text both inside output_tokens, priced at different rates.
+        let payload = json!({
+            "data": [{"b64_json": "aW1hZ2U="}],
+            "usage": {
+                "input_tokens": 1_554,
+                "output_tokens": 403,
+                "input_tokens_details": {"text_tokens": 18, "image_tokens": 1_536, "cached_tokens": 1_024},
+                "output_tokens_details": {"image_tokens": 272, "text_tokens": 131},
+            },
+        });
+        let (_, usage) = public_images(payload, &admission(1), None).expect("valid answer");
+        assert_eq!(usage.image_output_tokens, Some(272));
+        assert_eq!(usage.image_input_tokens, Some(1_536));
+        assert_eq!(usage.cached_input_tokens, Some(1_024));
+
+        // No breakdown: the subsets stay unknown, never an invented 0.
+        let bare = json!({
+            "data": [{"b64_json": "aW1hZ2U="}],
+            "usage": {"input_tokens": 11, "output_tokens": 272},
+        });
+        let (_, usage) = public_images(bare, &admission(1), None).expect("valid answer");
+        assert_eq!(usage.image_output_tokens, None);
+        assert_eq!(usage.cached_input_tokens, None);
+
+        // A subset above its total is clamped to the total.
+        let over = json!({
+            "data": [{"b64_json": "aW1hZ2U="}],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 100,
+                "input_tokens_details": {"cached_tokens": 50},
+                "output_tokens_details": {"image_tokens": 500},
+            },
+        });
+        let (_, usage) = public_images(over, &admission(1), None).expect("valid answer");
+        assert_eq!(usage.image_output_tokens, Some(100));
+        assert_eq!(usage.cached_input_tokens, Some(10));
     }
 
     #[test]
