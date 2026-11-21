@@ -184,7 +184,7 @@ world-model alias mean self-hosted spend, not a missing price.
 bench config-budget uv run exp config budget 75 --root "$ROOT"
 ```
 
-The default per-command budget is `$10`. The router step freezes a `$60` provider ceiling and
+The default per-command budget is `$50`. The router step freezes a `$60` provider ceiling and
 reserves the complete conservative schedule up front, so the shared ceiling must be raised
 before that command or it fails closed.
 
