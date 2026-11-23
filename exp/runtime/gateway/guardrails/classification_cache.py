@@ -10,8 +10,8 @@ from pydantic import Field
 
 from exp.common.core.artifacts import ContractModel
 
-CategoryScores = tuple[tuple[str, float], ...]
-"""Ordered ``(category, score)`` pairs, each score in ``[0, 1]``."""
+ProbabilityScores = tuple[tuple[str, float], ...]
+"""Ordered identity/probability pairs, each score in ``[0, 1]``."""
 
 
 class VerdictCacheSettings(ContractModel):
@@ -27,7 +27,7 @@ class VerdictCacheSettings(ContractModel):
 
 
 class VerdictCache:
-    """Least-recently-used map from a window digest to its category scores.
+    """Least-recently-used map from a window digest to its question probabilities.
 
     Keys are SHA-256 digests and values are scores, so the cache never holds
     request text. Callers store only definitive answers; a classifier error is
@@ -45,10 +45,10 @@ class VerdictCache:
         self._max_entries = settings.max_entries
         self._ttl_seconds = settings.ttl_seconds
         self._monotonic = monotonic
-        self._entries: OrderedDict[bytes, tuple[float, CategoryScores]] = OrderedDict()
+        self._entries: OrderedDict[bytes, tuple[float, ProbabilityScores]] = OrderedDict()
         self._lock = threading.Lock()
 
-    def get(self, key: bytes) -> CategoryScores | None:
+    def get(self, key: bytes) -> ProbabilityScores | None:
         """Return fresh scores for ``key`` and mark them recently used.
 
         Args:
@@ -68,12 +68,12 @@ class VerdictCache:
             self._entries.move_to_end(key)
             return scores
 
-    def put(self, key: bytes, scores: CategoryScores) -> None:
+    def put(self, key: bytes, scores: ProbabilityScores) -> None:
         """Store one definitive answer and evict the least recently used overflow.
 
         Args:
             key: SHA-256 digest of the configuration and window.
-            scores: Category scores the decision model produced for that window.
+            scores: Question probabilities the decision model produced for that window.
         """
         if self._max_entries == 0:
             return

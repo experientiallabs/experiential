@@ -409,6 +409,12 @@ impl CaptureCollector {
         py.detach(|| collector.settle(request_id, keep_prompt, keep_response));
     }
 
+    /// Finish rejected input without a public response, preserving hosted settlement gating.
+    fn finish_unexposed(&self, py: Python<'_>, request_id: &str) {
+        let collector = self.inner.clone();
+        py.detach(|| collector.finish_unexposed(request_id));
+    }
+
     /// Close within the stated drain budget, releasing the GIL while a sink finishes.
     #[pyo3(signature = (timeout_seconds=10.0))]
     fn close(&self, py: Python<'_>, timeout_seconds: f64) -> PyResult<bool> {

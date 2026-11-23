@@ -150,7 +150,14 @@ impl InputLatch {
             .take();
         let mut began = None;
         let decision = match inspected {
-            Inspection::Denied(failure) => Err(failure),
+            Inspection::Denied(failure) => {
+                if let Some(capture) = capture {
+                    if crate::capture::python::begin_bytes(&capture.collector, &capture.bytes) {
+                        began = Some(capture.collector);
+                    }
+                }
+                Err(failure)
+            }
             Inspection::Allowed | Inspection::Expired => {
                 if let Some(capture) = capture {
                     let registered =
@@ -175,6 +182,13 @@ impl InputLatch {
                 collector.settle(&self.request_id, false, false);
             }
             return Ok(InputDecision::AdmissionClosed);
+        }
+        // Denial never exposes provider output and does not grant hosted retention.
+        // Holding release prevents close from racing this input-only completion.
+        if decision.is_err() {
+            if let Some(collector) = began {
+                collector.finish_unexposed(&self.request_id);
+            }
         }
         *release = Release::Ready(decision.clone());
         decision

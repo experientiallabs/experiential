@@ -33,7 +33,7 @@ from exp.runtime.gateway.decisions_contracts import (
     NoulQuestion,
 )
 from exp.runtime.gateway.guardrails.classification_cache import (
-    CategoryScores,
+    ProbabilityScores,
     VerdictCache,
     VerdictCacheSettings,
 )
@@ -176,7 +176,7 @@ class ClassificationTelemetry:
         self._counts = {"cache_hits": 0, "cache_misses": 0, "errors": 0}
         self._latency_seconds = 0.0
 
-    def record(self, scores: CategoryScores, *, cached: bool, latency_seconds: float) -> None:
+    def record(self, scores: ProbabilityScores, *, cached: bool, latency_seconds: float) -> None:
         """Count one definitive answer, from the cache or from the model."""
         with self._lock:
             self._counts["cache_hits" if cached else "cache_misses"] += 1
@@ -295,9 +295,9 @@ class DecisionModelClassifier:
             return ClassifierVerdict(flagged=False)
         key = sha256(self._digest.encode() + b"\n" + state.encode("utf-8")).digest()
         started = self._monotonic()
-        scores = self._cache.get(key)
-        cached = scores is not None
-        if scores is None:
+        answers = self._cache.get(key)
+        cached = answers is not None
+        if answers is None:
             try:
                 probabilities = await self._decide(state)
             except ClassifierProtocolError as exc:
@@ -312,11 +312,13 @@ class DecisionModelClassifier:
                     exc,
                 )
                 raise
-            scores = tuple(
-                (name, category.score(probabilities))
-                for name, category in self._document.categories.items()
-            )
-            self._cache.put(key, scores)
+            answers = tuple(probabilities.items())
+            self._cache.put(key, answers)
+        probabilities = dict(answers)
+        scores = tuple(
+            (name, category.score(probabilities))
+            for name, category in self._document.categories.items()
+        )
         latency = self._monotonic() - started
         self._telemetry.record(scores, cached=cached, latency_seconds=latency)
         _logger.info(
@@ -330,7 +332,14 @@ class DecisionModelClassifier:
         )
         categories = self._document.categories
         category_scores = tuple(
-            CategoryScore(category=name, score=value, flagged=value >= categories[name].threshold)
+            CategoryScore(
+                category=name,
+                score=value,
+                flagged=value >= categories[name].threshold,
+                threshold=categories[name].threshold,
+                aggregate=categories[name].aggregate,
+                question_scores={key: probabilities[key] for key in categories[name].questions},
+            )
             for name, value in scores
         )
         return ScoredVerdict(
@@ -338,6 +347,7 @@ class DecisionModelClassifier:
             scores=category_scores,
             subject_sha256=sha256(state.encode("utf-8")).hexdigest(),
             cached=cached,
+            configuration_digest=self.configuration_digest,
         )
 
     async def inspect_output(

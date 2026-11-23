@@ -29,9 +29,12 @@ from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import (
     NativeGuardrailsMixin,
+    inspect_admission_input,
+    inspect_new_admission,
     native_output_mode,
-    open_admission_guardrails,
+    prepare_admission_capture,
     prepare_admitted_input,
+    reject_admitted_input,
     require_capture,
     validate_guardrail_engine,
 )
@@ -66,8 +69,6 @@ from exp.runtime.gateway.native_bridge_errors import (
 )
 from exp.runtime.gateway.native_capture import (
     CaptureController,
-    PendingCapture,
-    discard_capture,
     select_capture_model,
 )
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
@@ -368,19 +369,9 @@ class NativeControlPlane(
             raise NativeBridgeError(error) from exc
 
         original_subject = request
-        guardrails = open_admission_guardrails(
-            self._guardrails, authorization, request, data, deadline_monotonic=deadline
+        guardrails, request, parallel_guardrail = inspect_new_admission(
+            self, authorization, request, data, deadline
         )
-        if guardrails is not None:
-            guardrails.detectors = self._guardrail_detectors
-        parallel_guardrail = isinstance(authorization.target, DirectTarget) and (
-            guardrails is not None and guardrails.can_overlap_input(request)
-        )
-        try:
-            if guardrails is not None:
-                request = guardrails.inspect_input(request, defer=parallel_guardrail)
-        except GuardrailRejected as exc:
-            raise NativeBridgeError(public_failure_error(exc.failure)) from None
         captured_request = request
         retention_request = strip_stale_reasoning_history(request)
         try:
@@ -416,10 +407,15 @@ class NativeControlPlane(
         pinned_reasoning_route = verified_reasoning_route
         request = strip_stale_reasoning_history(request)
         if request != captured_request and guardrails is not None:
-            try:
-                request = guardrails.inspect_input(request, defer=parallel_guardrail)
-            except GuardrailRejected as exc:
-                raise NativeBridgeError(public_failure_error(exc.failure)) from None
+            request = inspect_admission_input(
+                self,
+                guardrails,
+                authorization,
+                request,
+                captured_request=captured_request,
+                session_id=optional_text(data.get("capture_session_id")),
+                defer=parallel_guardrail,
+            )
         if pinned_reasoning_route is not None and not has_active_reasoning_content(request):
             pinned_reasoning_route = None
         if continuation_context is not None:
@@ -432,14 +428,13 @@ class NativeControlPlane(
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise _authority_error(exc) from exc
 
-        pending_capture = (
-            PendingCapture(captured_request, optional_text(data.get("capture_session_id")))
-            if self._capture is not None
-            else None
+        pending_capture = prepare_admission_capture(
+            self,
+            authorization,
+            captured_request,
+            optional_text(data.get("capture_session_id")),
+            parallel=parallel_guardrail,
         )
-        if not parallel_guardrail:
-            require_capture(self._capture, self._accounting, authorization, pending_capture)
-            pending_capture = None
         # Escalation is accounted contentless and unbilled; probe failures raise below.
         probe_failure: Exception | None = None
         web_search_admission: JsonObject | None = None
@@ -507,13 +502,13 @@ class NativeControlPlane(
                 try:
                     request = guardrails.inspect_input(request)
                 except GuardrailRejected as exc:
-                    discard_capture(self._capture, authorization.request_id)
-                    self._accounting.finish_request_quietly(
+                    reject_admitted_input(
+                        self,
                         authorization,
                         exc.failure,
+                        pending_capture,
                         web_search_requests=1 if web_search_admission is not None else 0,
                     )
-                    raise NativeBridgeError(public_failure_error(exc.failure)) from None
             _require_bound_wire_authority(
                 None
                 if continuation_context is None
@@ -729,13 +724,13 @@ class NativeControlPlane(
                     parallel=parallel_guardrail and cache_state is None,
                 )
             except GuardrailRejected as exc:
-                discard_capture(self._capture, authorization.request_id)
-                self._accounting.finish_request_quietly(
+                reject_admitted_input(
+                    self,
                     authorization,
                     exc.failure,
+                    pending_capture,
                     web_search_requests=1 if web_search_admission is not None else 0,
                 )
-                raise NativeBridgeError(public_failure_error(exc.failure)) from None
         if pending_capture is not None and not (
             guardrails is not None and guardrails.input_pending
         ):

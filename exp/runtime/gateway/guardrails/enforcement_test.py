@@ -55,7 +55,7 @@ from exp.runtime.gateway.guardrails.contracts import (
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.http_json import HttpJsonClassifier
 from exp.runtime.gateway.guardrails.observation import ObservationAdmission, ObservationLease
-from exp.runtime.gateway.guardrails.recording import ClassificationRecord
+from exp.runtime.gateway.guardrails.recording import ClassificationRecord, ObservationRecord
 from exp.runtime.gateway.guardrails.regex import (
     BuiltinPattern,
     RegexAdapterDocument,
@@ -1953,11 +1953,26 @@ def _scored(*, flagged: bool) -> ScoredVerdict:
     return ScoredVerdict(
         flagged=flagged,
         scores=(
-            CategoryScore(category="weapons", score=0.91 if flagged else 0.1, flagged=flagged),
-            CategoryScore(category="fraud", score=0.2, flagged=False),
+            CategoryScore(
+                category="weapons",
+                score=0.91 if flagged else 0.1,
+                flagged=flagged,
+                threshold=0.8,
+                aggregate="max",
+                question_scores={"weapon": 0.91 if flagged else 0.1},
+            ),
+            CategoryScore(
+                category="fraud",
+                score=0.2,
+                flagged=False,
+                threshold=0.8,
+                aggregate="max",
+                question_scores={"fraud": 0.2},
+            ),
         ),
         subject_sha256="c" * 64,
         cached=False,
+        configuration_digest="d" * 64,
     )
 
 
@@ -1999,6 +2014,7 @@ def test_enforced_block_delivers_its_scores_with_the_request_identity() -> None:
     assert record.outcome is GuardrailOutcome.FLAGGED
     assert record.scores == _scored(flagged=True).scores
     assert (record.subject_sha256, record.cached) == ("c" * 64, False)
+    assert record.configuration_digest == "d" * 64
 
 
 def test_observed_allow_delivers_scores_without_gating_the_request() -> None:
@@ -2023,3 +2039,29 @@ def test_unscored_verdicts_deliver_no_score_record() -> None:
         session.inspect_input(_request("hello"))
     engine.close(timeout_seconds=2)
     assert records == []
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_deferred_block_scores_require_the_gate_to_commit(committed: bool) -> None:
+    """An optional verdict that loses to expiry cannot report a committed block."""
+    engine, records = _scoring_engine(_scored(flagged=True), mode="enforce")
+    deferred: list[ObservationRecord] = []
+    policy = engine.policies_for(_authorization())[0]
+    with pytest.raises(GuardrailRejected):
+        asyncio.run(
+            engine.enforce_input(
+                policy=policy,
+                request=_request("hello"),
+                request_id="request-one",
+                deadline_monotonic=time.monotonic() + 5,
+                defer_rejection=deferred.append,
+            )
+        )
+    [pending] = deferred
+    assert records == []
+    if committed:
+        engine.record_input_rejection(pending)
+    engine.close(timeout_seconds=2)
+    assert len(records) == int(committed)
+    if records:
+        assert records[0].decision is GuardrailAction.BLOCK

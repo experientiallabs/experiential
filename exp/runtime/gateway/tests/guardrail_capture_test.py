@@ -144,7 +144,7 @@ def test_observation_retains_required_release_failure_in_native_settlement(
 def test_parallel_capture_waits_for_input_approval_and_fails_without_charge(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str, stream: bool, outcome: str
 ) -> None:
-    """Raw sinks receive only approved prompts; failed capture withholds paid generation."""
+    """Consented blocked prompts survive; only approved output reaches the sink or caller."""
     classifier = _Classifier(outcome)
     records: list[str] = []
     begins: list[tuple[str, str | None, str | None]] = []
@@ -267,7 +267,7 @@ def test_parallel_capture_waits_for_input_approval_and_fails_without_charge(
             assert attempts[0][0] == terminal
             assert attempts[0][1] > 0 if outcome == "allow" else attempts[0][1] == 0
             assert control._accounting.entry(request_id) is None  # noqa: SLF001 - lifetime assertion.
-            if outcome in {"block", "error", "timeout"}:
+            if outcome in {"error", "timeout"}:
                 assert begins == []
             else:
                 assert len(begins) == 1
@@ -284,7 +284,7 @@ def test_parallel_capture_waits_for_input_approval_and_fails_without_charge(
             assert collector.close(2)
             assert not worker.is_alive()
     parsed = [CaptureRecord.model_validate_json(record) for record in records]
-    assert len(parsed) == (1 if outcome == "allow" else 0)
+    assert len(parsed) == (1 if outcome in {"allow", "block"} else 0)
     if parsed:
         captured = parsed[0]
         assert captured.request.request_id == request_id
@@ -292,9 +292,13 @@ def test_parallel_capture_waits_for_input_approval_and_fails_without_charge(
         assert captured.request.context["session_id"] == "capture-episode"
         assert captured.request.scope.identity_id == "default"
         assert captured.request.scope.application_id == "capture-fixture"
-        assert captured.response is not None and captured.response.status == 200
         assert "synthetic prompt" in captured.request.model_dump_json()
-        assert "private-provider-result" in captured.response.model_dump_json()
+        if outcome == "block":
+            assert captured.response is None
+            assert "private-provider-result" not in captured.model_dump_json()
+        else:
+            assert captured.response is not None and captured.response.status == 200
+            assert "private-provider-result" in captured.response.model_dump_json()
 
 
 @dataclass(frozen=True)
@@ -608,7 +612,7 @@ def test_customer_funded_capture_begins_after_synchronous_input_approval(
                             json.loads(error.value.public_error_json)["code"]
                             == "capture_unavailable"
                         )
-                    assert len(begins) == (0 if outcome == "block" else 1)
+                    assert len(begins) == 1
             finally:
                 classifier.release.set()
         with sqlite3.connect(components.ledger.database_path) as db:
@@ -620,11 +624,13 @@ def test_customer_funded_capture_begins_after_synchronous_input_approval(
         classifier.release.set()
         assert collector.close(2)
         components.write_ledger.close()
-    assert len(records) == (1 if outcome == "allow" else 0)
+    assert len(records) == (1 if outcome in {"allow", "block"} else 0)
     if records:
         captured = CaptureRecord.model_validate_json(records[0])
-        assert captured.request.request_id == request_id
-        assert captured.request.model_id == admission["exact_model_id"]
+        assert captured.request.request_id == begins[0]
+        assert captured.response is None
+        if outcome == "allow":
+            assert captured.request.model_id == admission["exact_model_id"]
 
 
 @pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
@@ -632,14 +638,21 @@ def test_customer_funded_capture_begins_after_synchronous_input_approval(
 def test_rejected_search_releases_serial_capture_through_native_http(
     tmp_path: Path, surface: str, stream: bool
 ) -> None:
-    """Repeated denied retrievals release capture capacity without dispatch or delivery."""
+    """Repeated denied retrievals retain only consented input without provider dispatch."""
     records: list[str] = []
     registered: list[str] = []
+    delivered = threading.Event()
+
+    def deliver(record: str) -> None:
+        """Signal that asynchronous input delivery has released its collector capacity."""
+        records.append(record)
+        delivered.set()
+
     collector = exp_gateway_native.CaptureCollector(
         CaptureConfiguration(
             settlement_required=False, maximum_pending_records=1
         ).model_dump_json(),
-        records.append,
+        deliver,
     )
 
     def application_for(authorization: AuthorizationSnapshot) -> str:
@@ -692,13 +705,15 @@ def test_rejected_search_releases_serial_capture_through_native_http(
                 )
                 assert response.status_code == 400, response.text
                 assert "capture_unavailable" not in response.text
+                assert delivered.wait(2), "blocked input was not delivered"
+                delivered.clear()
                 assert collector.begin(_request_json()), (
                     "denied retrieval retained capture capacity"
                 )
                 collector.settle("request", False, False)
             assert len(registered) == len(search.queries) == 2
             assert upstream == []
-            assert records == []
+            assert len(records) == 2
             with sqlite3.connect(components.ledger.database_path) as db:
                 assert db.execute(
                     "SELECT terminal_state, web_search_requests FROM gateway_requests"
@@ -712,12 +727,13 @@ def test_rejected_search_releases_serial_capture_through_native_http(
             assert collector.close(2)
             components.write_ledger.close()
             assert not worker.is_alive()
-    assert records == []
+    assert len(records) == 2
+    assert all(CaptureRecord.model_validate_json(record).response is None for record in records)
 
 
 @pytest.mark.parametrize("phase", ["post-search", "dispatch"])
 @pytest.mark.parametrize("retained_settlement", [False, True])
-def test_late_serial_guardrail_rejection_discards_capture_before_settlement_recovery(
+def test_late_serial_guardrail_rejection_retains_input_before_settlement_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, retained_settlement: bool
 ) -> None:
     """Both late denial paths free real collector capacity even while ledger writes fail."""
@@ -738,11 +754,18 @@ def test_late_serial_guardrail_rejection_discards_capture_before_settlement_reco
     components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"})
     records: list[str] = []
     registered: list[str] = []
+    delivered = threading.Event()
+
+    def deliver(record: str) -> None:
+        """Signal completion of the asynchronous input-only delivery."""
+        records.append(record)
+        delivered.set()
+
     collector = exp_gateway_native.CaptureCollector(
         CaptureConfiguration(
             settlement_required=False, maximum_pending_records=1
         ).model_dump_json(),
-        records.append,
+        deliver,
     )
 
     def application_for(authorization: AuthorizationSnapshot) -> str:
@@ -778,7 +801,8 @@ def test_late_serial_guardrail_rejection_discards_capture_before_settlement_reco
             assert json.loads(error.value.public_error_json)["code"] == "content_filter"
             assert len(registered) == 1
             assert len(guardrail.requests) == 2
-            assert collector.begin(_request_json()), "denied request retained capture capacity"
+            assert delivered.wait(2), "blocked input was not delivered"
+            assert collector.begin(_request_json()), "delivered request retained capture capacity"
             collector.settle("request", False, False)
             assert control._accounting.request_settlements.pending is retained_settlement  # noqa: SLF001
         control._accounting.request_settlements.retry(64)  # noqa: SLF001 - durable recovery check.
@@ -793,4 +817,5 @@ def test_late_serial_guardrail_rejection_discards_capture_before_settlement_reco
             collector.settle(request_id, False, False)
         assert collector.close(2)
         components.write_ledger.close()
-    assert records == []
+    assert len(records) == 1
+    assert CaptureRecord.model_validate_json(records[0]).response is None

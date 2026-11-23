@@ -9,9 +9,11 @@ from dataclasses import dataclass
 
 from exp.runtime.gateway.guardrails.contracts import (
     CategoryScore,
+    GuardrailAction,
     GuardrailCheck,
     GuardrailOutcome,
     GuardrailPolicy,
+    ScoredVerdict,
 )
 
 
@@ -24,12 +26,14 @@ class ObservationRecord:
         check: Frozen check identity, capability and authored action, or a policy outcome.
         outcome: Observed result, including unsupported and skipped coverage.
         latency_seconds: Measured bounded inspection duration.
+        classification: Scored evidence awaiting a native decision, otherwise None.
     """
 
     policy: GuardrailPolicy
     check: GuardrailCheck | None
     outcome: GuardrailOutcome
     latency_seconds: float
+    classification: ClassificationRecord | None = None
 
 
 @dataclass(frozen=True)
@@ -45,6 +49,8 @@ class ClassificationRecord:
         subject_sha256: SHA-256 of the exact window text the model read.
         cached: Whether the scores came from the verdict cache.
         latency_seconds: Measured bounded inspection duration.
+        configuration_digest: Digest of the classifier configuration that produced the scores.
+        decision: Action committed by this check; observation always allows.
     """
 
     request_id: str
@@ -55,6 +61,33 @@ class ClassificationRecord:
     subject_sha256: str
     cached: bool
     latency_seconds: float
+    configuration_digest: str
+    decision: GuardrailAction
+
+
+def classification_record(
+    request_id: str,
+    policy: GuardrailPolicy,
+    check: GuardrailCheck,
+    outcome: GuardrailOutcome,
+    verdict: ScoredVerdict,
+    latency_seconds: float,
+) -> ClassificationRecord:
+    """Freeze the exact scored check without retaining its subject or credentials."""
+    return ClassificationRecord(
+        request_id=request_id,
+        policy=policy,
+        check=check,
+        outcome=outcome,
+        scores=verdict.scores,
+        subject_sha256=verdict.subject_sha256,
+        cached=verdict.cached,
+        latency_seconds=latency_seconds,
+        configuration_digest=verdict.configuration_digest,
+        decision=(
+            check.action if verdict.flagged and policy.mode == "enforce" else GuardrailAction.ALLOW
+        ),
+    )
 
 
 class ObservationRecorder[RecordT]:

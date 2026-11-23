@@ -1,5 +1,13 @@
 # Gateway capture hosting interface
 
+Input rejected by a content guardrail is eligible for input-only capture under the
+same authenticated host policy as allowed input. This includes serial admission,
+parallel checks and later refusals after request preparation. Capture never grants
+provider execution. Hosted collectors still wait for the ledger's retention verdict;
+storage opt-out, consent expiry and erasure remain the host's authority. No rejected
+provider output, reasoning, tool calls or log probabilities are retained. A full or
+unavailable capture collector preserves the original moderation refusal.
+
 Experiential owns one Rust collector for authenticated request context, HTTP
 response capture, bounded lifecycle state and worker-owned delivery. Python
 prepares the effective request during admission and configures a destination.

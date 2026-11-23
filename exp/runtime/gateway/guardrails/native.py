@@ -5,13 +5,18 @@ from __future__ import annotations
 import importlib
 import json
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Never, Protocol, cast
 
 from exp_gateway_native import OptionalInputDecision
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import BillingSource
-from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    DirectTarget,
+    GatewayFailure,
+    GatewayRequest,
+)
 from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
     GuardrailCompletion,
@@ -20,19 +25,23 @@ from exp.runtime.gateway.guardrails.contracts import (
     OutputGuardrailMode,
 )
 from exp.runtime.gateway.guardrails.session import GuardrailSession, denied_input_failure
-from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
+from exp.runtime.gateway.native_accounting_errors import NativeBridgeError, authority_error
 from exp.runtime.gateway.native_capture import (
     CaptureController,
     PendingCapture,
     begin_capture,
     capture_unavailable_failure,
     discard_capture,
+    finish_rejected_capture,
 )
-from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+from exp.runtime.gateway.native_settlement import optional_text
+from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 
 if TYPE_CHECKING:
+    from exp.runtime.gateway.guardrails.deterministic import NativeDetector
     from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+    from exp.runtime.gateway.native_components import SyncWriteLedger
     from exp.runtime.gateway.routing import GatewayRoute
 
 
@@ -281,6 +290,96 @@ class _GuardrailPlane(Protocol):
 
     _accounting: NativeAttemptAccounting
     _capture: CaptureController | None
+    _write_ledger: SyncWriteLedger
+    _guardrails: GuardrailEngine | None
+    _guardrail_detectors: dict[str, NativeDetector]
+
+
+def inspect_new_admission(
+    plane: _GuardrailPlane,
+    authorization: AuthorizationSnapshot,
+    request: GatewayRequest,
+    data: JsonObject,
+    deadline: float,
+) -> tuple[GuardrailSession | None, GatewayRequest, bool]:
+    """Freeze policy and choose the input gate before routing or capture admission."""
+    session = open_admission_guardrails(
+        plane._guardrails, authorization, request, data, deadline_monotonic=deadline
+    )
+    if session is not None:
+        session.detectors = plane._guardrail_detectors
+    parallel = isinstance(authorization.target, DirectTarget) and (
+        session is not None and session.can_overlap_input(request)
+    )
+    inspected = inspect_admission_input(
+        plane,
+        session,
+        authorization,
+        request,
+        session_id=optional_text(data.get("capture_session_id")),
+        defer=parallel,
+    )
+    return session, inspected, parallel
+
+
+def inspect_admission_input(
+    plane: _GuardrailPlane,
+    session: GuardrailSession | None,
+    authorization: AuthorizationSnapshot,
+    request: GatewayRequest,
+    *,
+    session_id: str | None,
+    defer: bool,
+    captured_request: GatewayRequest | None = None,
+) -> GatewayRequest:
+    """Inspect admission input and durably finish a consented pre-route rejection."""
+    if session is None:
+        return request
+    try:
+        return session.inspect_input(request, defer=defer)
+    except GuardrailRejected as exc:
+        try:
+            plane._write_ledger.accept_request(authorization=authorization)
+        except Exception as error:  # noqa: BLE001 - ledger diagnostics stay private.
+            raise authority_error(error) from error
+        reject_admitted_input(
+            plane,
+            authorization,
+            exc.failure,
+            PendingCapture(captured_request or request, session_id),
+        )
+
+
+def reject_admitted_input(
+    plane: _GuardrailPlane,
+    authorization: AuthorizationSnapshot,
+    failure: GatewayFailure,
+    pending: PendingCapture | None,
+    *,
+    web_search_requests: int = 0,
+) -> Never:
+    """Retain eligible input and durably reject without exposing any provider output."""
+    finish_rejected_capture(plane._capture, authorization, failure, pending)
+    plane._accounting.finish_request_quietly(
+        authorization, failure, web_search_requests=web_search_requests
+    )
+    raise NativeBridgeError(public_failure_error(failure)) from None
+
+
+def prepare_admission_capture(
+    plane: _GuardrailPlane,
+    authorization: AuthorizationSnapshot,
+    request: GatewayRequest,
+    session_id: str | None,
+    *,
+    parallel: bool,
+) -> PendingCapture | None:
+    """Register serial capture or hold the same consented input for its parallel decision."""
+    pending = None if plane._capture is None else PendingCapture(request, session_id)
+    if parallel:
+        return pending
+    require_capture(plane._capture, plane._accounting, authorization, pending)
+    return None
 
 
 def prepare_admitted_input(
@@ -312,7 +411,7 @@ def _prepare_native_optional_input(
     pending: PendingCapture | None,
     model_id: str,
 ) -> bool:
-    """Bind optional expiry to a native capability without retaining unapproved input."""
+    """Bind optional expiry and consented input capture to one native decision capability."""
     wait_ms = session.optional_input_wait_ms()
     if wait_ms is None:
         return False
@@ -374,7 +473,9 @@ class NativeGuardrailsMixin:
             if entry.guardrails is None
             else entry.guardrails.input_decision()
         )
-        if decision["action"] == "allow":
+        if decision["action"] == "allow" or (
+            decision["action"] == "error" and entry.pending_capture is not None
+        ):
             # Reservation owns this same lock during ledger I/O. Poll without
             # waiting so unrelated dispatch and settlement workers remain available.
             if not entry.execution_lock.acquire(blocking=False):
@@ -384,7 +485,7 @@ class NativeGuardrailsMixin:
                 if self._accounting.entry(request_id) is not entry or entry.pending_abandon:
                     return '{"action":"closed"}'
                 session = entry.guardrails
-                assert session is not None  # Only the same session's approval reaches capture.
+                assert session is not None  # Only the admitted session decides retention timing.
                 decision = session.input_decision()
                 pending = entry.pending_capture
                 if decision["action"] == "allow" and pending is not None:
@@ -399,6 +500,15 @@ class NativeGuardrailsMixin:
                         session.cancel(capture_unavailable_failure())
                     entry.pending_capture = None
                     decision = session.input_decision()
+                elif decision["action"] == "error" and pending is not None:
+                    finish_rejected_capture(
+                        self._capture,
+                        entry.authorization,
+                        GatewayFailure.model_validate(decision["failure"]),
+                        pending,
+                        entry.route.snapshot.exact_model_id,
+                    )
+                    entry.pending_capture = None
             finally:
                 entry.execution_lock.release()
                 try:
