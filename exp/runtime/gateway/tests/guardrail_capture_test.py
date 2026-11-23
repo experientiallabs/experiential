@@ -633,6 +633,14 @@ def test_customer_funded_capture_begins_after_synchronous_input_approval(
             assert captured.request.model_id == admission["exact_model_id"]
 
 
+def _begin_after_acknowledgement(collector: exp_gateway_native.CaptureCollector) -> None:
+    """Wait for sink return to release admission, then prove the slot is reusable."""
+    deadline = time.monotonic() + 2
+    while not collector.begin(_request_json()):
+        assert time.monotonic() < deadline, "acknowledged request retained capture capacity"
+        time.sleep(0.01)
+
+
 @pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
 @pytest.mark.parametrize("stream", [False, True])
 def test_rejected_search_releases_serial_capture_through_native_http(
@@ -644,7 +652,7 @@ def test_rejected_search_releases_serial_capture_through_native_http(
     delivered = threading.Event()
 
     def deliver(record: str) -> None:
-        """Signal that asynchronous input delivery has released its collector capacity."""
+        """Signal receipt; admission is released only after this callback returns."""
         records.append(record)
         delivered.set()
 
@@ -707,9 +715,7 @@ def test_rejected_search_releases_serial_capture_through_native_http(
                 assert "capture_unavailable" not in response.text
                 assert delivered.wait(2), "blocked input was not delivered"
                 delivered.clear()
-                assert collector.begin(_request_json()), (
-                    "denied retrieval retained capture capacity"
-                )
+                _begin_after_acknowledgement(collector)
                 collector.settle("request", False, False)
             assert len(registered) == len(search.queries) == 2
             assert upstream == []
@@ -757,7 +763,7 @@ def test_late_serial_guardrail_rejection_retains_input_before_settlement_recover
     delivered = threading.Event()
 
     def deliver(record: str) -> None:
-        """Signal completion of the asynchronous input-only delivery."""
+        """Signal receipt; admission is released only after this callback returns."""
         records.append(record)
         delivered.set()
 
@@ -802,7 +808,7 @@ def test_late_serial_guardrail_rejection_retains_input_before_settlement_recover
             assert len(registered) == 1
             assert len(guardrail.requests) == 2
             assert delivered.wait(2), "blocked input was not delivered"
-            assert collector.begin(_request_json()), "delivered request retained capture capacity"
+            _begin_after_acknowledgement(collector)
             collector.settle("request", False, False)
             assert control._accounting.request_settlements.pending is retained_settlement  # noqa: SLF001
         control._accounting.request_settlements.retry(64)  # noqa: SLF001 - durable recovery check.
