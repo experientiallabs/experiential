@@ -3,9 +3,9 @@
 //! OpenRouter reports what it charged the calling account for one generation
 //! as `usage.cost`, a USD amount ("the total amount charged to your
 //! account", https://openrouter.ai/docs/use-cases/usage-accounting), beside
-//! `is_byok`. It arrives on the Chat Completions usage, which the gateway
-//! reads from the final usage chunk of the upstream stream (a non-streaming
-//! caller drains that same stream), and settles as
+//! `is_byok`, on both its Chat Completions and Responses usage. The gateway
+//! reads it from the final usage report of the upstream stream (a
+//! non-streaming caller drains that same stream) and settles it as
 //! `provider_reported_cost_nano_usd`.
 //!
 //! Only `cost` is read. `cost_details.upstream_inference_cost` is what the
@@ -14,17 +14,19 @@
 //! no fee field that would turn it into that amount. A usage without `cost`
 //! therefore reports no charge rather than a reconstructed one. A BYOK answer
 //! (`is_byok: true`) also reports none: the caller's own upstream key paid for
-//! the generation, so `cost` is not its price.
+//! the generation, so `cost` is not its price. Only an absent `is_byok` or an
+//! explicit `false` lets the cost through.
 //!
 //! The charge is metadata beside the token meter: an absent, malformed or
-//! negative `cost` (or a non-boolean `is_byok`) reports no charge and never
-//! fails the stream, so the host prices that attempt from its token counts.
+//! negative `cost` (or an `is_byok` that is neither absent nor `false`)
+//! reports no charge and never fails the stream, so the host prices that
+//! attempt from its token counts.
 
 use serde_json::{Map, Number, Value};
 
 use super::MAXIMUM_LEDGER_COUNT;
 
-/// The catalog provider id of OpenRouter rungs, whose Chat usage reports `cost`.
+/// The catalog provider id of OpenRouter rungs, whose usage reports `cost`.
 pub const OPENROUTER_PROVIDER: &str = "openrouter";
 
 /// Nano-USD per USD.
@@ -37,7 +39,7 @@ const NANO_DIGITS: usize = 9;
 /// the answer is BYOK or reports no usable cost.
 pub(super) fn openrouter_cost_nano_usd(usage: &Map<String, Value>) -> Option<u64> {
     match usage.get("is_byok") {
-        None | Some(Value::Null) | Some(Value::Bool(false)) => {}
+        None | Some(Value::Bool(false)) => {}
         Some(_) => return None,
     }
     match usage.get("cost") {
@@ -51,6 +53,9 @@ pub(super) fn openrouter_cost_nano_usd(usage: &Map<String, Value>) -> Option<u64
 /// A float is converted from its shortest round-trip decimal text (the text
 /// OpenRouter sent), never by multiplying the binary value, so `0.000123`
 /// becomes exactly 123,000 rather than 123,001 from representation error.
+/// OpenRouter serializes `cost` from an IEEE double, whose shortest text this
+/// reproduces; a lexeme with more significant digits than a double holds is
+/// rounded to the nearest double first (the parsed JSON keeps no lexeme).
 /// Negative, non-finite and beyond-ledger amounts are `None`.
 fn usd_to_nano_usd_ceil(cost: &Number) -> Option<u64> {
     if let Some(whole) = cost.as_u64() {

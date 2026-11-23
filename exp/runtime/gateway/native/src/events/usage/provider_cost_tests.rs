@@ -157,3 +157,47 @@ fn a_later_usage_report_without_cost_keeps_the_reported_cost() {
     let usage = normalizer.observed_usage().expect("observed usage");
     assert_eq!(usage.provider_reported_cost_nano_usd, Some(1_600_000));
 }
+
+#[test]
+fn a_null_byok_flag_is_no_evidence_the_answer_was_not_byok() {
+    let mut wire = openrouter_usage();
+    wire["is_byok"] = Value::Null;
+    let usage = streamed_usage(Dialect::OpenAiCompatible, true, wire);
+    assert_eq!(usage.provider_reported_cost_nano_usd, None);
+}
+
+#[test]
+fn an_openrouter_responses_terminal_reports_its_cost() {
+    let completed = |byok: bool| {
+        json!({
+            "type": "response.completed",
+            "response": {"status": "completed", "usage": {
+                "input_tokens": 12, "output_tokens": 3, "total_tokens": 15,
+                "cost": 0.000045, "is_byok": byok,
+            }},
+        })
+    };
+    for (reports_cost, byok, expected) in [
+        (true, false, Some(45_000)),
+        (true, true, None),
+        (false, false, None),
+    ] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        normalizer.set_provider_reported_cost(reports_cost);
+        let events = normalizer
+            .feed(&SseEvent {
+                event: Some("response.completed".to_string()),
+                data: completed(byok).to_string(),
+            })
+            .expect("valid terminal");
+        let usage = events
+            .into_iter()
+            .find_map(|event| match event {
+                Event::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .expect("terminal usage");
+        assert_eq!(usage.input_tokens, Some(12));
+        assert_eq!(usage.provider_reported_cost_nano_usd, expected);
+    }
+}
