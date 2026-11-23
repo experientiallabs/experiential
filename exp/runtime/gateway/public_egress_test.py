@@ -220,3 +220,19 @@ def test_the_system_resolver_keeps_distinct_answers_in_order(
         "93.184.216.34",
         "2606:2800:220:1::1",
     ]
+
+
+def test_serving_policy_applies_for_the_serve_and_restores_after() -> None:
+    """The serve flag holds while serving and the standalone default returns afterwards."""
+    assert public_egress.public_upstreams_only() is False
+    with public_egress.serving_policy(True):
+        assert public_egress.public_upstreams_only() is True
+        with public_egress.provider_client(timeout=httpx.Timeout(5.0)) as client:
+            assert isinstance(client._transport, PublicOnlyTransport)
+    assert public_egress.public_upstreams_only() is False
+    with pytest.raises(RuntimeError), public_egress.serving_policy(True):
+        raise RuntimeError("serve failed")
+    assert public_egress.public_upstreams_only() is False
+    with public_egress.provider_client(timeout=httpx.Timeout(5.0)) as client:
+        assert not isinstance(client._transport, PublicOnlyTransport)
+        assert client.trust_env is False

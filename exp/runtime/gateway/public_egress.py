@@ -14,6 +14,13 @@ connect time:
   verifies, and HTTP still addresses, the original hostname.
 - Environment proxies are ignored and redirects stay off.
 
+``serve_native_gateway`` is the one source of the policy: it applies its own
+``public_upstreams_only`` flag here for as long as it serves
+(:func:`serving_policy`), and :func:`provider_client` reads it on every call,
+so every control plane in the process (execution-bound ones included) holds
+the same rule as the native transport. Outside a serve the policy is off,
+the standalone default that permits local and private servers.
+
 The address ranges mirror the native policy exactly: private, loopback,
 link-local, shared, reserved, documentation, benchmarking and multicast IPv4
 ranges, and every IPv6 address outside global unicast ``2000::/3`` or inside
@@ -26,7 +33,9 @@ from __future__ import annotations
 
 import ipaddress
 import socket
-from collections.abc import Callable, Iterable, Sequence
+import threading
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 
 import httpcore
 import httpx
@@ -259,3 +268,61 @@ def public_only_client(
         trust_env=False,
         transport=PublicOnlyTransport(resolver=resolver),
     )
+
+
+class _ProcessPolicy:
+    """The process's current public-only flag, owned by the serving host."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._public_only = False
+
+    def get(self) -> bool:
+        with self._lock:
+            return self._public_only
+
+    def swap(self, public_only: bool) -> bool:
+        with self._lock:
+            previous, self._public_only = self._public_only, public_only
+            return previous
+
+
+_POLICY = _ProcessPolicy()
+
+
+def public_upstreams_only() -> bool:
+    """Return whether the serving host currently requires public-only egress."""
+    return _POLICY.get()
+
+
+@contextmanager
+def serving_policy(public_only: bool) -> Iterator[None]:
+    """Apply the native serve flag to Python provider clients while serving.
+
+    Args:
+        public_only: ``serve_native_gateway``'s ``public_upstreams_only``.
+
+    Yields:
+        Nothing; the previous value is restored when serving returns.
+    """
+    previous = _POLICY.swap(public_only)
+    try:
+        yield
+    finally:
+        _POLICY.swap(previous)
+
+
+def provider_client(*, timeout: httpx.Timeout) -> httpx.Client:
+    """Build one provider client under the policy in force right now.
+
+    Args:
+        timeout: The client's request bounds.
+
+    Returns:
+        :func:`public_only_client` while the host serves public-only, otherwise
+        a client that may reach local or private servers. Both ignore
+        environment proxies and never follow redirects.
+    """
+    if public_upstreams_only():
+        return public_only_client(timeout=timeout)
+    return httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False)

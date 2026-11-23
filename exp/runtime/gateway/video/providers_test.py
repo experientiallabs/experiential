@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import json
 from collections.abc import Callable
 
@@ -21,7 +22,6 @@ from exp.runtime.gateway.video.providers import (
     VideoSubmitRejected,
     XaiVideoClient,
     default_http_factory,
-    public_http_factory,
     video_dialect,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -407,10 +407,10 @@ _METADATA = GatewayWireProfile(
 )
 
 
-def test_public_only_submit_and_poll_never_reach_a_private_origin(
+def test_a_public_only_serve_keeps_submit_and_poll_off_a_private_origin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A video origin resolving to instance metadata is refused before any socket opens."""
+    """While the host serves public-only, an origin resolving to metadata is never dialled."""
     asked: list[str] = []
 
     def getaddrinfo(host: str, port: int, **_kwargs: object) -> list[tuple[object, ...]]:
@@ -422,21 +422,48 @@ def test_public_only_submit_and_poll_never_reach_a_private_origin(
 
     monkeypatch.setattr(public_egress.socket, "getaddrinfo", getaddrinfo)
     monkeypatch.setattr(public_egress.httpcore.SyncBackend, "connect_tcp", connect)
-    client = VeoVideoClient(http=public_http_factory)
-    with pytest.raises(VideoSubmitRejected) as rejected:
-        client.submit(_METADATA, VideoSubmission(request=VideoRequest(prompt="p"), model_id="veo"))
+    client = VeoVideoClient()
+    with public_egress.serving_policy(True):
+        with pytest.raises(VideoSubmitRejected) as rejected:
+            client.submit(
+                _METADATA, VideoSubmission(request=VideoRequest(prompt="p"), model_id="veo")
+            )
+        with pytest.raises(VideoPollUnavailable):
+            client.poll(_METADATA, "models/veo/operations/op-1")
     assert rejected.value.failure.failure_class is GatewayFailureClass.TRANSPORT
     assert rejected.value.failure.provider_detail is None
-    with pytest.raises(VideoPollUnavailable):
-        client.poll(_METADATA, "models/veo/operations/op-1")
     assert asked == ["metadata.internal.example", "metadata.internal.example"]
 
 
-def test_both_video_clients_ignore_environment_proxies(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Neither factory lets an ambient proxy carry a provider job call."""
+def test_the_standalone_default_still_reaches_a_private_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Outside a public-only serve the job client dials local and private servers as before."""
+    dialled: list[tuple[str, int]] = []
+
+    def connect(_self: object, host: str, port: int, **_kwargs: object) -> None:
+        dialled.append((host, port))
+        raise public_egress.httpcore.ConnectError("no server in this test")
+
+    monkeypatch.setattr(public_egress.httpcore.SyncBackend, "connect_tcp", connect)
+    local = dataclasses.replace(
+        _METADATA, videos_url="http://127.0.0.1:8089/v1beta/models/veo:predictLongRunning"
+    )
+    with pytest.raises(VideoSubmitRejected):
+        VeoVideoClient().submit(
+            local, VideoSubmission(request=VideoRequest(prompt="p"), model_id="veo")
+        )
+    assert dialled == [("127.0.0.1", 8089)]
+
+
+@pytest.mark.parametrize("public_only", [False, True])
+def test_the_job_client_ignores_environment_proxies(
+    monkeypatch: pytest.MonkeyPatch, public_only: bool
+) -> None:
+    """Under either policy, an ambient proxy never carries a provider job call."""
     monkeypatch.setenv("HTTPS_PROXY", "http://10.0.0.1:3128")
-    for factory in (default_http_factory, public_http_factory):
-        with factory() as client:
-            assert client.trust_env is False
-            assert client.follow_redirects is False
-            assert client._mounts == {}
+    with public_egress.serving_policy(public_only), default_http_factory() as client:
+        assert client.trust_env is False
+        assert client.follow_redirects is False
+        assert client._mounts == {}
+        assert isinstance(client._transport, public_egress.PublicOnlyTransport) is public_only

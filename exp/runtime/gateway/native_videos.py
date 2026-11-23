@@ -28,11 +28,6 @@ from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncW
 from exp.runtime.gateway.video.contracts import render_deleted_object, render_video_object
 from exp.runtime.gateway.video.engine import VideoEngine
 from exp.runtime.gateway.video.output import VideoOutputStore
-from exp.runtime.gateway.video.providers import (
-    default_http_factory,
-    default_video_clients,
-    public_http_factory,
-)
 from exp.runtime.gateway.video.store import ListOrder, VideoJobStore
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.video_requests import decode_video_create
@@ -47,7 +42,6 @@ class _VideoPlane(Protocol):
     _write_ledger: SyncWriteLedger
     _guardrails: GuardrailEngine | None
     _videos: VideoEngine | None
-    _public_upstreams_only: bool
 
 
 def _disabled() -> NativeBridgeError:
@@ -100,24 +94,13 @@ class NativeVideosMixin:
     """The ``video_*`` boundary methods."""
 
     _videos: VideoEngine | None
-    _public_upstreams_only: bool = False
-
-    @property
-    def public_upstreams_only(self) -> bool:
-        """Return whether this plane's own provider HTTP calls are public-HTTPS only."""
-        return self._public_upstreams_only
 
     def _bind_videos(self: _VideoPlane, *, start_poller: bool = True) -> None:
         """Build the video engine when the composition installs a job store.
 
-        Job submits and polls hold the native transport's public HTTPS
-        destination policy when the plane was built with
-        ``public_upstreams_only``.
-
         Args:
             start_poller: Whether to start the background settlement poller.
         """
-        http = public_http_factory if self._public_upstreams_only else default_http_factory
         jobs: VideoJobStore | None = getattr(self._components, "video_jobs", None)
         outputs: VideoOutputStore | None = getattr(self._components, "video_outputs", None)
         self._videos = (
@@ -128,7 +111,6 @@ class NativeVideosMixin:
                 ledger=self._write_ledger,
                 jobs=jobs,
                 guardrails=self._guardrails,
-                clients=default_video_clients(http=http),
                 outputs=outputs,
             )
         )

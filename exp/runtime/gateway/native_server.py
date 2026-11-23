@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Protocol, cast
 
 from exp.runtime.gateway.guardrails.deterministic import NativeDetector
+from exp.runtime.gateway.public_egress import serving_policy
 
 if TYPE_CHECKING:
     from exp_gateway_native import CaptureCollector, ExecutionBindings, ShutdownHandle
@@ -27,11 +28,6 @@ class NativeServerControlPlane(Protocol):
     @property
     def guardrail_detectors(self) -> dict[str, NativeDetector]:
         """Return the compiled deterministic guardrail rules, keyed by adapter."""
-        ...
-
-    @property
-    def public_upstreams_only(self) -> bool:
-        """Return whether the plane's own provider HTTP calls are public-HTTPS only."""
         ...
 
 
@@ -172,10 +168,10 @@ def serve_native_gateway(
         public_upstreams_only: Restrict native provider connections to public HTTPS
             addresses, including connection-time DNS checks and proxy bypass.
             Hosted embedders accepting customer endpoints must enable this. It
-            defaults to False for local/private model servers. The control plane
-            must be built with the same flag, which holds its video job client to
-            the same policy; a mismatch refuses to serve. Other Python callbacks
-            that make their own HTTP requests are not covered.
+            defaults to False for local/private model servers. While serving, the
+            same flag governs the gateway's own Python provider clients (video job
+            submit and poll) through ``public_egress.serving_policy``; other Python
+            callbacks that make their own HTTP requests are not covered.
         native_usage_enabled: Whether Rust owns ``/usage.json``. Hosted,
             multi-tenant callers should disable it so their own surface owns
             usage.
@@ -212,8 +208,6 @@ def serve_native_gateway(
     """
     if not 1 <= callback_permits <= 256:
         raise ValueError("callback_permits must be between 1 and 256")
-    if public_upstreams_only != control_plane.public_upstreams_only:
-        raise ValueError("public_upstreams_only must match the control plane's own egress policy")
     try:
         native = importlib.import_module("exp_gateway_native")
     except ModuleNotFoundError as exc:
@@ -245,15 +239,16 @@ def serve_native_gateway(
     if reserve is not None:
         config["pre_first_byte_reserve_seconds"] = reserve
     try:
-        native.serve(
-            cast("NativeControlPlane", control_plane),
-            json.dumps(config),
-            shutdown,
-            on_listening,
-            control_plane.guardrail_detectors,
-            capture,
-            execution_bindings,
-        )
+        with serving_policy(public_upstreams_only):
+            native.serve(
+                cast("NativeControlPlane", control_plane),
+                json.dumps(config),
+                shutdown,
+                on_listening,
+                control_plane.guardrail_detectors,
+                capture,
+                execution_bindings,
+            )
     except KeyboardInterrupt:
         # The native server drains on SIGINT before returning control to Python.
         pass

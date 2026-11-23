@@ -9,7 +9,7 @@ from unittest import mock
 
 import pytest
 
-from exp.runtime.gateway import native_server
+from exp.runtime.gateway import native_server, public_egress
 from exp.runtime.gateway.native_server import (
     PRE_FIRST_BYTE_MAX_ENV,
     PRE_FIRST_BYTE_RESERVE_ENV,
@@ -49,9 +49,7 @@ def test_host_passes_the_serve_configuration(
     monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
     monkeypatch.setenv(PRE_FIRST_BYTE_RESERVE_ENV, "20")
     monkeypatch.setenv(PRE_FIRST_BYTE_MAX_ENV, "480")
-    control = SimpleNamespace(
-        guardrail_detectors={}, request_timeout_seconds=37.0, public_upstreams_only=public_only
-    )
+    control = SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=37.0)
     scopes = cast("native_server.ExecutionBindings", object())
 
     serve_native_gateway(
@@ -113,9 +111,7 @@ def test_host_forwards_an_embedder_owned_shutdown_handle(
     handle = object()
 
     serve_native_gateway(
-        SimpleNamespace(
-            guardrail_detectors={}, request_timeout_seconds=12.0, public_upstreams_only=False
-        ),
+        SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=12.0),
         host="127.0.0.1",
         port=8080,
         shutdown=cast("native_server.ShutdownHandle", handle),
@@ -131,9 +127,7 @@ def test_host_maps_native_runtime_failures(monkeypatch: pytest.MonkeyPatch) -> N
 
     with pytest.raises(NativeGatewayServerError, match="bind failed"):
         serve_native_gateway(
-            SimpleNamespace(
-                guardrail_detectors={}, request_timeout_seconds=10.0, public_upstreams_only=False
-            ),
+            SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=10.0),
             host="127.0.0.1",
             port=8080,
         )
@@ -147,9 +141,7 @@ def test_host_treats_native_keyboard_interrupt_as_clean_shutdown(
     monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
 
     serve_native_gateway(
-        SimpleNamespace(
-            guardrail_detectors={}, request_timeout_seconds=10.0, public_upstreams_only=False
-        ),
+        SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=10.0),
         host="127.0.0.1",
         port=8080,
     )
@@ -165,9 +157,7 @@ def test_host_requires_the_extension(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(native_server.importlib, "import_module", missing)
     with pytest.raises(NativeGatewayServerError, match="not installed"):
         serve_native_gateway(
-            SimpleNamespace(
-                guardrail_detectors={}, request_timeout_seconds=10.0, public_upstreams_only=False
-            ),
+            SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=10.0),
             host="127.0.0.1",
             port=8080,
         )
@@ -189,22 +179,24 @@ def test_the_budget_ceiling_override_is_optional_and_validated() -> None:
         pre_first_byte_max_seconds({PRE_FIRST_BYTE_MAX_ENV: "-5"})
 
 
-@pytest.mark.parametrize(("plane_public", "serve_public"), [(False, True), (True, False)])
-def test_host_refuses_a_mismatched_egress_policy(
-    monkeypatch: pytest.MonkeyPatch, plane_public: bool, serve_public: bool
+@pytest.mark.parametrize("public_only", [False, True])
+def test_host_hands_its_egress_policy_to_python_provider_clients(
+    monkeypatch: pytest.MonkeyPatch, public_only: bool
 ) -> None:
-    """The native transport and the plane's own HTTP clients hold one destination policy."""
-    native = SimpleNamespace(serve=mock.Mock())
+    """The serve flag is the one source: Python provider clients follow it while serving."""
+    seen: list[bool] = []
+
+    def serve(*_args: object) -> None:
+        """Observe the policy the control plane's own clients see mid-serve."""
+        seen.append(public_egress.public_upstreams_only())
+
+    native = SimpleNamespace(serve=serve)
     monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
-    with pytest.raises(ValueError, match="public_upstreams_only"):
-        serve_native_gateway(
-            SimpleNamespace(
-                guardrail_detectors={},
-                request_timeout_seconds=10.0,
-                public_upstreams_only=plane_public,
-            ),
-            host="127.0.0.1",
-            port=8080,
-            public_upstreams_only=serve_public,
-        )
-    native.serve.assert_not_called()
+    serve_native_gateway(
+        SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=10.0),
+        host="127.0.0.1",
+        port=8080,
+        public_upstreams_only=public_only,
+    )
+    assert seen == [public_only]
+    assert public_egress.public_upstreams_only() is False
