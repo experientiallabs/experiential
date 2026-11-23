@@ -633,6 +633,7 @@ mod tests {
             image_input_tokens: None,
             billed_units: None,
             cache_writes_read_back: false,
+            provider_reported_cost_nano_usd: None,
         }
     }
 

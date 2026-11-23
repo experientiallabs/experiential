@@ -137,6 +137,10 @@ class GatewayUsage(ContractModel):
             vendor as one contents page), or None when the settlement named none.
         web_search_cost_nano_usd: The search vendor's own reported cost for those
             searches in whole nano-USD, or None when it reported none.
+        provider_reported_cost_nano_usd: What the model provider itself reported
+            charging for this attempt in whole nano-USD, rounded up, or None when it
+            reported none. Only OpenRouter reports one (its ``usage.cost`` on a
+            non-BYOK answer); every other provider leaves it None.
         tool_search_requests: Gateway-executed tool-search rounds billed to the attempt.
         billed_units: Media units priced by the deployment's unit card (characters,
             audio or video seconds, images), beside or instead of tokens; None on
@@ -171,6 +175,7 @@ class GatewayUsage(ContractModel):
     """The search vendor's own reported cost for this attempt's web searches
     (Exa ``costDollars.total``) in whole nano-USD; None when the vendor
     reported none. A host billing the true pass-through prefers it."""
+    provider_reported_cost_nano_usd: int | None = Field(default=None, ge=0)
     tool_search_requests: int = Field(default=0, ge=0)
     """Gateway-executed tool-search rounds billed to this attempt; never a
     provider meter and not a subset of any token total. Zero on every attempt

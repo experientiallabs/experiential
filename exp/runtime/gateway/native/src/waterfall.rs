@@ -918,6 +918,8 @@ mod malformed_tool_ladder_tests;
 #[cfg(test)]
 mod progress_tests;
 #[cfg(test)]
+mod provider_cost_ladder_tests;
+#[cfg(test)]
 mod repair_ladder_tests;
 #[cfg(test)]
 mod revisit_ladder_tests;

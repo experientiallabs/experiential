@@ -5572,6 +5572,35 @@ def test_a_quote_prices_exactly_what_the_later_settlement_writes() -> None:
     assert registry.entry(entry.authorization.request_id) is None
 
 
+def test_the_provider_reported_cost_reaches_the_price_and_settle_callbacks() -> None:
+    """OpenRouter's reported charge rides the usage both host callbacks receive, unchanged."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    payload: JsonObject = {
+        "request_id": entry.authorization.request_id,
+        "attempt_id": started["attempt_id"],
+        "outcome": "completed",
+        "usage": {
+            "input_tokens": 14,
+            "output_tokens": 543,
+            "provider_reported_cost_nano_usd": 1_600_000,
+        },
+        "upstream_provider": "Fireworks",
+        "finalize": True,
+        "opened": True,
+    }
+    encoded = json.dumps(payload)
+    assert registry.price(encoded) == "{}"
+    registry.settle(encoded)
+    priced = ledger.priced[0]["terminal_event"]
+    assert isinstance(priced, GatewayEvent) and priced.usage is not None
+    assert priced.usage.provider_reported_cost_nano_usd == 1_600_000
+    settled = ledger.terminal_events[-1]
+    assert settled is not None and settled.usage is not None
+    assert settled.usage.provider_reported_cost_nano_usd == 1_600_000
+    assert ledger.upstream_providers[-1] == "Fireworks"
+
+
 def test_a_failed_quote_retains_nothing_and_the_settlement_still_lands() -> None:
     """A quote failure is the data plane's cue to settle first; it leaves no recovery state."""
     registry, ledger, entry = _registry()

@@ -292,6 +292,7 @@ pub(super) async fn run_attempt(
         }
         relay.set_serialize_tool_calls(wire.serialize_tool_calls);
         relay.set_cache_writes_within_reads(wire.cache_writes_within_reads);
+        relay.set_provider_reported_cost(wire.provider == crate::events::OPENROUTER_PROVIDER);
         relay.set_twelve_hour_cache_writes(
             wire.upstream_payload
                 .pointer("/prompt_cache_options/ttl")
