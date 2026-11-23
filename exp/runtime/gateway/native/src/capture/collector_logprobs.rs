@@ -20,7 +20,10 @@ impl Collector {
         let Some(entry) = pending.entries.get_mut(request_id) else {
             return false;
         };
-        if !self.config.capture_logprobs || !(room || entry.record.provider_logprobs.is_some()) {
+        if entry.unexposed
+            || !self.config.capture_logprobs
+            || !(room || entry.record.provider_logprobs.is_some())
+        {
             return false;
         }
         if entry.record.provider_logprobs.is_none() {
@@ -36,6 +39,7 @@ impl Collector {
             if let Some(captured) = pending
                 .entries
                 .get_mut(request_id)
+                .filter(|entry| !entry.unexposed)
                 .and_then(|entry| entry.record.provider_logprobs.as_mut())
             {
                 captured.logprobs_injected = true;
@@ -60,7 +64,11 @@ impl Collector {
         let retained = self.retained_bytes(&pending);
         let maximum_pending = self.config.maximum_pending_bytes;
         let maximum_response = self.config.maximum_response_bytes;
-        let Some(entry) = pending.entries.get_mut(request_id) else {
+        let Some(entry) = pending
+            .entries
+            .get_mut(request_id)
+            .filter(|entry| !entry.unexposed)
+        else {
             return;
         };
         let record_room = super::super::logprobs::record_room(

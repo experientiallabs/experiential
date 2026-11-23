@@ -7,6 +7,9 @@ provider execution. Hosted collectors still wait for the ledger's retention verd
 storage opt-out, consent expiry and erasure remain the host's authority. No rejected
 provider output, reasoning, tool calls or log probabilities are retained. A full or
 unavailable capture collector preserves the original moderation refusal.
+Cancellation that wins before the input gate commits a refusal keeps the existing
+cancelled disposition and does not become a captured moderation block. A committed
+refusal permanently seals its capture against late provider or relay output.
 
 Experiential owns one Rust collector for authenticated request context, HTTP
 response capture, bounded lifecycle state and worker-owned delivery. Python

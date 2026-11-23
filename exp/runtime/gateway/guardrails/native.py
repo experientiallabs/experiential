@@ -15,6 +15,7 @@ from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
     GatewayFailure,
+    GatewayFailureClass,
     GatewayRequest,
 )
 from exp.runtime.gateway.guardrails.contracts import (
@@ -338,6 +339,8 @@ def inspect_admission_input(
     try:
         return session.inspect_input(request, defer=defer)
     except GuardrailRejected as exc:
+        if plane._capture is None or exc.failure.failure_class is not GatewayFailureClass.GUARDRAIL:
+            raise NativeBridgeError(public_failure_error(exc.failure)) from None
         try:
             plane._write_ledger.accept_request(authorization=authorization)
         except Exception as error:  # noqa: BLE001 - ledger diagnostics stay private.
