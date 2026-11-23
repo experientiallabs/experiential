@@ -29,6 +29,11 @@ class NativeServerControlPlane(Protocol):
         """Return the compiled deterministic guardrail rules, keyed by adapter."""
         ...
 
+    @property
+    def public_upstreams_only(self) -> bool:
+        """Return whether the plane's own provider HTTP calls are public-HTTPS only."""
+        ...
+
 
 class NativeGatewayServerError(RuntimeError):
     """The native extension could not serve."""
@@ -167,8 +172,10 @@ def serve_native_gateway(
         public_upstreams_only: Restrict native provider connections to public HTTPS
             addresses, including connection-time DNS checks and proxy bypass.
             Hosted embedders accepting customer endpoints must enable this. It
-            defaults to False for local/private model servers and does not cover
-            Python control-plane callbacks that make their own HTTP requests.
+            defaults to False for local/private model servers. The control plane
+            must be built with the same flag, which holds its video job client to
+            the same policy; a mismatch refuses to serve. Other Python callbacks
+            that make their own HTTP requests are not covered.
         native_usage_enabled: Whether Rust owns ``/usage.json``. Hosted,
             multi-tenant callers should disable it so their own surface owns
             usage.
@@ -205,6 +212,8 @@ def serve_native_gateway(
     """
     if not 1 <= callback_permits <= 256:
         raise ValueError("callback_permits must be between 1 and 256")
+    if public_upstreams_only != control_plane.public_upstreams_only:
+        raise ValueError("public_upstreams_only must match the control plane's own egress policy")
     try:
         native = importlib.import_module("exp_gateway_native")
     except ModuleNotFoundError as exc:

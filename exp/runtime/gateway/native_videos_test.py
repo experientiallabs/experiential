@@ -15,6 +15,14 @@ import pytest
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayFailure
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
 from exp.runtime.gateway.native_videos import NativeVideosMixin
+from exp.runtime.gateway.video.providers import (
+    VEO_DIALECT,
+    XAI_VIDEOS_DIALECT,
+    VeoVideoClient,
+    XaiVideoClient,
+    default_http_factory,
+    public_http_factory,
+)
 
 
 class _Ledger:
@@ -35,8 +43,9 @@ class _Ledger:
 class _Plane(NativeVideosMixin):
     """A bare plane exposing only what the video methods read."""
 
-    def __init__(self, video_jobs: object | None) -> None:
+    def __init__(self, video_jobs: object | None, *, public_upstreams_only: bool = False) -> None:
         """Bind a components stub with an optional video job store."""
+        self._public_upstreams_only = public_upstreams_only
         self._components = cast(Any, SimpleNamespace(video_jobs=video_jobs))
         self._write_ledger = cast(Any, _Ledger())
         self._guardrails = None
@@ -80,3 +89,20 @@ def test_a_missing_bearer_key_is_named() -> None:
     with pytest.raises(NativeBridgeError) as refused:
         plane.video_create(json.dumps({"fields": {}}))
     assert _status(refused.value) == (400, "bearer_key")
+
+
+@pytest.mark.parametrize(
+    ("public_only", "factory"), [(False, default_http_factory), (True, public_http_factory)]
+)
+def test_the_plane_egress_policy_selects_the_video_job_client(
+    public_only: bool, factory: object
+) -> None:
+    """A public-only plane submits and polls video jobs through the public-only client."""
+    plane = _Plane(object(), public_upstreams_only=public_only)
+    assert plane.public_upstreams_only is public_only
+    assert plane._videos is not None
+    clients = plane._videos._clients
+    assert {VEO_DIALECT, XAI_VIDEOS_DIALECT} <= set(clients)
+    for client in clients.values():
+        assert isinstance(client, VeoVideoClient | XaiVideoClient)
+        assert client._http is factory

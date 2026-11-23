@@ -36,10 +36,7 @@ from exp.runtime.gateway.guardrails.native import (
     validate_guardrail_engine,
 )
 from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
-from exp.runtime.gateway.native_accounting import (
-    NativeAttemptAccounting,
-    NativeBridgeError,
-)
+from exp.runtime.gateway.native_accounting import NativeAttemptAccounting, NativeBridgeError
 from exp.runtime.gateway.native_accounting import (
     authority_error as _authority_error,
 )
@@ -121,10 +118,7 @@ from exp.runtime.gateway.native_responses import (
 )
 from exp.runtime.gateway.native_rung_policy import throttle_redial_budgets
 from exp.runtime.gateway.native_rungs import build_rung_dispatch
-from exp.runtime.gateway.native_settlement import (
-    gateway_updating_failure,
-    optional_text,
-)
+from exp.runtime.gateway.native_settlement import gateway_updating_failure, optional_text
 from exp.runtime.gateway.native_tool_search import NativeToolSearchMixin
 from exp.runtime.gateway.native_videos import NativeVideosMixin
 from exp.runtime.gateway.provider_preferences import reorder_admitted_route as _reorder
@@ -203,6 +197,7 @@ class NativeControlPlane(
         automatic_cache: AutomaticCacheHost | None = None,
         background_recovery: bool = True,
         fleet_lane_gate: FleetLaneGate | None = None,
+        public_upstreams_only: bool = False,
     ) -> None:
         """Bind loaded gateway components for serving.
 
@@ -233,6 +228,8 @@ class NativeControlPlane(
                 lets a host schedule serialized recover_accounting calls, including
                 after native execution stops until accounting_drained is true.
             fleet_lane_gate: Host fleet-wide lane admission (``fleet_lanes``).
+            public_upstreams_only: Hold the plane's own provider HTTP calls (video
+                job submits and polls) to public HTTPS, matching the native serve flag.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -266,6 +263,7 @@ class NativeControlPlane(
         )
         # Finish fallible initialization before background workers can retain the ledger.
         reservation_encoder()
+        self._public_upstreams_only = public_upstreams_only
         self._bind_videos(start_poller=False)
         # Shared accounting owns reservations, health, recovery and deadline cleanup.
         self._accounting = NativeAttemptAccounting(

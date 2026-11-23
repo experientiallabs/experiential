@@ -9,6 +9,7 @@ from collections.abc import Callable
 import httpx
 import pytest
 
+from exp.runtime.gateway import public_egress
 from exp.runtime.gateway.stream_contracts import GatewayFailureClass
 from exp.runtime.gateway.video.contracts import VideoReferenceImage, VideoRequest, VideoStatus
 from exp.runtime.gateway.video.providers import (
@@ -19,6 +20,8 @@ from exp.runtime.gateway.video.providers import (
     VideoSubmitAmbiguous,
     VideoSubmitRejected,
     XaiVideoClient,
+    default_http_factory,
+    public_http_factory,
     video_dialect,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -393,3 +396,47 @@ def test_video_dialect_reads_the_profile() -> None:
     assert video_dialect(_XAI) == "xai_videos"
     no_video = GatewayWireProfile(dialect="openai_compatible", url="https://x/v1/chat/completions")
     assert video_dialect(no_video) is None
+
+
+_METADATA = GatewayWireProfile(
+    dialect="gemini_generate_content",
+    url="https://metadata.internal.example/v1beta/models/veo:streamGenerateContent",
+    videos_url="https://metadata.internal.example/v1beta/models/veo:predictLongRunning",
+    headers={"x-goog-api-key": "secret"},
+    model_id="veo-3.1-fast-generate-preview",
+)
+
+
+def test_public_only_submit_and_poll_never_reach_a_private_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A video origin resolving to instance metadata is refused before any socket opens."""
+    asked: list[str] = []
+
+    def getaddrinfo(host: str, port: int, **_kwargs: object) -> list[tuple[object, ...]]:
+        asked.append(host)
+        return [(2, 1, 6, "", ("169.254.169.254", port))]
+
+    def connect(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a refused destination must never be dialled")
+
+    monkeypatch.setattr(public_egress.socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(public_egress.httpcore.SyncBackend, "connect_tcp", connect)
+    client = VeoVideoClient(http=public_http_factory)
+    with pytest.raises(VideoSubmitRejected) as rejected:
+        client.submit(_METADATA, VideoSubmission(request=VideoRequest(prompt="p"), model_id="veo"))
+    assert rejected.value.failure.failure_class is GatewayFailureClass.TRANSPORT
+    assert rejected.value.failure.provider_detail is None
+    with pytest.raises(VideoPollUnavailable):
+        client.poll(_METADATA, "models/veo/operations/op-1")
+    assert asked == ["metadata.internal.example", "metadata.internal.example"]
+
+
+def test_both_video_clients_ignore_environment_proxies(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Neither factory lets an ambient proxy carry a provider job call."""
+    monkeypatch.setenv("HTTPS_PROXY", "http://10.0.0.1:3128")
+    for factory in (default_http_factory, public_http_factory):
+        with factory() as client:
+            assert client.trust_env is False
+            assert client.follow_redirects is False
+            assert client._mounts == {}
