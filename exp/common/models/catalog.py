@@ -456,6 +456,8 @@ class GatewayDeploymentCapabilities(ContractModel):
             Not consulted for routing: every route honors the cap (native Responses routes
             forward it, other routes run their built-in tools in the gateway, which enforces it).
         supports_structured_text: Whether schema-constrained text output is supported.
+        supports_vllm_sampling: Whether the compatible wire accepts vLLM's
+            ``repetition_penalty`` and ``min_p``, independently of priority scheduling.
         supports_stop_sequences: Whether caller-specified stop sequences are supported.
         supports_image_input: Whether the wire and model accept images; else images are refused.
         supports_image_url_input: Whether the provider fetches remote images; undeclared URLs
@@ -599,6 +601,7 @@ class GatewayDeploymentCapabilities(ContractModel):
     supports_grammar_tools: bool = False
     supports_tool_call_limit: bool = False
     supports_structured_text: bool = False
+    supports_vllm_sampling: bool = False
     supports_stop_sequences: bool = False
     supports_image_input: bool = False
     supports_image_url_input: bool = False

@@ -354,10 +354,12 @@ def rung_sampling_extras(
 ) -> frozenset[SamplingExtraName]:
     """The OpenRouter sampling extras one rung's wire carries.
 
-    OpenRouter's Chat Completions wire documents all three. A self-hosted vLLM
-    rung (the host authored ``upstream_priority`` on it, the same signal that
-    sends vLLM's ``priority`` field) takes ``repetition_penalty`` and ``min_p``
-    but has no ``top_a``. Every other wire carries none: the catalog's generic
+    OpenRouter's Chat Completions wire documents all three. A compatible rung
+    declaring ``supports_vllm_sampling`` takes ``repetition_penalty`` and
+    ``min_p`` without requiring priority scheduling. An authored
+    ``upstream_priority`` policy also declares a self-hosted vLLM wire and
+    carries those same extras. Neither declaration supports ``top_a``.
+    Every other wire carries none: the catalog's generic
     ``openai-compatible`` provider also covers resellers (Groq, Mistral, xAI,
     Cerebras and others) that refuse unknown body fields with a 400, and a
     provider 400 does not fail over, so the extras are dropped there with
@@ -373,7 +375,9 @@ def rung_sampling_extras(
     if openrouter_chat_wire(deployment.provider, dialect):
         return OPENROUTER_SAMPLING_EXTRAS
     policy = deployment.gateway.dispatch
-    if dialect == "openai_compatible" and policy is not None and policy.upstream_priority:
+    vllm_sampling = deployment.gateway.capabilities.supports_vllm_sampling
+    priority_vllm = policy is not None and policy.upstream_priority
+    if dialect == "openai_compatible" and (vllm_sampling or priority_vllm):
         return VLLM_SAMPLING_EXTRAS
     return frozenset()
 

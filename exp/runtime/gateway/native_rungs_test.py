@@ -1024,11 +1024,22 @@ def test_the_session_header_reaches_the_frozen_wire_entry() -> None:
     assert entry["headers"] == {"Authorization": "Bearer k", NOVITA_SESSION_HEADER: "xpls-abc"}
 
 
-def _extras_dispatch(provider: str, dialect: str, *, self_hosted: bool = False) -> RungDispatch:
+def _extras_dispatch(
+    provider: str, dialect: str, *, self_hosted: bool = False, vllm_sampling: bool = False
+) -> RungDispatch:
     """Freeze one rung for a decoded Chat request carrying all three sampling extras.
 
     ``self_hosted`` authors ``upstream_priority`` on the rung, the host's mark
     of a self-hosted vLLM server.
+
+    Args:
+        provider: Catalog provider for the synthetic route.
+        dialect: Resolved protocol used by the provider wire.
+        self_hosted: Whether the route declares upstream priority support.
+        vllm_sampling: Whether sampling support is declared independently.
+
+    Returns:
+        The prepared native dispatch and its unsupported-parameter disclosures.
     """
     request = decode_chat(
         {
@@ -1041,6 +1052,18 @@ def _extras_dispatch(provider: str, dialect: str, *, self_hosted: bool = False) 
         }
     ).request.model_copy(update={"include_usage": True})
     rung = _deployment(f"{provider}-rung", provider)
+    if vllm_sampling:
+        rung = rung.model_copy(
+            update={
+                "gateway": rung.gateway.model_copy(
+                    update={
+                        "capabilities": rung.gateway.capabilities.model_copy(
+                            update={"supports_vllm_sampling": True}
+                        )
+                    }
+                )
+            }
+        )
     if self_hosted:
         rung = rung.model_copy(
             update={
@@ -1071,6 +1094,37 @@ def test_a_vllm_rung_receives_repetition_penalty_and_min_p() -> None:
     # vLLM has no top_a: the rung dispatches without it and the drop is named.
     assert "top_a" not in payload
     assert dispatch.disclosures == ("top_a->dropped(unsupported_by_provider)",)
+
+
+def test_vllm_sampling_does_not_require_priority_scheduling() -> None:
+    """A qualified FIFO vLLM route gets sampling extras without a priority field."""
+    dispatch = _extras_dispatch("openai-compatible", "openai_compatible", vllm_sampling=True)
+    payload = dispatch.wire_entry["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert (payload["repetition_penalty"], payload["min_p"]) == (1.1, 0.05)
+    assert "priority" not in payload
+    assert "top_a" not in payload
+    assert dispatch.disclosures == ("top_a->dropped(unsupported_by_provider)",)
+
+
+@pytest.mark.parametrize(
+    ("provider", "dialect"),
+    (("openai", "openai_responses"), ("anthropic", "anthropic_messages")),
+)
+def test_vllm_sampling_declaration_cannot_widen_an_incompatible_wire(
+    provider: str, dialect: str
+) -> None:
+    """A mislabeled native wire still drops every unsupported extra.
+
+    Args:
+        provider: Strict provider whose protocol does not accept vLLM extras.
+        dialect: The provider's resolved native wire protocol.
+    """
+    dispatch = _extras_dispatch(provider, dialect, vllm_sampling=True)
+    payload = dispatch.wire_entry["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert not {"repetition_penalty", "min_p", "top_a"} & set(payload)
+    assert len(dispatch.sampling_disclosures) == 3
 
 
 def test_an_openrouter_rung_receives_every_sampling_extra() -> None:

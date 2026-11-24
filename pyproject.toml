@@ -1,6 +1,6 @@
 [project]
 name = "experiential"
-version = "0.7.261"
+version = "0.7.262"
 description = "Build simulations and optimize model routing from agent traces."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -9,7 +9,7 @@ dependencies = [
     # Every requirement here and in the extras is an exact pin, except `openai`: callers'
     # own code imports that SDK next to this package, so it stays a certified range. A
     # version moves only by a reviewed edit, and [tool.uv] keeps it 7 days old.
-    "exp-gateway-native==0.3.205",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
+    "exp-gateway-native==0.3.206",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
     # Cross-platform advisory locking for durable registries edited in place. Declared directly
     # because `exp.common.core.locks` imports it and Unix-only `fcntl` is not a portable boundary.
     "filelock==4.2.1",
@@ -23,7 +23,7 @@ dependencies = [
     "httpx2==2.13.1",  # at or above 2.12, the OpenAI SDK's response-decompression security floor
     # The capture engine needs Python 3.13+ because mitmproxy on 3.12 conflicts with
     # Pydantic's typing-extensions floor. Other commands remain available on 3.12.
-    "exp-mitmproxy==12.2.3.post3; python_version >= '3.13'",
+    "exp-mitmproxy==12.2.3.post4; python_version >= '3.13'",
     "exp-mitmproxy-rs==0.12.11.post1; python_version >= '3.13'",
     "cryptography==50.0.1; python_version >= '3.13'",
     "brotli==1.2.1; python_version >= '3.13'",
@@ -151,5 +151,5 @@ exclude-newer-package = { experiential = false, exp-gateway-native = false, exp-
 exp-gateway-native = { path = "exp/runtime/gateway/native" }
 
 # Immutable development pins for Capture's reviewed forks; release metadata uses PyPI names.
-exp-mitmproxy = { git = "https://github.com/experientiallabs/mitmproxy.git", rev = "a401f5af274a534c7c44be5ea3e542651970cfbc" }
+exp-mitmproxy = { git = "https://github.com/experientiallabs/mitmproxy.git", rev = "a0238f5236d98d4a9252eda5599c13083e73f748" }
 exp-mitmproxy-rs = { git = "https://github.com/experientiallabs/mitmproxy_rs.git", rev = "866da0a0aff1a8e57def4da6a941fca0c44dd98d", subdirectory = "mitmproxy-rs" }

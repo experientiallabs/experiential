@@ -929,13 +929,13 @@ wheels = [
 
 [[package]]
 name = "exp-gateway-native"
-version = "0.3.205"
+version = "0.3.206"
 source = { directory = "exp/runtime/gateway/native" }
 
 [[package]]
 name = "exp-mitmproxy"
-version = "12.2.3.post3"
-source = { git = "https://github.com/experientiallabs/mitmproxy.git?rev=a401f5af274a534c7c44be5ea3e542651970cfbc#a401f5af274a534c7c44be5ea3e542651970cfbc" }
+version = "12.2.3.post4"
+source = { git = "https://github.com/experientiallabs/mitmproxy.git?rev=a0238f5236d98d4a9252eda5599c13083e73f748#a0238f5236d98d4a9252eda5599c13083e73f748" }
 dependencies = [
     { name = "aioquic" },
     { name = "argon2-cffi" },
@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "experiential"
-version = "0.7.261"
+version = "0.7.262"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
@@ -1048,7 +1048,7 @@ requires-dist = [
     { name = "cryptography", marker = "python_full_version >= '3.13'", specifier = "==50.0.1" },
     { name = "et-xmlfile", marker = "extra == 'artifact-edits'", specifier = "==2.0.0" },
     { name = "exp-gateway-native", directory = "exp/runtime/gateway/native" },
-    { name = "exp-mitmproxy", marker = "python_full_version >= '3.13'", git = "https://github.com/experientiallabs/mitmproxy.git?rev=a401f5af274a534c7c44be5ea3e542651970cfbc" },
+    { name = "exp-mitmproxy", marker = "python_full_version >= '3.13'", git = "https://github.com/experientiallabs/mitmproxy.git?rev=a0238f5236d98d4a9252eda5599c13083e73f748" },
     { name = "exp-mitmproxy-rs", marker = "python_full_version >= '3.13'", git = "https://github.com/experientiallabs/mitmproxy_rs.git?subdirectory=mitmproxy-rs&rev=866da0a0aff1a8e57def4da6a941fca0c44dd98d" },
     { name = "experiential", extras = ["artifact-edits"], marker = "extra == 'dev'" },
     { name = "experiential", extras = ["sft"], marker = "extra == 'dev'" },
@@ -3833,14 +3833,15 @@ wheels = [
 
 [[package]]
 name = "urwid"
-version = "3.0.5"
+version = "4.0.13"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "typing-extensions" },
     { name = "wcwidth" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b1/59/67cd42db7c549c0c106d2b56d2d2ec1915c459e0a92722029efc5359e871/urwid-3.0.5.tar.gz", hash = "sha256:24be27ffafdb68c09cd95dc21b60ccfd02843320b25ce5feee1708b34fad5a23", size = 860746, upload-time = "2026-02-02T14:38:43.958Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ee/cc/0296b98c284d0b9c375e068bfcc6693c0a8b36e3ad7ce507ce7b3a8d2448/urwid-4.0.13.tar.gz", hash = "sha256:23afb15197b9e3b656b8c55bb3e18d50463c34db1982ec81ef5034525bea6c76", size = 891170, upload-time = "2026-08-25T13:59:50.569Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/09/6a/efd8ad30ab250a4ad23dc7c07437b374921042cb35215e468d49977822f7/urwid-3.0.5-py3-none-any.whl", hash = "sha256:f188144261224fdfc9b56b4222869bd0eac90fd7895cf1e376129cdc7e13bc84", size = 296957, upload-time = "2026-02-02T14:38:42.044Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/e9/4a31e301daab899c550767e417c7e4b1a4773591d3298d59db0393034a1b/urwid-4.0.13-py3-none-any.whl", hash = "sha256:bee62404d24d06d9ffa74d834b03d5ba53c419a135b36831775fc69c6246e6fa", size = 310654, upload-time = "2026-08-25T13:59:48.466Z" },
 ]
 
 [[package]]
