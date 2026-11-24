@@ -1,6 +1,6 @@
 [package]
 name = "exp-gateway-native"
-version = "0.3.205"
+version = "0.3.206"
 edition = "2021"
 description = "Rust data plane for the Experiential local gateway (PoC), embedded as a PyO3 extension."
 license = "Apache-2.0"
@@ -31,6 +31,9 @@ bytes = "1"
 futures-util = "0.3"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
+# Security exception 2026-11-24: lock transitive url to 2.5.9 and its required
+# form_urlencoded 1.2.3 for RUSTSEC-2026-0592. Remove this age exception after
+# 2026-11-27 23:03:07 UTC, when both releases are seven days old. No audit suppression.
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 sha2 = "0.10"
@@ -38,7 +41,7 @@ sha2 = "0.10"
 # codec frame lengths so a transcription reservation bounds what the provider meters.
 symphonia = { version = "0.6.1", default-features = false, features = ["wav", "ogg", "mkv", "isomp4", "mp3", "flac", "id3v2"] }
 thiserror = "2"
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "=0.41.0", features = ["bundled"] }
 
 [profile.release]
 lto = "thin"
