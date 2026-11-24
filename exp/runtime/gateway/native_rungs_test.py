@@ -1031,6 +1031,15 @@ def _extras_dispatch(
 
     ``self_hosted`` authors ``upstream_priority`` on the rung, the host's mark
     of a self-hosted vLLM server.
+
+    Args:
+        provider: Catalog provider for the synthetic route.
+        dialect: Resolved protocol used by the provider wire.
+        self_hosted: Whether the route declares upstream priority support.
+        vllm_sampling: Whether sampling support is declared independently.
+
+    Returns:
+        The prepared native dispatch and its unsupported-parameter disclosures.
     """
     request = decode_chat(
         {
@@ -1105,7 +1114,12 @@ def test_vllm_sampling_does_not_require_priority_scheduling() -> None:
 def test_vllm_sampling_declaration_cannot_widen_an_incompatible_wire(
     provider: str, dialect: str
 ) -> None:
-    """A mislabeled native wire still drops every unsupported extra."""
+    """A mislabeled native wire still drops every unsupported extra.
+
+    Args:
+        provider: Strict provider whose protocol does not accept vLLM extras.
+        dialect: The provider's resolved native wire protocol.
+    """
     dispatch = _extras_dispatch(provider, dialect, vllm_sampling=True)
     payload = dispatch.wire_entry["upstream_payload"]
     assert isinstance(payload, dict)

@@ -24,7 +24,16 @@ from exp.runtime.gateway.tests.native_json_object_test import _provider_response
 
 
 def _configure(root: Path, base_url: str, declared: bool) -> str:
-    """Create one explicitly qualified FIFO route with a synthetic provider credential."""
+    """Create one explicitly qualified FIFO route with a synthetic provider credential.
+
+    Args:
+        root: Isolated test gateway workspace.
+        base_url: Loopback provider endpoint that records native HTTP requests.
+        declared: Whether the route explicitly supports vLLM sampling extras.
+
+    Returns:
+        The synthetic customer key granted access to the configured alias.
+    """
     manager = GatewayManagement(root)
     manager.initialize()
     upsert_connection(
@@ -74,7 +83,14 @@ def _configure(root: Path, base_url: str, declared: bool) -> str:
 def test_vllm_controls_reach_the_wire_without_priority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declared: bool, stream: bool
 ) -> None:
-    """Both response modes preserve qualified controls and disclose unqualified drops."""
+    """Both response modes preserve qualified controls and disclose unqualified drops.
+
+    Args:
+        tmp_path: Isolated test gateway workspace.
+        monkeypatch: Fixture supplying a synthetic provider credential.
+        declared: Whether to qualify the route for vLLM sampling extras.
+        stream: Whether the customer requests streamed response events.
+    """
     received: list[JsonObject] = []
     body = _provider_response("openai-compatible")
 
