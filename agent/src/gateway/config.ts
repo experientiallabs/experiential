@@ -9,6 +9,11 @@
 /** Provider id under which the gateway's models are registered in Pi. */
 export const GATEWAY_PROVIDER_ID = "experiential";
 
+/** The gateway's global alias for its best general model; new sessions start on it when listed. */
+export const LARGE_MODEL_ALIAS = "experiential-large-model";
+/** The gateway's global alias for its fast, inexpensive model; helper calls use it when listed. */
+export const SMALL_MODEL_ALIAS = "experiential-small-model";
+
 /** The hosted gateway's OpenAI-compatible root. */
 export const HOSTED_GATEWAY_BASE_URL = "https://api.experientiallabs.ai/v1";
 

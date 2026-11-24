@@ -2,7 +2,7 @@
 
 export { applyCliEnvironment, expCodeHome } from "./cli/environment.js";
 export { runCli } from "./cli/run.js";
-export { createExpCodeExtension, EXP_CODE_TOOL_NAMES, type ExpCodeExtensionOptions } from "./extension/index.js";
+export { createExpCodeExtension, createIdentityExtension, EXP_CODE_TOOL_NAMES, type ExpCodeExtensionOptions } from "./extension/index.js";
 export {
   GATEWAY_PROVIDER_ID,
   type GatewayConfig,

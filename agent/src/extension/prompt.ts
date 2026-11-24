@@ -1,11 +1,16 @@
 /**
- * The cowork section of the system prompt.
+ * exp-code's parts of the system prompt.
  *
- * Pi builds the prompt from structured sections (tools, rules, skills, working directory). This
- * section adds what a general-purpose coworker needs beyond coding: producing deliverables as
- * files, verifying them, and explaining results to people who may not be programmers. Document
- * formats are covered by the bundled skills, which the model loads on demand.
+ * The upstream harness builds the prompt from structured sections (preamble, tools, rules, docs,
+ * skills, working directory). exp-code states its own identity in the preamble, points the docs
+ * section at its own README, and adds the cowork section: what a general-purpose coworker needs
+ * beyond coding (deliverables as files, verifying them, explaining results to people who may not
+ * be programmers). Document formats are covered by the bundled skills, loaded on demand.
  */
+
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { getDocsPath, getExamplesPath } from "@earendil-works/pi-coding-agent";
 
 export const COWORK_SECTION_NAME = "cowork";
 
@@ -41,4 +46,56 @@ export function addConversationSection(options: PromptSections, instructions: st
 /** Add the cowork section to Pi's structured system prompt options. */
 export function addCoworkSection(options: PromptSections): void {
   options.sections[COWORK_SECTION_NAME] = COWORK_SECTION;
+}
+
+/** The upstream default preamble, which names the upstream harness. */
+export const UPSTREAM_PREAMBLE =
+  "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.";
+
+/** exp-code's preamble: the agent's name and maker. */
+export const EXP_CODE_PREAMBLE =
+  "You are exp-code, the coding and cowork agent made by Experiential. Help users inspect files, run commands, modify code, and produce finished work. If asked who or what you are, you are exp-code by Experiential.";
+
+/** exp-code's README, when it ships next to this module (the npm package; not the runner bundle). */
+export function expCodeReadmePath(): string | undefined {
+  const path = fileURLToPath(new URL("../../README.md", import.meta.url));
+  return existsSync(path) ? path : undefined;
+}
+
+/** The docs section: exp-code's README first, then the reference docs for extending it. */
+export function docsSection(readmePath: string | undefined = expCodeReadmePath()): string {
+  const lines = ["exp-code documentation (read only when the user asks about exp-code itself, how to use it, or how to extend it):"];
+  if (readmePath !== undefined) lines.push(`- exp-code README (usage, login, gateway, models, tools, modes): ${readmePath}`);
+  lines.push(
+    `- Reference docs for extending exp-code: ${getDocsPath()}`,
+    `- Examples: ${getExamplesPath()} (extensions, custom tools, SDK)`,
+    "- Resolve docs/... under the reference docs and examples/... under Examples, not the current working directory",
+    "- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md)",
+    "- exp-code keeps its user configuration in ~/.exp-code/agent (settings.json, extensions/, skills/, sessions/), where these docs say ~/.pi/agent",
+    "- Before implementing changes to exp-code's own setup, read the relevant docs and examples in full."
+  );
+  return lines.join("\n");
+}
+
+/** Minimal shape of the prompt options the identity edit reads. */
+export interface IdentityPromptOptions extends PromptSections {
+  customPrompt?: string;
+}
+
+/**
+ * Point the docs section at exp-code. Skipped when the user supplied their own system prompt,
+ * which carries no docs section.
+ */
+export function addDocsSection(options: IdentityPromptOptions): void {
+  if (options.customPrompt) return;
+  options.sections.docs = docsSection();
+}
+
+/**
+ * The rendered prompt with exp-code's preamble in place of the upstream one, or undefined when the
+ * prompt does not start with the upstream preamble (a custom system prompt is left as written).
+ */
+export function withExpCodePreamble(systemPrompt: string): string | undefined {
+  if (!systemPrompt.startsWith(UPSTREAM_PREAMBLE)) return undefined;
+  return EXP_CODE_PREAMBLE + systemPrompt.slice(UPSTREAM_PREAMBLE.length);
 }

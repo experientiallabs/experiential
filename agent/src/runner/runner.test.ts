@@ -226,6 +226,8 @@ describe("runner", () => {
     await run([{ text: "ok" }]);
     const system = JSON.stringify((gateway.completions()[0]?.messages as { content: unknown }[])[0]);
     expect(system).toContain("<cowork>");
+    expect(system).toContain("You are exp-code, the coding and cowork agent made by Experiential");
+    expect(system).not.toContain("running inside pi");
     for (const skill of ["docx", "xlsx", "pptx", "pdf", "charts", "data-analysis"]) expect(system).toContain(`<name>${skill}</name>`);
   });
 

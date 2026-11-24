@@ -8,11 +8,14 @@
 
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { GATEWAY_PROVIDER_ID, type GatewayConfig } from "../gateway/config.js";
+import { GATEWAY_PROVIDER_ID, type GatewayConfig, SMALL_MODEL_ALIAS } from "../gateway/config.js";
 
 export interface WebSearchOptions {
   gateway: GatewayConfig;
-  /** Alias the search runs on when the session's model is not a gateway model. */
+  /**
+   * Alias the search runs on when the session's model is not a gateway model. Without one, the
+   * search uses `experiential-small-model` when the gateway lists it.
+   */
   model?: string;
   fetch?: typeof globalThis.fetch;
 }
@@ -60,7 +63,8 @@ export function createWebSearchTool(options: WebSearchOptions) {
     annotations: { readOnlyHint: true, openWorldHint: true },
     async execute(_toolCallId, { query }, signal, _onUpdate, ctx) {
       const sessionModel = ctx?.model?.provider === GATEWAY_PROVIDER_ID ? ctx.model.id : undefined;
-      const model = sessionModel ?? options.model;
+      const smallModel = ctx?.modelRegistry?.find(GATEWAY_PROVIDER_ID, SMALL_MODEL_ALIAS) !== undefined ? SMALL_MODEL_ALIAS : undefined;
+      const model = sessionModel ?? options.model ?? smallModel;
       if (model === undefined) {
         return failure("Web search needs an Experiential gateway model. Switch to one with /model and try again.", query);
       }

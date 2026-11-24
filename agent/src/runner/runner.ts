@@ -29,7 +29,7 @@ import {
   type ToolDefinition
 } from "@earendil-works/pi-coding-agent";
 import type { AskUserDetails } from "../extension/ask-user.js";
-import { createExpCodeExtension } from "../extension/index.js";
+import { createExpCodeExtension, createIdentityExtension } from "../extension/index.js";
 import { addConversationSection } from "../extension/prompt.js";
 import { resolveSkillsDir } from "../extension/skills.js";
 import { normalizeTodos } from "../extension/todo.js";
@@ -271,7 +271,9 @@ export async function runOnce(options: RunnerOptions): Promise<RunEndStatus> {
           }
         })
       },
-      { name: "exp-code-runner", factory: runnerExtension }
+      { name: "exp-code-runner", factory: runnerExtension },
+      // Last, so its preamble swap sees every other prompt edit.
+      { name: "exp-code-identity", factory: createIdentityExtension() }
     ]
   });
   await resourceLoader.reload();
