@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { GatewayConfig } from "../gateway/config.js";
-import { createExpCodeExtension } from "./index.js";
-import { COWORK_SECTION, COWORK_SECTION_NAME } from "./prompt.js";
+import { createExpCodeExtension, createIdentityExtension } from "./index.js";
+import { COWORK_SECTION, COWORK_SECTION_NAME, EXP_CODE_PREAMBLE, UPSTREAM_PREAMBLE } from "./prompt.js";
 
 /** A minimal recorder for the parts of Pi's ExtensionAPI the extension uses. */
 function fakePi() {
@@ -27,8 +27,17 @@ describe("exp-code extension", () => {
     const options = { sections: {} as Record<string, string> };
     for (const handler of pi.handlers.get("before_agent_start") ?? []) await handler({ systemPromptOptions: options }, {});
     expect(options.sections[COWORK_SECTION_NAME]).toBe(COWORK_SECTION);
+    expect(options.sections.docs).toContain("exp-code README");
     const discovered = (await pi.handlers.get("resources_discover")?.[0]?.({}, {})) as { skillPaths: string[] };
     expect(discovered.skillPaths[0]).toMatch(/skills$/);
+  });
+
+  it("names the agent exp-code in the preamble, leaving a custom prompt alone", async () => {
+    const pi = fakePi();
+    await createIdentityExtension()(pi.api as never);
+    const handler = pi.handlers.get("before_agent_start")![0]!;
+    expect(await handler({ systemPrompt: `${UPSTREAM_PREAMBLE}\n\n<cwd>\n/w\n</cwd>` }, {})).toEqual({ systemPrompt: `${EXP_CODE_PREAMBLE}\n\n<cwd>\n/w\n</cwd>` });
+    expect(await handler({ systemPrompt: "Mine." }, {})).toBeUndefined();
   });
 
   it("runs without a gateway, warning interactive sessions once", async () => {

@@ -1,5 +1,5 @@
 /**
- * The exp-code Pi extension: cowork tools, the cowork prompt section, the document skills, and
+ * The exp-code extension: cowork tools, the cowork prompt section, the document skills, and
  * the Experiential gateway provider.
  *
  * The CLI and the headless runner load the same factory; they differ only in the options (where
@@ -10,7 +10,7 @@ import { type BashOperations, createLocalBashOperations, type ExtensionFactory }
 import type { GatewayConfig } from "../gateway/config.js";
 import { type GatewayProviderOptions, registerGatewayProvider } from "../gateway/provider.js";
 import { createAskUserTool } from "./ask-user.js";
-import { addCoworkSection } from "./prompt.js";
+import { addCoworkSection, addDocsSection, withExpCodePreamble } from "./prompt.js";
 import { resolveSkillsDir } from "./skills.js";
 import { createTodoTool } from "./todo.js";
 import { createWebFetchTool } from "./web-fetch.js";
@@ -45,6 +45,7 @@ export function createExpCodeExtension(options: ExpCodeExtensionOptions): Extens
     }
     pi.on("before_agent_start", (event) => {
       addCoworkSection(event.systemPromptOptions);
+      addDocsSection(event.systemPromptOptions);
     });
     pi.on("resources_discover", () => ({ skillPaths: [resolveSkillsDir(options.skillsRoot)] }));
     const problem = options.gatewayProblem;
@@ -53,5 +54,21 @@ export function createExpCodeExtension(options: ExpCodeExtensionOptions): Extens
         if (ctx.hasUI) ctx.ui.notify(problem, "warning");
       });
     }
+  };
+}
+
+/**
+ * The extension that gives the agent exp-code's name in the system prompt preamble.
+ *
+ * The upstream preamble is not a replaceable section, so the rendered prompt is replaced, which
+ * fixes its text for the turn. Load this factory LAST: a prompt edit from any extension loaded
+ * after it would be lost.
+ */
+export function createIdentityExtension(): ExtensionFactory {
+  return (pi) => {
+    pi.on("before_agent_start", (event) => {
+      const systemPrompt = withExpCodePreamble(event.systemPrompt);
+      return systemPrompt === undefined ? undefined : { systemPrompt };
+    });
   };
 }

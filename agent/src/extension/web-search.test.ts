@@ -36,6 +36,14 @@ describe("web_search", () => {
     expect((none as { isError?: boolean }).isError).toBe(true);
   });
 
+  it("falls back to experiential-small-model when the gateway lists it", async () => {
+    const { fetch, seen } = reply({ choices: [{ message: { content: "ok" } }] });
+    const listed = (provider: string, id: string) => provider === "experiential" && id === "experiential-small-model";
+    const withRegistry = { model: { provider: "anthropic", id: "x" }, modelRegistry: { find: (p: string, id: string) => (listed(p, id) ? {} : undefined) } } as never;
+    await createWebSearchTool({ gateway, fetch }).execute("c", { query: "q" }, undefined, undefined, withRegistry);
+    expect(seen[0]?.body.model).toBe("experiential-small-model");
+  });
+
   it("reports gateway errors and an ignored search parameter as tool errors", async () => {
     const refused = await createWebSearchTool({ gateway, model: "m", fetch: reply({ error: { message: "no credits" } }, { status: 402 }).fetch }).execute("c", { query: "q" }, undefined, undefined, undefined as never);
     expect(refused.content[0]).toEqual({ type: "text", text: "Web search failed (402): no credits" });

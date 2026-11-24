@@ -72,7 +72,7 @@ saved when neither key variable is set:
 | `EXP_GATEWAY_KEY` | Local gateway key. Selects the local gateway when no hosted key is set. |
 | `EXP_CODE_GATEWAY` | `hosted` or `local`, to choose explicitly. |
 | `EXP_CODE_BASE_URL` | Another base URL for the chosen gateway. |
-| `EXP_CODE_MODEL` | Default model alias (otherwise the first alias the gateway lists). |
+| `EXP_CODE_MODEL` | Default model alias (otherwise `experiential-large-model` when listed, else the first alias the gateway lists). |
 | `EXP_CODE_WIRE` | Force one wire API: `completions`, `responses`, or `messages`. |
 | `EXP_CODE_HOME` | Configuration directory (default `~/.exp-code`). |
 | `EXP_PLATFORM_URL` | Platform origin `exp-code login` opens (default `https://platform.experientiallabs.ai`). |
@@ -87,7 +87,10 @@ settled cost, which exp-code shows as the cost of the turn.
 
 exp-code keeps its own configuration in `~/.exp-code/agent` (settings, saved credentials,
 sessions, extensions, skills). In a project it reads `AGENTS.md` for instructions and `.pi/`
-for project settings and resources. Telemetry and the update check are off.
+for project settings and resources. Telemetry and the update check are off. Before anything
+loads, exp-code points the harness at this directory (`PI_CODING_AGENT_DIR=~/.exp-code/agent`),
+so it never shares state with another agent install, and it leaves `PI_TELEMETRY` and
+`PI_SKIP_VERSION_CHECK` off unless you set them.
 
 ## Modes
 
@@ -100,8 +103,16 @@ exp-code --model experiential/<alias>     # pick a model
 exp-code -c                               # continue the last session
 ```
 
-The full flag list, and the JSON and RPC formats, are in the upstream docs linked under
-[Built on Pi](#built-on-pi).
+`exp-code --help` lists every flag. The JSON and RPC formats are described in the reference
+docs linked under [Acknowledgements](#acknowledgements).
+
+New sessions start on `experiential-large-model` when the gateway lists it (otherwise the first
+alias it lists). `EXP_CODE_MODEL`, `--model`, and a model you chose earlier with `/model` all
+take precedence. When a session's model is not a gateway model, `web_search` runs on
+`experiential-small-model` if the gateway lists it.
+
+The first interactive start installs the two file-search helpers (`fd` and `rg`) into
+`~/.exp-code/agent/bin` when they are not on your `PATH`, with one line of progress.
 
 ## The extension
 
@@ -182,15 +193,9 @@ attaches `exp-code-runner.mjs` (the self-contained sandbox runner), its `.sha256
 `exp-code-protocol.ts` (the runner protocol) to a GitHub release, so a host can pin a version
 and verify the file it runs. With an `NPM_TOKEN` secret configured it also publishes to npm.
 
-## Built on Pi
+## Acknowledgements
 
-exp-code is built on [Pi's coding agent](https://github.com/earendil-works/pi/tree/main/packages/coding-agent)
-(`@earendil-works/pi-coding-agent`, exact-pinned) and extends it with the Experiential gateway
-provider, the cowork tools and skills, and the sandbox runner. The terminal UI, sessions,
-compaction, extensions, skills, MCP and the print, JSON and RPC modes work as Pi documents
-them: see its [CLI](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/cli.md),
+exp-code is a fork of [Pi's coding agent](https://github.com/earendil-works/pi/tree/main/packages/coding-agent)
+(MIT), which it uses as an exact-pinned dependency; its [CLI](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/cli.md),
 [JSON](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/json.md), and
-[RPC](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md) docs.
-exp-code sets Pi's `PI_CODING_AGENT_DIR` to `~/.exp-code/agent` before Pi loads, so it never
-shares state with a Pi installation, and leaves `PI_TELEMETRY` and `PI_SKIP_VERSION_CHECK` off
-unless you set them.
+[RPC](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md) docs describe the formats exp-code keeps.
