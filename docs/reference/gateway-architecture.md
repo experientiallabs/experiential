@@ -875,9 +875,9 @@ admission drops it with `top_k->dropped(unsupported_by_provider)` because defaul
 drop with `<parameter>->dropped(unsupported_by_provider)`. These are soft preferences.
 OpenRouter's Chat sampling extras `repetition_penalty` (0 to 2, exclusive of 0), `min_p` and
 `top_a` (0 to 1) are accepted on every Chat request, as OpenRouter accepts them: each rung whose
-wire carries a field receives it (OpenRouter all three; a self-hosted vLLM rung, one whose
-dispatch policy authors `upstream_priority` such as an Experiential Cloud lane, `repetition_penalty`
-and `min_p`), and every other rung, generic OpenAI-compatible resellers included, dispatches
+wire carries a field receives it (OpenRouter all three; a compatible vLLM rung declaring
+`supports_vllm_sampling` or `upstream_priority`, `repetition_penalty` and `min_p`). Sampling support
+does not enable priority scheduling. Every other rung, generic compatible resellers included, dispatches
 without it, disclosed as `<parameter>->dropped(unsupported_by_provider)`. A value of
 the wrong type or outside its range is still a 400 naming the field.
 Chat token probabilities are opt-in on verified compatible rungs; see [Chat token probabilities](chat-logprobs.md).

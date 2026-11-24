@@ -8,8 +8,9 @@ drop is disclosed in ``ignored_parameters``. A request is never refused for
 asking, but its values stay validated, so an out-of-range value is a named 400.
 
 Which wire accepts which field is decided once per rung in ``native_rungs``:
-OpenRouter carries all three, a self-hosted vLLM rung (``upstream_priority``
-authored) carries ``repetition_penalty`` and ``min_p`` (vLLM has no ``top_a``),
+OpenRouter carries all three, a compatible vLLM rung (``supports_vllm_sampling``
+or ``upstream_priority`` authored) carries ``repetition_penalty`` and ``min_p``
+(vLLM has no ``top_a``),
 and every other wire carries none: OpenAI, Azure, Anthropic, Gemini, Bedrock,
 the native Responses dialect, and the generic OpenAI-compatible resellers,
 some of which refuse unknown body fields.
