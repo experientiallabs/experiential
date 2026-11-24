@@ -38,7 +38,7 @@ sha2 = "0.10"
 # codec frame lengths so a transcription reservation bounds what the provider meters.
 symphonia = { version = "0.6.1", default-features = false, features = ["wav", "ogg", "mkv", "isomp4", "mp3", "flac", "id3v2"] }
 thiserror = "2"
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 
 [profile.release]
 lto = "thin"
