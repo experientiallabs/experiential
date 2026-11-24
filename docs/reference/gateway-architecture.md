@@ -877,7 +877,7 @@ OpenRouter's Chat sampling extras `repetition_penalty` (0 to 2, exclusive of 0),
 `top_a` (0 to 1) are accepted on every Chat request, as OpenRouter accepts them: each rung whose
 wire carries a field receives it (OpenRouter all three; a compatible vLLM rung declaring
 `supports_vllm_sampling` or `upstream_priority`, `repetition_penalty` and `min_p`). Sampling support
-does not enable priority scheduling. Every other rung, generic compatible resellers included, dispatches
+does not enable priority scheduling. The direct-alias CLI exposes `--supports-vllm-sampling`; updates retain it only for the same endpoint. Every other rung dispatches
 without it, disclosed as `<parameter>->dropped(unsupported_by_provider)`. A value of
 the wrong type or outside its range is still a 400 naming the field.
 Chat token probabilities are opt-in on verified compatible rungs; see [Chat token probabilities](chat-logprobs.md).

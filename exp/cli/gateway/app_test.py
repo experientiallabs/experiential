@@ -366,6 +366,93 @@ def test_direct_alias_uses_provider_certification_for_tool_streaming(
     assert not replaced_custom.gateway.capabilities.supports_streaming_tool_arguments
 
 
+def test_direct_alias_vllm_sampling_is_authored_retained_and_revoked(tmp_path: Path) -> None:
+    """CLI declarations survive same-endpoint updates but never certify a replacement.
+
+    Args:
+        tmp_path: Isolated local gateway workspace.
+    """
+    runner = CliRunner()
+    suffix = ["--root", str(tmp_path), "--non-interactive", "--json"]
+    for command in (
+        ["config", "gateway", "init"],
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "custom",
+            "--provider",
+            "openai-compatible",
+            "--base-url",
+            "https://custom.example.test/v1",
+        ],
+    ):
+        result = runner.invoke(app, command + suffix)
+        assert result.exit_code == 0, result.output
+
+    def author(operation: str, *flags: str) -> None:
+        """Author the same direct alias through the public CLI.
+
+        Args:
+            operation: Create or update the alias.
+            flags: Explicit endpoint capability declarations.
+        """
+        result = runner.invoke(
+            app,
+            [
+                "config",
+                "gateway",
+                "alias",
+                operation,
+                "custom-model",
+                "--deployment",
+                "custom:fixture",
+                "--exact-model",
+                "fixture",
+                *flags,
+                *suffix,
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+    def declared() -> bool:
+        """Read the current authored route declaration.
+
+        Returns:
+            Whether the CLI persisted vLLM sampling support.
+        """
+        gateway = load_model_catalog(tmp_path / "models.toml").models["custom-model"].gateway
+        assert gateway is not None
+        return gateway.capabilities.supports_vllm_sampling
+
+    author("create", "--supports-vllm-sampling")
+    assert declared()
+    author("update")
+    assert declared()
+    author("update", "--no-supports-vllm-sampling")
+    assert not declared()
+    author("update", "--supports-vllm-sampling")
+    replaced = runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "update",
+            "custom",
+            "--provider",
+            "openai-compatible",
+            "--base-url",
+            "https://replacement.example.test/v1",
+            *suffix,
+        ],
+    )
+    assert replaced.exit_code == 0, replaced.output
+    author("update")
+    assert not declared()
+
+
 def test_direct_alias_declares_image_capabilities_per_provider(tmp_path: Path) -> None:
     """Only a URL-fetching provider may carry a caller's remote image URL."""
     runner = CliRunner()

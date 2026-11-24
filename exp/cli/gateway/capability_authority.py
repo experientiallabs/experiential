@@ -2,24 +2,37 @@
 
 from __future__ import annotations
 
-from exp.common.models import ConnectionConfig, read_model_catalog_document
+from exp.common.models import (
+    ConnectionConfig,
+    GatewayDeploymentCapabilities,
+    read_model_catalog_document,
+)
 from exp.runtime.gateway.catalog_authority import authored_snapshot_path
 from exp.runtime.gateway.management import GatewayManagement
 
 
-def retained_streaming_tool_arguments(
+def retained_gateway_capabilities(
     manager: GatewayManagement,
     *,
     alias_id: str,
     connection_id: str,
     connection: ConnectionConfig,
-) -> bool | None:
+) -> GatewayDeploymentCapabilities | None:
     """Return a prior declaration only for the same frozen endpoint identity.
 
     The mutable connection name is insufficient authority: an operator may
     replace its endpoint while retaining the name. The active alias revision's
     immutable snapshot and provider binding must both match the candidate
     connection before its endpoint-specific declaration can be reused.
+
+    Args:
+        manager: Gateway whose active alias owns the prior snapshot.
+        alias_id: Alias being reconfigured.
+        connection_id: Candidate provider connection name.
+        connection: Candidate connection with its current endpoint identity.
+
+    Returns:
+        Prior capabilities for the exact endpoint, or None when it changed.
     """
     active = next(
         (item for item in manager.aliases() if item.alias_id == alias_id and item.active),
@@ -52,4 +65,4 @@ def retained_streaming_tool_arguments(
         or snapshot.connections.get(connection_id) != bound.config
     ):
         return None
-    return record.gateway.capabilities.supports_streaming_tool_arguments
+    return record.gateway.capabilities
