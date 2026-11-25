@@ -13,14 +13,20 @@
 //!
 //! * `messages`: the value of `request.context.request.messages`. A plan that
 //!   keeps the prompt out replaces it with `[]`.
-//! * `response`: the value of the record's `response`. A plan that keeps the
-//!   response out replaces it with `null`.
 //! * `source_json`, `provider_context` (in the request context) and
-//!   `wire_request` (in `transport`): whole members, including the separating
-//!   comma, so deleting the span leaves valid JSON.
+//!   `wire_request` (in `transport`): whole members, including one separating
+//!   comma, deleted with the prompt. The two context members are deleted
+//!   together, as the prompt plan does.
+//! * `response`: the value of the record's `response`, replaced by `null`
+//!   when a plan keeps the response out, together with the response-derived
+//!   fields the collector itself clears when response retention is denied:
+//!   `response_fields` (provider reasoning and its source, completed tool
+//!   calls, metrics, the Gemini parts' source) are replaced by `null`,
+//!   `gemini_thought_parts` by `[]`, and the `provider_logprobs` member is
+//!   deleted.
 //!
-//! Spans never overlap, and splicing them in any order of descending start
-//! offsets yields exactly the record a decoded rewrite would produce.
+//! Spans never overlap, and splicing them all in descending start order yields
+//! exactly the record a decoded rewrite would produce.
 
 use std::cell::{Cell, RefCell};
 
@@ -34,20 +40,27 @@ use super::split::SplitRecord;
 /// Version of the facts document; a destination checks it before trusting spans.
 pub(crate) const FACTS_VERSION: u32 = 1;
 
+type Span = [usize; 2];
+
 /// The parts a storage plan may drop, as byte spans of one encoded record.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Spans {
-    pub messages: Option<[usize; 2]>,
-    pub response: Option<[usize; 2]>,
-    pub source_json: Option<[usize; 2]>,
-    pub provider_context: Option<[usize; 2]>,
-    pub wire_request: Option<[usize; 2]>,
+    pub messages: Option<Span>,
+    pub source_json: Option<Span>,
+    pub provider_context: Option<Span>,
+    pub wire_request: Option<Span>,
+    pub response: Option<Span>,
+    pub response_fields: Vec<Span>,
+    pub gemini_thought_parts: Option<Span>,
+    pub provider_logprobs: Option<Span>,
 }
 
 #[derive(Clone, Copy)]
-enum ValueSlot {
+pub(super) enum ValueSlot {
     Messages,
     Response,
+    ResponseField,
+    GeminiThoughtParts,
 }
 
 #[derive(Clone, Copy)]
@@ -93,6 +106,26 @@ impl Probe {
         }
     }
 
+    /// Wrap a response-derived top-level value; `present` is false for an
+    /// absent (null or empty) value, which no plan needs to touch.
+    pub(super) fn response_field<'a, T: Serialize + ?Sized>(
+        &'a self,
+        value: &'a T,
+        slot: ValueSlot,
+        present: bool,
+    ) -> Spanned<'a, T> {
+        Spanned {
+            value,
+            probe: self,
+            slot: present.then_some(slot),
+        }
+    }
+
+    /// Record the whole `provider_logprobs` member, written with its leading comma.
+    pub(super) fn record_logprobs(&self, start: usize) {
+        self.values.borrow_mut().provider_logprobs = Some([start, self.position.get()]);
+    }
+
     pub(super) fn transport<'a>(&'a self, transport: &'a Value) -> ProbedObject<'a> {
         ProbedObject {
             value: transport,
@@ -103,34 +136,56 @@ impl Probe {
 
     fn record_value(&self, slot: ValueSlot, start: usize, end: usize) {
         let mut spans = self.values.borrow_mut();
-        let target = match slot {
-            ValueSlot::Messages => &mut spans.messages,
-            ValueSlot::Response => &mut spans.response,
-        };
-        *target = Some([start, end]);
+        match slot {
+            ValueSlot::Messages => spans.messages = Some([start, end]),
+            ValueSlot::Response => spans.response = Some([start, end]),
+            ValueSlot::ResponseField => spans.response_fields.push([start, end]),
+            ValueSlot::GeminiThoughtParts => spans.gemini_thought_parts = Some([start, end]),
+        }
     }
 
     fn record_member(&self, member: Member, span: MemberSpan) {
         self.members.borrow_mut()[member as usize] = Some(span);
     }
 
-    /// Final spans over `bytes`: a member written first in its object also
-    /// takes the comma that follows it, so removing it leaves valid JSON.
+    /// Final spans over `bytes`. A member written first in its object takes
+    /// the comma that follows it, every other member the comma before it, so
+    /// removing one leaves valid JSON. When the two context members are
+    /// adjacent and the earlier is first, both would claim the one comma
+    /// between them; the later then takes the comma after it instead, so the
+    /// spans stay disjoint and removing both leaves valid JSON.
     fn finish(&self, bytes: &[u8]) -> Spans {
-        let mut spans = *self.values.borrow();
+        let mut spans = self.values.borrow().clone();
         let members = *self.members.borrow();
+        let trailing = |end: usize| {
+            if bytes.get(end) == Some(&b',') {
+                end + 1
+            } else {
+                end
+            }
+        };
         let close = |span: Option<MemberSpan>| {
             span.map(|span| {
-                let end = if span.first && bytes.get(span.end) == Some(&b',') {
-                    span.end + 1
+                let end = if span.first {
+                    trailing(span.end)
                 } else {
                     span.end
                 };
                 [span.start, end]
             })
         };
-        spans.source_json = close(members[Member::SourceJson as usize]);
-        spans.provider_context = close(members[Member::ProviderContext as usize]);
+        let mut context = [
+            close(members[Member::SourceJson as usize]),
+            close(members[Member::ProviderContext as usize]),
+        ];
+        if let [Some(a), Some(b)] = &mut context {
+            let (earlier, later) = if a[0] < b[0] { (a, b) } else { (b, a) };
+            if later[0] < earlier[1] {
+                later[0] = earlier[1];
+                later[1] = trailing(later[1]);
+            }
+        }
+        [spans.source_json, spans.provider_context] = context;
         spans.wire_request = close(members[Member::WireRequest as usize]);
         spans
     }
@@ -259,8 +314,8 @@ impl Serialize for ProbedRecord<'_> {
     }
 }
 
-#[derive(Serialize)]
-struct ResponseFacts {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct ResponseFacts {
     kind: &'static str,
     status: u16,
     truncated: bool,
@@ -268,6 +323,23 @@ struct ResponseFacts {
 }
 
 impl ResponseFacts {
+    /// Flags of a response as delivered in a split skeleton, which may record
+    /// loss (an unreadable or cut spilled stream) the in-memory facts lack.
+    pub(crate) fn of_skeleton(response: &Value) -> Option<Self> {
+        let kind = match response.get("kind")?.as_str()? {
+            "json" => "json",
+            "sse" => "sse",
+            _ => return None,
+        };
+        let flag = |name: &str| response.get(name).and_then(Value::as_bool) == Some(true);
+        Some(Self {
+            kind,
+            status: u16::try_from(response.get("status")?.as_u64()?).ok()?,
+            truncated: flag("truncated"),
+            client_disconnected: flag("client_disconnected"),
+        })
+    }
+
     fn of(response: &Response) -> Self {
         match response {
             Response::Json { status, .. } => Self {
@@ -322,14 +394,12 @@ struct Facts<'a> {
 fn facts(
     record: &Record,
     schema_version: u32,
-    complete: bool,
+    response: Option<ResponseFacts>,
     split: bool,
     record_bytes: usize,
     spans: Option<Spans>,
 ) -> Option<Vec<u8>> {
-    let response = complete
-        .then(|| record.response.as_ref().map(ResponseFacts::of))
-        .flatten();
+    let complete = response.is_some();
     serde_json::to_vec(&Facts {
         facts_version: FACTS_VERSION,
         schema_version,
@@ -374,7 +444,7 @@ pub(crate) fn encode_with_facts(
     let facts = facts(
         record,
         schema_version,
-        record.response.is_some(),
+        record.response.as_ref().map(ResponseFacts::of),
         false,
         encoded.len(),
         Some(spans),
@@ -387,7 +457,7 @@ pub(crate) fn split_facts(record: &Record, split: &SplitRecord) -> Option<Vec<u8
     facts(
         record,
         record.schema_version,
-        split.complete,
+        split.response,
         true,
         split.skeleton.len(),
         None,

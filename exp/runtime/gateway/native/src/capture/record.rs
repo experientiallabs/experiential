@@ -293,20 +293,66 @@ impl<R: Serialize> Record<R> {
                 None => record.serialize_field("transport", transport)?,
             }
         }
-        record.serialize_field("provider_reasoning", &reasoning.text)?;
-        record.serialize_field("provider_reasoning_source_json", &reasoning.source_json)?;
-        record.serialize_field("provider_tool_calls_json", &self.provider_tool_calls_json)?;
-        record.serialize_field("deployment_id", &self.deployment_id)?;
-        record.serialize_field("metrics", &self.metrics)?;
-        record.serialize_field("gemini_thought_parts", &parts)?;
-        record.serialize_field("gemini_thought_parts_source_json", &parts_source)?;
+        match probe {
+            None => {
+                record.serialize_field("provider_reasoning", &reasoning.text)?;
+                record.serialize_field("provider_reasoning_source_json", &reasoning.source_json)?;
+                record
+                    .serialize_field("provider_tool_calls_json", &self.provider_tool_calls_json)?;
+                record.serialize_field("deployment_id", &self.deployment_id)?;
+                record.serialize_field("metrics", &self.metrics)?;
+                record.serialize_field("gemini_thought_parts", &parts)?;
+                record.serialize_field("gemini_thought_parts_source_json", &parts_source)?;
+            }
+            Some(probe) => {
+                // The response-derived fields a denied response retention clears.
+                use super::facts::ValueSlot::{GeminiThoughtParts, ResponseField};
+                record.serialize_field(
+                    "provider_reasoning",
+                    &probe.response_field(&reasoning.text, ResponseField, reasoning.text.is_some()),
+                )?;
+                record.serialize_field(
+                    "provider_reasoning_source_json",
+                    &probe.response_field(
+                        &reasoning.source_json,
+                        ResponseField,
+                        reasoning.source_json.is_some(),
+                    ),
+                )?;
+                record.serialize_field(
+                    "provider_tool_calls_json",
+                    &probe.response_field(
+                        &self.provider_tool_calls_json,
+                        ResponseField,
+                        self.provider_tool_calls_json.is_some(),
+                    ),
+                )?;
+                record.serialize_field("deployment_id", &self.deployment_id)?;
+                record.serialize_field(
+                    "metrics",
+                    &probe.response_field(&self.metrics, ResponseField, self.metrics.is_some()),
+                )?;
+                record.serialize_field(
+                    "gemini_thought_parts",
+                    &probe.response_field(&parts, GeminiThoughtParts, !parts.is_empty()),
+                )?;
+                record.serialize_field(
+                    "gemini_thought_parts_source_json",
+                    &probe.response_field(&parts_source, ResponseField, parts_source.is_some()),
+                )?;
+            }
+        }
         record.serialize_field("captured_at", &self.captured_at)?;
         if let Some(logprobs) = self
             .provider_logprobs
             .as_ref()
             .filter(|l| l.logprobs_injected)
         {
+            let start = probe.map(|probe| probe.position.get());
             record.serialize_field("provider_logprobs", logprobs)?;
+            if let (Some(probe), Some(start)) = (probe, start) {
+                probe.record_logprobs(start);
+            }
         }
         record.end()
     }

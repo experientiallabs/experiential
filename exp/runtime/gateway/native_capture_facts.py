@@ -31,21 +31,35 @@ class CaptureFactSpans(ContractModel):
     """Byte spans, ``[start, end)``, of the parts a storage plan may drop.
 
     Attributes:
-        messages: The value of ``request.context.request.messages``; replaced by ``[]``.
-        response: The value of the record's ``response``; replaced by ``null``.
-        source_json: The whole ``source_json`` member of the request context,
-            with its separating comma; removed.
+        messages: The value of ``request.context.request.messages``; replaced by
+            ``[]`` when the prompt is kept out.
+        source_json: The whole ``source_json`` member of the request context
+            with one separating comma; removed with the prompt (together with
+            ``provider_context``).
         provider_context: The whole ``provider_context`` member of the request
-            context, with its separating comma; removed.
-        wire_request: The whole ``wire_request`` member of ``transport``, with
-            its separating comma; removed.
+            context with one separating comma; removed with the prompt.
+        wire_request: The whole ``wire_request`` member of ``transport`` with
+            one separating comma; removed with the prompt.
+        response: The value of the record's ``response``; replaced by ``null``
+            when the response is kept out.
+        response_fields: Values of the response-derived fields present in the
+            record (provider reasoning and its source, completed tool calls,
+            metrics, the Gemini parts' source); replaced by ``null`` with the
+            response, as the collector clears them itself.
+        gemini_thought_parts: The non-empty Gemini thought parts value;
+            replaced by ``[]`` with the response.
+        provider_logprobs: The whole ``provider_logprobs`` member with its
+            leading comma; removed with the response.
     """
 
     messages: ByteSpan | None
-    response: ByteSpan | None
     source_json: ByteSpan | None
     provider_context: ByteSpan | None
     wire_request: ByteSpan | None
+    response: ByteSpan | None
+    response_fields: tuple[ByteSpan, ...]
+    gemini_thought_parts: ByteSpan | None
+    provider_logprobs: ByteSpan | None
 
 
 class CaptureResponseFacts(ContractModel):
@@ -112,8 +126,10 @@ class CaptureRecordFacts(ContractModel):
 
         Keeping both returns ``record`` itself. Dropping the prompt empties the
         messages and removes ``source_json``, ``provider_context`` and the
-        wire request; dropping the response nulls it. The result is the same
-        JSON a decoded rewrite would produce.
+        wire request; dropping the response nulls it and clears every
+        response-derived field exactly as the collector does when response
+        retention is denied. The result is the same JSON a decoded rewrite
+        would produce.
 
         Args:
             record: The record bytes handed beside these facts.
@@ -143,8 +159,14 @@ class CaptureRecordFacts(ContractModel):
                 for span in (spans.source_json, spans.provider_context, spans.wire_request)
                 if span is not None
             )
-        if not keep_response and spans.response is not None:
-            edits.append((spans.response, b"null"))
+        if not keep_response:
+            if spans.response is not None:
+                edits.append((spans.response, b"null"))
+            edits.extend((span, b"null") for span in spans.response_fields)
+            if spans.gemini_thought_parts is not None:
+                edits.append((spans.gemini_thought_parts, b"[]"))
+            if spans.provider_logprobs is not None:
+                edits.append((spans.provider_logprobs, b""))
         edits.sort()
         view = memoryview(record)
         pieces: list[bytes | memoryview] = []

@@ -129,6 +129,8 @@ def test_served_requests_arrive_as_facts_beside_their_record_bytes(
         assert facts.response.kind == document["response"]["kind"]
         assert facts.response.kind == ("sse" if stream else "json")
         assert facts.response.status == 200
+        # A served record carries response-derived fields (at least its metrics).
+        assert facts.spans is not None and facts.spans.response_fields
         assert b"capture task" not in json.dumps(facts.model_dump()).encode()
         for keep_prompt in (True, False):
             for keep_response in (True, False):

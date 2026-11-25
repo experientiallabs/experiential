@@ -226,13 +226,17 @@ A bytes destination can also set `facts_output=True` (advertised as
 the record is encoded: request id, scope, protocol, model and deployment ids,
 capture time, whether a response is present with its kind, status and loss flags,
 the record's byte length, and for a whole record the byte spans of the parts a
-storage plan may drop (the messages value, the response value, and the
-`source_json`, `provider_context` and `wire_request` members with their
-separating commas). A destination identifies and frames a record without decoding
-it, and `CaptureRecordFacts.planned` applies a plan that keeps the prompt or the
-response out as a byte splice whose result equals the decoded rewrite. Spans
-cost a position read per wrapped value during the one encoding the record needs
-anyway; a split skeleton carries none. A facts document over 16 KiB refuses its
+storage plan may drop: the messages value and the `source_json`,
+`provider_context` and `wire_request` members (with one separating comma each)
+for the prompt; the response value, the response-derived fields the collector
+clears itself when response retention is denied (reasoning and its source, tool
+calls, metrics, Gemini parts and their source) and the `provider_logprobs`
+member for the response. A destination identifies and frames a record without
+decoding it, and `CaptureRecordFacts.planned` applies a plan as a byte splice
+whose result equals the decoded rewrite. Spans cost a position read per wrapped
+value during the one encoding the record needs anyway. A split skeleton carries
+no spans, and its response flags are read from the skeleton as delivered, so a
+spilled stream cut on the way to disk reports `truncated`. A facts document over 16 KiB refuses its
 record like an oversized payload.
 
 By default, batched storage retains complete schema-1 records. A destination that
