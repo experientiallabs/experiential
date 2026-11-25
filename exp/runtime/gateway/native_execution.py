@@ -959,8 +959,7 @@ def deployment_wire_entry(
             capabilities.time_to_first_byte_seconds_per_million_input_tokens
         ),
         "time_to_first_token_base_seconds": capabilities.time_to_first_token_base_seconds,
-        # A failover-only rung's tokens (`native_fallback_rules`): the data
-        # plane never counts it as a first-dial or unmatched successor.
+        # Failover-only tokens (`native_fallback_rules`): never a first-dial or unmatched successor.
         "failover_only_on": (
             None if capabilities.failover_only_on is None else list(capabilities.failover_only_on)
         ),
@@ -968,29 +967,8 @@ def deployment_wire_entry(
         "code_assist_envelope": profile.code_assist_envelope is not None,  # nested answers
         "capture_logprobs": capture_logprobs,
         "rung_family": rung_family_index(route, deployment),  # throttle redial reserve
-        **public_provider_entry(route, deployment),
+        **route.snapshot.public_provider_member(deployment.deployment_id),
     }
-
-
-def public_provider_entry(route: GatewayRoute, deployment: ExactModelDeployment) -> JsonObject:
-    """Return the rung's ``x-gateway-provider`` label member, or nothing.
-
-    An unlabelled route sends no member, so the data plane names the rung's
-    provider id as before. A labelled route sends every rung's label, and an
-    empty string for a rung it did not name, which the data plane answers
-    without the header.
-
-    Args:
-        route: Resolved ordered route owning the deployment.
-        deployment: The deployment this wire entry dispatches to.
-
-    Returns:
-        ``{"public_provider": label}`` for a labelled route, else ``{}``.
-    """
-    labels = route.snapshot.public_providers
-    if not labels:
-        return {}
-    return {"public_provider": labels.get(deployment.deployment_id, "")}
 
 
 def native_serving_blockers(components: LocalGatewayComponents) -> tuple[str, ...]:

@@ -11,8 +11,6 @@ import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway import native_execution
 from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.ingest.conversion import load_gateway_capture
 from exp.runtime.gateway.lifecycle import load_gateway_components
@@ -23,7 +21,6 @@ from exp.runtime.gateway.local_capture import (
 )
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_server import serve_native_gateway
-from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.tests.launch_test import (
     _configure_gateway,
     _LoopbackProvider,
@@ -93,19 +90,14 @@ def _serve(root: Path, *, publish: bool) -> Iterator[tuple[str, str]]:
 @pytest.fixture
 def labelled_routes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Have the host label every route's lead rung, as a resolver would."""
-    entry = native_execution.public_provider_entry
+    member = ExecutionSnapshot.public_provider_member
 
-    def labelled(route: GatewayRoute, deployment: ExactModelDeployment) -> JsonObject:
-        """Rebind the route's snapshot with a label for its lead rung."""
-        snapshot = ExecutionSnapshot.model_validate(
-            {
-                **route.snapshot.model_dump(),
-                "public_providers": {route.snapshot.deployment_ids[0]: _LABEL},
-            }
-        )
-        return entry(route.model_copy(update={"snapshot": snapshot}), deployment)
+    def labelled(self: ExecutionSnapshot, deployment_id: str) -> dict[str, str]:
+        """Answer as if the route's lead rung carried the host's label."""
+        snapshot = self.model_copy(update={"public_providers": {self.deployment_ids[0]: _LABEL}})
+        return member(snapshot, deployment_id)
 
-    monkeypatch.setattr(native_execution, "public_provider_entry", labelled)
+    monkeypatch.setattr(ExecutionSnapshot, "public_provider_member", labelled)
 
 
 def _body(surface: str, *, stream: bool) -> JsonObject:

@@ -71,6 +71,24 @@ class ExecutionSnapshot(ContractModel):
             raise ValueError("public provider labels must name deployments of this route")
         return self
 
+    def public_provider_member(self, deployment_id: DeploymentId) -> dict[str, str]:
+        """Return a rung's ``public_provider`` wire member, or nothing.
+
+        An unlabelled route sends no member, so the data plane names the rung's
+        provider id as before. A labelled route sends every rung's label, and an
+        empty string for a rung it did not name, which the data plane answers
+        without the ``x-gateway-provider`` header.
+
+        Args:
+            deployment_id: The rung whose wire entry is being built.
+
+        Returns:
+            ``{"public_provider": label}`` on a labelled route, else ``{}``.
+        """
+        if not self.public_providers:
+            return {}
+        return {"public_provider": self.public_providers.get(deployment_id, "")}
+
     def stage_for_depth(self, depth: int) -> ModelExecutionStage:
         """Return the exact destination authority, never substitute the root model."""
         if not 0 <= depth < len(self.deployment_ids):
