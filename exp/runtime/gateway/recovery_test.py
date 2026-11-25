@@ -6,6 +6,7 @@ from itertools import permutations
 import pytest
 
 from exp.runtime.gateway.recovery import (
+    RecoveryCause,
     RecoveryObservation,
     RecoveryScope,
     RecoverySnapshot,
@@ -876,3 +877,118 @@ def test_eviction_and_credential_rotation_lose_warmth() -> None:
         registry.choose(key(), (("fallback", scope()),), eligible=eligible, snapshot=None).reason
         == "normal_selection"
     )
+
+
+def _kept_fallback_registry(
+    clock: Clock, *, depart_primary: bool = True, cause: RecoveryCause = "local_capacity"
+) -> SessionRecoveryRegistry:
+    """A primary that was warm and departed, and a warm retained fallback."""
+    registry = SessionRecoveryRegistry(clock=clock)
+    warm(registry, "primary")
+    if depart_primary:
+        registry.depart(key(), "primary", scope(), cause)
+    warm(registry, "fallback")
+    return registry
+
+
+@pytest.mark.parametrize(
+    ("setup", "expected"),
+    [
+        ("cooldown", "cooldown_not_elapsed"),
+        ("headroom", "no_local_headroom"),
+        ("ineligible", "lane_ineligible:health_suppressed"),
+        ("rebound", "warm_scope_mismatch:credential_scope"),
+        ("no_departure", "no_departure_record"),
+        ("credential", "newer_credential_failure"),
+        ("throttle", "newer_throttle_failure"),
+        ("transport", "transport_snapshot_unavailable"),
+    ],
+)
+def test_a_kept_fallback_names_the_check_the_preferred_route_failed(
+    setup: str, expected: str
+) -> None:
+    """Each refusal carries its closed reason; the decision itself is unchanged."""
+    clock = Clock()
+    causes: dict[str, RecoveryCause] = {
+        "credential": "credential",
+        "throttle": "throttle",
+        "transport": "transport",
+    }
+    cause = causes.get(setup, "local_capacity")
+    registry = _kept_fallback_registry(clock, depart_primary=setup != "no_departure", cause=cause)
+    if setup != "cooldown":
+        clock.now += 10
+    primary_scope = scope("re-released") if setup == "rebound" else scope()
+    decision = registry.choose(
+        key(),
+        (("primary", primary_scope), ("fallback", scope())),
+        eligible=lambda deployment: setup != "ineligible" or deployment != "primary",
+        snapshot=None,
+        local_capacity=lambda deployment: setup != "headroom" or deployment != "primary",
+        ineligible_reason=lambda _deployment: "health_suppressed",
+    )
+    assert (decision.deployment_id, decision.reason) == ("fallback", "retained_warm_fallback")
+    assert decision.skip_reason == expected
+    assert [skip.deployment_id for skip in decision.skipped] == ["primary"]
+
+
+def test_scope_mismatch_names_only_the_field_never_its_value() -> None:
+    """The differing field is named; neither scope's value reaches the reason or the log."""
+    clock = Clock()
+    registry = _kept_fallback_registry(clock)
+    clock.now += 10
+    decision = registry.choose(
+        key(),
+        (("primary", scope("secret-receipt")), ("fallback", scope())),
+        eligible=eligible,
+        snapshot=None,
+        local_capacity=eligible,
+    )
+    assert decision.skip_reason == "warm_scope_mismatch:credential_scope"
+    assert "secret" not in repr(decision)
+
+
+def test_recovery_and_normal_selection_carry_no_skip() -> None:
+    """Only a kept warm fallback names skipped routes."""
+    clock = Clock()
+    registry = _kept_fallback_registry(clock)
+    clock.now += 10
+    candidates = (("primary", scope()), ("fallback", scope()))
+    recovered = registry.choose(
+        key(), candidates, eligible=eligible, snapshot=None, local_capacity=eligible
+    )
+    assert recovered.reason == "recovered_preferred_route"
+    assert recovered.skipped == () and recovered.skip_reason is None
+    assert registry.choose(key("other"), candidates, eligible=eligible, snapshot=None).skipped == ()
+
+
+def test_skip_log_is_rate_limited_per_lane_and_reason(caplog: pytest.LogCaptureFixture) -> None:
+    """One line per lane and reason per minute, counting what it suppressed."""
+    caplog.set_level("INFO", logger="exp.runtime.gateway.recovery")
+    clock = Clock()
+    registry = _kept_fallback_registry(clock)
+    candidates = (("primary", scope()), ("fallback", scope()))
+
+    def choose() -> None:
+        """Admit once with the primary out of headroom."""
+        registry.choose(
+            key(),
+            candidates,
+            eligible=eligible,
+            snapshot=None,
+            local_capacity=lambda deployment: deployment != "primary",
+        )
+
+    clock.now += 10
+    choose()
+    choose()
+    lines = [r.getMessage() for r in caplog.records if "recovery_skipped" in r.getMessage()]
+    assert lines == [
+        "recovery_skipped deployment=primary reason=no_local_headroom retained=fallback "
+        "suppressed=0"
+    ]
+    clock.now += 61
+    warm(registry, "fallback")
+    choose()
+    lines = [r.getMessage() for r in caplog.records if "recovery_skipped" in r.getMessage()]
+    assert lines[-1].endswith("suppressed=1")

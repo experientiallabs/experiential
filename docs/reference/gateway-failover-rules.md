@@ -190,3 +190,33 @@ exactly as before. An alias revision that opted into refusal failover keeps its 
 and a `failover_only_on` rung that names `refusal` or `refusal:content_policy` keeps taking such a
 refusal on its own opt-in, as it did before this rule (the one-shot gate governs only unrestricted rungs).
 The walk never leaves the request's route, so it never changes the model.
+
+## Returning to a preferred route after a spill
+
+On a `maximize_cache_affinity` stage, session recovery (`exp/runtime/gateway/recovery.py`)
+decides once at admission whether a session that spilled to a warm fallback returns to an earlier
+preferred route (`recovered_preferred_route`) or stays (`retained_warm_fallback`). When it stays,
+the decision names the first check each earlier route failed (`RecoveryDecision.skipped`, a closed
+`RecoverySkipReason`):
+
+| Reason | The preferred route |
+|---|---|
+| `no_warm_evidence`, `warm_evidence_expired` | holds no live cache evidence for this session prefix |
+| `warm_scope_mismatch:<field>` | holds evidence bound to a different scope; `<field>` names the first differing scope field, never its value |
+| `no_departure_record` | never departed, so there is nothing to recover from |
+| `lane_ineligible:<reason>` | is a conditional rung (`conditional_rung`) or circuit-suppressed (`health_suppressed`) |
+| `departure_scope_mismatch:<field>` | departed under a different scope |
+| `cooldown_not_elapsed` | departed less than the cooldown (or its `Retry-After`) ago |
+| `no_local_headroom` | has no local concurrency, rate or fair-share room for the trial |
+| `newer_credential_failure`, `newer_throttle_failure` | failed for that cause after its evidence was recorded |
+| `transport_snapshot_unavailable`, `transport_negative_evicted`, `no_transport_recovery_observation`, `transport_observation_unhealthy`, `no_recovery_lease` | departed for transport and the fleet has not proven it healthy again |
+
+Each skip is logged as one content-free line, `recovery_skipped deployment=<id> reason=<code>
+retained=<id> suppressed=<n>`, at most once per lane and reason per minute. A recovery host that
+also implements `RecoverySkipObserver.recovery_skipped` receives them once per admission, so its own
+ledger can record them beside the request's attempts. Neither changes the decision.
+
+A `credential_scope` mismatch means the host bound the route's credential under a new
+`DispatchCredentialReceipt`. The receipt is the credential generation that recovery evidence is
+scoped to, so a host keeps it stable while the credential itself is unchanged; re-issuing it on a
+cache renewal of the same credential makes every session's warm evidence on that route unusable.
