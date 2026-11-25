@@ -258,9 +258,9 @@ def test_tls_trust_honors_operator_ca_overrides_but_not_proxies(
     calls: list[bool] = []
     real = httpx.create_ssl_context
 
-    def record(*args: object, trust_env: bool = True, **kwargs: object) -> object:
+    def record(*, trust_env: bool = True) -> ssl.SSLContext:
         calls.append(trust_env)
-        return real(*args, trust_env=trust_env, **kwargs)
+        return real(trust_env=trust_env)
 
     monkeypatch.setattr(public_egress.httpx, "create_ssl_context", record)
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
