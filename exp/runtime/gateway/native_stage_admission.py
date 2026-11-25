@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import logging
 import time
@@ -53,7 +54,9 @@ def report_recovery_skips(host: RecoveryHost, request_id: str, decision: Recover
     try:
         host.recovery_skipped(request_id, decision.deployment_id, decision.skipped)
     except Exception:  # noqa: BLE001 - an observer never changes serving.
-        _logger.warning("Recovery skip observation failed; routing unchanged")
+        # The warning is advisory too: a strict log handler may not abort admission.
+        with contextlib.suppress(Exception):
+            _logger.warning("Recovery skip observation failed; routing unchanged")
 
 
 def require_native_model_stage_contract(route: GatewayRoute) -> None:

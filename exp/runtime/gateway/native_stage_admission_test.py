@@ -1,6 +1,7 @@
 """Native admission consumes session evidence while respecting stage and host gates."""
 
 import json
+import logging
 import time
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
@@ -1791,3 +1792,25 @@ def test_an_observer_fault_never_changes_routing(caplog: pytest.LogCaptureFixtur
     )
     assert placement.recovery_reason == "retained_warm_fallback"
     assert "Recovery skip observation failed" in caplog.text
+
+
+def test_an_observer_fault_under_a_strict_log_handler_never_changes_routing() -> None:
+    """Even when the warning about a raising observer itself raises, routing stands."""
+
+    class Strict(logging.Handler):
+        """A handler that fails every record it is handed."""
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """Fail."""
+            raise RuntimeError("handler down")
+
+    target = logging.getLogger("exp.runtime.gateway.native_stage_admission")
+    handler = Strict()
+    target.addHandler(handler)
+    try:
+        placement, *_ = _kept_fallback(
+            ObservingHost(fail=True), lead_headroom=False, rotate_credential=False
+        )
+    finally:
+        target.removeHandler(handler)
+    assert placement.recovery_reason == "retained_warm_fallback"
