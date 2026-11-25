@@ -41,6 +41,7 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         code_assist_envelope: false,
         capture_logprobs: false,
         rung_family: None,
+        public_provider: None,
     }
 }
 

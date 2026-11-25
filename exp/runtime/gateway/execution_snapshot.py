@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from pydantic import Field, model_validator
+from typing import Annotated
+
+from pydantic import Field, StringConstraints, model_validator
 
 from exp.common.core.artifacts import ContractModel
 from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
@@ -15,11 +17,24 @@ from exp.common.models.gateway_catalog import (
 from exp.common.models.gateway_chains import ModelExecutionStage, ModelTraversalEvent
 from exp.runtime.gateway.contracts import AuthorizationSnapshot
 
+PublicProviderLabel = Annotated[
+    str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+]
+"""A host-chosen provider name for ``x-gateway-provider``: one header-safe token."""
+
 
 class ExecutionSnapshot(ContractModel):
     """Route-bound request plan created only after exact-model selection.
 
     Attributes:
+        public_providers: Host-chosen provider names the data plane puts on
+            ``x-gateway-provider`` instead of each rung's provider id. Empty
+            (the default) keeps the provider id on every rung. A non-empty map
+            labels the route: a rung it does not name answers with no
+            ``x-gateway-provider`` header at all, so a host that relabels a
+            route never leaks a provider id it meant to hide. Keys must be
+            deployments of this route. Presentation only: routing, attempts and
+            settlement keep the real provider.
         model_stages: Frozen ordered stage segments; empty for an unstaged exact-model route.
         traversal_events: Immutable expansion provenance, not mutable runtime visitation state.
     """
@@ -40,6 +55,7 @@ class ExecutionSnapshot(ContractModel):
     # Rungs the host flagged for OpenRouter's per-request ZDR constraint; the
     # dispatch builder tightens each and fails closed on a wire that cannot.
     zdr_constrained_deployment_ids: tuple[DeploymentId, ...] = ()
+    public_providers: dict[DeploymentId, PublicProviderLabel] = Field(default_factory=dict)
     model_stages: tuple[ModelExecutionStage, ...] = ()
     traversal_events: tuple[ModelTraversalEvent, ...] = ()
 
@@ -51,6 +67,8 @@ class ExecutionSnapshot(ContractModel):
             and tuple(d for s in self.model_stages for d in s.deployment_ids) != self.deployment_ids
         ):
             raise ValueError("execution stages must exactly cover ordered deployment_ids")
+        if not set(self.public_providers) <= set(self.deployment_ids):
+            raise ValueError("public provider labels must name deployments of this route")
         return self
 
     def stage_for_depth(self, depth: int) -> ModelExecutionStage:

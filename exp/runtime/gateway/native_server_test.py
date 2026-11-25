@@ -63,6 +63,7 @@ def test_host_passes_the_serve_configuration(
         public_upstreams_only=public_only,
         time_to_first_byte_seconds=12.0,
         native_usage_enabled=False,
+        publish_deployment_header=False,
         maximum_retained_output_bytes=512 * 1024 * 1024,
     )
 
@@ -80,6 +81,7 @@ def test_host_passes_the_serve_configuration(
     assert config["public_upstreams_only"] is public_only
     assert config["time_to_first_byte_seconds"] == 12.0
     assert config["native_usage_enabled"] is False
+    assert config["publish_deployment_header"] is False
     assert config["maximum_retained_output_bytes"] == 512 * 1024 * 1024
     assert config["pre_first_byte_reserve_seconds"] == 20.0
     assert config["pre_first_byte_max_seconds"] == 480.0

@@ -680,3 +680,23 @@ async fn unregistered_requests_are_excluded_but_admitted_errors_are_evidence() {
     assert_eq!(status, 429);
     assert_eq!(body, json!({"error":{"message":"provider throttled"}}));
 }
+
+#[tokio::test]
+async fn a_withheld_deployment_header_still_reaches_the_captured_record() {
+    let (collector, receiver) = collector(4096);
+    let response = Response::builder()
+        .header("content-type", "application/json")
+        .header("x-gateway-deployment", "deployment-7")
+        .header("x-gateway-provider", "example")
+        .body(Body::from(r#"{"id":"completion"}"#))
+        .unwrap();
+    let captured = capture_response(Some(collector.clone()), "request", response);
+    // The serving layer withholds the id from the client after the handler ran.
+    let answered = crate::server::withhold_deployment_header(captured).await;
+    assert!(answered.headers().get("x-gateway-deployment").is_none());
+    assert_eq!(answered.headers()["x-gateway-provider"], "example");
+    let body = answered.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], br#"{"id":"completion"}"#);
+    let record = record(&collector, receiver);
+    assert_eq!(record.deployment_id.as_deref(), Some("deployment-7"));
+}

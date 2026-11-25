@@ -968,7 +968,29 @@ def deployment_wire_entry(
         "code_assist_envelope": profile.code_assist_envelope is not None,  # nested answers
         "capture_logprobs": capture_logprobs,
         "rung_family": rung_family_index(route, deployment),  # throttle redial reserve
+        **public_provider_entry(route, deployment),
     }
+
+
+def public_provider_entry(route: GatewayRoute, deployment: ExactModelDeployment) -> JsonObject:
+    """Return the rung's ``x-gateway-provider`` label member, or nothing.
+
+    An unlabelled route sends no member, so the data plane names the rung's
+    provider id as before. A labelled route sends every rung's label, and an
+    empty string for a rung it did not name, which the data plane answers
+    without the header.
+
+    Args:
+        route: Resolved ordered route owning the deployment.
+        deployment: The deployment this wire entry dispatches to.
+
+    Returns:
+        ``{"public_provider": label}`` for a labelled route, else ``{}``.
+    """
+    labels = route.snapshot.public_providers
+    if not labels:
+        return {}
+    return {"public_provider": labels.get(deployment.deployment_id, "")}
 
 
 def native_serving_blockers(components: LocalGatewayComponents) -> tuple[str, ...]:

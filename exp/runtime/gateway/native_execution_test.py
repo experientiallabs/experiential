@@ -1149,6 +1149,30 @@ def test_route_narrowing_and_reordering_keep_the_zdr_constraint_flags() -> None:
     assert route.snapshot.zdr_constrained_deployment_ids == ()
 
 
+def test_wire_entry_names_public_providers_only_on_a_labelled_route() -> None:
+    """An unlabelled route keeps today's entry; a labelled one names every rung."""
+    route = _route()
+    profile = GatewayWireProfile(dialect="openai_compatible", url="https://provider.test")
+    assert "public_provider" not in deployment_wire_entry(route, route.deployment, profile, {})
+    labelled = route.model_copy(
+        update={
+            "snapshot": ExecutionSnapshot.model_validate(
+                {
+                    **route.snapshot.model_dump(),
+                    "public_providers": {"one": "example_cloud"},
+                }
+            )
+        }
+    )
+    one, two = labelled.deployment, labelled.fallback_deployments[0]
+    assert deployment_wire_entry(labelled, one, profile, {})["public_provider"] == "example_cloud"
+    # An unnamed rung of a labelled route answers with no provider header.
+    assert deployment_wire_entry(labelled, two, profile, {})["public_provider"] == ""
+    assert deployment_wire_entry(labelled, one, profile, {})["provider"] == one.provider
+    narrowed = select_route_deployments(labelled, (0, 1))
+    assert narrowed.snapshot.public_providers == {"one": "example_cloud"}
+
+
 def test_wire_entry_carries_the_codex_native_tool_translation_map() -> None:
     """A translated Codex request carries the inversion map to the data plane."""
     route = _route()

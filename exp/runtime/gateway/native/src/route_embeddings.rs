@@ -456,8 +456,13 @@ fn served_headers(
     let (provider, deployment_id) = admission
         .route
         .get(depth)
-        .map(|wire| (wire.provider.clone(), wire.deployment_id.clone()))
-        .unwrap_or_default();
+        .map(|wire| {
+            (
+                wire.header_provider().map(str::to_owned),
+                wire.deployment_id.clone(),
+            )
+        })
+        .unwrap_or((Some(String::new()), String::new()));
     let mut headers = vec![
         ("x-request-id".to_string(), admission.request_id.clone()),
         ("x-gateway-alias".to_string(), admission.alias.clone()),
@@ -469,7 +474,6 @@ fn served_headers(
             "x-gateway-canonical-model".to_string(),
             admission.exact_model_id.clone(),
         ),
-        ("x-gateway-provider".to_string(), provider),
         ("x-gateway-deployment".to_string(), deployment_id),
         ("x-gateway-route-depth".to_string(), depth.to_string()),
         (
@@ -477,6 +481,11 @@ fn served_headers(
             admission.route_reason.clone(),
         ),
     ];
+    if let Some(provider) = provider {
+        // Beside the canonical model, where it has always been listed.
+        let at = headers.len() - 3;
+        headers.insert(at, ("x-gateway-provider".to_string(), provider));
+    }
     if let Some(value) = client_request_id {
         headers.push(("x-client-request-id".to_string(), value));
     }

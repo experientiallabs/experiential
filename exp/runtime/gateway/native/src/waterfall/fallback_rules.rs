@@ -266,6 +266,7 @@ mod tests {
             code_assist_envelope: false,
             capture_logprobs: false,
             rung_family: None,
+            public_provider: None,
         }
     }
 

@@ -297,8 +297,13 @@ pub(crate) fn commit_independent(
 pub(crate) fn commit_dependent(admission: &Admission, depth: usize) -> Vec<(String, String)> {
     let served = admission.route.get(depth);
     let (provider, deployment_id) = served
-        .map(|wire| (wire.provider.clone(), wire.deployment_id.clone()))
-        .unwrap_or_default();
+        .map(|wire| {
+            (
+                wire.header_provider().map(str::to_owned),
+                wire.deployment_id.clone(),
+            )
+        })
+        .unwrap_or((Some(String::new()), String::new()));
     let mut headers = vec![
         (
             "x-gateway-canonical-model".to_string(),
@@ -309,7 +314,6 @@ pub(crate) fn commit_dependent(admission: &Admission, depth: usize) -> Vec<(Stri
                 .map(|wire| wire.exact_model_id.clone())
                 .unwrap_or_else(|| admission.exact_model_id.clone()),
         ),
-        ("x-gateway-provider".to_string(), provider),
         ("x-gateway-deployment".to_string(), deployment_id),
         ("x-gateway-route-depth".to_string(), depth.to_string()),
         (
@@ -317,6 +321,11 @@ pub(crate) fn commit_dependent(admission: &Admission, depth: usize) -> Vec<(Stri
             admission.route_reason.clone(),
         ),
     ];
+    if let Some(provider) = provider {
+        // Beside the canonical model, where it has always been listed.
+        let at = headers.len() - 3;
+        headers.insert(at, ("x-gateway-provider".to_string(), provider));
+    }
     // A rung dispatched under OpenRouter's zero-data-retention constraint
     // says so, so the host can attest the answer as ZDR-served; absent on
     // every ordinary rung rather than a literal `false`.
@@ -502,7 +511,13 @@ mod tests {
     use super::*;
 
     fn admission(zdr_constrained: bool) -> Admission {
-        serde_json::from_value(serde_json::json!({
+        let mut value = admission_json();
+        value["route"][0]["zdr_constrained"] = serde_json::json!(zdr_constrained);
+        serde_json::from_value(value).expect("admission decodes")
+    }
+
+    fn admission_json() -> serde_json::Value {
+        serde_json::json!({
             "request_id": "req",
             "alias": "public-model",
             "alias_revision_id": "rev",
@@ -522,12 +537,74 @@ mod tests {
                 "upstream_payload": {},
                 "upstream_body": null,
                 "idempotency_key": "op",
-                "zdr_constrained": zdr_constrained,
             }],
             "maximum_total_attempts": 1,
             "maximum_same_deployment_attempts": 1,
-        }))
-        .expect("admission decodes")
+        })
+    }
+
+    fn labelled(label: Option<&str>) -> Admission {
+        let mut admission = admission(false);
+        admission.route[0].public_provider = label.map(str::to_owned);
+        admission
+    }
+
+    fn provider_header(headers: &[(String, String)]) -> Vec<&str> {
+        headers
+            .iter()
+            .filter(|(name, _)| name == "x-gateway-provider")
+            .map(|(_, value)| value.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn an_unlabelled_rung_names_its_provider_beside_the_canonical_model() {
+        let headers = commit_dependent(&labelled(None), 0);
+        assert_eq!(provider_header(&headers), ["openrouter"]);
+        assert_eq!(headers[1].0, "x-gateway-provider");
+        assert_eq!(headers[0].0, "x-gateway-canonical-model");
+    }
+
+    #[test]
+    fn a_host_label_replaces_the_provider_id_and_keeps_the_deployment() {
+        let headers = commit_dependent(&labelled(Some("experiential_cloud")), 0);
+        assert_eq!(provider_header(&headers), ["experiential_cloud"]);
+        assert_eq!(headers[1].0, "x-gateway-provider");
+        assert!(headers.contains(&("x-gateway-deployment".to_string(), "or-rung".to_string())));
+    }
+
+    #[test]
+    fn an_empty_or_unsafe_label_omits_the_header_rather_than_name_the_provider() {
+        let long = "a".repeat(65);
+        for label in [
+            "",
+            "-leading",
+            "two words",
+            "line\r\nbreak",
+            "caf\u{e9}",
+            &long,
+        ] {
+            let headers = commit_dependent(&labelled(Some(label)), 0);
+            assert!(provider_header(&headers).is_empty(), "{label:?}");
+            assert!(headers.iter().all(|(_, value)| value != "openrouter"));
+        }
+        let longest = "a".repeat(64);
+        assert_eq!(
+            provider_header(&commit_dependent(&labelled(Some(&longest)), 0)),
+            [longest.as_str()]
+        );
+    }
+
+    #[test]
+    fn a_label_rides_the_admission_json() {
+        let mut value = admission_json();
+        value["route"][0]["public_provider"] = serde_json::json!("Example.Cloud-1");
+        let admission: Admission = serde_json::from_value(value).expect("admission decodes");
+        assert_eq!(
+            admission.route[0].header_provider(),
+            Some("Example.Cloud-1")
+        );
+        assert_eq!(admission.route[0].provider, "openrouter");
     }
 
     #[test]
