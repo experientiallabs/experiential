@@ -232,7 +232,7 @@ impl<R> Record<R> {
 impl<R: Serialize> Serialize for Record<R> {
     /// Project only exceptional reasoning text; never clone the request or response.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.serialize_update(serializer, false)
+        self.serialize_update(serializer, false, None)
     }
 }
 
@@ -240,15 +240,19 @@ struct CompletionUpdate<'a, R>(&'a Record<R>);
 
 impl<R: Serialize> Serialize for CompletionUpdate<'_, R> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0.serialize_update(serializer, true)
+        self.0.serialize_update(serializer, true, None)
     }
 }
 
 impl<R: Serialize> Record<R> {
-    fn serialize_update<S: Serializer>(
+    /// Serialize one record or completion update. A `probe` records the byte
+    /// spans of the parts a storage plan may drop while the bytes are written
+    /// (`super::facts`); the output is byte-identical with or without it.
+    pub(super) fn serialize_update<S: Serializer>(
         &self,
         serializer: S,
         completion: bool,
+        probe: Option<&super::facts::Probe>,
     ) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
         struct Reference<'a> {
@@ -274,12 +278,20 @@ impl<R: Serialize> Record<R> {
                     model_id: &self.request.model_id,
                 },
             )?;
+        } else if let Some(probe) = probe {
+            record.serialize_field("request", &probe.request(&self.request))?;
         } else {
             record.serialize_field("request", &self.request)?;
         }
-        record.serialize_field("response", &self.response)?;
+        match probe {
+            Some(probe) => record.serialize_field("response", &probe.response(&self.response))?,
+            None => record.serialize_field("response", &self.response)?,
+        }
         if let Some(transport) = &self.transport {
-            record.serialize_field("transport", transport)?;
+            match probe {
+                Some(probe) => record.serialize_field("transport", &probe.transport(transport))?,
+                None => record.serialize_field("transport", transport)?,
+            }
         }
         record.serialize_field("provider_reasoning", &reasoning.text)?;
         record.serialize_field("provider_reasoning_source_json", &reasoning.source_json)?;

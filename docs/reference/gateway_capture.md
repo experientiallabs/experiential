@@ -218,6 +218,22 @@ storage boundary; the JSON, size limits and acknowledgement semantics are
 identical. Failed members retain the same bytes object across retries.
 Once preparation succeeds, the redundant decoded record tree is released before
 preparing the next member. Its admission charge remains until acknowledgement.
+A bytes destination can also set `facts_output=True` (advertised as
+`exp_gateway_native.CAPTURE_FACTS_VERSION`). Each member then arrives as
+`("facts", facts, record)`: `record` is exactly the value bytes output hands
+(record bytes or a split tuple) and `facts` is a small content-free JSON document
+(`exp/runtime/gateway/native_capture_facts.py`, `CaptureRecordFacts`) computed while
+the record is encoded: request id, scope, protocol, model and deployment ids,
+capture time, whether a response is present with its kind, status and loss flags,
+the record's byte length, and for a whole record the byte spans of the parts a
+storage plan may drop (the messages value, the response value, and the
+`source_json`, `provider_context` and `wire_request` members with their
+separating commas). A destination identifies and frames a record without decoding
+it, and `CaptureRecordFacts.planned` applies a plan that keeps the prompt or the
+response out as a byte splice whose result equals the decoded rewrite. Spans
+cost a position read per wrapped value during the one encoding the record needs
+anyway; a split skeleton carries none. A facts document over 16 KiB refuses its
+record like an oversized payload.
 
 By default, batched storage retains complete schema-1 records. A destination that
 supports incremental updates can explicitly set `completion_references=True` to

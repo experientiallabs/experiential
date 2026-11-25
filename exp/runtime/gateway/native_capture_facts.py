@@ -1,0 +1,158 @@
+"""Content-free facts the native collector hands beside each batched capture record.
+
+With ``CaptureCollector.batched(..., bytes_output=True, facts_output=True)``
+every record reaches the destination as ``("facts", facts, record)``: ``facts``
+is the small JSON document modeled here, computed natively while the record
+was encoded, and ``record`` is exactly the value plain bytes output would hand
+(the record bytes, or a ``SplitRecord`` tuple). A destination reads identity,
+completeness and response flags from the facts and frames ``record`` without
+decoding it. A storage plan that keeps the prompt or the response out is
+applied with :meth:`CaptureRecordFacts.planned`, a byte splice over the spans,
+never a parse. The native module advertises the contract as
+``exp_gateway_native.CAPTURE_FACTS_VERSION``.
+"""
+
+from __future__ import annotations
+
+from typing import Final, Literal
+
+from pydantic import Field, model_validator
+
+from exp.common.core.artifacts import ContractModel
+from exp.runtime.gateway.native_capture import CaptureScope
+
+CAPTURE_FACTS_VERSION: Final = 1
+CAPTURE_FACTS_TAG: Final = "facts"
+
+ByteSpan = tuple[int, int]
+
+
+class CaptureFactSpans(ContractModel):
+    """Byte spans, ``[start, end)``, of the parts a storage plan may drop.
+
+    Attributes:
+        messages: The value of ``request.context.request.messages``; replaced by ``[]``.
+        response: The value of the record's ``response``; replaced by ``null``.
+        source_json: The whole ``source_json`` member of the request context,
+            with its separating comma; removed.
+        provider_context: The whole ``provider_context`` member of the request
+            context, with its separating comma; removed.
+        wire_request: The whole ``wire_request`` member of ``transport``, with
+            its separating comma; removed.
+    """
+
+    messages: ByteSpan | None
+    response: ByteSpan | None
+    source_json: ByteSpan | None
+    provider_context: ByteSpan | None
+    wire_request: ByteSpan | None
+
+
+class CaptureResponseFacts(ContractModel):
+    """Content-free flags of a record's response.
+
+    Attributes:
+        kind: Whether the response is one JSON body or a list of SSE frames.
+        status: Observed HTTP response status.
+        truncated: Whether capture limits excluded part of a stream.
+        client_disconnected: Whether the consumer stopped before body completion.
+    """
+
+    kind: Literal["json", "sse"]
+    status: int = Field(ge=100, le=599)
+    truncated: bool
+    client_disconnected: bool
+
+
+class CaptureRecordFacts(ContractModel):
+    """The facts document of one record; it never carries prompt or response content.
+
+    Attributes:
+        facts_version: Facts contract version, always ``CAPTURE_FACTS_VERSION``.
+        schema_version: The record's schema: 1 for a whole record, 2 for a
+            completion update that references an already delivered prompt.
+        request_id: Authenticated request identifier.
+        scope: Authority-derived organization, identity and application binding.
+        protocol: Public HTTP request surface.
+        model_id: Selected model identifier, when routing selected one.
+        deployment_id: Selected provider deployment identifier, when available.
+        captured_at: Admission timestamp as Unix seconds.
+        complete: Whether the record carries the request's response.
+        response: Response flags when ``complete``, otherwise None.
+        split: Whether ``record`` is a split skeleton with parts on disk.
+        record_bytes: Length of the record bytes (or split skeleton) handed beside.
+        spans: Storage-plan spans over a whole record; None for a split skeleton.
+    """
+
+    facts_version: Literal[1]
+    schema_version: Literal[1, 2]
+    request_id: str = Field(min_length=1, max_length=512)
+    scope: CaptureScope
+    protocol: Literal["chat_completions", "responses", "messages", "generate_content"]
+    model_id: str | None
+    deployment_id: str | None
+    captured_at: float = Field(ge=0, allow_inf_nan=False)
+    complete: bool
+    response: CaptureResponseFacts | None
+    split: bool
+    record_bytes: int = Field(ge=0)
+    spans: CaptureFactSpans | None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> CaptureRecordFacts:
+        """A split skeleton has no spans; response flags appear only on a complete record."""
+        if self.split == (self.spans is not None):
+            raise ValueError("a whole record has spans and a split skeleton has none")
+        if self.response is not None and not self.complete:
+            raise ValueError("response facts require a complete record")
+        return self
+
+    def planned(self, record: bytes, *, keep_prompt: bool, keep_response: bool) -> bytes:
+        """Return ``record`` with the parts a storage plan drops removed, without parsing it.
+
+        Keeping both returns ``record`` itself. Dropping the prompt empties the
+        messages and removes ``source_json``, ``provider_context`` and the
+        wire request; dropping the response nulls it. The result is the same
+        JSON a decoded rewrite would produce.
+
+        Args:
+            record: The record bytes handed beside these facts.
+            keep_prompt: Whether the prompt may be stored.
+            keep_response: Whether the response may be stored.
+
+        Returns:
+            The record bytes the plan permits.
+
+        Raises:
+            ValueError: The facts describe a split skeleton, or ``record`` is
+                not the record they describe.
+        """
+        if keep_prompt and keep_response:
+            return record
+        if self.spans is None:
+            raise ValueError("a split skeleton carries no storage-plan spans")
+        if len(record) != self.record_bytes:
+            raise ValueError("record bytes do not match their facts")
+        spans = self.spans
+        edits: list[tuple[ByteSpan, bytes]] = []
+        if not keep_prompt:
+            if spans.messages is not None:
+                edits.append((spans.messages, b"[]"))
+            edits.extend(
+                (span, b"")
+                for span in (spans.source_json, spans.provider_context, spans.wire_request)
+                if span is not None
+            )
+        if not keep_response and spans.response is not None:
+            edits.append((spans.response, b"null"))
+        edits.sort()
+        view = memoryview(record)
+        pieces: list[bytes | memoryview] = []
+        cursor = 0
+        for (start, end), replacement in edits:
+            if not cursor <= start <= end <= len(record):
+                raise ValueError("capture facts spans are out of order or out of range")
+            pieces.extend((view[cursor:start], replacement))
+            cursor = end
+        pieces.append(view[cursor:])
+        return b"".join(pieces)

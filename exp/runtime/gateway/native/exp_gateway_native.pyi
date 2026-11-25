@@ -78,6 +78,10 @@ class CaptureResponse:
 # A record too large for memory: ("split", skeleton JSON, reference marker,
 # [(part kind, file path, byte length), ...]). See native_capture.CaptureSpillConfiguration.
 SplitRecord = tuple[Literal["split"], bytes, str, list[tuple[Literal["json", "frames"], str, int]]]
+# Facts output: ("facts", facts JSON, record), the record exactly as bytes output
+# hands it. See native_capture_facts.CaptureRecordFacts.
+FactsRecord = tuple[Literal["facts"], bytes, bytes | SplitRecord]
+CAPTURE_FACTS_VERSION: int
 
 class CaptureCollector:
     """Bounded native content capture with an off-path persistence destination."""
@@ -102,6 +106,18 @@ class CaptureCollector:
         completion_references: bool = False,
         independent_retries: bool = False,
         bytes_output: Literal[True],
+        facts_output: Literal[False] = False,
+    ) -> CaptureCollector: ...
+    @staticmethod
+    @overload
+    def batched(
+        config_json: str,
+        sink: Callable[[tuple[FactsRecord, ...]], list[bool]],
+        *,
+        completion_references: bool = False,
+        independent_retries: bool = False,
+        bytes_output: Literal[True],
+        facts_output: Literal[True],
     ) -> CaptureCollector: ...
     @staticmethod
     def sqlite(config_json: str, local_json: str) -> CaptureCollector | None: ...

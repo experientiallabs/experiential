@@ -1,0 +1,399 @@
+//! Content-free record facts and storage-plan spans for a batched destination.
+//!
+//! A destination that frames capture records without decoding them still has
+//! to know who a record belongs to, whether it carries a response, and (to
+//! honor a storage plan that keeps the prompt or the response out) where those
+//! parts sit. With facts output the collector hands it a small JSON document
+//! beside the record bytes, computed natively while the record is encoded, so
+//! the destination never parses the record to answer those questions.
+//!
+//! The facts are content-free: identities, protocol, model and deployment
+//! ids, response status flags, sizes and byte spans. Spans are `[start, end)`
+//! byte offsets into the record bytes handed beside them:
+//!
+//! * `messages`: the value of `request.context.request.messages`. A plan that
+//!   keeps the prompt out replaces it with `[]`.
+//! * `response`: the value of the record's `response`. A plan that keeps the
+//!   response out replaces it with `null`.
+//! * `source_json`, `provider_context` (in the request context) and
+//!   `wire_request` (in `transport`): whole members, including the separating
+//!   comma, so deleting the span leaves valid JSON.
+//!
+//! Spans never overlap, and splicing them in any order of descending start
+//! offsets yields exactly the record a decoded rewrite would produce.
+
+use std::cell::{Cell, RefCell};
+
+use serde::ser::{SerializeMap, SerializeStruct};
+use serde::{Serialize, Serializer};
+use serde_json::Value;
+
+use super::record::{Protocol, Record, Request, Response, Scope};
+use super::split::SplitRecord;
+
+/// Version of the facts document; a destination checks it before trusting spans.
+pub(crate) const FACTS_VERSION: u32 = 1;
+
+/// The parts a storage plan may drop, as byte spans of one encoded record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct Spans {
+    pub messages: Option<[usize; 2]>,
+    pub response: Option<[usize; 2]>,
+    pub source_json: Option<[usize; 2]>,
+    pub provider_context: Option<[usize; 2]>,
+    pub wire_request: Option<[usize; 2]>,
+}
+
+#[derive(Clone, Copy)]
+enum ValueSlot {
+    Messages,
+    Response,
+}
+
+#[derive(Clone, Copy)]
+enum Member {
+    SourceJson,
+    ProviderContext,
+    WireRequest,
+}
+
+/// A recorded member span; `first` marks a member written without a leading comma.
+#[derive(Clone, Copy, Default)]
+struct MemberSpan {
+    start: usize,
+    end: usize,
+    first: bool,
+}
+
+/// Shared between the bounded writer (which publishes its length) and the
+/// serializer wrappers below (which read it around the values they wrap).
+#[derive(Default)]
+pub(crate) struct Probe {
+    pub(super) position: Cell<usize>,
+    values: RefCell<Spans>,
+    members: RefCell<[Option<MemberSpan>; 3]>,
+}
+
+impl Probe {
+    pub(super) fn request<'a>(&'a self, request: &'a Request) -> ProbedRequest<'a> {
+        ProbedRequest {
+            request,
+            probe: self,
+        }
+    }
+
+    pub(super) fn response<'a, R: Serialize>(
+        &'a self,
+        response: &'a Option<R>,
+    ) -> Spanned<'a, Option<R>> {
+        Spanned {
+            value: response,
+            probe: self,
+            slot: response.is_some().then_some(ValueSlot::Response),
+        }
+    }
+
+    pub(super) fn transport<'a>(&'a self, transport: &'a Value) -> ProbedObject<'a> {
+        ProbedObject {
+            value: transport,
+            probe: self,
+            kind: ObjectKind::Transport,
+        }
+    }
+
+    fn record_value(&self, slot: ValueSlot, start: usize, end: usize) {
+        let mut spans = self.values.borrow_mut();
+        let target = match slot {
+            ValueSlot::Messages => &mut spans.messages,
+            ValueSlot::Response => &mut spans.response,
+        };
+        *target = Some([start, end]);
+    }
+
+    fn record_member(&self, member: Member, span: MemberSpan) {
+        self.members.borrow_mut()[member as usize] = Some(span);
+    }
+
+    /// Final spans over `bytes`: a member written first in its object also
+    /// takes the comma that follows it, so removing it leaves valid JSON.
+    fn finish(&self, bytes: &[u8]) -> Spans {
+        let mut spans = *self.values.borrow();
+        let members = *self.members.borrow();
+        let close = |span: Option<MemberSpan>| {
+            span.map(|span| {
+                let end = if span.first && bytes.get(span.end) == Some(&b',') {
+                    span.end + 1
+                } else {
+                    span.end
+                };
+                [span.start, end]
+            })
+        };
+        spans.source_json = close(members[Member::SourceJson as usize]);
+        spans.provider_context = close(members[Member::ProviderContext as usize]);
+        spans.wire_request = close(members[Member::WireRequest as usize]);
+        spans
+    }
+}
+
+/// Records the byte span of the value it wraps.
+pub(super) struct Spanned<'a, T: ?Sized> {
+    value: &'a T,
+    probe: &'a Probe,
+    slot: Option<ValueSlot>,
+}
+
+impl<T: Serialize + ?Sized> Serialize for Spanned<'_, T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let start = self.probe.position.get();
+        let written = self.value.serialize(serializer)?;
+        if let Some(slot) = self.slot {
+            self.probe
+                .record_value(slot, start, self.probe.position.get());
+        }
+        Ok(written)
+    }
+}
+
+/// The request, field for field as its derived serialization writes it.
+pub(super) struct ProbedRequest<'a> {
+    request: &'a Request,
+    probe: &'a Probe,
+}
+
+impl Serialize for ProbedRequest<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let request = self.request;
+        let mut state = serializer.serialize_struct("Request", 5)?;
+        state.serialize_field("request_id", &request.request_id)?;
+        state.serialize_field("scope", &request.scope)?;
+        state.serialize_field("protocol", &request.protocol)?;
+        state.serialize_field("model_id", &request.model_id)?;
+        state.serialize_field(
+            "context",
+            &ProbedObject {
+                value: &request.context,
+                probe: self.probe,
+                kind: ObjectKind::Context,
+            },
+        )?;
+        state.end()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ObjectKind {
+    /// The request context: `request` nests the messages; two repeated members.
+    Context,
+    /// The context's `request`: the messages value.
+    ContextRequest,
+    /// The transport: the redacted wire request member.
+    Transport,
+}
+
+/// A JSON object written entry by entry exactly as `Value` writes it.
+pub(super) struct ProbedObject<'a> {
+    value: &'a Value,
+    probe: &'a Probe,
+    kind: ObjectKind,
+}
+
+impl Serialize for ProbedObject<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Value::Object(entries) = self.value else {
+            return self.value.serialize(serializer);
+        };
+        let mut map = serializer.serialize_map(Some(entries.len()))?;
+        for (index, (key, value)) in entries.iter().enumerate() {
+            let member = match (self.kind, key.as_str()) {
+                (ObjectKind::Context, "source_json") => Some(Member::SourceJson),
+                (ObjectKind::Context, "provider_context") => Some(Member::ProviderContext),
+                (ObjectKind::Transport, "wire_request") => Some(Member::WireRequest),
+                _ => None,
+            };
+            let start = self.probe.position.get();
+            map.serialize_key(key)?;
+            match (self.kind, key.as_str()) {
+                (ObjectKind::Context, "request") if value.is_object() => {
+                    map.serialize_value(&ProbedObject {
+                        value,
+                        probe: self.probe,
+                        kind: ObjectKind::ContextRequest,
+                    })?;
+                }
+                (ObjectKind::ContextRequest, "messages") => {
+                    map.serialize_value(&Spanned {
+                        value,
+                        probe: self.probe,
+                        slot: Some(ValueSlot::Messages),
+                    })?;
+                }
+                _ => map.serialize_value(value)?,
+            }
+            if let Some(member) = member {
+                self.probe.record_member(
+                    member,
+                    MemberSpan {
+                        start,
+                        end: self.probe.position.get(),
+                        first: index == 0,
+                    },
+                );
+            }
+        }
+        map.end()
+    }
+}
+
+/// One record serialized through the probe.
+struct ProbedRecord<'a> {
+    record: &'a Record,
+    completion: bool,
+    probe: &'a Probe,
+}
+
+impl Serialize for ProbedRecord<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.record
+            .serialize_update(serializer, self.completion, Some(self.probe))
+    }
+}
+
+#[derive(Serialize)]
+struct ResponseFacts {
+    kind: &'static str,
+    status: u16,
+    truncated: bool,
+    client_disconnected: bool,
+}
+
+impl ResponseFacts {
+    fn of(response: &Response) -> Self {
+        match response {
+            Response::Json { status, .. } => Self {
+                kind: "json",
+                status: *status,
+                truncated: false,
+                client_disconnected: false,
+            },
+            Response::Sse {
+                status,
+                truncated,
+                client_disconnected,
+                ..
+            } => Self {
+                kind: "sse",
+                status: *status,
+                truncated: *truncated,
+                client_disconnected: *client_disconnected,
+            },
+            Response::Spilled(spilled) => Self {
+                kind: if spilled.sse { "sse" } else { "json" },
+                status: spilled.status,
+                truncated: spilled.truncated,
+                client_disconnected: spilled.client_disconnected,
+            },
+        }
+    }
+}
+
+/// The facts document; field names are the destination's contract.
+#[derive(Serialize)]
+struct Facts<'a> {
+    facts_version: u32,
+    schema_version: u32,
+    request_id: &'a str,
+    scope: &'a Scope,
+    protocol: Protocol,
+    model_id: Option<&'a str>,
+    deployment_id: Option<&'a str>,
+    captured_at: f64,
+    /// Whether the record carries the request's response.
+    complete: bool,
+    response: Option<ResponseFacts>,
+    /// Whether the record is a split skeleton (its parts are on disk).
+    split: bool,
+    /// Bytes of the record (or of the split skeleton) handed beside the facts.
+    record_bytes: usize,
+    /// Byte spans over the record; absent for a split skeleton.
+    spans: Option<Spans>,
+}
+
+fn facts(
+    record: &Record,
+    schema_version: u32,
+    complete: bool,
+    split: bool,
+    record_bytes: usize,
+    spans: Option<Spans>,
+) -> Option<Vec<u8>> {
+    let response = complete
+        .then(|| record.response.as_ref().map(ResponseFacts::of))
+        .flatten();
+    serde_json::to_vec(&Facts {
+        facts_version: FACTS_VERSION,
+        schema_version,
+        request_id: &record.request.request_id,
+        scope: &record.request.scope,
+        protocol: record.request.protocol,
+        model_id: record.request.model_id.as_deref(),
+        deployment_id: record.deployment_id.as_deref(),
+        captured_at: record.captured_at,
+        complete,
+        response,
+        split,
+        record_bytes,
+        spans,
+    })
+    .ok()
+}
+
+/// Encode a whole record exactly as `Record::encode` (or `encode_update` when
+/// `completion_references`) would, and its facts with spans over those bytes.
+pub(crate) fn encode_with_facts(
+    record: &Record,
+    maximum_bytes: usize,
+    completion_references: bool,
+) -> Option<(String, Vec<u8>)> {
+    if !record.valid() {
+        return None;
+    }
+    let completion = completion_references && record.checkpointed && record.response.is_some();
+    let probe = Probe::default();
+    let encoded = super::budget::encode_tracked(
+        &ProbedRecord {
+            record,
+            completion,
+            probe: &probe,
+        },
+        maximum_bytes,
+        Some(&probe.position),
+    )?;
+    let spans = probe.finish(encoded.as_bytes());
+    let schema_version = if completion { 2 } else { record.schema_version };
+    let facts = facts(
+        record,
+        schema_version,
+        record.response.is_some(),
+        false,
+        encoded.len(),
+        Some(spans),
+    )?;
+    Some((encoded, facts))
+}
+
+/// Facts for a split record's skeleton; spans are not computed over a skeleton.
+pub(crate) fn split_facts(record: &Record, split: &SplitRecord) -> Option<Vec<u8>> {
+    facts(
+        record,
+        record.schema_version,
+        split.complete,
+        true,
+        split.skeleton.len(),
+        None,
+    )
+}
+
+#[cfg(test)]
+#[path = "facts_test.rs"]
+mod tests;
