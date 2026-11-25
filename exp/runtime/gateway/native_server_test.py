@@ -9,7 +9,7 @@ from unittest import mock
 
 import pytest
 
-from exp.runtime.gateway import native_server
+from exp.runtime.gateway import native_server, public_egress
 from exp.runtime.gateway.native_server import (
     PRE_FIRST_BYTE_MAX_ENV,
     PRE_FIRST_BYTE_RESERVE_ENV,
@@ -177,3 +177,27 @@ def test_the_budget_ceiling_override_is_optional_and_validated() -> None:
     assert pre_first_byte_max_seconds({PRE_FIRST_BYTE_MAX_ENV: "900"}) == 900.0
     with pytest.raises(ValueError):
         pre_first_byte_max_seconds({PRE_FIRST_BYTE_MAX_ENV: "-5"})
+
+
+@pytest.mark.parametrize("public_only", [False, True])
+def test_host_hands_its_egress_policy_to_python_provider_clients(
+    monkeypatch: pytest.MonkeyPatch, public_only: bool
+) -> None:
+    """The serve flag turns the Python policy on (never off) before serving and keeps it on."""
+    seen: list[bool] = []
+
+    def serve(*_args: object) -> None:
+        """Observe the policy the control plane's own clients see mid-serve."""
+        seen.append(public_egress.public_upstreams_only())
+
+    native = SimpleNamespace(serve=serve)
+    monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
+    serve_native_gateway(
+        SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=10.0),
+        host="127.0.0.1",
+        port=8080,
+        public_upstreams_only=public_only,
+    )
+    assert seen == [public_only]
+    # One-way: a poller or an overlapping serve may outlive this call.
+    assert public_egress.public_upstreams_only() is public_only
