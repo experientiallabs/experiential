@@ -51,6 +51,7 @@ def rewrite(record: bytes, *, keep_prompt: bool, keep_response: bool) -> JsonObj
             document[key] = None
         document["gemini_thought_parts"] = []
         document.pop("provider_logprobs", None)
+        document.pop("transport", None)
     if not keep_prompt:
         context = document["request"]["context"]
         context["request"]["messages"] = []
@@ -230,6 +231,7 @@ def _facts(**overrides: JsonValue) -> JsonObject:
             "response_fields": [],
             "gemini_thought_parts": None,
             "provider_logprobs": None,
+            "transport": None,
         },
     }
     return {**document, **overrides}
@@ -267,6 +269,7 @@ def test_inconsistent_facts_and_mismatched_records_are_refused() -> None:
                 "response_fields": [],
                 "gemini_thought_parts": None,
                 "provider_logprobs": None,
+                "transport": None,
             },
         )
     )

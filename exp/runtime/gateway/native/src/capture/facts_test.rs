@@ -49,13 +49,14 @@ fn splice(bytes: &str, spans: &Spans, keep_prompt: bool, keep_response: bool) ->
     let mut edits: Vec<([usize; 2], &str)> = Vec::new();
     if !keep_prompt {
         edits.extend(spans.messages.map(|span| (span, "[]")));
-        for span in [
-            spans.source_json,
-            spans.provider_context,
-            spans.wire_request,
-        ]
-        .into_iter()
-        .flatten()
+        let wire_request = if keep_response {
+            spans.wire_request
+        } else {
+            None
+        };
+        for span in [spans.source_json, spans.provider_context, wire_request]
+            .into_iter()
+            .flatten()
         {
             edits.push((span, ""));
         }
@@ -65,6 +66,7 @@ fn splice(bytes: &str, spans: &Spans, keep_prompt: bool, keep_response: bool) ->
         edits.extend(spans.response_fields.iter().map(|span| (*span, "null")));
         edits.extend(spans.gemini_thought_parts.map(|span| (span, "[]")));
         edits.extend(spans.provider_logprobs.map(|span| (span, "")));
+        edits.extend(spans.transport.map(|span| (span, "")));
     }
     edits.sort_by_key(|(span, _)| std::cmp::Reverse(span[0]));
     for pair in edits.windows(2) {
@@ -94,6 +96,7 @@ fn rewrite(bytes: &str, keep_prompt: bool, keep_response: bool) -> Value {
         }
         record["gemini_thought_parts"] = json!([]);
         record.as_object_mut().unwrap().remove("provider_logprobs");
+        record.as_object_mut().unwrap().remove("transport");
     }
     if !keep_prompt {
         let context = record["request"]["context"].as_object_mut().unwrap();
@@ -175,6 +178,7 @@ fn spans_of(facts: &Value) -> Spans {
         response_fields: serde_json::from_value(facts["spans"]["response_fields"].clone()).unwrap(),
         gemini_thought_parts: span("gemini_thought_parts"),
         provider_logprobs: span("provider_logprobs"),
+        transport: span("transport"),
     }
 }
 

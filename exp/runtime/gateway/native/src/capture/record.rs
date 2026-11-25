@@ -289,7 +289,11 @@ impl<R: Serialize> Record<R> {
         }
         if let Some(transport) = &self.transport {
             match probe {
-                Some(probe) => record.serialize_field("transport", &probe.transport(transport))?,
+                Some(probe) => {
+                    let start = probe.position.get();
+                    record.serialize_field("transport", &probe.transport(transport))?;
+                    probe.record_transport(start);
+                }
                 None => record.serialize_field("transport", transport)?,
             }
         }

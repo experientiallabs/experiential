@@ -39,7 +39,9 @@ class CaptureFactSpans(ContractModel):
         provider_context: The whole ``provider_context`` member of the request
             context with one separating comma; removed with the prompt.
         wire_request: The whole ``wire_request`` member of ``transport`` with
-            one separating comma; removed with the prompt.
+            one separating comma; removed with the prompt. It lies inside
+            ``transport``, so a plan that keeps the response out removes
+            ``transport`` instead.
         response: The value of the record's ``response``; replaced by ``null``
             when the response is kept out.
         response_fields: Values of the response-derived fields present in the
@@ -50,6 +52,10 @@ class CaptureFactSpans(ContractModel):
             replaced by ``[]`` with the response.
         provider_logprobs: The whole ``provider_logprobs`` member with its
             leading comma; removed with the response.
+        transport: The whole ``transport`` member with its leading comma
+            (caller-facing headers, timing and the wire request); removed with
+            the response, since the collector delivers no relay evidence for a
+            request whose response it may not keep.
     """
 
     messages: ByteSpan | None
@@ -60,6 +66,7 @@ class CaptureFactSpans(ContractModel):
     response_fields: tuple[ByteSpan, ...]
     gemini_thought_parts: ByteSpan | None
     provider_logprobs: ByteSpan | None
+    transport: ByteSpan | None
 
 
 class CaptureResponseFacts(ContractModel):
@@ -154,9 +161,11 @@ class CaptureRecordFacts(ContractModel):
         if not keep_prompt:
             if spans.messages is not None:
                 edits.append((spans.messages, b"[]"))
+            # The wire request goes with the whole transport when the response does.
+            wire_request = spans.wire_request if keep_response else None
             edits.extend(
                 (span, b"")
-                for span in (spans.source_json, spans.provider_context, spans.wire_request)
+                for span in (spans.source_json, spans.provider_context, wire_request)
                 if span is not None
             )
         if not keep_response:
@@ -167,6 +176,8 @@ class CaptureRecordFacts(ContractModel):
                 edits.append((spans.gemini_thought_parts, b"[]"))
             if spans.provider_logprobs is not None:
                 edits.append((spans.provider_logprobs, b""))
+            if spans.transport is not None:
+                edits.append((spans.transport, b""))
         edits.sort()
         view = memoryview(record)
         pieces: list[bytes | memoryview] = []

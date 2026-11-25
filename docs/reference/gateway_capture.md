@@ -230,8 +230,10 @@ storage plan may drop: the messages value and the `source_json`,
 `provider_context` and `wire_request` members (with one separating comma each)
 for the prompt; the response value, the response-derived fields the collector
 clears itself when response retention is denied (reasoning and its source, tool
-calls, metrics, Gemini parts and their source) and the `provider_logprobs`
-member for the response. A destination identifies and frames a record without
+calls, metrics, Gemini parts and their source) and the `provider_logprobs` and
+`transport` members for the response (the collector delivers no relay evidence
+for a request whose response it may not keep; `wire_request` lies inside
+`transport`). A destination identifies and frames a record without
 decoding it, and `CaptureRecordFacts.planned` applies a plan as a byte splice
 whose result equals the decoded rewrite. Spans cost a position read per wrapped
 value during the one encoding the record needs anyway. A split skeleton carries

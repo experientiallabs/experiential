@@ -22,10 +22,13 @@
 //!   fields the collector itself clears when response retention is denied:
 //!   `response_fields` (provider reasoning and its source, completed tool
 //!   calls, metrics, the Gemini parts' source) are replaced by `null`,
-//!   `gemini_thought_parts` by `[]`, and the `provider_logprobs` member is
-//!   deleted.
+//!   `gemini_thought_parts` by `[]`, and the `provider_logprobs` and
+//!   `transport` members are deleted (the collector delivers no relay
+//!   evidence for a request whose response it may not keep).
 //!
-//! Spans never overlap, and splicing them all in descending start order yields
+//! `wire_request` lies inside `transport`; a plan that keeps the response out
+//! deletes `transport` and skips `wire_request`. Every other pair of spans is
+//! disjoint, and splicing the selected spans in descending start order yields
 //! exactly the record a decoded rewrite would produce.
 
 use std::cell::{Cell, RefCell};
@@ -59,6 +62,7 @@ pub(crate) struct Spans {
     pub response_fields: Vec<Span>,
     pub gemini_thought_parts: Option<Span>,
     pub provider_logprobs: Option<Span>,
+    pub transport: Option<Span>,
 }
 
 #[derive(Clone, Copy)]
@@ -125,6 +129,11 @@ impl Probe {
             probe: self,
             slot: present.then_some(slot),
         }
+    }
+
+    /// Record the whole `transport` member, written with its leading comma.
+    pub(super) fn record_transport(&self, start: usize) {
+        self.values.borrow_mut().transport = Some([start, self.position.get()]);
     }
 
     /// Record the whole `provider_logprobs` member, written with its leading comma.
