@@ -32,9 +32,11 @@ class ExecutionSnapshot(ContractModel):
             (the default) keeps the provider id on every rung. A non-empty map
             labels the route: a rung it does not name answers with no
             ``x-gateway-provider`` header at all, so a host that relabels a
-            route never leaks a provider id it meant to hide. Keys must be
-            deployments of this route. Presentation only: routing, attempts and
-            settlement keep the real provider.
+            route never leaks a provider id it meant to hide. A label for a
+            deployment outside the route is ignored, so a route narrowed at
+            admission keeps the host's whole map and stays labelled even when
+            every labelled rung was narrowed away. Presentation only: routing,
+            attempts and settlement keep the real provider.
         model_stages: Frozen ordered stage segments; empty for an unstaged exact-model route.
         traversal_events: Immutable expansion provenance, not mutable runtime visitation state.
     """
@@ -67,8 +69,6 @@ class ExecutionSnapshot(ContractModel):
             and tuple(d for s in self.model_stages for d in s.deployment_ids) != self.deployment_ids
         ):
             raise ValueError("execution stages must exactly cover ordered deployment_ids")
-        if not set(self.public_providers) <= set(self.deployment_ids):
-            raise ValueError("public provider labels must name deployments of this route")
         return self
 
     def public_provider_member(self, deployment_id: DeploymentId) -> dict[str, str]:

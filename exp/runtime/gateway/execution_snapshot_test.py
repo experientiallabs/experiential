@@ -34,7 +34,11 @@ def test_public_providers_refuse_a_label_that_is_not_one_header_token(label: str
         _with_labels({"one": label})
 
 
-def test_public_providers_must_name_deployments_of_the_route() -> None:
-    """A label for a deployment the route does not dispatch is refused."""
-    with pytest.raises(ValidationError, match="public provider labels"):
-        _with_labels({"elsewhere": "example_cloud"})
+def test_a_narrowed_labelled_route_stays_valid_and_labelled() -> None:
+    """Narrowing away the labelled rung keeps the map, so no rung falls back to its id."""
+    snapshot = _with_labels({"one": "example_cloud"})
+    narrowed = snapshot.model_copy(update={"deployment_ids": ("two",)})
+    assert ExecutionSnapshot.model_validate(narrowed.model_dump()) == narrowed
+    assert narrowed.public_provider_member("two") == {"public_provider": ""}
+    assert snapshot.public_provider_member("one") == {"public_provider": "example_cloud"}
+    assert _route().snapshot.public_provider_member("one") == {}
