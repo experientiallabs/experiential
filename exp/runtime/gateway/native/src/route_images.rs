@@ -638,6 +638,7 @@ fn public_images(
         billed_units: None,
         cache_writes_read_back: false,
         image_output_tokens,
+        provider_reported_cost_nano_usd: None,
     };
     Ok((Value::Object(public), usage))
 }

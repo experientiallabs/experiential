@@ -126,6 +126,7 @@ impl Normalizer {
             cache_writes_read_back: writes.is_some(),
             image_output_tokens: fields.image,
             image_input_tokens: None,
+            provider_reported_cost_nano_usd: None,
         });
         Ok(())
     }

@@ -85,6 +85,11 @@ pub struct Usage {
     /// Media units priced by the deployment's unit card; absent on token-priced attempts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billed_units: Option<BilledUnits>,
+    /// What the provider itself reported charging for this attempt, in whole
+    /// nano-USD rounded up: OpenRouter's `usage.cost` on a non-BYOK answer
+    /// (`usage/provider_cost.rs`). Absent on every other provider and answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_reported_cost_nano_usd: Option<u64>,
     /// The provider read this call's cache writes back in-call (Google explicit
     /// caching). Settlement stays disjoint; Chat reports the writes inside
     /// `cached_tokens` too, as OpenRouter's Gemini relay does. A rendering fact
@@ -768,6 +773,9 @@ pub fn simplified_event(event: &Event) -> Value {
             }
             if let Some(image) = usage.image_input_tokens {
                 payload["image_input_tokens"] = serde_json::json!(image);
+            }
+            if let Some(cost) = usage.provider_reported_cost_nano_usd {
+                payload["provider_reported_cost_nano_usd"] = serde_json::json!(cost);
             }
             payload
         }

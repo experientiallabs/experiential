@@ -244,6 +244,19 @@ impl Normalizer {
         );
     }
 
+    /// Read the provider's own per-request charge from usage (OpenRouter's
+    /// `usage.cost`, see `provider_cost.rs`). Only the OpenAI-shaped wires
+    /// OpenRouter serves (Chat Completions and Responses) honour it.
+    pub fn set_provider_reported_cost(&mut self, reported: bool) {
+        self.openai_usage.set_provider_reported_cost(
+            reported
+                && matches!(
+                    self.dialect,
+                    Dialect::OpenAiCompatible | Dialect::OpenAiResponses
+                ),
+        );
+    }
+
     /// Record that this rung asked OpenAI for 12-hour cache writes, so writes
     /// reported without their lifetime split bill at 12 hours. Only a
     /// Responses normalizer honours it: no other wire carries the lifetime.

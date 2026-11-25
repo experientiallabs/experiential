@@ -535,7 +535,7 @@ fn settle_argument_bills_tool_search_rounds_only_on_the_finalizing_settlement() 
 }
 
 #[test]
-fn settle_argument_preserves_upstream_provider_and_cache_ttl_usage_together() {
+fn settle_argument_preserves_upstream_provider_reported_cost_and_cache_ttl_usage_together() {
     let usage = Usage {
         input_tokens: Some(1_000),
         output_tokens: Some(10),
@@ -548,6 +548,7 @@ fn settle_argument_preserves_upstream_provider_and_cache_ttl_usage_together() {
         cache_writes_read_back: false,
         image_output_tokens: None,
         image_input_tokens: None,
+        provider_reported_cost_nano_usd: Some(1_600_000),
     };
     let named = settle_argument(
         "req",
@@ -572,6 +573,11 @@ fn settle_argument_preserves_upstream_provider_and_cache_ttl_usage_together() {
     assert_eq!(parsed["usage"]["input_tokens"], 1_000);
     assert_eq!(parsed["usage"]["cache_creation_input_tokens"], 600);
     assert_eq!(parsed["usage"]["cache_creation_1h_input_tokens"], 200);
+    // OpenRouter's reported charge rides the usage object beside the counts.
+    assert_eq!(
+        parsed["usage"]["provider_reported_cost_nano_usd"],
+        1_600_000
+    );
     let unnamed = settle_argument(
         "req",
         "att",

@@ -13,8 +13,11 @@ mod cache_subsets;
 mod cache_ttl;
 #[path = "usage/gemini_modalities.rs"]
 mod gemini_modalities;
+#[path = "usage/provider_cost.rs"]
+mod provider_cost;
 use gemini_modalities::gemini_image_candidates;
 pub use gemini_modalities::gemini_output_covering_image;
+pub use provider_cost::OPENROUTER_PROVIDER;
 
 impl Usage {
     /// Mark unknown subsets that an OpenAI-compatible shape represents as zero.
@@ -67,6 +70,9 @@ impl Usage {
         self.reasoning_tokens = self.reasoning_tokens.max(newer.reasoning_tokens);
         self.image_output_tokens = self.image_output_tokens.max(newer.image_output_tokens);
         self.image_input_tokens = self.image_input_tokens.max(newer.image_input_tokens);
+        self.provider_reported_cost_nano_usd = self
+            .provider_reported_cost_nano_usd
+            .max(newer.provider_reported_cost_nano_usd);
         self.cache_writes_read_back |= newer.cache_writes_read_back;
     }
 
@@ -244,6 +250,8 @@ pub(crate) struct OpenAiUsageAccumulator {
     pending_cache_creation_1h_input_tokens: Option<u64>,
     // The rung asked OpenAI for 12-hour cache writes.
     twelve_hour_writes_requested: bool,
+    // The rung's provider reports its own per-request charge (OpenRouter).
+    provider_reported_cost: bool,
 }
 
 impl OpenAiUsageAccumulator {
@@ -255,6 +263,11 @@ impl OpenAiUsageAccumulator {
     /// Record that the rung asked for 12-hour cache writes before usage arrives.
     pub(crate) fn set_twelve_hour_writes_requested(&mut self, requested: bool) {
         self.twelve_hour_writes_requested = requested;
+    }
+
+    /// Read OpenRouter's own per-request charge before any usage arrives.
+    pub(crate) fn set_provider_reported_cost(&mut self, reported: bool) {
+        self.provider_reported_cost = reported;
     }
 
     pub(crate) fn update_chat(&mut self, value: &Value) -> Result<Usage, String> {
@@ -389,6 +402,10 @@ impl OpenAiUsageAccumulator {
             cache_writes_read_back: false,
             image_output_tokens,
             image_input_tokens: None,
+            provider_reported_cost_nano_usd: self
+                .provider_reported_cost
+                .then(|| provider_cost::openrouter_cost_nano_usd(object))
+                .flatten(),
         });
         // Initial split fragments support a provisional mode until counters
         // change. A coherent raw output/reasoning/total sample may correct it;
@@ -551,6 +568,7 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
         cache_writes_read_back: false,
         image_output_tokens,
         image_input_tokens: None,
+        provider_reported_cost_nano_usd: None,
     })
 }
 
@@ -595,6 +613,7 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
         cache_writes_read_back: false,
         image_output_tokens: None,
         image_input_tokens: None,
+        provider_reported_cost_nano_usd: None,
     })
 }
 

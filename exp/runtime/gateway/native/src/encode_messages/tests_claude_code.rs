@@ -58,6 +58,7 @@ fn start_frame_carries_the_upstream_start_usage_when_known() {
         cache_writes_read_back: false,
         image_output_tokens: None,
         image_input_tokens: None,
+        provider_reported_cost_nano_usd: None,
     }));
     let frames = encoder.start().expect("starts");
     let start: Value = serde_json::from_str(
@@ -196,6 +197,7 @@ fn upstream_start_usage_outranks_the_pre_dispatch_estimate() {
         cache_writes_read_back: false,
         image_output_tokens: None,
         image_input_tokens: None,
+        provider_reported_cost_nano_usd: None,
     }));
     let frames = encoder.start().expect("starts");
     let start: Value = serde_json::from_str(

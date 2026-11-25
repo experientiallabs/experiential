@@ -813,6 +813,9 @@ def _usage_from_payload(
         reasoning_tokens=_optional_count(payload.get("reasoning_tokens")),
         image_output_tokens=_optional_count(payload.get("image_output_tokens")),
         image_input_tokens=_optional_count(payload.get("image_input_tokens")),
+        provider_reported_cost_nano_usd=_optional_cost(
+            payload.get("provider_reported_cost_nano_usd")
+        ),
         tool_names=names,
         web_search_requests=web_search_requests,
         web_search_results=web_search_results,
@@ -827,6 +830,12 @@ def _optional_count(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
+
+
+def _optional_cost(value: object) -> int | None:
+    """Return one non-negative integer nano-USD charge, ``None`` when unreported or malformed."""
+    count = _optional_count(value)
+    return count if count is not None and count >= 0 else None
 
 
 def _optional_wait(value: object) -> int | None:

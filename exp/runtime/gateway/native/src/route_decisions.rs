@@ -741,6 +741,7 @@ fn decision_usage(payload: &Value) -> Result<Usage, Failure> {
         cache_writes_read_back: false,
         image_output_tokens: None,
         image_input_tokens: None,
+        provider_reported_cost_nano_usd: None,
     })
 }
 
