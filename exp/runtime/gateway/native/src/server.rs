@@ -108,6 +108,11 @@ pub struct ServeConfig {
     /// keeps the FIFO semaphore.
     #[serde(default)]
     pub permit_priority_aging_seconds: Option<f64>,
+    /// Whether client answers carry `x-gateway-deployment`. False removes it
+    /// from every answer as it leaves; capture reads it inside the handler,
+    /// before the removal, so captured records keep the deployment id.
+    #[serde(default = "default_publish_deployment_header")]
+    pub publish_deployment_header: bool,
 }
 
 fn default_graceful_timeout_seconds() -> f64 {
@@ -168,6 +173,19 @@ fn default_maximum_retained_output_bytes() -> usize {
 #[cfg(test)]
 pub(crate) fn default_retained_for_tests() -> usize {
     default_maximum_retained_output_bytes()
+}
+
+fn default_publish_deployment_header() -> bool {
+    true
+}
+
+/// The header naming the deployment that served an answer.
+const DEPLOYMENT_HEADER: &str = "x-gateway-deployment";
+
+/// Remove the serving deployment's id from an answer leaving the gateway.
+pub(crate) async fn withhold_deployment_header(mut response: Response) -> Response {
+    response.headers_mut().remove(DEPLOYMENT_HEADER);
+    response
 }
 
 fn default_native_usage_enabled() -> bool {
@@ -338,6 +356,12 @@ pub async fn run(
         ))
     } else {
         app
+    };
+    // Outermost, so it sees every answer after its handler (and capture) ran.
+    let app = if config.publish_deployment_header {
+        app
+    } else {
+        app.layer(axum::middleware::map_response(withhold_deployment_header))
     };
     let app = app.with_state(crate::execution_context::ServerState {
         base: state,

@@ -127,9 +127,8 @@ pub(super) enum Answer {
     Forbidden(&'static str),
     /// A 200 event stream carrying these SSE frames, then `[DONE]`.
     Stream(&'static [&'static str]),
-    /// A 200 native Responses event stream carrying these SSE frames and
-    /// then a `response.completed` terminal (the Responses wire has no
-    /// `[DONE]`).
+    /// A 200 native Responses event stream carrying these SSE frames, then a
+    /// `response.completed` terminal (the Responses wire has no `[DONE]`).
     ResponsesStream(&'static [&'static str]),
     /// A 200 native Responses event stream whose only frame is this
     /// `response.failed` terminal (how OpenRouter's Responses relay reports
@@ -323,6 +322,7 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         code_assist_envelope: false,
         capture_logprobs: false,
         rung_family: None,
+        public_provider: None,
     }
 }
 

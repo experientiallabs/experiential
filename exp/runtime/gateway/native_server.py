@@ -110,6 +110,7 @@ def serve_native_gateway(
     time_to_first_token_seconds: float = 120.0,
     pre_first_byte_budget_seconds: float = 90.0,
     native_usage_enabled: bool = True,
+    publish_deployment_header: bool = True,
     maximum_retained_output_bytes: int | None = None,
     capture: CaptureCollector | None = None,
     execution_bindings: ExecutionBindings | None = None,
@@ -176,6 +177,10 @@ def serve_native_gateway(
         native_usage_enabled: Whether Rust owns ``/usage.json``. Hosted,
             multi-tenant callers should disable it so their own surface owns
             usage.
+        publish_deployment_header: Whether client answers carry
+            ``x-gateway-deployment``. A host that treats deployment ids as
+            internal passes False; the data plane then removes the header
+            from every answer as it leaves, after capture has read it.
         maximum_retained_output_bytes: Worker-wide bound on provider output
             retained across all in-flight streams (tool arguments, buffered
             Messages blocks, non-streaming aggregations, Responses
@@ -230,6 +235,7 @@ def serve_native_gateway(
         "time_to_first_token_seconds": time_to_first_token_seconds,
         "pre_first_byte_budget_seconds": pre_first_byte_budget_seconds,
         "native_usage_enabled": native_usage_enabled,
+        "publish_deployment_header": publish_deployment_header,
     }
     if maximum_retained_output_bytes is not None:
         config["maximum_retained_output_bytes"] = maximum_retained_output_bytes

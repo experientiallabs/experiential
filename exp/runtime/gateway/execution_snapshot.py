@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from pydantic import Field, model_validator
+from typing import Annotated
+
+from pydantic import Field, StringConstraints, model_validator
 
 from exp.common.core.artifacts import ContractModel
 from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
@@ -15,11 +17,26 @@ from exp.common.models.gateway_catalog import (
 from exp.common.models.gateway_chains import ModelExecutionStage, ModelTraversalEvent
 from exp.runtime.gateway.contracts import AuthorizationSnapshot
 
+PublicProviderLabel = Annotated[
+    str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+]
+"""A host-chosen provider name for ``x-gateway-provider``: one header-safe token."""
+
 
 class ExecutionSnapshot(ContractModel):
     """Route-bound request plan created only after exact-model selection.
 
     Attributes:
+        public_providers: Host-chosen provider names the data plane puts on
+            ``x-gateway-provider`` instead of each rung's provider id. Empty
+            (the default) keeps the provider id on every rung. A non-empty map
+            labels the route: a rung it does not name answers with no
+            ``x-gateway-provider`` header at all, so a host that relabels a
+            route never leaks a provider id it meant to hide. A label for a
+            deployment outside the route is ignored, so a route narrowed at
+            admission keeps the host's whole map and stays labelled even when
+            every labelled rung was narrowed away. Presentation only: routing,
+            attempts and settlement keep the real provider.
         model_stages: Frozen ordered stage segments; empty for an unstaged exact-model route.
         traversal_events: Immutable expansion provenance, not mutable runtime visitation state.
     """
@@ -40,6 +57,7 @@ class ExecutionSnapshot(ContractModel):
     # Rungs the host flagged for OpenRouter's per-request ZDR constraint; the
     # dispatch builder tightens each and fails closed on a wire that cannot.
     zdr_constrained_deployment_ids: tuple[DeploymentId, ...] = ()
+    public_providers: dict[DeploymentId, PublicProviderLabel] = Field(default_factory=dict)
     model_stages: tuple[ModelExecutionStage, ...] = ()
     traversal_events: tuple[ModelTraversalEvent, ...] = ()
 
@@ -52,6 +70,24 @@ class ExecutionSnapshot(ContractModel):
         ):
             raise ValueError("execution stages must exactly cover ordered deployment_ids")
         return self
+
+    def public_provider_member(self, deployment_id: DeploymentId) -> dict[str, str]:
+        """Return a rung's ``public_provider`` wire member, or nothing.
+
+        An unlabelled route sends no member, so the data plane names the rung's
+        provider id as before. A labelled route sends every rung's label, and an
+        empty string for a rung it did not name, which the data plane answers
+        without the ``x-gateway-provider`` header.
+
+        Args:
+            deployment_id: The rung whose wire entry is being built.
+
+        Returns:
+            ``{"public_provider": label}`` on a labelled route, else ``{}``.
+        """
+        if not self.public_providers:
+            return {}
+        return {"public_provider": self.public_providers.get(deployment_id, "")}
 
     def stage_for_depth(self, depth: int) -> ModelExecutionStage:
         """Return the exact destination authority, never substitute the root model."""

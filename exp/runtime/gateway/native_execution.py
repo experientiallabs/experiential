@@ -959,8 +959,7 @@ def deployment_wire_entry(
             capabilities.time_to_first_byte_seconds_per_million_input_tokens
         ),
         "time_to_first_token_base_seconds": capabilities.time_to_first_token_base_seconds,
-        # A failover-only rung's tokens (`native_fallback_rules`): the data
-        # plane never counts it as a first-dial or unmatched successor.
+        # Failover-only tokens (`native_fallback_rules`): never a first-dial or unmatched successor.
         "failover_only_on": (
             None if capabilities.failover_only_on is None else list(capabilities.failover_only_on)
         ),
@@ -968,6 +967,7 @@ def deployment_wire_entry(
         "code_assist_envelope": profile.code_assist_envelope is not None,  # nested answers
         "capture_logprobs": capture_logprobs,
         "rung_family": rung_family_index(route, deployment),  # throttle redial reserve
+        **route.snapshot.public_provider_member(deployment.deployment_id),
     }
 
 

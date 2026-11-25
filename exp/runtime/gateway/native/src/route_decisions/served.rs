@@ -38,7 +38,6 @@ pub(super) fn served_headers(
             "x-gateway-canonical-model".to_string(),
             admission.exact_model_id.clone(),
         ),
-        ("x-gateway-provider".to_string(), wire.provider.clone()),
         (
             "x-gateway-deployment".to_string(),
             wire.deployment_id.clone(),
@@ -49,6 +48,11 @@ pub(super) fn served_headers(
             admission.route_reason.clone(),
         ),
     ];
+    if let Some(provider) = wire.header_provider() {
+        // Beside the canonical model, where it has always been listed.
+        let at = headers.len() - 3;
+        headers.insert(at, ("x-gateway-provider".to_string(), provider.to_owned()));
+    }
     if let Some(value) = client_request_id {
         headers.push(("x-client-request-id".to_string(), value));
     }

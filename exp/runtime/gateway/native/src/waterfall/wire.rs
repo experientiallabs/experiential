@@ -180,6 +180,35 @@ pub struct DeploymentWire {
     /// older admissions, which never reserve.
     #[serde(default)]
     pub rung_family: Option<u32>,
+    /// The host's provider name for this rung's `x-gateway-provider` header.
+    /// Absent: the header names `provider`. Present: the header carries this
+    /// label, or no header at all when it is empty or not one header-safe
+    /// token (a host that relabels a route never wants the provider id it
+    /// meant to hide). Presentation only; attempts and settlement keep
+    /// `provider`.
+    #[serde(default)]
+    pub public_provider: Option<String>,
+}
+
+/// The longest provider label a host may put on `x-gateway-provider`.
+const MAXIMUM_PUBLIC_PROVIDER_BYTES: usize = 64;
+
+impl DeploymentWire {
+    /// The value of this rung's `x-gateway-provider` header, or None to omit it.
+    pub fn header_provider(&self) -> Option<&str> {
+        let Some(label) = self.public_provider.as_deref() else {
+            return Some(&self.provider);
+        };
+        let valid = label.len() <= MAXIMUM_PUBLIC_PROVIDER_BYTES
+            && label
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_alphanumeric())
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        valid.then_some(label)
+    }
 }
 
 /// The frozen retry-policy facts returned by admission.
