@@ -136,11 +136,15 @@ class CaptureRecordFacts(ContractModel):
         """Return ``record`` with the parts a storage plan drops removed, without parsing it.
 
         Keeping both returns ``record`` itself. Dropping the prompt empties the
-        messages and removes ``source_json``, ``provider_context`` and the
-        wire request; dropping the response nulls it and clears every
-        response-derived field exactly as the collector does when response
-        retention is denied. The result is the same JSON a decoded rewrite
-        would produce.
+        conversation (the messages) and removes every verbatim copy of the
+        caller's request (``source_json``, ``provider_context`` and the wire
+        request); the other effective request fields (model, parameters, tool
+        declarations, metadata) stay, so a destination that must not keep those
+        either keeps no record, as the collector itself does when prompt
+        retention is denied. Dropping the response nulls it and clears every
+        response-derived field and the relay transport exactly as the
+        collector does when response retention is denied. The result is the
+        same JSON a decoded rewrite would produce.
 
         Args:
             record: The record bytes handed beside these facts.
