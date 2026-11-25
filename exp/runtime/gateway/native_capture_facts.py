@@ -14,6 +14,7 @@ never a parse. The native module advertises the contract as
 
 from __future__ import annotations
 
+import json
 from typing import Final, Literal
 
 from pydantic import Field, model_validator
@@ -31,6 +32,8 @@ class CaptureFactSpans(ContractModel):
     """Byte spans, ``[start, end)``, of the parts a storage plan may drop.
 
     Attributes:
+        request_id: The request id's JSON string; checked before any splice so
+            facts paired with another request's record are refused.
         messages: The value of ``request.context.request.messages``; replaced by
             ``[]`` when the prompt is kept out.
         source_json: The whole ``source_json`` member of the request context
@@ -58,6 +61,7 @@ class CaptureFactSpans(ContractModel):
             request whose response it may not keep.
     """
 
+    request_id: ByteSpan
     messages: ByteSpan | None
     source_json: ByteSpan | None
     provider_context: ByteSpan | None
@@ -121,11 +125,11 @@ class CaptureRecordFacts(ContractModel):
 
     @model_validator(mode="after")
     def _consistent(self) -> CaptureRecordFacts:
-        """A split skeleton has no spans; response flags appear only on a complete record."""
+        """A split skeleton has no spans; complete means exactly that response facts exist."""
         if self.split == (self.spans is not None):
             raise ValueError("a whole record has spans and a split skeleton has none")
-        if self.response is not None and not self.complete:
-            raise ValueError("response facts require a complete record")
+        if self.complete != (self.response is not None):
+            raise ValueError("a record is complete exactly when it carries response facts")
         return self
 
     def planned(self, record: bytes, *, keep_prompt: bool, keep_response: bool) -> bytes:
@@ -148,15 +152,19 @@ class CaptureRecordFacts(ContractModel):
 
         Raises:
             ValueError: The facts describe a split skeleton, or ``record`` is
-                not the record they describe.
+                not the record they describe (its length, or the request id
+                at its span, differs).
         """
         if keep_prompt and keep_response:
             return record
         if self.spans is None:
             raise ValueError("a split skeleton carries no storage-plan spans")
-        if len(record) != self.record_bytes:
-            raise ValueError("record bytes do not match their facts")
         spans = self.spans
+        # Constant-time binding: the length and the request id where the facts put it.
+        start, end = spans.request_id
+        request_id = json.dumps(self.request_id, ensure_ascii=False).encode()
+        if len(record) != self.record_bytes or record[start:end] != request_id:
+            raise ValueError("record bytes do not match their facts")
         edits: list[tuple[ByteSpan, bytes]] = []
         if not keep_prompt:
             if spans.messages is not None:

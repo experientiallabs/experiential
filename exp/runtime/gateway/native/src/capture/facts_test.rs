@@ -170,6 +170,7 @@ fn spans_of(facts: &Value) -> Spans {
         serde_json::from_value(facts["spans"][name].clone()).unwrap()
     };
     Spans {
+        request_id: span("request_id"),
         messages: span("messages"),
         source_json: span("source_json"),
         provider_context: span("provider_context"),
@@ -278,6 +279,7 @@ fn spans_point_at_exactly_the_values_they_name() {
         let (start, end) = (span[0].as_u64().unwrap(), span[1].as_u64().unwrap());
         &encoded[start as usize..end as usize]
     };
+    assert_eq!(slice("request_id"), r#""request-1""#);
     assert_eq!(slice("messages"), r#"[{"role":"user","content":"雪,}"}]"#);
     let response: Value = serde_json::from_str(slice("response")).unwrap();
     assert_eq!(response["kind"], "sse");
@@ -335,6 +337,8 @@ fn a_completion_reference_matches_its_update_encoding_and_has_no_prompt_spans() 
     assert_eq!(encoded, record.encode_update(1 << 20).unwrap());
     let facts: Value = serde_json::from_slice(&facts).unwrap();
     assert_eq!(facts["schema_version"], 2);
+    let [start, end] = spans_of(&facts).request_id.unwrap();
+    assert_eq!(&encoded[start..end], r#""request-1""#);
     assert_eq!(facts["spans"]["messages"], Value::Null);
     assert_eq!(facts["spans"]["source_json"], Value::Null);
     assert!(facts["spans"]["response"].is_array());

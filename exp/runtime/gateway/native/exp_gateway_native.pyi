@@ -96,6 +96,7 @@ class CaptureCollector:
         completion_references: bool = False,
         independent_retries: bool = False,
         bytes_output: Literal[False] = False,
+        facts_output: Literal[False] = False,
     ) -> CaptureCollector: ...
     @staticmethod
     @overload

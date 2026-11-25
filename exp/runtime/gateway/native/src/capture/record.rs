@@ -255,8 +255,8 @@ impl<R: Serialize> Record<R> {
         probe: Option<&super::facts::Probe>,
     ) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
-        struct Reference<'a> {
-            request_id: &'a str,
+        struct Reference<'a, I: Serialize> {
+            request_id: I,
             scope: &'a Scope,
             protocol: Protocol,
             model_id: &'a Option<String>,
@@ -269,15 +269,27 @@ impl<R: Serialize> Record<R> {
             &if completion { 2 } else { self.schema_version },
         )?;
         if completion {
-            record.serialize_field(
-                "request",
-                &Reference {
-                    request_id: &self.request.request_id,
-                    scope: &self.request.scope,
-                    protocol: self.request.protocol,
-                    model_id: &self.request.model_id,
-                },
-            )?;
+            let request_id = self.request.request_id.as_str();
+            match probe {
+                Some(probe) => record.serialize_field(
+                    "request",
+                    &Reference {
+                        request_id: probe.request_id(request_id),
+                        scope: &self.request.scope,
+                        protocol: self.request.protocol,
+                        model_id: &self.request.model_id,
+                    },
+                )?,
+                None => record.serialize_field(
+                    "request",
+                    &Reference {
+                        request_id,
+                        scope: &self.request.scope,
+                        protocol: self.request.protocol,
+                        model_id: &self.request.model_id,
+                    },
+                )?,
+            }
         } else if let Some(probe) = probe {
             record.serialize_field("request", &probe.request(&self.request))?;
         } else {

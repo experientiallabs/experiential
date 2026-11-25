@@ -11,6 +11,9 @@
 //! ids, response status flags, sizes and byte spans. Spans are `[start, end)`
 //! byte offsets into the record bytes handed beside them:
 //!
+//! * `request_id`: the request id's JSON string. A destination checks the
+//!   bytes there (and the record length) before splicing, so facts paired
+//!   with another request's record are refused in constant time.
 //! * `messages`: the value of `request.context.request.messages`. A plan that
 //!   keeps the prompt out replaces it with `[]`.
 //! * `source_json`, `provider_context` (in the request context) and
@@ -54,6 +57,8 @@ type Span = [usize; 2];
 /// The parts a storage plan may drop, as byte spans of one encoded record.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Spans {
+    /// The request id's JSON string, which binds the spans to this record.
+    pub request_id: Option<Span>,
     pub messages: Option<Span>,
     pub source_json: Option<Span>,
     pub provider_context: Option<Span>,
@@ -67,6 +72,7 @@ pub(crate) struct Spans {
 
 #[derive(Clone, Copy)]
 pub(super) enum ValueSlot {
+    RequestId,
     Messages,
     Response,
     ResponseField,
@@ -98,6 +104,15 @@ pub(crate) struct Probe {
 }
 
 impl Probe {
+    /// Wrap the request id, whose span binds a destination's splice to this record.
+    pub(super) fn request_id<'a>(&'a self, request_id: &'a str) -> Spanned<'a, str> {
+        Spanned {
+            value: request_id,
+            probe: self,
+            slot: Some(ValueSlot::RequestId),
+        }
+    }
+
     pub(super) fn request<'a>(&'a self, request: &'a Request) -> ProbedRequest<'a> {
         ProbedRequest {
             request,
@@ -152,6 +167,7 @@ impl Probe {
     fn record_value(&self, slot: ValueSlot, start: usize, end: usize) {
         let mut spans = self.values.borrow_mut();
         match slot {
+            ValueSlot::RequestId => spans.request_id = Some([start, end]),
             ValueSlot::Messages => spans.messages = Some([start, end]),
             ValueSlot::Response => spans.response = Some([start, end]),
             ValueSlot::ResponseField => spans.response_fields.push([start, end]),
@@ -235,7 +251,7 @@ impl Serialize for ProbedRequest<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let request = self.request;
         let mut state = serializer.serialize_struct("Request", 5)?;
-        state.serialize_field("request_id", &request.request_id)?;
+        state.serialize_field("request_id", &self.probe.request_id(&request.request_id))?;
         state.serialize_field("scope", &request.scope)?;
         state.serialize_field("protocol", &request.protocol)?;
         state.serialize_field("model_id", &request.model_id)?;

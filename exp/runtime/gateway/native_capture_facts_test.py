@@ -221,8 +221,9 @@ def _facts(**overrides: JsonValue) -> JsonObject:
         "complete": False,
         "response": None,
         "split": False,
-        "record_bytes": 2,
+        "record_bytes": 3,
         "spans": {
+            "request_id": [0, 3],
             "messages": None,
             "source_json": None,
             "provider_context": None,
@@ -253,14 +254,21 @@ def test_inconsistent_facts_and_mismatched_records_are_refused() -> None:
             )
         )
     with pytest.raises(ValidationError):
+        CaptureRecordFacts.model_validate(_facts(complete=True))
+    with pytest.raises(ValidationError):
         CaptureRecordFacts.model_validate(_facts(facts_version=2))
     facts = CaptureRecordFacts.model_validate(_facts())
     with pytest.raises(ValueError, match="do not match"):
-        facts.planned(b"{}  ", keep_prompt=False, keep_response=True)
+        facts.planned(b'"r"  ', keep_prompt=False, keep_response=True)
+    # Same length, another request's id at the span: refused.
+    with pytest.raises(ValueError, match="do not match"):
+        facts.planned(b'"q"', keep_prompt=False, keep_response=True)
+    assert facts.planned(b'"r"', keep_prompt=False, keep_response=True) == b'"r"'
     overlapping = CaptureRecordFacts.model_validate(
         _facts(
             record_bytes=10,
             spans={
+                "request_id": [0, 3],
                 "messages": [2, 6],
                 "source_json": None,
                 "provider_context": None,
@@ -274,4 +282,4 @@ def test_inconsistent_facts_and_mismatched_records_are_refused() -> None:
         )
     )
     with pytest.raises(ValueError, match="out of order"):
-        overlapping.planned(b"0123456789", keep_prompt=False, keep_response=False)
+        overlapping.planned(b'"r"3456789', keep_prompt=False, keep_response=False)

@@ -225,8 +225,10 @@ A bytes destination can also set `facts_output=True` (advertised as
 (`exp/runtime/gateway/native_capture_facts.py`, `CaptureRecordFacts`) computed while
 the record is encoded: request id, scope, protocol, model and deployment ids,
 capture time, whether a response is present with its kind, status and loss flags,
-the record's byte length, and for a whole record the byte spans of the parts a
-storage plan may drop: the messages value and the `source_json`,
+the record's byte length, and for a whole record the span of its request id
+(checked with the length before any splice, so facts paired with another
+request's record are refused) and the byte spans of the parts a storage plan
+may drop: the messages value and the `source_json`,
 `provider_context` and `wire_request` members (with one separating comma each)
 for the prompt; the response value, the response-derived fields the collector
 clears itself when response retention is denied (reasoning and its source, tool
