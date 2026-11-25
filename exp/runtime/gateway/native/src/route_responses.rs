@@ -382,7 +382,7 @@ async fn respond_from_responses_events(
                 return error_response(&failure.public_error());
             }
         };
-    let aggregated = match completed_responses_body_for(
+    let mut aggregated = match completed_responses_body_for(
         &admission,
         depth,
         created_at,
@@ -484,9 +484,13 @@ async fn respond_from_responses_events(
         }
         return error_response(&guard.settlement_error());
     }
-    let headers = served_headers(&admission, client_request_id.as_deref(), served);
+    let mut headers = served_headers(&admission, client_request_id.as_deref(), served);
+    if let Some(extensions) = guard.response_extensions() {
+        extensions.extend_body(&mut aggregated.body);
+        extensions.extend_headers(&mut headers);
+    }
     if stream_body {
-        let body = match encode_responses_sse(
+        let mut body = match encode_responses_sse(
             &admission,
             depth,
             created_at,
@@ -496,6 +500,9 @@ async fn respond_from_responses_events(
             Ok(body) => body,
             Err(error) => return error_response(&error),
         };
+        if let Some(extensions) = guard.response_extensions() {
+            extensions.extend_sse_body(&mut body);
+        }
         if let Some(mut owner) = lease.take() {
             let mut sorted = headers.clone();
             sorted.sort();
@@ -700,7 +707,7 @@ async fn stream_responses(
         let mut reasoning_content_carrier: Option<String> = None;
         // Withhold undecided deterministic redaction segments.
         let mut output_guardrails = StreamGuardrails::new(&request_id, incremental_guardrail);
-        let terminal_frames: Vec<String>;
+        let mut terminal_frames: Vec<String>;
 
         macro_rules! fail_stream {
             ($failure:expr) => {{
@@ -904,6 +911,9 @@ async fn stream_responses(
             if let Some(mut owner) = lease.take() {
                 owner.abandon().await;
             }
+        }
+        if let Some(extensions) = guard.response_extensions() {
+            extensions.extend_frames(&mut terminal_frames);
         }
         finish_stream_terminal(
             &sender,

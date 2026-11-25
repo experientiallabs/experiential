@@ -51,6 +51,7 @@ mod replay;
 mod replay_repair;
 mod request_policy;
 mod respond;
+mod response_extensions;
 mod responses_retention;
 mod retained;
 mod route_audio;

@@ -75,6 +75,7 @@ from exp.runtime.gateway.recovery import (
 from exp.runtime.gateway.recovery_test import Clock, eligible
 from exp.runtime.gateway.request_policy import GatewayRequestPolicy, GatewayRoutingPolicy
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
+from exp.runtime.gateway.response_extensions import GatewayResponseExtensions
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.rung_admission import RungLoadKey, RungLoadRegistry, RungShed, _RungLoad
 from exp.runtime.openai_protocol.errors import (
@@ -5569,6 +5570,95 @@ def test_a_quote_prices_exactly_what_the_later_settlement_writes() -> None:
     assert priced["terminal_event"] == ledger.terminal_events[-1]
     assert priced["finalize_request"] is True
     assert ledger.finished[-1]["finalize"] is True
+    assert registry.entry(entry.authorization.request_id) is None
+
+
+class _ExtendingLedger(_RecordingLedger):
+    """Recording ledger that also hands the data plane response extensions."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        """Start with no extensions taken; ``fail`` makes every take raise."""
+        super().__init__()
+        self.fail = fail
+        self.taken: list[str] = []
+
+    def take_response_extensions(self, request_id: str) -> GatewayResponseExtensions | None:
+        """Return one fixed extension per request, once."""
+        if self.fail:
+            raise RuntimeError("scripted extension failure")
+        if request_id in self.taken:
+            return None
+        self.taken.append(request_id)
+        return GatewayResponseExtensions(
+            usage={"cost": 0.0016, "is_byok": False},
+            body={"provider": "example"},
+            headers=(("x-example-notice", "settled"),),
+        )
+
+
+def _extending_registry(
+    ledger: _ExtendingLedger,
+) -> tuple[NativeAttemptAccounting, InflightRequest]:
+    """Compose a registry over ``ledger`` with the shared two-deployment route."""
+    _, _, entry = _registry(register=False)
+    registry = NativeAttemptAccounting(ledger)  # type: ignore[arg-type]
+    registry.register(entry)
+    return registry, entry
+
+
+def _completed(entry: InflightRequest, attempt_id: object, *, finalize: bool) -> str:
+    """Encode one completed settlement for ``entry``'s active attempt."""
+    return json.dumps(
+        {
+            "request_id": entry.authorization.request_id,
+            "attempt_id": attempt_id,
+            "outcome": "completed",
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+            "tool_names": [],
+            "failure": None,
+            "finalize": finalize,
+            "opened": True,
+        }
+    )
+
+
+def test_a_quote_reply_carries_the_hosts_response_extensions_once() -> None:
+    """The priced reply hands the extension over; the later settle reply is plain."""
+    ledger = _ExtendingLedger()
+    registry, entry = _extending_registry(ledger)
+    started = _start(registry, ordinal=0)
+    encoded = _completed(entry, started["attempt_id"], finalize=True)
+    reply = json.loads(registry.price(encoded))
+    assert reply == {
+        "response_extensions": {
+            "usage": {"cost": 0.0016, "is_byok": False},
+            "body": {"provider": "example"},
+            "headers": [["x-example-notice", "settled"]],
+        }
+    }
+    assert registry.settle(encoded) == "{}"
+    assert ledger.taken == [entry.authorization.request_id]
+
+
+def test_a_finalizing_settle_reply_carries_extensions_and_a_continuing_one_does_not() -> None:
+    """Only the write that finalizes the request answers with the host's members."""
+    ledger = _ExtendingLedger()
+    registry, entry = _extending_registry(ledger)
+    first = _start(registry, ordinal=0)
+    assert registry.settle(_completed(entry, first["attempt_id"], finalize=False)) == "{}"
+    second = _start(registry, ordinal=1, current_depth=0)
+    reply = json.loads(registry.settle(_completed(entry, second["attempt_id"], finalize=True)))
+    assert reply["response_extensions"]["usage"]["cost"] == 0.0016
+    assert len(ledger.finished) == 2
+
+
+def test_a_failing_extension_source_never_changes_the_settlement() -> None:
+    """An extension failure answers the plain reply; the write already landed."""
+    ledger = _ExtendingLedger(fail=True)
+    registry, entry = _extending_registry(ledger)
+    started = _start(registry, ordinal=0)
+    assert registry.settle(_completed(entry, started["attempt_id"], finalize=True)) == "{}"
+    assert len(ledger.finished) == 1
     assert registry.entry(entry.authorization.request_id) is None
 
 

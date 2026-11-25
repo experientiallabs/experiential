@@ -218,7 +218,7 @@ pub(super) async fn stream_response(
                 }
             }
             for outward in delivery.pace(outward_events, deadline).await {
-                let encoded = match encoder.feed(&outward) {
+                let mut encoded = match encoder.feed(&outward) {
                     Ok(encoded) => encoded,
                     Err(_) => {
                         if terminal.is_some() {
@@ -235,6 +235,9 @@ pub(super) async fn stream_response(
                     }
                 };
                 if outward.is_terminal() {
+                    if let Some(extensions) = guard.response_extensions() {
+                        extensions.extend_frames(&mut encoded);
+                    }
                     // Terminal frames flow through the shared publication tail
                     // so keyed owners publish the exact byte stream first.
                     finish_stream_terminal(

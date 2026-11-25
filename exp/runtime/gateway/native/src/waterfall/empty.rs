@@ -110,5 +110,6 @@ pub(super) async fn settle_output_less(
         empty_completion: false,
         tool_search_rounds: Vec::new(),
         rate_limit_headers,
+        response_extensions: guard.response_extensions().cloned(),
     })
 }

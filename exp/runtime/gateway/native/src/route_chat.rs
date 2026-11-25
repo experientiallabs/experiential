@@ -335,6 +335,7 @@ async fn settled_chat_response(
     client_request_id: Option<String>,
 ) -> Response {
     let served = settled.served();
+    let extensions = settled.response_extensions;
     let mut events = settled.events;
     let refusal_completed = complete_visible_refusal(&mut events);
     if refusal_completed.is_none() {
@@ -360,12 +361,18 @@ async fn settled_chat_response(
             return error_response(&error);
         }
     }
-    let headers = served_headers(admission, client_request_id.as_deref(), served);
+    let mut headers = served_headers(admission, client_request_id.as_deref(), served);
+    if let Some(extensions) = &extensions {
+        extensions.extend_headers(&mut headers);
+    }
     if admission.stream {
-        let body = match encode_chat_sse(admission, created_at, &events, None, false) {
+        let mut body = match encode_chat_sse(admission, created_at, &events, None, false) {
             Ok(body) => body,
             Err(error) => return error_response(&error),
         };
+        if let Some(extensions) = &extensions {
+            extensions.extend_sse_body(&mut body);
+        }
         if let Some(mut owner) = lease.take() {
             let mut sorted = headers.clone();
             sorted.sort();
@@ -399,6 +406,9 @@ async fn settled_chat_response(
             owner.abandon().await;
         }
         return error_response(&failure.clone().boundary().public_error());
+    }
+    if let Some(extensions) = &extensions {
+        extensions.extend_body(&mut aggregated.body);
     }
     if let Some(mut owner) = lease.take() {
         let mut sorted = headers.clone();
@@ -637,9 +647,13 @@ async fn respond_from_chat_events(
         }
         return error_response(&guard.settlement_error());
     }
-    let headers = served_headers(&admission, client_request_id.as_deref(), served);
+    let mut headers = served_headers(&admission, client_request_id.as_deref(), served);
+    if let Some(extensions) = guard.response_extensions() {
+        extensions.extend_body(&mut aggregated.body);
+        extensions.extend_headers(&mut headers);
+    }
     if stream_body {
-        let body = match encode_chat_sse(
+        let mut body = match encode_chat_sse(
             &admission,
             created_at,
             &events,
@@ -649,6 +663,9 @@ async fn respond_from_chat_events(
             Ok(body) => body,
             Err(error) => return error_response(&error),
         };
+        if let Some(extensions) = guard.response_extensions() {
+            extensions.extend_sse_body(&mut body);
+        }
         if let Some(mut owner) = lease.take() {
             let mut sorted = headers.clone();
             sorted.sort();

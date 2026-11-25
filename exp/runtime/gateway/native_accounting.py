@@ -99,7 +99,7 @@ from exp.runtime.gateway.native_settlement import (
     web_search_requests_from_terminal,
     web_search_requests_kwarg,
 )
-from exp.runtime.gateway.native_settlement_quote import quote_settlement
+from exp.runtime.gateway.native_settlement_quote import quote_settlement, settlement_reply
 from exp.runtime.gateway.recovery import RecoveryHost, SessionRecoveryRegistry
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
@@ -751,7 +751,7 @@ class NativeAttemptAccounting:
                 finalization flag, and witnessed provider metadata.
 
         Returns:
-            An empty JSON object; repeated settlement is a no-op.
+            The reply, with host response extensions when finalizing; a repeat is a no-op.
 
         Raises:
             NativeBridgeError: The write failed; the data plane or deadline sweep retries it.
@@ -856,7 +856,7 @@ class NativeAttemptAccounting:
                 discard_guardrails(self._fence.drop(self._inflight, request_id))
             elif entry.active_attempt_id == attempt_id:
                 entry.active_attempt_id = None
-        return "{}"
+        return settlement_reply(self._write_ledger, request_id, finalize=finalize)
 
     def abandon(self, argument: str) -> str:
         """Terminalize one accepted request with no settleable outcome.

@@ -18,6 +18,7 @@ use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
 use crate::metrics::METRICS;
 use crate::replay::OwnerLease;
+use crate::response_extensions::ResponseExtensions;
 use crate::waterfall::CommittedAttempt;
 use crate::web_search::WebSearchMeter;
 
@@ -237,7 +238,7 @@ async fn deliver(
     bridge: &Bridge,
     method: &'static str,
     argument: String,
-) -> Result<(), PublicError> {
+) -> Result<String, PublicError> {
     let mut last = PublicError::internal();
     for backoff_ms in [0u64, 100, 500, 2_000] {
         if backoff_ms > 0 {
@@ -245,7 +246,7 @@ async fn deliver(
             METRICS.record_settlement_retry();
         }
         match bridge.call(method, argument.clone()).await {
-            Ok(_) => return Ok(()),
+            Ok(reply) => return Ok(reply),
             Err(error) => last = error,
         }
     }
@@ -326,6 +327,9 @@ pub struct AttemptGuard {
     dispatch: Option<crate::dispatch_capacity::DispatchPermit>,
     /// The control plane's public error from the last failed delivery.
     settlement_error: Option<PublicError>,
+    /// Additive members the host returned with the finalizing price or
+    /// settlement, stamped on the terminal payload (`response_extensions`).
+    response_extensions: Option<ResponseExtensions>,
 }
 
 /// Holds one unit of the shutdown drain counter for a detached stream task,
@@ -386,6 +390,7 @@ impl AttemptGuard {
             observation: Observation::default(),
             dispatch: None,
             settlement_error: None,
+            response_extensions: None,
         }
     }
 
@@ -552,8 +557,9 @@ impl AttemptGuard {
         else {
             return true;
         };
-        if self.bridge.call("price", argument.clone()).await.is_ok() {
+        if let Ok(reply) = self.bridge.call("price", argument.clone()).await {
             self.priced = true;
+            self.response_extensions = ResponseExtensions::from_reply(&reply);
             return true;
         }
         self.deliver_decided(argument, finalize).await
@@ -680,7 +686,13 @@ impl AttemptGuard {
 
     /// Deliver one decided settlement and update the guard's ownership.
     async fn deliver_decided(&mut self, argument: String, finalize: bool) -> bool {
-        let delivered = self.record_delivery(deliver(&self.bridge, "settle", argument).await);
+        let reply = deliver(&self.bridge, "settle", argument).await;
+        if let (true, Ok(reply)) = (finalize, &reply) {
+            if self.response_extensions.is_none() {
+                self.response_extensions = ResponseExtensions::from_reply(reply);
+            }
+        }
+        let delivered = self.record_delivery(reply.map(drop));
         if finalize {
             // The control plane retained a failed terminal write verbatim,
             // so its sweep (not the drop backstop) owns the retry.
@@ -760,7 +772,7 @@ impl AttemptGuard {
             })),
         )
         .await;
-        self.record_delivery(delivered)
+        self.record_delivery(delivered.map(drop))
     }
 
     /// Retain a failed delivery's public error and report whether it landed.
@@ -772,6 +784,12 @@ impl AttemptGuard {
                 false
             }
         }
+    }
+
+    /// The host's additive members for this request's terminal payload,
+    /// once a finalizing price or settlement returned them.
+    pub(crate) fn response_extensions(&self) -> Option<&ResponseExtensions> {
+        self.response_extensions.as_ref()
     }
 
     /// The public error a caller answers after a terminal write did not land:
