@@ -360,6 +360,10 @@ class RecoverySkipLog:
 
     The line names the deployment id, the closed reason code and the scope field
     name, never a scope value, credential, tenant or content. Bounded state.
+
+    Attributes:
+        overflowed: Skips not logged because every remembered key was still
+            inside its interval when a new key arrived.
     """
 
     def __init__(self, *, interval_seconds: float = 60, maximum_keys: int = 4096) -> None:
@@ -369,9 +373,16 @@ class RecoverySkipLog:
         self._last: OrderedDict[tuple[str, str], float] = OrderedDict()
         self._suppressed: dict[tuple[str, str], int] = {}
         self._lock = threading.Lock()
+        self.overflowed = 0
 
     def emit(self, skipped: tuple[RecoverySkip, ...], retained: str, *, now: float) -> None:
-        """Log each skip whose lane and reason were not logged within the interval."""
+        """Log each skip whose lane and reason were not logged within the interval.
+
+        A key is forgotten only once its interval has passed. When the bound is
+        full of keys still inside their interval, a new key is not logged at
+        all (counted in ``overflowed``), so the bound never lets a line repeat
+        within its minute.
+        """
         for skip in skipped:
             key = (skip.deployment_id, skip.code)
             with self._lock:
@@ -379,12 +390,16 @@ class RecoverySkipLog:
                 if last is not None and now - last < self._interval:
                     self._suppressed[key] = self._suppressed.get(key, 0) + 1
                     continue
+                if last is None and len(self._last) >= self._maximum:
+                    while self._last and now - next(iter(self._last.values())) >= self._interval:
+                        expired, _ = self._last.popitem(last=False)
+                        self._suppressed.pop(expired, None)
+                    if len(self._last) >= self._maximum:
+                        self.overflowed += 1
+                        continue
                 suppressed = self._suppressed.pop(key, 0)
+                self._last.pop(key, None)
                 self._last[key] = now
-                self._last.move_to_end(key)
-                while len(self._last) > self._maximum:
-                    dropped, _ = self._last.popitem(last=False)
-                    self._suppressed.pop(dropped, None)
             _logger.info(
                 "recovery_skipped deployment=%s reason=%s retained=%s suppressed=%d",
                 skip.deployment_id,
@@ -750,7 +765,10 @@ class SessionRecoveryRegistry:
                 skipped=tuple(skipped),
             )
         if decision.skipped:
-            self._skip_log.emit(decision.skipped, retained, now=now)
+            try:
+                self._skip_log.emit(decision.skipped, retained, now=now)
+            except Exception:  # noqa: BLE001 - a diagnostic never changes routing.
+                pass
         return decision
 
     def _try_recover(
@@ -785,11 +803,13 @@ class SessionRecoveryRegistry:
             return skip("warm_scope_mismatch", _differing_field(warm.scope, scope))
         if departed is None:
             return skip("no_departure_record")
-        if not eligible(deployment_id):
-            return skip(
-                "lane_ineligible",
-                None if ineligible_reason is None else ineligible_reason(deployment_id),
-            )
+        if ineligible_reason is not None:
+            # One evaluation decides and names the refusal, so a health window
+            # closing between two calls cannot drop the qualifier.
+            if (why := ineligible_reason(deployment_id)) is not None:
+                return skip("lane_ineligible", why)
+        elif not eligible(deployment_id):
+            return skip("lane_ineligible")
         if departed.scope != scope:
             return skip("departure_scope_mismatch", _differing_field(departed.scope, scope))
         if now < departed.retry_at:

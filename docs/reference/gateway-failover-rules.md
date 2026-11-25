@@ -204,7 +204,7 @@ the decision names the first check each earlier route failed (`RecoveryDecision.
 | `no_warm_evidence`, `warm_evidence_expired` | holds no live cache evidence for this session prefix |
 | `warm_scope_mismatch:<field>` | holds evidence bound to a different scope; `<field>` names the first differing scope field, never its value |
 | `no_departure_record` | never departed, so there is nothing to recover from |
-| `lane_ineligible:<reason>` | is a conditional rung (`conditional_rung`) or circuit-suppressed (`health_suppressed`) |
+| `lane_ineligible:<reason>` | is a conditional rung (`conditional_rung`), circuit-suppressed (`health_suppressed`), or outranked for a cache-marked request by an earlier marker-honoring wire (`marker_wire_outranked`) |
 | `departure_scope_mismatch:<field>` | departed under a different scope |
 | `cooldown_not_elapsed` | departed less than the cooldown (or its `Retry-After`) ago |
 | `no_local_headroom` | has no local concurrency, rate or fair-share room for the trial |

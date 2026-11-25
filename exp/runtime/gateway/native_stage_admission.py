@@ -262,9 +262,22 @@ def stage_affinity_ordered_rungs(
                 for prior in range(depth)
             ):
                 allowed.add(deployment_id)
-        candidates = tuple(item for item in candidates if item[0] in allowed)
-        if not candidates:
+        if not allowed:
             return route, wires, placement
+        outranked = {deployment_id for deployment_id, _ in candidates} - allowed
+    else:
+        outranked = set()
+
+    def recovery_ineligible(deployment_id: str) -> str | None:
+        """Name why a route may not be this request's recovery target, or None."""
+        if deployment_id in outranked:
+            return "marker_wire_outranked"
+        return ineligible(deployment_id)
+
+    def recovery_eligible(deployment_id: str) -> bool:
+        """A route this request may recover to or keep (``recovery_ineligible`` is None)."""
+        return recovery_ineligible(deployment_id) is None
+
     decision_started = time.monotonic()
     try:
         observation = host.snapshot()
@@ -274,10 +287,10 @@ def stage_affinity_ordered_rungs(
     decision = registry.choose(
         key,
         candidates,
-        eligible=eligible,
+        eligible=recovery_eligible,
         snapshot=observation,
         local_capacity=headroom,
-        ineligible_reason=ineligible,
+        ineligible_reason=recovery_ineligible,
     )
     if decision.skipped:
         report_recovery_skips(host, authorization.request_id, decision)
