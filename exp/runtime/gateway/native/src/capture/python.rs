@@ -56,10 +56,6 @@ struct ContextSource<'a> {
 
 const BATCH_RECORDS: usize = 64;
 const BATCH_BYTES: usize = 2 * 1024 * 1024;
-/// Upper bound on one facts document: four validated identities of at most
-/// 512 bytes, escaped, plus model and deployment ids and fixed fields. A
-/// larger one (an unbounded deployment id) refuses its record.
-const FACTS_RESERVE_BYTES: usize = 16 * 1024;
 
 struct PythonBatchSink {
     callback: Py<PyAny>,
@@ -92,11 +88,7 @@ impl PythonBatchSink {
     ) -> Result<EncodedRecord, ()> {
         let split = super::split::split(record, store, maximum_bytes).ok_or(())?;
         let facts = if self.facts_output {
-            Some(
-                super::facts::split_facts(record, &split)
-                    .filter(|facts| facts.len() <= FACTS_RESERVE_BYTES)
-                    .ok_or(())?,
-            )
+            Some(super::facts::split_facts(record, &split).ok_or(())?)
         } else {
             None
         };
@@ -198,7 +190,7 @@ impl Sink for PythonBatchSink {
         // (up to four bytes per character) and the concurrent UTF-8 encoding.
         // Facts output is bytes output only, whose payloads take one byte per
         // byte: the four-fold string slack covers every facts document
-        // (at most FACTS_RESERVE_BYTES each) many times over.
+        // (at most `facts::MAXIMUM_FACTS_BYTES` each) many times over.
         (maximum_record_bytes + BATCH_BYTES) * 5 + BATCH_RECORDS * 256
     }
 
@@ -214,7 +206,6 @@ impl Sink for PythonBatchSink {
                 maximum_bytes,
                 self.completion_references,
             ) {
-                Some((_, facts)) if facts.len() > FACTS_RESERVE_BYTES => Err(()),
                 Some((encoded, facts)) => Self::prepare_with_facts(&encoded, &facts),
                 None => match &self.spill {
                     Some(store) => self.prepare_split(record, store, maximum_bytes),

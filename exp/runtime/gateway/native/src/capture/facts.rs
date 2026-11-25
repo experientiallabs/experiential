@@ -40,6 +40,12 @@ use super::split::SplitRecord;
 /// Version of the facts document; a destination checks it before trusting spans.
 pub(crate) const FACTS_VERSION: u32 = 1;
 
+/// Upper bound on one facts document: four validated identities of at most
+/// 512 bytes, escaped, plus model and deployment ids and fixed fields. The
+/// encoder stops at the bound, so a larger document (an oversized deployment
+/// id) refuses its record without being materialized.
+pub(crate) const MAXIMUM_FACTS_BYTES: usize = 16 * 1024;
+
 type Span = [usize; 2];
 
 /// The parts a storage plan may drop, as byte spans of one encoded record.
@@ -400,7 +406,7 @@ fn facts(
     spans: Option<Spans>,
 ) -> Option<Vec<u8>> {
     let complete = response.is_some();
-    serde_json::to_vec(&Facts {
+    let facts = &Facts {
         facts_version: FACTS_VERSION,
         schema_version,
         request_id: &record.request.request_id,
@@ -414,8 +420,8 @@ fn facts(
         split,
         record_bytes,
         spans,
-    })
-    .ok()
+    };
+    super::budget::encode(facts, MAXIMUM_FACTS_BYTES).map(String::into_bytes)
 }
 
 /// Encode a whole record exactly as `Record::encode` (or `encode_update` when

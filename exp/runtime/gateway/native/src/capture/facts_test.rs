@@ -346,6 +346,9 @@ fn the_record_bound_and_record_validity_still_apply() {
     let plain = record.encode(1 << 20).unwrap();
     assert!(encode_with_facts(&record, plain.len() - 1, false).is_none());
     assert!(encode_with_facts(&record, plain.len(), false).is_some());
+    let mut oversized = record.clone();
+    oversized.deployment_id = Some("d".repeat(MAXIMUM_FACTS_BYTES));
+    assert!(encode_with_facts(&oversized, 1 << 20, false).is_none());
     let mut invalid = record;
     invalid.request.request_id = " ".into();
     assert!(encode_with_facts(&invalid, 1 << 20, false).is_none());
