@@ -721,6 +721,32 @@ def test_a_claude_plan_without_the_operator_app_names_the_configuration(
     assert GatewayManagement(root).provider_connections() == ()
 
 
+def test_an_antigravity_plan_is_refused_by_the_local_cli(tmp_path: Path) -> None:
+    """The local CLI names the embedder seam instead of attempting an Antigravity sign-in."""
+    root = _initialized_root(tmp_path)
+
+    result = _runner.invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "provider",
+            "add",
+            "ag-plan",
+            "--provider",
+            "gemini",
+            "--subscription",
+            "antigravity",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "subscription_token_source_factory" in _plain_output(result.output)
+    assert GatewayManagement(root).provider_connections() == ()
+
+
 def _add_imported_plan(root: Path, auth_file: Path) -> Result:
     """Run ``provider add plan-a`` as a ChatGPT plan imported from a Codex file."""
     return _runner.invoke(

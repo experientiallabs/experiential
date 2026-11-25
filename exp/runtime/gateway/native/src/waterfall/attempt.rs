@@ -299,6 +299,7 @@ pub(super) async fn run_attempt(
                 == Some("12h"),
         );
         relay.set_gemini_cache_writes(wire.automatic_cache_written_tokens);
+        relay.set_code_assist_envelope(wire.code_assist_envelope);
         relay.set_native_tool_translation(wire.native_tool_translation.clone());
         relay.set_tool_search_tool_name(ctx.tool_search.map(|search| search.tool_name.clone()));
         if !wire.model_id.is_empty() {

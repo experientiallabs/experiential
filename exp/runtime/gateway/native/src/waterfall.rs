@@ -335,6 +335,7 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
                 "context_window_limit_tokens": failure.context_window_limit_tokens,
                 "provider_content_filter": failure.provider_content_filter,
                 "malformed_tool_call": failure.malformed_tool_call,
+                "provider_account_suspended": failure.account_suspended,
             }))),
         }));
         let started_text = match ctx.bridge.call("start_attempt", argument).await {

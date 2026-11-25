@@ -444,6 +444,15 @@ pub fn stream_failure(kind: StreamErrorKind, detail: Option<String>) -> Failure 
 /// passes through unchanged.
 pub fn customer_credential_failure(failure: Failure, provider: &str) -> Failure {
     let message = match failure.failure_class {
+        FailureClass::ProviderAuthentication if failure.account_suspended => {
+            let appeal = crate::google_account_verdicts::appeal_url_of(&failure)
+                .map(|url| format!("; appeal at {url}"))
+                .unwrap_or_default();
+            format!(
+                "{provider} suspended your connected account for a terms-of-service \
+                 violation{appeal}; connect another account to keep using this provider"
+            )
+        }
         FailureClass::ProviderAuthentication => format!(
             "your connected {provider} credential was rejected by the provider; update the \
              key on this organization's {provider} provider connection and resend"

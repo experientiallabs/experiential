@@ -165,6 +165,13 @@ fn settle_argument(
             if failure.malformed_tool_call {
                 wire["malformed_tool_call"] = json!(true);
             }
+            // A suspended provider account, so the host pulls it and can name
+            // the appeal URL to its owner.
+            if failure.account_suspended {
+                wire["provider_account_suspended"] = json!(true);
+                wire["provider_appeal_url"] =
+                    json!(crate::google_account_verdicts::appeal_url_of(failure));
+            }
             // A customer-addressed origin's failure: health keeps no nameable
             // cause for it, so a later refusal cannot replay it.
             failure.with_wire_origin(wire)

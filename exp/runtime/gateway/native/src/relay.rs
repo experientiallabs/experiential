@@ -475,6 +475,11 @@ impl UpstreamRelay {
         self.normalizer.set_gemini_cache_writes(written);
     }
 
+    /// Read this rung's frames through the Cloud Code Assist envelope.
+    pub fn set_code_assist_envelope(&mut self, enveloped: bool) {
+        self.normalizer.set_code_assist_envelope(enveloped);
+    }
+
     /// Carry the Codex native-tool inversion map (see
     /// `codex_native_inversion`); applied to every tool-call event this relay
     /// yields. Empty leaves every event untouched.

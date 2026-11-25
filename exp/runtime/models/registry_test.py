@@ -46,6 +46,7 @@ from exp.runtime.models.preflight import CapabilityRequirement, ModelCapabilityE
 from exp.runtime.models.providers import async_transport
 from exp.runtime.models.providers.anthropic import AnthropicClient
 from exp.runtime.models.providers.anthropic_subscription import AnthropicSubscriptionClient
+from exp.runtime.models.providers.antigravity_subscription import AntigravitySubscriptionClient
 from exp.runtime.models.providers.async_transport import (
     HttpxAsyncJsonTransport,
     ScriptedAsyncJsonTransport,
@@ -1134,6 +1135,59 @@ def test_claude_plan_connection_needs_the_operator_app_and_then_signs_each_dispa
     )
     assert steered["tool_choice"] == {"type": "auto", "disable_parallel_tool_use": True}
     assert built == ["claude-plan:anthropic"]
+
+
+def test_antigravity_plan_connection_resolves_to_the_code_assist_client() -> None:
+    """An Antigravity alias resolves to the Code Assist client on the lane's own model id."""
+    plan = ConnectionConfig(
+        provider="gemini",
+        subscription="antigravity",
+        code_assist_project="proud-sprite-a1b2",
+        code_assist_user_agent="platform-ua/1",
+    )
+    catalog = ModelCatalog(
+        connections={"ag-plan": plan},
+        models={
+            "flash": ModelRecord(
+                connection="ag-plan",
+                model="gemini-3-flash-high",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=_DEFAULT_CAPABILITIES,
+            )
+        },
+        roles=ModelRoles(candidates=("flash",), incumbent="flash"),
+    )
+    tokens = StoredOAuthTokens(access_token="injected", refresh_token="r", expires_at_ms=1)
+
+    class _Source:
+        """An embedder-supplied token source."""
+
+        connection_id = "ag-plan"
+
+        def current(self) -> StoredOAuthTokens:
+            """Return the injected sign-in."""
+            return tokens
+
+    def factory(*, connection_id: str, connection: ConnectionConfig) -> _Source:
+        """Return the embedder source."""
+        del connection_id, connection
+        return _Source()
+
+    resolved = RuntimeModelCatalog(
+        catalog,
+        environment={},
+        transport_factory=lambda: ScriptedJsonTransport([]),
+        subscription_token_source_factory=factory,
+    ).resolve("flash")
+    assert isinstance(resolved.client, AntigravitySubscriptionClient)
+    profile = resolved.client.gateway_wire_profile()
+    assert profile.code_assist_envelope is not None
+    assert profile.code_assist_envelope.model == "gemini-3-flash-high"
+    assert profile.code_assist_envelope.project == "proud-sprite-a1b2"
+    assert profile.headers["User-Agent"] == "platform-ua/1"
+    assert resolved.client.sign_gateway_dispatch(url=profile.url, body="{}") == {
+        "Authorization": "Bearer injected"
+    }
 
 
 @pytest.mark.parametrize("card", [None, GatewayTokenPrices()])

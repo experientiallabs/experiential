@@ -38,6 +38,7 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         throttle_redial: None,
         failover_only_on: None,
         zdr_constrained: false,
+        code_assist_envelope: false,
         capture_logprobs: false,
         rung_family: None,
     }

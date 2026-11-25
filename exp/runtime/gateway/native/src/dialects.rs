@@ -260,6 +260,13 @@ impl Normalizer {
             written.filter(|_| self.dialect == Dialect::GeminiGenerateContent);
     }
 
+    /// Read each frame's Gemini response from the Cloud Code Assist
+    /// envelope's top-level `response` object (an Antigravity plan rung).
+    /// Only a Gemini normalizer honours it.
+    pub fn set_code_assist_envelope(&mut self, enveloped: bool) {
+        self.code_assist_envelope = enveloped && self.dialect == Dialect::GeminiGenerateContent;
+    }
+
     /// Whether the latest normalized meter replaces earlier ones instead of
     /// merging by maximum. OpenAI accumulators already coalesce raw reports;
     /// normalized counts can decrease when reasoning evidence becomes decisive
@@ -510,6 +517,8 @@ pub struct Normalizer {
     // Tokens this attempt's own automatic Google cache create wrote; reported
     // cache reads up to this count settle as writes read back in the same call.
     gemini_cache_writes: Option<u64>,
+    // Frames arrive nested in the Cloud Code Assist envelope (`response`).
+    code_assist_envelope: bool,
     // Fireworks-only route identity authorizing reasoning_content capture.
     reasoning_content_route_sha256: Option<String>,
     // Caller-known label words (the dispatched model id) exempt from the
@@ -592,6 +601,7 @@ impl Normalizer {
             gemini_tool_index: 0,
             gemini: gemini::StreamState::default(),
             gemini_cache_writes: None,
+            code_assist_envelope: false,
             reasoning_content_route_sha256,
             request_words: Vec::new(),
             deferred_tool_failure: None,
@@ -788,7 +798,16 @@ impl Normalizer {
 /// Shared by the parity-fixture entry point and the golden-fixture tests so
 /// exactly one drive loop mirrors the server.
 pub fn drain_stream_fixture(dialect: Dialect, chunks: &[Vec<u8>]) -> (Vec<Value>, Option<Failure>) {
-    let mut normalizer = Normalizer::new(dialect);
+    drain_stream_fixture_with(Normalizer::new(dialect), dialect, chunks)
+}
+
+/// [`drain_stream_fixture`] through a caller-configured normalizer (a rung
+/// flag such as the Code Assist envelope set on it first).
+pub(crate) fn drain_stream_fixture_with(
+    mut normalizer: Normalizer,
+    dialect: Dialect,
+    chunks: &[Vec<u8>],
+) -> (Vec<Value>, Option<Failure>) {
     let mut decoder = FrameDecoder::new(dialect);
     let mut simplified = Vec::new();
     for chunk in chunks {

@@ -29,20 +29,19 @@ from exp.common.models import (
 from exp.common.models.catalog_prices import GatewayTokenPrices
 from exp.runtime.models.credentials import (
     DispatchCredentialReceipt,
-    connection_credential_binding,
     read_connection_api_key,
     read_connection_credential,
+)
+from exp.runtime.models.plan_clients import (
+    PlanClientSettings,
+    PlanConnectionError,
+    plan_client,
 )
 from exp.runtime.models.preflight import CapabilityRequirement, preflight_capabilities
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.anthropic import ANTHROPIC_BASE_URL, AnthropicClient
-from exp.runtime.models.providers.anthropic_subscription import (
-    AnthropicOAuthApp,
-    AnthropicSubscriptionClient,
-    anthropic_oauth_app_from_environment,
-    anthropic_re_sign_in_hint,
-    anthropic_refresher,
-)
+from exp.runtime.models.providers.anthropic_subscription import AnthropicOAuthApp
+from exp.runtime.models.providers.antigravity_subscription import AntigravityOAuthApp
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
     HttpxAsyncJsonTransport,
@@ -61,11 +60,6 @@ from exp.runtime.models.providers.bedrock import (
     BedrockRuntimeFactory,
     BoundedBedrockClient,
 )
-from exp.runtime.models.providers.chatgpt_subscription import (
-    ChatGptSubscriptionClient,
-    chatgpt_re_sign_in_hint,
-    chatgpt_refresher,
-)
 from exp.runtime.models.providers.elevenlabs import ElevenLabsClient
 from exp.runtime.models.providers.elevenlabs_audio import ELEVENLABS_BASE_URL
 from exp.runtime.models.providers.gemini import GEMINI_BASE_URL, GeminiClient
@@ -75,11 +69,7 @@ from exp.runtime.models.providers.openai_compatible import (
     OpenAICompatibleClient,
     OpenRouterClient,
 )
-from exp.runtime.models.providers.subscription_tokens import (
-    StoredSubscriptionTokenSource,
-    SubscriptionTokenSource,
-    SubscriptionTokenSourceFactory,
-)
+from exp.runtime.models.providers.subscription_tokens import SubscriptionTokenSourceFactory
 from exp.runtime.models.providers.tinker_sampling import (
     TinkerOptionalDependencyError,
     TinkerSampler,
@@ -193,6 +183,7 @@ class RuntimeModelCatalog:
         auth_store: ProviderAuthStore | None = None,
         subscription_token_source_factory: SubscriptionTokenSourceFactory | None = None,
         anthropic_oauth_app: AnthropicOAuthApp | None = None,
+        antigravity_oauth_app: AntigravityOAuthApp | None = None,
     ) -> None:
         """Create a local resolver without importing SDK registries or contacting providers.
 
@@ -206,6 +197,9 @@ class RuntimeModelCatalog:
                 embedder supplies one backed by its own secret store.
             anthropic_oauth_app: The OAuth app Anthropic issued to this operator for Claude
                 plan sign-in. Omit it to read ``EXP_ANTHROPIC_OAUTH_*`` from ``environment``.
+            antigravity_oauth_app: The OAuth client Antigravity sign-ins in ``auth_store`` are
+                refreshed through. Omit it to read ``EXP_ANTIGRAVITY_OAUTH_*`` from
+                ``environment``; unused when ``subscription_token_source_factory`` is given.
             transport_factory: Explicit transport construction for HTTP-backed providers.
             http_timeout_seconds: Finite positive request-timeout floor for HTTP completion
                 and embedding clients, including injected transport work. Completions retain
@@ -235,9 +229,14 @@ class RuntimeModelCatalog:
         self._tinker_sampler_factory = tinker_sampler_factory
         self._bedrock_runtime_factory = bedrock_runtime_factory
         self._vertex_token_provider_factory = vertex_token_provider_factory
-        self._auth_store = auth_store
-        self._subscription_token_source_factory = subscription_token_source_factory
-        self._anthropic_oauth_app = anthropic_oauth_app
+        self._plan_settings = PlanClientSettings(
+            environment=self._environment,
+            http_timeout_seconds=http_timeout_seconds,
+            auth_store=auth_store,
+            token_source_factory=subscription_token_source_factory,
+            anthropic_oauth_app=anthropic_oauth_app,
+            antigravity_oauth_app=antigravity_oauth_app,
+        )
 
     def requires_model_chain_authority(self, *, pool_id: str) -> bool:
         """Classify the selected authored root through exact normalized pool/model membership."""
@@ -761,45 +760,6 @@ class RuntimeModelCatalog:
             return transport.for_route(ProviderRoute(provider=provider, alias=alias))
         return transport
 
-    def _anthropic_app(self) -> AnthropicOAuthApp:
-        """Return the operator's Anthropic OAuth app.
-
-        Raises:
-            ModelConnectionError: No app is configured.
-        """
-        app = self._anthropic_oauth_app or anthropic_oauth_app_from_environment(self._environment)
-        if app is None:
-            raise ModelConnectionError(
-                "Claude plan connections need the OAuth app Anthropic issued to this operator; "
-                "set EXP_ANTHROPIC_OAUTH_CLIENT_ID and EXP_ANTHROPIC_OAUTH_REDIRECT_URI"
-            )
-        return app
-
-    def _subscription_tokens(
-        self, connection_id: str, connection: ConnectionConfig
-    ) -> SubscriptionTokenSource:
-        """Build the bearer source for one plan connection."""
-        if self._subscription_token_source_factory is not None:
-            return self._subscription_token_source_factory(
-                connection_id=connection_id, connection=connection
-            )
-        match connection.subscription:
-            case "chatgpt":
-                refresher = chatgpt_refresher()
-                hint = chatgpt_re_sign_in_hint(connection_id)
-            case "anthropic":
-                refresher = anthropic_refresher(self._anthropic_app())
-                hint = anthropic_re_sign_in_hint(connection_id)
-            case None:
-                raise ModelConnectionError(f"connection {connection_id!r} is not a plan sign-in")
-        return StoredSubscriptionTokenSource(
-            store=self._auth_store if self._auth_store is not None else ProviderAuthStore(),
-            connection_id=connection_id,
-            binding=connection_credential_binding(connection),
-            refresher=refresher,
-            re_sign_in_hint=hint,
-        )
-
     def _resolve_subscription(
         self,
         alias: str,
@@ -810,37 +770,17 @@ class RuntimeModelCatalog:
         served_model_id: str | None,
     ) -> ResolvedModel:
         """Resolve one alias on a plan connection to its per-dispatch-bearer client."""
-        tokens = self._subscription_tokens(connection_id, connection)
-        client: ChatGptSubscriptionClient | AnthropicSubscriptionClient
-        match connection.subscription:
-            case "chatgpt":
-                client = ChatGptSubscriptionClient(
-                    model=snapshot,
-                    tokens=tokens,
-                    transport=self._bound_transport(connection.provider, alias),
-                    timeout_seconds=self._http_timeout_seconds,
-                    supports_temperature=capabilities.supports_temperature,
-                    supports_top_p=_supports_top_p(capabilities),
-                    supports_reasoning=capabilities.supports_reasoning,
-                    reasoning_effort=capabilities.reasoning_effort,
-                    sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
-                )
-            case "anthropic":
-                client = AnthropicSubscriptionClient(
-                    model=snapshot,
-                    tokens=tokens,
-                    app=self._anthropic_app(),
-                    transport=self._bound_transport(connection.provider, alias),
-                    timeout_seconds=self._http_timeout_seconds,
-                    supports_temperature=capabilities.supports_temperature,
-                    supports_top_p=_supports_top_p(capabilities),
-                    supports_top_k=_supports_flag(capabilities, "supports_top_k"),
-                    supports_reasoning=capabilities.supports_reasoning,
-                    reasoning_effort=capabilities.reasoning_effort,
-                    supports_forced_tool_choice=capabilities.supports_forced_tool_choice,
-                )
-            case None:
-                raise ModelConnectionError(f"connection {connection_id!r} is not a plan sign-in")
+        try:
+            client = plan_client(
+                self._plan_settings,
+                connection_id=connection_id,
+                connection=connection,
+                snapshot=snapshot,
+                capabilities=capabilities,
+                transport=self._bound_transport(connection.provider, alias),
+            )
+        except PlanConnectionError as exc:
+            raise ModelConnectionError(str(exc)) from exc
         return ResolvedModel(
             alias, snapshot, capabilities, client, None, served_model_id=served_model_id
         )

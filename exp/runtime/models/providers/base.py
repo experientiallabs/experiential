@@ -44,6 +44,7 @@ from exp.runtime.models.providers.attempt_timeouts import (
 from exp.runtime.models.providers.attempt_timeouts import (
     completion_timeout_seconds as completion_timeout_seconds,
 )
+from exp.runtime.models.providers.code_assist_envelope import CodeAssistEnvelope
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderRetryableResponseError,
@@ -379,6 +380,13 @@ class GatewayWireProfile:
     first system block is that header, whatever the caller's prompt. API-key and host rungs
     never set it, so their payloads are untouched."""
 
+    code_assist_envelope: CodeAssistEnvelope | None = None
+    """Set only by an Antigravity plan connection: this ``gemini_generate_content`` rung's
+    Gemini body is nested in the Cloud Code Assist envelope carrying this project and plan
+    model id (``code_assist_envelope``), and its streamed answers arrive nested under
+    ``response``. Requires ``signs_request_body``: the per-dispatch bearer rides the frozen
+    envelope."""
+
     embeddings_url: str | None = None
     """Full OpenAI-wire ``/embeddings`` endpoint for this connection, sharing
     ``headers``; ``None`` when the connection speaks no embeddings wire, so the
@@ -462,6 +470,10 @@ class GatewayWireProfile:
             "gemini_thinking",
         }:
             raise ValueError("gateway reasoning wire format is not implemented")
+        if self.code_assist_envelope is not None and (
+            self.dialect != "gemini_generate_content" or not self.signs_request_body
+        ):
+            raise ValueError("a Code Assist envelope needs a body-signing Gemini wire")
         if self.supports_reasoning and self.reasoning_wire_format == "none":
             raise ValueError("reasoning support requires a concrete wire format")
         if self.reasoning_effort is not None and not self.supports_reasoning:

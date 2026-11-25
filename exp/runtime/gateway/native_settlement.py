@@ -206,7 +206,16 @@ def failure_from_boundary_payload(payload: object) -> GatewayFailure | None:
         ),
         provider_content_filter=data.get("provider_content_filter") is True,
         malformed_tool_call=data.get("malformed_tool_call") is True,
+        provider_account_suspended=data.get("provider_account_suspended") is True,
+        provider_appeal_url=_appeal_url(data.get("provider_appeal_url")),
     )
+
+
+def _appeal_url(value: object) -> str | None:
+    """Keep a boundary appeal URL only when it is a bounded https URL."""
+    if isinstance(value, str) and value.startswith("https://") and len(value) <= 200:
+        return value
+    return None
 
 
 def header_timeout_from_payload(value: object) -> GatewayHeaderTimeout | None:
@@ -428,6 +437,8 @@ def terminal_from_settlement(
             tenant_origin=failure_payload.get("tenant_origin") is True,
             provider_content_filter=failure_payload.get("provider_content_filter") is True,
             malformed_tool_call=failure_payload.get("malformed_tool_call") is True,
+            provider_account_suspended=failure_payload.get("provider_account_suspended") is True,
+            provider_appeal_url=_appeal_url(failure_payload.get("provider_appeal_url")),
         )
         if (
             failure.failure_class == GatewayFailureClass.THROTTLED

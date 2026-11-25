@@ -320,16 +320,16 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         throttle_redial: None,
         failover_only_on: None,
         zdr_constrained: false,
+        code_assist_envelope: false,
         capture_logprobs: false,
         rung_family: None,
     }
 }
 
-/// One native Responses rung whose replayed input carries these reasoning
-/// payloads (sealed elsewhere, as far as the scripted rung is concerned)
-/// beside the caller's visible turns. Every test names its own payloads: the
-/// per-worker repair memory is process-global, so a payload one test's
-/// refusal remembers would be stripped proactively in another.
+/// One native Responses rung whose replayed input carries these reasoning payloads (sealed
+/// elsewhere, as far as the scripted rung is concerned) beside the caller's visible turns.
+/// Every test names its own payloads: the per-worker repair memory is process-global, so a
+/// payload one test's refusal remembers would be stripped proactively in another.
 pub(super) fn responses_wire(deployment_id: &str, url: &str, encrypted: &[&str]) -> DeploymentWire {
     // The Codex shape: the call replays with the provider id of its turn.
     let mut input = vec![
