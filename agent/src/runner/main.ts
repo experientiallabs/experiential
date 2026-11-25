@@ -3,11 +3,12 @@
  * root:
  *
  *   AGENT_GATEWAY_KEY=xpl_... [AGENT_CALLBACK_TOKEN=...] node runner.mjs <runId>
- *     [--session-dir DIR] [--work-dir DIR] [--user NAME]
+ *     [--session-dir DIR] [--work-dir DIR] [--user NAME] [--platform-tools]
  *
  * The secrets are read once and deleted from this process's environment. When the runner is
  * root, the model's commands run as the unprivileged account (default `user`) with a minimal
- * environment of their own.
+ * environment of their own. `--platform-tools` gives the model the read-only Experiential platform
+ * tools for the run's key; they are off by default (see RunnerOptions.platformTools).
  */
 
 import { applyCliEnvironment } from "../cli/environment.js";
@@ -22,21 +23,23 @@ interface RunnerArgs {
   sessionDir: string;
   workDir: string;
   user: string;
+  platformTools: boolean;
 }
 
 /** Parse the runner's arguments, or return a usage error. */
 export function parseRunnerArgs(argv: string[]): RunnerArgs | string {
-  const args: RunnerArgs = { runId: "", sessionDir: SESSION_DIR, workDir: WORK_DIR, user: "user" };
+  const args: RunnerArgs = { runId: "", sessionDir: SESSION_DIR, workDir: WORK_DIR, user: "user", platformTools: false };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]!;
     const value = argv[index + 1];
     if (arg === "--session-dir" && value !== undefined) ((args.sessionDir = value), (index += 1));
     else if (arg === "--work-dir" && value !== undefined) ((args.workDir = value), (index += 1));
     else if (arg === "--user" && value !== undefined) ((args.user = value), (index += 1));
+    else if (arg === "--platform-tools") args.platformTools = true;
     else if (args.runId === "" && !arg.startsWith("-")) args.runId = arg;
     else return `unexpected argument: ${arg}`;
   }
-  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(args.runId)) return "usage: runner.mjs <runId> [--session-dir DIR] [--work-dir DIR] [--user NAME]";
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(args.runId)) return "usage: runner.mjs <runId> [--session-dir DIR] [--work-dir DIR] [--user NAME] [--platform-tools]";
   return args;
 }
 
@@ -69,7 +72,7 @@ export async function main(): Promise<void> {
   // The model's tools run as the account and cannot read the private session directory, so the
   // skills live in a root-owned, world-readable place.
   const skillsRoot = account ? SHARED_SKILLS_ROOT : undefined;
-  const status = await runOnce({ sessionDir: parsed.sessionDir, workDir: parsed.workDir, runId: parsed.runId, apiKey, callbackToken, account, skillsRoot });
+  const status = await runOnce({ sessionDir: parsed.sessionDir, workDir: parsed.workDir, runId: parsed.runId, apiKey, callbackToken, account, skillsRoot, platformTools: parsed.platformTools });
   process.exit(status === "error" ? 1 : 0);
 }
 

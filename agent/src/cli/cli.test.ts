@@ -71,6 +71,17 @@ describe("exp-code CLI", () => {
     expect(existsSync(join(home, ".pi"))).toBe(false);
   });
 
+  it("gives a hosted session the Experiential platform tools unless EXP_CODE_PLATFORM_TOOLS=0", async () => {
+    const names = () => ((gateway.completions().at(-1)!.tools as { function: { name: string } }[]) ?? []).map((tool) => tool.function.name);
+    const hostedEnv = { EXP_API_KEY: "xpl_test", EXP_CODE_BASE_URL: gateway.baseUrl, EXP_CODE_MODEL: "fake-model" };
+    gateway.script([{ text: "on" }]);
+    expect((await runCli(["-p", "hi"], hostedEnv)).stdout.trim()).toBe("on");
+    expect(names()).toEqual(expect.arrayContaining(["experiential_search_requests", "experiential_get_request", "experiential_usage", "experiential_models", "experiential_evals"]));
+    gateway.script([{ text: "off" }]);
+    expect((await runCli(["-p", "hi"], { ...hostedEnv, EXP_CODE_PLATFORM_TOOLS: "0" })).stdout.trim()).toBe("off");
+    expect(names().filter((name) => name.startsWith("experiential_"))).toEqual([]);
+  });
+
   it("emits Pi's JSON event stream in --mode json", async () => {
     gateway.script([{ text: "json mode" }]);
     const result = await runCli(["--mode", "json", "hi"], { EXP_GATEWAY_KEY: "local-key", EXP_CODE_BASE_URL: gateway.baseUrl });

@@ -13,6 +13,7 @@ import { parseAuthCommand, runAuthCommand, runLoginInTerminal } from "../auth/lo
 import { createExpCodeExtension, createIdentityExtension } from "../extension/index.js";
 import { type GatewayResolution, resolveGateway } from "../gateway/config.js";
 import { fetchGatewayModels, parseWireApi } from "../gateway/models.js";
+import { platformToolsEnabled } from "../platform/index.js";
 import { EXP_CODE_VERSION } from "../version.js";
 import { createBrandingExtension, rebrandHelp } from "./branding.js";
 import { expCodeHome } from "./environment.js";
@@ -28,7 +29,8 @@ Models come from the Experiential gateway. \`exp-code login\` signs in through y
 saves a key (\`exp-code login --status\` shows it, \`exp-code logout\` forgets it); EXP_API_KEY (hosted)
 or EXP_GATEWAY_KEY (a local \`exp\` gateway) in the environment take precedence. EXP_CODE_MODEL picks the default model
 (otherwise experiential-large-model when the gateway lists it), EXP_CODE_WIRE (completions, responses, messages) forces the wire API, and EXP_CODE_HOME moves the
-configuration directory (default ~/.exp-code). Documentation: ${DOCS_URL}
+configuration directory (default ~/.exp-code), and EXP_CODE_PLATFORM_TOOLS=0 turns off the tools that read
+your organization's Experiential data (request log, usage, models, evals). Documentation: ${DOCS_URL}
 `;
 
 /** Run the CLI with the given arguments (without the node and script paths). */
@@ -89,6 +91,7 @@ export async function runCli(args: string[], env: NodeJS.ProcessEnv = process.en
           factory: createExpCodeExtension({
             gateway: resolution.config,
             gatewayProblem: resolution.problem,
+            platformTools: platformToolsEnabled(env),
             provider: { cacheDir, wire, onListingError: (error) => console.error(`exp-code: ${error.message}`) }
           })
         },

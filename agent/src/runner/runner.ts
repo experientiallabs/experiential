@@ -36,6 +36,7 @@ import { normalizeTodos } from "../extension/todo.js";
 import { createWebFetchTool } from "../extension/web-fetch.js";
 import { createWebSearchTool } from "../extension/web-search.js";
 import { GATEWAY_PROVIDER_ID, type GatewayConfig, trimBaseUrl } from "../gateway/config.js";
+import { platformOrigin, tracesSkillDir } from "../platform/index.js";
 import { DEFAULT_MAX_TOKENS, fetchGatewayModels, type ListedModel } from "../gateway/models.js";
 import { gatewayProviderConfig, gatewayProviderModels, messageBilling } from "../gateway/provider.js";
 import { conversationTraceHeaders } from "../gateway/trace.js";
@@ -78,7 +79,15 @@ export interface RunnerOptions {
    * as (the private session directory is not); defaults to the session's agent directory.
    */
   skillsRoot?: string;
-  /** fetch for the callback, push, and web search (model calls use Pi's own HTTP client). */
+  /**
+   * Give the model the read-only Experiential platform tools (the organization's request log,
+   * usage, models and evals) for the run's key. Off by default: a run reads untrusted pages and
+   * files, and with these tools a prompt injection there could read the organization's stored
+   * prompts and leak them through another tool. Enable only for a sandbox whose key and network
+   * make that acceptable.
+   */
+  platformTools?: boolean;
+  /** fetch for the callback, push, web search and the platform tools (model calls use Pi's own HTTP client). */
   fetch?: typeof globalThis.fetch;
   /** Clock, for tests. */
   now?: () => number;
@@ -255,7 +264,11 @@ export async function runOnce(options: RunnerOptions): Promise<RunEndStatus> {
     noExtensions: true,
     noPromptTemplates: true,
     noThemes: true,
-    additionalSkillPaths: [resolveSkillsDir(options.skillsRoot ?? agentDir)],
+    additionalSkillPaths: [
+      resolveSkillsDir(options.skillsRoot ?? agentDir),
+      // The traces skill describes the platform tools, so it ships only with them.
+      ...(options.platformTools === true && platformOrigin(gateway) !== undefined ? [tracesSkillDir(options.skillsRoot ?? agentDir)] : [])
+    ],
     extensionFactories: [
       {
         name: "exp-code",
@@ -264,6 +277,7 @@ export async function runOnce(options: RunnerOptions): Promise<RunEndStatus> {
           shell: options.account ? sandboxBashOperations(options.account) : undefined,
           searchModel: spec.model,
           skillsRoot: options.skillsRoot ?? agentDir,
+          platformTools: options.platformTools === true,
           provider: {
             fetch: options.fetch,
             wire: "openai-completions",

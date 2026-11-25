@@ -8,12 +8,14 @@ describe("runner arguments", () => {
       runId: "11111111-2222-3333-4444-555555555555",
       sessionDir: SESSION_DIR,
       workDir: WORK_DIR,
-      user: "user"
+      user: "user",
+      platformTools: false
     });
   });
 
   it("accepts overrides and refuses bad run ids", () => {
-    expect(parseRunnerArgs(["run-1", "--session-dir", "/s", "--work-dir", "/w", "--user", "agent"])).toEqual({ runId: "run-1", sessionDir: "/s", workDir: "/w", user: "agent" });
+    expect(parseRunnerArgs(["run-1", "--session-dir", "/s", "--work-dir", "/w", "--user", "agent"])).toEqual({ runId: "run-1", sessionDir: "/s", workDir: "/w", user: "agent", platformTools: false });
+    expect(parseRunnerArgs(["run-1", "--platform-tools"])).toMatchObject({ runId: "run-1", platformTools: true });
     expect(typeof parseRunnerArgs([])).toBe("string");
     expect(typeof parseRunnerArgs(["../etc"])).toBe("string");
     expect(typeof parseRunnerArgs(["a", "b"])).toBe("string");
