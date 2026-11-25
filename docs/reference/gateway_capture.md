@@ -237,7 +237,10 @@ calls, metrics, Gemini parts and their source) and the `provider_logprobs` and
 for a request whose response it may not keep; `wire_request` lies inside
 `transport`). A destination identifies and frames a record without
 decoding it, and `CaptureRecordFacts.planned` applies a plan as a byte splice
-whose result equals the decoded rewrite. Spans cost a position read per wrapped
+whose result equals the decoded rewrite. Keeping the prompt out removes the
+conversation and every verbatim copy of the request but keeps the effective
+configuration (model, parameters, tool declarations, metadata); a destination
+that may not keep that either stores no record, as the collector does itself. Spans cost a position read per wrapped
 value during the one encoding the record needs anyway. A split skeleton carries
 no spans, and its response flags are read from the skeleton as delivered, so a
 spilled stream cut on the way to disk reports `truncated`. A facts document over 16 KiB refuses its
