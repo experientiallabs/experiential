@@ -344,12 +344,21 @@ fn a_completion_reference_matches_its_update_encoding_and_has_no_prompt_spans() 
 fn the_record_bound_and_record_validity_still_apply() {
     let record = record(contexts()[0].clone(), Some(sse()), None);
     let plain = record.encode(1 << 20).unwrap();
-    assert!(encode_with_facts(&record, plain.len() - 1, false).is_none());
-    assert!(encode_with_facts(&record, plain.len(), false).is_some());
+    assert_eq!(
+        encode_with_facts(&record, plain.len() - 1, false).unwrap_err(),
+        Unencodable::Record
+    );
+    assert!(encode_with_facts(&record, plain.len(), false).is_ok());
     let mut oversized = record.clone();
     oversized.deployment_id = Some("d".repeat(MAXIMUM_FACTS_BYTES));
-    assert!(encode_with_facts(&oversized, 1 << 20, false).is_none());
+    assert_eq!(
+        encode_with_facts(&oversized, 1 << 20, false).unwrap_err(),
+        Unencodable::Facts
+    );
     let mut invalid = record;
     invalid.request.request_id = " ".into();
-    assert!(encode_with_facts(&invalid, 1 << 20, false).is_none());
+    assert_eq!(
+        encode_with_facts(&invalid, 1 << 20, false).unwrap_err(),
+        Unencodable::Facts
+    );
 }

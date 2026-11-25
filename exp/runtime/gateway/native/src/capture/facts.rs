@@ -430,9 +430,9 @@ pub(crate) fn encode_with_facts(
     record: &Record,
     maximum_bytes: usize,
     completion_references: bool,
-) -> Option<(String, Vec<u8>)> {
+) -> Result<(String, Vec<u8>), Unencodable> {
     if !record.valid() {
-        return None;
+        return Err(Unencodable::Facts);
     }
     let completion = completion_references && record.checkpointed && record.response.is_some();
     let probe = Probe::default();
@@ -444,7 +444,8 @@ pub(crate) fn encode_with_facts(
         },
         maximum_bytes,
         Some(&probe.position),
-    )?;
+    )
+    .ok_or(Unencodable::Record)?;
     let spans = probe.finish(encoded.as_bytes());
     let schema_version = if completion { 2 } else { record.schema_version };
     let facts = facts(
@@ -454,8 +455,20 @@ pub(crate) fn encode_with_facts(
         false,
         encoded.len(),
         Some(spans),
-    )?;
-    Some((encoded, facts))
+    )
+    .ok_or(Unencodable::Facts)?;
+    Ok((encoded, facts))
+}
+
+/// Why `encode_with_facts` refused a record. Only an oversized record may be
+/// handed over split instead; an invalid record or oversized facts (whose
+/// identities would not fit a split record's facts either) are refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unencodable {
+    /// The record exceeds the encoded-record bound.
+    Record,
+    /// The record is invalid, or its facts exceed `MAXIMUM_FACTS_BYTES`.
+    Facts,
 }
 
 /// Facts for a split record's skeleton; spans are not computed over a skeleton.

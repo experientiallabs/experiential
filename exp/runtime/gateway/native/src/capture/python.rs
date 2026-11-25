@@ -206,11 +206,13 @@ impl Sink for PythonBatchSink {
                 maximum_bytes,
                 self.completion_references,
             ) {
-                Some((encoded, facts)) => Self::prepare_with_facts(&encoded, &facts),
-                None => match &self.spill {
+                Ok((encoded, facts)) => Self::prepare_with_facts(&encoded, &facts),
+                // Too large for one in-memory record: keep it whole as a split record.
+                Err(super::facts::Unencodable::Record) => match &self.spill {
                     Some(store) => self.prepare_split(record, store, maximum_bytes),
                     None => Err(()),
                 },
+                Err(super::facts::Unencodable::Facts) => Err(()),
             };
         }
         let encoded = if self.completion_references {
