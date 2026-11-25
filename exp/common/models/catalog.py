@@ -69,6 +69,10 @@ from exp.common.models.nano_usd_upgrade import (
     upgrade_legacy_billing_source,
     upgrade_model_catalog_document,
 )
+from exp.common.models.subscription_connection import (
+    SubscriptionKind,
+    require_plan_connection_shape,
+)
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _AZURE_API_VERSION = re.compile(r"^(?:v1|\d{4}-\d{2}-\d{2}(?:-preview)?)$")
@@ -125,22 +129,6 @@ class ModelCatalogError(ValueError):
     """A local model catalog was malformed or named a credential value."""
 
 
-SubscriptionKind = Literal["chatgpt", "anthropic"]
-"""Consumer plan a connection signs in with instead of an API key.
-
-``chatgpt`` is a ChatGPT plan reaching the Codex Responses backend; ``anthropic`` is a Claude
-plan reaching the Messages API through the OAuth application Anthropic issued to the operator.
-The connection stores no credential NAME: the sign-in lives under the connection ID and the
-gateway mints a fresh bearer per dispatch from it.
-"""
-
-SUBSCRIPTION_PROVIDERS: dict[SubscriptionKind, str] = {
-    "chatgpt": "openai",
-    "anthropic": "anthropic",
-}
-"""The one catalog provider each plan kind is a sign-in for."""
-
-
 class ConnectionConfig(ContractModel):
     """Local provider connection metadata, with an optional credential environment name only."""
 
@@ -161,6 +149,11 @@ class ConnectionConfig(ContractModel):
     failure into one opaque error and holds its socket to the tenant destination policy."""
     subscription: SubscriptionKind | None = None
     """Consumer plan sign-in this connection dispatches on, instead of an API key."""
+    code_assist_project: str | None = Field(default=None, max_length=128)
+    """An Antigravity plan's Cloud Code Assist project id, sent on every dispatch."""
+    code_assist_user_agent: str | None = Field(default=None, max_length=512)
+    """An Antigravity plan's full ``User-Agent`` header; ``None`` uses the operator default.
+    The lane's provider model id is the plan's own model id, dispatched verbatim."""
 
     @field_validator("api_key_env", "aws_access_key_id_env")
     @classmethod
@@ -186,6 +179,12 @@ class ConnectionConfig(ContractModel):
 
     @model_validator(mode="after")
     def _require_secret_free_connection_metadata(self) -> ConnectionConfig:
+        require_plan_connection_shape(
+            subscription=self.subscription,
+            provider=self.provider,
+            code_assist_project=self.code_assist_project,
+            code_assist_user_agent=self.code_assist_user_agent,
+        )
         if self.subscription is not None:
             self._require_bare_subscription_connection()
         if self.inference_geo is not None and self.provider != "anthropic":
@@ -305,12 +304,6 @@ class ConnectionConfig(ContractModel):
         """
         if self.subscription is None:
             return
-        expected = SUBSCRIPTION_PROVIDERS[self.subscription]
-        if self.provider != expected:
-            raise ValueError(
-                f"subscription {self.subscription!r} is a sign-in for provider {expected!r}, "
-                f"not {self.provider!r}"
-            )
         if self.api_key_env is not None or self.aws_access_key_id_env is not None:
             raise ValueError(
                 "a subscription connection signs in through the browser and stores no "
@@ -358,6 +351,8 @@ class ConnectionConfig(ContractModel):
             identity["tenant_origin"] = True
         if self.subscription is not None:  # a different backend than the API-key origin
             identity["subscription"] = self.subscription
+        if self.code_assist_project is not None:  # the plan account's quota project
+            identity["code_assist_project"] = self.code_assist_project
         effective_bedrock_auth_mode = self.bedrock_auth_mode
         if (
             self.provider == "bedrock"
@@ -400,6 +395,10 @@ class ConnectionConfig(ContractModel):
             serialized.pop("tenant_origin", None)
         if self.subscription is None:
             serialized.pop("subscription", None)
+        if self.code_assist_project is None:
+            serialized.pop("code_assist_project", None)
+        if self.code_assist_user_agent is None:
+            serialized.pop("code_assist_user_agent", None)
         return serialized
 
 

@@ -45,6 +45,7 @@ from exp.runtime.gateway.native_rungs import (
 )
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.code_assist_envelope import CodeAssistEnvelope
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
 from exp.runtime.models.providers.openrouter_routing import OPENROUTER_METADATA_HEADER
 from exp.runtime.models.providers.protocol import NativeWireClient
@@ -1337,3 +1338,54 @@ class _AnthropicKeyClient:
             headers={"x-api-key": "k", "anthropic-version": "2023-06-01"},
             model_id="claude-sonnet-5",
         )
+
+
+class _SigningClient:
+    """An Antigravity-shaped client that signs each dispatch with a bearer."""
+
+    def gateway_wire_profile(self) -> GatewayWireProfile:
+        """Unused: the test passes its profile explicitly."""
+        raise AssertionError("not called")
+
+    def sign_gateway_dispatch(self, *, url: str, body: str) -> dict[str, str]:
+        """Return a fixed bearer."""
+        del url, body
+        return {"Authorization": "Bearer plan"}
+
+
+def test_an_antigravity_rung_freezes_its_gemini_body_in_the_code_assist_envelope() -> None:
+    """The finished Gemini body is nested under ``request`` beside project and plan model."""
+    rung = _deployment("ag-rung", "gemini")
+    route = _route((rung,))
+    profile = GatewayWireProfile(
+        dialect="gemini_generate_content",
+        url="https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse",
+        headers={"User-Agent": "antigravity/hub/test", "content-type": "application/json"},
+        model_id="gemini-3-flash",
+        signs_request_body=True,
+        code_assist_envelope=CodeAssistEnvelope(project="proud-sprite-a1b2", model="g3-flash"),
+    )
+    request = _request().model_copy(update={"provider_session_id": "xpls-conv"})
+    dispatch = build_rung_dispatch(
+        route,
+        rung,
+        profile,
+        _SigningClient(),
+        provider_request=request,
+        public_request=request,
+        authorization=route.snapshot.authorization,
+    )
+    entry = dispatch.wire_entry
+    assert entry["upstream_payload"] is None
+    assert entry["code_assist_envelope"] is True
+    body = json.loads(str(entry["upstream_body"]))
+    assert body["project"] == "proud-sprite-a1b2"
+    assert body["model"] == "g3-flash"
+    assert body["userAgent"] == "antigravity"
+    assert body["requestType"] == "agent"
+    assert body["requestId"].startswith("agent-")
+    assert body["request"]["sessionId"] == "xpls-conv"
+    assert body["request"]["contents"][0]["parts"] == [{"text": "hi"}]
+    assert "safetySettings" not in body["request"]
+    assert dispatch.signer is not None
+    assert dispatch.binding is not None

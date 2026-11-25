@@ -1051,6 +1051,33 @@ def test_terminal_from_settlement_carries_the_provider_content_filter() -> None:
         assert failure.provider_content_filter is expected
 
 
+def test_a_suspended_provider_account_and_its_appeal_reach_the_attempt_row() -> None:
+    """Google's ``TOS_VIOLATION`` verdict settles marked, with the appeal URL kept."""
+    payload: dict[str, object] = {
+        "failure_class": "provider_authentication",
+        "safe_message": "the provider suspended the account behind this connection",
+        "provider_detail": "http 403: TOS_VIOLATION; appeal_url=https://g.co/appeal",
+        "provider_account_suspended": True,
+        "provider_appeal_url": "https://g.co/appeal",
+    }
+    _terminal, failure = terminal_from_settlement(
+        {"outcome": "failed", "usage": None, "tool_names": [], "failure": payload}
+    )
+    assert failure is not None
+    assert failure.provider_account_suspended is True
+    assert failure.provider_appeal_url == "https://g.co/appeal"
+    boundary = failure_from_boundary_payload(payload)
+    assert boundary is not None and boundary.provider_account_suspended is True
+    # A non-https or oversized URL is dropped, and only a literal true marks suspension.
+    for url in ("http://g.co/appeal", "https://" + "a" * 300, 7):
+        parsed = failure_from_boundary_payload(
+            {**payload, "provider_appeal_url": url, "provider_account_suspended": 1}
+        )
+        assert parsed is not None
+        assert parsed.provider_appeal_url is None
+        assert parsed.provider_account_suspended is False
+
+
 def test_boundary_payload_and_settlement_carry_a_malformed_tool_call() -> None:
     """The malformed-tool-call verdict reaches the candidate choice and the attempt row."""
     payload: dict[str, object] = {

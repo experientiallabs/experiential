@@ -66,6 +66,7 @@ unchanged: it uses the AWS credential chain and has no stored API key.
 | OpenAI | `openai` | `api_key_env` (suggested `OPENAI_API_KEY`) | Official OpenAI origin |
 | ChatGPT plan | `openai` with `subscription = "chatgpt"` | Browser sign-in stored under the connection ID; no `api_key_env` | `https://chatgpt.com/backend-api/codex` |
 | Claude plan | `anthropic` with `subscription = "anthropic"` | Sign-in through the operator's Anthropic OAuth app; no `api_key_env` | Official Anthropic origin |
+| Antigravity plan | `gemini` with `subscription = "antigravity"` and `code_assist_project` | Google sign-in supplied by an embedder's token source; no `api_key_env` | `https://daily-cloudcode-pa.googleapis.com` |
 | OpenRouter | `openrouter` | `api_key_env` (suggested `OPENROUTER_API_KEY`) | Official OpenRouter origin |
 | Anthropic | `anthropic` | `api_key_env` (suggested `ANTHROPIC_API_KEY`) | Official Anthropic origin |
 | Gemini | `gemini` | `api_key_env` (suggested `GEMINI_API_KEY`) | Official Gemini origin |
@@ -156,7 +157,7 @@ enters the replay identity of a structured completion plan only once it is decla
 The gateway decides forced tool choice on its own wire path, by its capability-preservation
 policy described under Claude Sonnet 5.5.
 
-## Plan connections (ChatGPT and Claude)
+## Plan connections (ChatGPT, Claude and Antigravity)
 
 A connection may dispatch on a consumer plan instead of an API key: `subscription = "chatgpt"`
 (provider `openai`) or `subscription = "anthropic"` (provider `anthropic`). The connection names
@@ -200,6 +201,42 @@ Responses and Messages callers are served alike; Claude Code's own requests pass
 A plan rung pre-serializes its body for the per-dispatch bearer, so the engine's
 encrypted-reasoning replay repair does not run on it. Plan connections serve the gateway only;
 `exp config providers`, build, and optimize keep using API keys.
+
+### Antigravity plans
+
+`subscription = "antigravity"` (provider `gemini`) dispatches Gemini models on a Google
+Antigravity plan through the consumer Cloud Code Assist backend. The connection carries
+`code_assist_project`, the project id the account's Code Assist onboarding returned (required, and
+part of the connection identity), and optionally `code_assist_user_agent`, the full `User-Agent`
+its dispatches send. The plan names models in its own vocabulary, so a lane's provider model id is
+the plan's id (as an Azure lane's is its deployment name) and is sent verbatim;
+`fetch_antigravity_models(access_token, project)` in
+`exp.runtime.models.providers.antigravity_subscription` lists the account's ids with each model's
+remaining quota fraction and reset time.
+
+The local CLI does not sign Antigravity accounts in: an embedder supplies the bearer through
+`subscription_token_source_factory`. A sign-in stored in the local credential file is refreshed
+through the OAuth client it was issued to, configured with `EXP_ANTIGRAVITY_OAUTH_CLIENT_ID` and
+`EXP_ANTIGRAVITY_OAUTH_CLIENT_SECRET` (optional `_TOKEN_URL`); a revoked sign-in
+(`invalid_grant`) names the re-sign-in. Every dispatch sends the connection's
+`code_assist_user_agent`, else `EXP_ANTIGRAVITY_USER_AGENT`, else a current Antigravity client
+string (the backend gates newer models on the client version).
+
+The rung builds the ordinary Gemini body and nests it in the Code Assist envelope
+(`project`, `model`, `userAgent`, `requestType`, a fresh `requestId`, and `request.sessionId`
+from the gateway's provider session id when one exists). `safetySettings` is dropped; tool
+schemas move from `parametersJsonSchema` to `parameters` with local `$ref` inlined, `const` as a
+one-value `enum`, and `$schema`, `$defs`, `definitions`, `default` and `examples` removed. A tool
+name over 64 characters, containing `/`, or starting with a digit is refused before dispatch
+rather than renamed. A fixed thinking budget at or above `maxOutputTokens` is lowered under it.
+Streamed answers arrive nested under `response`; the data plane reads the inner response and its
+`usageMetadata`. Google's `ErrorInfo` reasons classify the account: `QUOTA_EXHAUSTED` or
+`INSUFFICIENT_G1_CREDITS_BALANCE` under 429 is `provider_quota` with the stated reset as its wait,
+`RATE_LIMIT_EXCEEDED` is a throttle whose wait comes from `RetryInfo` (ledger detail
+`http 429: RATE_LIMIT_EXCEEDED`), and `TOS_VIOLATION` under
+403 is a never-redialed `provider_authentication` failure marked `provider_account_suspended`
+with the appeal URL (`provider_appeal_url`, also in the ledger detail). Only Gemini models are
+served through an Antigravity plan.
 
 ## TypeSafe SystemOne decisions
 

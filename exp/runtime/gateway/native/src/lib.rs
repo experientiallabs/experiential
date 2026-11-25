@@ -30,6 +30,7 @@ mod eventstream;
 mod execution_binding;
 mod execution_context;
 mod first_token_bound;
+mod google_account_verdicts;
 mod guardrails;
 mod image_output;
 mod logprobs;

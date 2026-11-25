@@ -326,6 +326,11 @@ def provider_add(
     with usage_error(ValueError):
         if codex_auth_file is not None and subscription is None:
             raise ValueError("--codex-auth-file requires --subscription chatgpt")
+        if subscription == "antigravity":
+            raise ValueError(
+                "the local CLI does not sign Antigravity accounts in; an embedder connects "
+                "them through RuntimeModelCatalog(subscription_token_source_factory=...)"
+            )
         config = ConnectionConfig(
             provider=provider,
             base_url=base_url,

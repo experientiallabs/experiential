@@ -16,7 +16,7 @@ from exp.runtime.gateway.sqlite.nano_usd_migration import (
     migrate_money_to_nano_usd,
 )
 
-SCHEMA_VERSION = 34
+SCHEMA_VERSION = 35
 
 
 class GatewaySchemaError(RuntimeError):
@@ -821,6 +821,15 @@ _MIGRATIONS: dict[int, tuple[MigrationStep, ...]] = {
         "image_input_rate IS NULL OR image_input_rate >= 0)",
         "ALTER TABLE gateway_attempts ADD COLUMN long_context_image_input_rate INTEGER CHECK ("
         "long_context_image_input_rate IS NULL OR long_context_image_input_rate >= 0)",
+    ),
+    35: (  # the Antigravity plan kind, CHECK-only rewrite
+        "PRAGMA writable_schema = ON",
+        "UPDATE sqlite_master SET sql = replace(sql, "
+        "'''chatgpt'', ''anthropic'')', '''chatgpt'', ''anthropic'', ''antigravity'')') "
+        "WHERE type = 'table' AND name = 'provider_connection_revisions'",
+        "PRAGMA writable_schema = RESET",
+        "CREATE TABLE gateway_schema_refresh_v35 (noop INTEGER) STRICT",
+        "DROP TABLE gateway_schema_refresh_v35",
     ),
     24: (  # plan sign-in kind: part of the connection identity digest, so it rides the revision
         "ALTER TABLE provider_connection_revisions ADD COLUMN subscription TEXT "

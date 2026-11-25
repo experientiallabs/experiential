@@ -551,6 +551,12 @@ class GatewayFailure(ContractModel):
             makes the first one per request both failover-eligible and
             redialable; like ``TRANSPORT``, an untried sibling is preferred
             over the redial (``native_execution.next_route_candidate``).
+        provider_account_suspended: A ``PROVIDER_AUTHENTICATION`` failure on which the
+            provider said it SUSPENDED the account behind the rung (Google's
+            ``TOS_VIOLATION``): never redialed, and the host pulls the account instead of
+            waiting for it to recover.
+        provider_appeal_url: Where the suspended account's owner appeals, when the
+            provider said (an https URL of at most 200 characters).
     """
 
     failure_class: GatewayFailureClass
@@ -588,6 +594,8 @@ class GatewayFailure(ContractModel):
     context_window_limit_tokens: int | None = Field(default=None, ge=1)
     provider_content_filter: bool = False
     malformed_tool_call: bool = False
+    provider_account_suspended: bool = False
+    provider_appeal_url: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 def _validate_responses_probability_records(

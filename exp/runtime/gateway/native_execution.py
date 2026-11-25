@@ -953,8 +953,7 @@ def deployment_wire_entry(
         if stage.throttle_redial is None
         else stage.throttle_redial.model_dump(mode="json"),
         "idempotency_key": deployment_operation_key(route, deployment),
-        # First-byte allowance overrides; the data plane falls back to its
-        # serving defaults when a deployment declares nothing.
+        # First-byte allowance overrides; absent ones take the serving defaults.
         "time_to_first_byte_base_seconds": capabilities.time_to_first_byte_base_seconds,
         "time_to_first_byte_seconds_per_million_input_tokens": (
             capabilities.time_to_first_byte_seconds_per_million_input_tokens
@@ -966,6 +965,7 @@ def deployment_wire_entry(
             None if capabilities.failover_only_on is None else list(capabilities.failover_only_on)
         ),
         "zdr_constrained": zdr_constrained,
+        "code_assist_envelope": profile.code_assist_envelope is not None,  # nested answers
         "capture_logprobs": capture_logprobs,
         "rung_family": rung_family_index(route, deployment),  # throttle redial reserve
     }

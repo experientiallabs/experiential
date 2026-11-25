@@ -7,6 +7,9 @@ use serde_json::Value;
 
 use crate::dialects::Dialect;
 use crate::errors::{Failure, FailureClass};
+use crate::google_account_verdicts::{
+    google_account_verdict, google_body_retry_seconds, google_error_info_reason,
+};
 use crate::param_attribution::{
     bounded_masked_line, content_filtered_completion, generic_error_code,
     rejected_by_account_quota, rejected_by_lane_limitation, rejected_by_routing_gate,
@@ -471,6 +474,19 @@ async fn non_success_failure(
         return crate::end_user_block::end_user_block_failure(Some(detail))
             .with_rate_limit_facts(rate_limit.clone(), retry_after);
     }
+    // Google's ErrorInfo reason names the ACCOUNT's state on a Gemini wire:
+    // a spent plan quota, or a suspension (`google_account_verdicts`).
+    if let Some(verdict) = google_account_verdict(dialect, status, body.as_deref()) {
+        let failure = verdict.failure(&status_detail(status));
+        return Failure {
+            rate_limit_headers: rate_limit.map(Box::new),
+            ..failure
+        };
+    }
+    // Google states a throttle's wait in the body (`RetryInfo`) and often
+    // sends no Retry-After header with it.
+    let retry_after = retry_after.or_else(|| google_body_retry_seconds(dialect, body.as_deref()));
+    let failure = failure.with_rate_limit_facts(rate_limit.clone(), retry_after);
     if status == 429 {
         // OpenAI answers an out-of-quota account with 429
         // `insufficient_quota`, the same status as a throttle. A status-
@@ -482,9 +498,12 @@ async fn non_success_failure(
         // window closed, which its headers do not (2026-09-14: 205
         // Novita 429s with 992-999 of 1000 requests remaining and no
         // Retry-After).
-        let code = body
-            .as_deref()
-            .and_then(|body| rejected_code(dialect, body));
+        // On a Gemini wire Google's ErrorInfo reason (`RATE_LIMIT_EXCEEDED`)
+        // names the window more precisely than the shared status token.
+        let code = google_error_info_reason(dialect, body.as_deref()).or_else(|| {
+            body.as_deref()
+                .and_then(|body| rejected_code(dialect, body))
+        });
         let detail = code
             .as_deref()
             .filter(|token| !generic_error_code(token))
