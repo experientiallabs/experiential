@@ -423,13 +423,11 @@ def test_a_public_only_serve_keeps_submit_and_poll_off_a_private_origin(
     monkeypatch.setattr(public_egress.socket, "getaddrinfo", getaddrinfo)
     monkeypatch.setattr(public_egress.httpcore.SyncBackend, "connect_tcp", connect)
     client = VeoVideoClient()
-    with public_egress.serving_policy(True):
-        with pytest.raises(VideoSubmitRejected) as rejected:
-            client.submit(
-                _METADATA, VideoSubmission(request=VideoRequest(prompt="p"), model_id="veo")
-            )
-        with pytest.raises(VideoPollUnavailable):
-            client.poll(_METADATA, "models/veo/operations/op-1")
+    public_egress.require_public_upstreams()
+    with pytest.raises(VideoSubmitRejected) as rejected:
+        client.submit(_METADATA, VideoSubmission(request=VideoRequest(prompt="p"), model_id="veo"))
+    with pytest.raises(VideoPollUnavailable):
+        client.poll(_METADATA, "models/veo/operations/op-1")
     assert rejected.value.failure.failure_class is GatewayFailureClass.TRANSPORT
     assert rejected.value.failure.provider_detail is None
     assert asked == ["metadata.internal.example", "metadata.internal.example"]
@@ -462,7 +460,9 @@ def test_the_job_client_ignores_environment_proxies(
 ) -> None:
     """Under either policy, an ambient proxy never carries a provider job call."""
     monkeypatch.setenv("HTTPS_PROXY", "http://10.0.0.1:3128")
-    with public_egress.serving_policy(public_only), default_http_factory() as client:
+    if public_only:
+        public_egress.require_public_upstreams()
+    with default_http_factory() as client:
         assert client.trust_env is False
         assert client.follow_redirects is False
         assert client._mounts == {}

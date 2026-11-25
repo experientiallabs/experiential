@@ -183,7 +183,7 @@ def test_the_budget_ceiling_override_is_optional_and_validated() -> None:
 def test_host_hands_its_egress_policy_to_python_provider_clients(
     monkeypatch: pytest.MonkeyPatch, public_only: bool
 ) -> None:
-    """The serve flag is the one source: Python provider clients follow it while serving."""
+    """The serve flag turns the Python policy on (never off) before serving and keeps it on."""
     seen: list[bool] = []
 
     def serve(*_args: object) -> None:
@@ -199,4 +199,5 @@ def test_host_hands_its_egress_policy_to_python_provider_clients(
         public_upstreams_only=public_only,
     )
     assert seen == [public_only]
-    assert public_egress.public_upstreams_only() is False
+    # One-way: a poller or an overlapping serve may outlive this call.
+    assert public_egress.public_upstreams_only() is public_only

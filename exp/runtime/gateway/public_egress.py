@@ -14,12 +14,14 @@ connect time:
   verifies, and HTTP still addresses, the original hostname.
 - Environment proxies are ignored and redirects stay off.
 
-``serve_native_gateway`` is the one source of the policy: it applies its own
-``public_upstreams_only`` flag here for as long as it serves
-(:func:`serving_policy`), and :func:`provider_client` reads it on every call,
-so every control plane in the process (execution-bound ones included) holds
-the same rule as the native transport. Outside a serve the policy is off,
-the standalone default that permits local and private servers.
+The policy is one process-wide flag that can only be turned ON
+(:func:`require_public_upstreams`): ``serve_native_gateway`` turns it on from
+its own ``public_upstreams_only``, and a hosted embedder may turn it on earlier,
+before constructing a control plane whose video poller starts at once.
+:func:`provider_client` reads it on every call, so every control plane in the
+process (execution-bound ones included, and pollers that outlive a serve)
+holds the same rule as the native transport. A process that never turns it on
+keeps the standalone default that permits local and private servers.
 
 The address ranges mirror the native policy exactly: private, loopback,
 link-local, shared, reserved, documentation, benchmarking and multicast IPv4
@@ -33,9 +35,9 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+import ssl
 import threading
-from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Iterable, Sequence
 
 import httpcore
 import httpx
@@ -232,7 +234,7 @@ class PublicOnlyTransport(httpx.HTTPTransport):
         """
         super().__init__(trust_env=False)
         self._pool = httpcore.ConnectionPool(
-            ssl_context=httpx.create_ssl_context(trust_env=False),
+            ssl_context=_trust_store(),
             network_backend=PublicOnlyNetworkBackend(resolver=resolver, inner=inner),
         )
 
@@ -270,46 +272,60 @@ def public_only_client(
     )
 
 
+def _trust_store() -> ssl.SSLContext:
+    """TLS verification that honors an operator's ``SSL_CERT_FILE`` / ``SSL_CERT_DIR``.
+
+    ``trust_env=False`` on the clients only keeps environment PROXIES out; the
+    certificate trust an operator configured for a private CA still applies.
+    """
+    return httpx.create_ssl_context(trust_env=True)
+
+
 class _ProcessPolicy:
-    """The process's current public-only flag, owned by the serving host."""
+    """The process's public-only flag: it can be turned on, never back off.
+
+    One-way on purpose. Control planes, their background video pollers and
+    every execution-bound plane in the process read this one flag, and their
+    lifetimes do not nest inside one ``serve_native_gateway`` call: a poller
+    starts at construction and runs until ``close()``, and two serves may
+    overlap. A flag that a finishing scope restored could reopen private egress
+    under a hosted server that is still running, so a hosted process stays
+    public-only until it exits.
+    """
 
     def __init__(self) -> None:
+        """Start permissive, the standalone default."""
         self._lock = threading.Lock()
         self._public_only = False
 
     def get(self) -> bool:
+        """Return the flag under the lock (a plain read of the current value)."""
         with self._lock:
             return self._public_only
 
-    def swap(self, public_only: bool) -> bool:
+    def require(self) -> None:
+        """Turn the flag on for the rest of the process; idempotent, never reversed."""
         with self._lock:
-            previous, self._public_only = self._public_only, public_only
-            return previous
+            self._public_only = True
 
 
 _POLICY = _ProcessPolicy()
 
 
 def public_upstreams_only() -> bool:
-    """Return whether the serving host currently requires public-only egress."""
+    """Return whether this process requires public-only egress for Python provider clients."""
     return _POLICY.get()
 
 
-@contextmanager
-def serving_policy(public_only: bool) -> Iterator[None]:
-    """Apply the native serve flag to Python provider clients while serving.
+def require_public_upstreams() -> None:
+    """Hold every Python provider client in this process to the public-only policy.
 
-    Args:
-        public_only: ``serve_native_gateway``'s ``public_upstreams_only``.
-
-    Yields:
-        Nothing; the previous value is restored when serving returns.
+    Hosted embedders call this before constructing a control plane, so a video
+    poller that starts at construction never runs a permissive client.
+    ``serve_native_gateway(public_upstreams_only=True)`` also calls it. It is
+    never undone: see :class:`_ProcessPolicy`.
     """
-    previous = _POLICY.swap(public_only)
-    try:
-        yield
-    finally:
-        _POLICY.swap(previous)
+    _POLICY.require()
 
 
 def provider_client(*, timeout: httpx.Timeout) -> httpx.Client:
@@ -325,4 +341,9 @@ def provider_client(*, timeout: httpx.Timeout) -> httpx.Client:
     """
     if public_upstreams_only():
         return public_only_client(timeout=timeout)
-    return httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False)
+    return httpx.Client(
+        timeout=timeout,
+        follow_redirects=False,
+        trust_env=False,
+        verify=_trust_store(),
+    )

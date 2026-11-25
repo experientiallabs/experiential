@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import ssl
+import threading
 from collections.abc import Iterable, Sequence
 
 import httpcore
@@ -222,17 +223,50 @@ def test_the_system_resolver_keeps_distinct_answers_in_order(
     ]
 
 
-def test_serving_policy_applies_for_the_serve_and_restores_after() -> None:
-    """The serve flag holds while serving and the standalone default returns afterwards."""
-    assert public_egress.public_upstreams_only() is False
-    with public_egress.serving_policy(True):
-        assert public_egress.public_upstreams_only() is True
-        with public_egress.provider_client(timeout=httpx.Timeout(5.0)) as client:
-            assert isinstance(client._transport, PublicOnlyTransport)
-    assert public_egress.public_upstreams_only() is False
-    with pytest.raises(RuntimeError), public_egress.serving_policy(True):
-        raise RuntimeError("serve failed")
-    assert public_egress.public_upstreams_only() is False
+def test_the_policy_is_one_way_once_required() -> None:
+    """Required once, every later provider client is public-only; nothing turns it back off."""
     with public_egress.provider_client(timeout=httpx.Timeout(5.0)) as client:
         assert not isinstance(client._transport, PublicOnlyTransport)
         assert client.trust_env is False
+    assert public_egress.public_upstreams_only() is False
+    public_egress.require_public_upstreams()
+    public_egress.require_public_upstreams()
+    assert public_egress.public_upstreams_only() is True
+    with public_egress.provider_client(timeout=httpx.Timeout(5.0)) as client:
+        assert isinstance(client._transport, PublicOnlyTransport)
+
+
+def test_a_poller_thread_sees_the_policy_a_later_serve_requires() -> None:
+    """A client built on another thread after the requirement (a video poller) is public-only."""
+    seen: list[bool] = []
+    public_egress.require_public_upstreams()
+
+    def poll() -> None:
+        with public_egress.provider_client(timeout=httpx.Timeout(5.0)) as client:
+            seen.append(isinstance(client._transport, PublicOnlyTransport))
+
+    thread = threading.Thread(target=poll)
+    thread.start()
+    thread.join()
+    assert seen == [True]
+
+
+def test_tls_trust_honors_operator_ca_overrides_but_not_proxies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SSL_CERT_FILE still selects the trust store; proxy variables are still ignored."""
+    calls: list[bool] = []
+    real = httpx.create_ssl_context
+
+    def record(*args: object, trust_env: bool = True, **kwargs: object) -> object:
+        calls.append(trust_env)
+        return real(*args, trust_env=trust_env, **kwargs)
+
+    monkeypatch.setattr(public_egress.httpx, "create_ssl_context", record)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    with public_egress.provider_client(timeout=httpx.Timeout(5.0)) as client:
+        assert client.trust_env is False
+    public_egress.require_public_upstreams()
+    with public_egress.provider_client(timeout=httpx.Timeout(5.0)) as client:
+        assert client.trust_env is False
+    assert calls and all(calls)

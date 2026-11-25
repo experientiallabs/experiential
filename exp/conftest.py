@@ -24,6 +24,18 @@ _SETTLE_SECONDS = 0.3
 
 
 @pytest.fixture(autouse=True)
+def isolate_public_egress_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give each test its own one-way public-egress flag.
+
+    ``require_public_upstreams`` is never undone in a process by design, so a
+    test that serves public-only must not leave the flag on for the next one.
+    """
+    from exp.runtime.gateway import public_egress
+
+    monkeypatch.setattr(public_egress, "_POLICY", public_egress._ProcessPolicy())  # noqa: SLF001
+
+
+@pytest.fixture(autouse=True)
 def isolate_provider_auth_store(
     tmp_path_factory: pytest.TempPathFactory,
     monkeypatch: pytest.MonkeyPatch,
