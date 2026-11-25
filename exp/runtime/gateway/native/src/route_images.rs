@@ -216,7 +216,7 @@ pub(crate) async fn serve_images(
 
     match run_ladder(state, &admission, raw_key, &mut guard, deadline, edit_parts).await {
         Err(error) => error_response(&error),
-        Ok(served) => {
+        Ok(mut served) => {
             if !guard
                 .settle("completed", Some(&served.usage), &[], None, true)
                 .await
@@ -224,7 +224,11 @@ pub(crate) async fn serve_images(
                 // Never hand out images the ledger did not record.
                 return error_response(&guard.settlement_error());
             }
-            let response_headers = served_headers(&admission, served.depth, client_request_id);
+            let mut response_headers = served_headers(&admission, served.depth, client_request_id);
+            if let Some(extensions) = guard.response_extensions() {
+                extensions.extend_media_body(&mut served.body);
+                extensions.extend_headers(&mut response_headers);
+            }
             json_response(StatusCode::OK, &served.body, &response_headers)
         }
     }

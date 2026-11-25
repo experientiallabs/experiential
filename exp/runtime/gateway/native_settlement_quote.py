@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import TYPE_CHECKING
 
 from exp.runtime.gateway.class_throttles import tier_settlement
@@ -14,7 +15,7 @@ from exp.runtime.gateway.native_accounting_errors import (
     accounting_recovering_error,
     authority_error,
 )
-from exp.runtime.gateway.native_components import SettlementPricer
+from exp.runtime.gateway.native_components import ResponseExtensionSource, SettlementPricer
 from exp.runtime.gateway.native_recovery import retain_recovery_observation_time
 from exp.runtime.gateway.native_settlement import (
     settlement_metadata,
@@ -27,6 +28,35 @@ from exp.runtime.gateway.native_settlement import (
 
 if TYPE_CHECKING:
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+    from exp.runtime.gateway.native_components import SyncWriteLedger
+
+logger = logging.getLogger(__name__)
+
+
+def settlement_reply(ledger: SyncWriteLedger, request_id: str, *, finalize: bool) -> str:
+    """Reply to one landed price or settlement, carrying the host's response extensions.
+
+    Only a finalizing call can carry them: its reply is what the data plane
+    awaits before the request's terminal bytes. A ledger that cannot supply
+    extensions, has none for the request, or fails to produce them answers the
+    plain empty reply, so the settlement outcome never depends on them.
+
+    Args:
+        ledger: The durable write ledger that just priced or settled the request.
+        request_id: The finalized request.
+        finalize: Whether the call finalized the request.
+
+    Returns:
+        ``{"response_extensions": ...}`` when the ledger supplied members, else ``{}``.
+    """
+    if not finalize or not isinstance(ledger, ResponseExtensionSource):
+        return "{}"
+    try:
+        extensions = ledger.take_response_extensions(request_id)
+        return "{}" if extensions is None else extensions.reply()
+    except Exception:  # noqa: BLE001 - extensions never change a landed settlement.
+        logger.warning("response extensions unavailable for %s", request_id, exc_info=True)
+        return "{}"
 
 
 def quote_settlement(accounting: NativeAttemptAccounting, argument: str) -> str:
@@ -46,7 +76,7 @@ def quote_settlement(accounting: NativeAttemptAccounting, argument: str) -> str:
         argument: The decided settlement payload the data plane will deliver.
 
     Returns:
-        An empty JSON object once the host priced the settlement.
+        The settlement reply once the host priced it (see :func:`settlement_reply`).
 
     Raises:
         NativeBridgeError: The ledger cannot price settlements, the request is
@@ -89,4 +119,6 @@ def quote_settlement(accounting: NativeAttemptAccounting, argument: str) -> str:
             if entry.pending_settlement is not None:
                 raise NativeBridgeError(accounting_recovering_error())
             entry.pending_settlement = data
-    return "{}"
+    return settlement_reply(
+        ledger, str(data["request_id"]), finalize=bool(data.get("finalize", True))
+    )

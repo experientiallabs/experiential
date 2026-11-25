@@ -311,6 +311,7 @@ async fn messages_wire_drift_response(
 /// bounded withheld refusal output ahead of the failing terminal.
 async fn settled_messages_response(admission: &Admission, settled: SettledAttempt) -> Response {
     let served = settled.served();
+    let extensions = settled.response_extensions;
     let mut events = settled.events;
     let refusal_completed = complete_visible_refusal(&mut events);
     if refusal_completed.is_none() {
@@ -331,23 +332,32 @@ async fn settled_messages_response(admission: &Admission, settled: SettledAttemp
             return messages_error_response(&error);
         }
     }
-    let headers = served_headers(admission, None, served);
+    let mut headers = served_headers(admission, None, served);
+    if let Some(extensions) = &extensions {
+        extensions.extend_headers(&mut headers);
+    }
     // A settled attempt carries no semantic output, so no reasoning was
     // issued and nothing needs sealing; exposure only governs display.
     let exposed = admission.reasoning_output_at(settled.depth);
     if admission.stream {
-        let body = match encode_messages_sse(admission, &events, None, exposed) {
+        let mut body = match encode_messages_sse(admission, &events, None, exposed) {
             Ok(body) => body,
             Err(error) => return messages_error_response(&error),
         };
+        if let Some(extensions) = &extensions {
+            extensions.extend_sse_body(&mut body);
+        }
         return sse_body_response(&headers, body);
     }
-    let aggregated = match completed_messages_body_for(admission, &events, None, exposed) {
+    let mut aggregated = match completed_messages_body_for(admission, &events, None, exposed) {
         Ok(aggregated) => aggregated,
         Err(error) => return messages_error_response(&error),
     };
     if let Some(failure) = &aggregated.failure {
         return messages_error_response(&failure.clone().boundary().public_error());
+    }
+    if let Some(extensions) = &extensions {
+        extensions.extend_body(&mut aggregated.body);
     }
     json_response(StatusCode::OK, &aggregated.body, &headers)
 }
@@ -383,7 +393,7 @@ async fn respond_from_messages_events(
             }
         }
     };
-    let aggregated =
+    let mut aggregated =
         match completed_messages_body_for(&admission, &events, carrier.as_deref(), exposed) {
             Ok(aggregated) => aggregated,
             Err(error) => {
@@ -473,12 +483,19 @@ async fn respond_from_messages_events(
         empty_completion,
         ..served
     };
-    let headers = served_headers(&admission, None, served);
+    let mut headers = served_headers(&admission, None, served);
+    if let Some(extensions) = guard.response_extensions() {
+        extensions.extend_body(&mut aggregated.body);
+        extensions.extend_headers(&mut headers);
+    }
     if stream_body {
-        let body = match encode_messages_sse(&admission, &events, carrier.as_deref(), exposed) {
+        let mut body = match encode_messages_sse(&admission, &events, carrier.as_deref(), exposed) {
             Ok(body) => body,
             Err(error) => return messages_error_response(&error),
         };
+        if let Some(extensions) = guard.response_extensions() {
+            extensions.extend_sse_body(&mut body);
+        }
         return sse_body_response(&headers, body);
     }
     json_response(StatusCode::OK, &aggregated.body, &headers)
@@ -832,7 +849,7 @@ async fn stream_messages(
                 }
             }
             for outward in delivery.pace(outward_events, deadline).await {
-                let encoded = match encoder.feed(&outward) {
+                let mut encoded = match encoder.feed(&outward) {
                     Ok(encoded) => encoded,
                     Err(_) => {
                         if terminal.is_some() {
@@ -848,6 +865,11 @@ async fn stream_messages(
                         ))
                     }
                 };
+                if let (true, Some(extensions)) =
+                    (outward.is_terminal(), guard.response_extensions())
+                {
+                    extensions.extend_frames(&mut encoded);
+                }
                 for data in encoded {
                     if !delivery.send(send_deadline, Bytes::from(data)).await {
                         committed.relay.close_transport();

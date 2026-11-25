@@ -24,6 +24,7 @@ pub(super) async fn settled_responses_response(
     client_request_id: Option<String>,
 ) -> Response {
     let served = settled.served();
+    let extensions = settled.response_extensions;
     let mut events = settled.events;
     let refusal_completed = complete_visible_refusal(&mut events);
     let failed = refusal_completed.is_none() && matches!(events.last(), Some(Event::Failed(_)));
@@ -35,12 +36,19 @@ pub(super) async fn settled_responses_response(
             return error_response(&collection_public_error(&failure.clone().boundary()));
         }
     }
-    let headers = served_headers(admission, client_request_id.as_deref(), served.clone());
+    let mut headers = served_headers(admission, client_request_id.as_deref(), served.clone());
+    if let (false, Some(extensions)) = (failed, &extensions) {
+        extensions.extend_headers(&mut headers);
+    }
     if admission.stream {
-        let body = match encode_responses_sse(admission, served.depth, created_at, &events, None) {
-            Ok(body) => body,
-            Err(error) => return error_response(&error),
-        };
+        let mut body =
+            match encode_responses_sse(admission, served.depth, created_at, &events, None) {
+                Ok(body) => body,
+                Err(error) => return error_response(&error),
+            };
+        if let (false, Some(extensions)) = (failed, &extensions) {
+            extensions.extend_sse_body(&mut body);
+        }
         if failed {
             // A failed flush is not a replayable success.
             if let Some(mut owner) = lease.take() {
@@ -64,7 +72,7 @@ pub(super) async fn settled_responses_response(
         }
         return sse_body_response(&headers, body);
     }
-    let aggregated =
+    let mut aggregated =
         match completed_responses_body_for(admission, served.depth, created_at, &events, None) {
             Ok(aggregated) => aggregated,
             Err(error) => return error_response(&error),
@@ -74,6 +82,9 @@ pub(super) async fn settled_responses_response(
             owner.abandon().await;
         }
         return error_response(&failure.clone().boundary().public_error());
+    }
+    if let Some(extensions) = &extensions {
+        extensions.extend_body(&mut aggregated.body);
     }
     if let Some(mut owner) = lease.take() {
         let mut sorted = headers.clone();

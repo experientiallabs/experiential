@@ -18,6 +18,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.interfaces import GatewayControlStore
+from exp.runtime.gateway.response_extensions import GatewayResponseExtensions
 from exp.runtime.gateway.routing import CatalogRouteResolver
 from exp.runtime.gateway.video.store import VideoJobStore
 from exp.runtime.models import RuntimeModelCatalog
@@ -149,6 +150,30 @@ class SettlementPricer(Protocol):
         on the response) without waiting on its durable settlement. It must
         neither write nor wait on settlement contention. Raising is safe: the
         data plane then settles before any terminal byte.
+        """
+        ...
+
+
+@runtime_checkable
+class ResponseExtensionSource(Protocol):
+    """Optional ledger capability: additive members for a finished completion.
+
+    A write ledger that also implements this is asked, right after a
+    finalizing ``price_attempt`` or ``finish_attempt`` returns, for the members
+    it wants on that request's response (for example the settled cost as
+    ``usage.cost``). The data plane stamps them on the terminal payload before
+    the bytes leave, so a host never rewrites response bodies itself. A ledger
+    without it (the local engine) leaves every response as the data plane
+    renders it.
+    """
+
+    def take_response_extensions(self, request_id: str) -> GatewayResponseExtensions | None:
+        """Return and forget the members for one finalized request, or ``None``.
+
+        Called on the data plane's settlement worker thread, after the price
+        or settle this request's terminal bytes wait on; it must not block on
+        settlement contention. Raising is safe: the response then carries no
+        extensions and the settlement outcome is unchanged.
         """
         ...
 

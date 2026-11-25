@@ -111,6 +111,9 @@ pub struct SettledAttempt {
     pub tool_search_rounds: Vec<ToolSearchRound>,
     /// See [`Served::rate_limit_headers`].
     pub rate_limit_headers: Vec<(String, String)>,
+    /// The host's additive members returned with this attempt's finalizing
+    /// settlement (see `response_extensions`).
+    pub(crate) response_extensions: Option<crate::response_extensions::ResponseExtensions>,
 }
 
 /// The facts of the attempt that served, as the response surfaces name them.
@@ -835,6 +838,7 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
                         empty_completion: false,
                         tool_search_rounds: Vec::new(),
                         rate_limit_headers: Vec::new(),
+                        response_extensions: guard.response_extensions().cloned(),
                     });
                 }
                 if failure.failure_class == FailureClass::EmptyCompletion {
@@ -858,6 +862,7 @@ pub async fn acquire_attempt(request_ctx: &WaterfallContext<'_>, guard: &mut Att
                         empty_completion: true,
                         tool_search_rounds: std::mem::take(&mut tool_search_rounds),
                         rate_limit_headers: Vec::new(),
+                        response_extensions: guard.response_extensions().cloned(),
                     });
                 }
                 let boundary = with_largest_retry_after(boundary, largest_retry_after);
