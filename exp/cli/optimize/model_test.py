@@ -27,6 +27,7 @@ from exp.common.models import (
     load_model_catalog,
     write_model_catalog,
 )
+from exp.common.models.gateway_catalog_test import unavailable_child_catalog
 from exp.common.project import ProjectStore
 from exp.optimize.model.sft import (
     SFTModelOptimizationConfig,
@@ -1445,20 +1446,25 @@ def test_catalog_setup_preserves_unrelated_concurrent_additions(tmp_path: Path) 
     fixture = _persisted_dataset(tmp_path)
     command = importlib.import_module("exp.cli.optimize.model")
     observed = _seed_catalog(fixture.store)
+    routing = unavailable_child_catalog()
     concurrent = observed.model_copy(
         update={
             "connections": {
                 **observed.connections,
+                **routing.connections,
                 "other": ConnectionConfig(provider="openai"),
             },
             "models": {
                 **observed.models,
+                **routing.models,
                 "other-model": ModelRecord(
                     billing_source=BillingSource.CUSTOMER_MANAGED,
                     connection="other",
                     model="other-model-id",
                 ),
             },
+            "gateway_pools": routing.gateway_pools,
+            "gateway_model_chains": routing.gateway_model_chains,
         }
     )
     write_model_catalog(fixture.store.model_catalog_path, concurrent)
@@ -1473,6 +1479,8 @@ def test_catalog_setup_preserves_unrelated_concurrent_additions(tmp_path: Path) 
     )
 
     updated = load_model_catalog(fixture.store.model_catalog_path)
+    assert updated.gateway_pools == concurrent.gateway_pools
+    assert updated.gateway_model_chains == concurrent.gateway_model_chains
     assert updated.connections["other"] == concurrent.connections["other"]
     assert updated.models["other-model"] == concurrent.models["other-model"]
     assert updated.connections["tinker-local"] == ConnectionConfig(

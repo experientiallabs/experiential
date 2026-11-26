@@ -21,6 +21,22 @@ from exp.common.models import (
     sync_provider_models,
     write_model_catalog,
 )
+from exp.common.models.gateway_catalog_test import unavailable_child_catalog
+
+
+def test_model_sync_preserves_authored_gateway_routing(tmp_path: Path) -> None:
+    """Account model discovery retains existing pools and chains beside the added models."""
+    path = tmp_path / "models.toml"
+    authored = unavailable_child_catalog()
+    write_model_catalog(path, authored)
+    connection, models = _hosted_models()
+
+    sync_provider_models(path, connection=connection, models=models)
+
+    updated = load_model_catalog(path)
+    assert updated.gateway_pools == authored.gateway_pools
+    assert updated.gateway_model_chains == authored.gateway_model_chains
+    assert updated.models["hosted-chat"] == models["hosted-chat"]
 
 
 def test_optimizer_provider_setup_still_requires_all_build_roles() -> None:
