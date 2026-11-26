@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import copy
 import hashlib
 import json
@@ -372,6 +373,30 @@ def test_jsonl_preserves_a_malformed_line_as_an_explicit_exclusion(tmp_path: Pat
     assert len(result.traces) == 1
     assert result.invalid_trace_count == 1
     assert result.traces[0].source.identity.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("jsonl", [False, True])
+def test_load_otlp_file_accepts_a_leading_utf8_bom(tmp_path: Path, *, jsonl: bool) -> None:
+    """A Unicode signature is ignored without changing exact-byte provenance.
+
+    Args:
+        tmp_path: Temporary directory receiving the OTLP fixture.
+        jsonl: Whether to exercise a multi-record JSONL export.
+    """
+    payloads = [_payload()]
+    if jsonl:
+        payloads.append(_payload("5" * 32))
+    separator = "\n" if jsonl else ""
+    raw = codecs.BOM_UTF8 + separator.join(json.dumps(payload) for payload in payloads).encode()
+    path = tmp_path / ("traces.jsonl" if jsonl else "traces.json")
+    path.write_bytes(raw)
+
+    result = load_otlp_file(path)
+
+    assert result.issues == ()
+    assert len(result.traces) == len(payloads)
+    assert result.source is not None
+    assert result.source.sha256 == hashlib.sha256(raw).hexdigest()
 
 
 def test_environment_capture_jsonl_normalizes_through_default_otlp_loader(tmp_path: Path) -> None:

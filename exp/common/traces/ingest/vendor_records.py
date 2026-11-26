@@ -80,7 +80,7 @@ def read_vendor_export(
     except OSError as exc:
         raise error_type(f"cannot read {vendor} export {path}: {exc}") from exc
     try:
-        text = raw.decode("utf-8")
+        text = raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise error_type(f"{vendor} export is not UTF-8: {path}") from exc
     source = SourceIdentity(

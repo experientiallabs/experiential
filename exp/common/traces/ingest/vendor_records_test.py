@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 from datetime import UTC, datetime
@@ -47,6 +48,27 @@ def test_read_vendor_export_retains_malformed_jsonl_lines(tmp_path: Path) -> Non
 
     assert export.payloads == ({"id": "span-1"}, {"id": "span-2"})
     assert [issue.source_record for issue in export.issues] == ["line-2"]
+
+
+@pytest.mark.parametrize("jsonl", [False, True])
+def test_read_vendor_export_accepts_a_leading_utf8_bom(tmp_path: Path, *, jsonl: bool) -> None:
+    """A Unicode signature is ignored while the source digest retains its bytes.
+
+    Args:
+        tmp_path: Temporary directory receiving the vendor fixture.
+        jsonl: Whether to exercise a multi-record JSONL export.
+    """
+    payloads = [{"id": "span-1"}, {"id": "span-2"}] if jsonl else [{"id": "span-1"}]
+    separator = "\n" if jsonl else ""
+    raw = codecs.BOM_UTF8 + separator.join(json.dumps(payload) for payload in payloads).encode()
+    path = tmp_path / ("export.jsonl" if jsonl else "export.json")
+    path.write_bytes(raw)
+
+    export = read_vendor_export(path, vendor="langfuse")
+
+    assert export.payloads == tuple(payloads)
+    assert export.issues == ()
+    assert export.source.sha256 == hashlib.sha256(raw).hexdigest()
 
 
 def test_read_vendor_export_rejects_unreadable_files(tmp_path: Path) -> None:
