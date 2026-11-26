@@ -263,7 +263,11 @@ exp config gateway budget remaining --period 2026-08 --root ROOT --json
 Omit required values in an interactive terminal to receive prompts. Pass `--non-interactive` to
 fail immediately instead. `--replace` changes a configured limit without deleting the month or its
 spend. Exhausting one deployment continues to the next certified exact-model route. Exhausting all
-applicable shared capacity returns OpenAI `insufficient_quota`. By default an unpriced attempt is
+applicable shared capacity returns OpenAI `insufficient_quota` whose message names the limit that
+refused (the team's, the caller's, the model's, or every route's monthly budget) and when it resets.
+An embedding ledger that refuses a reservation for its own reason can pass `public_message` on
+`BudgetReservationRejected`; that sentence is then the caller's message and the request's terminal
+message, with no monthly reset suffix. By default an unpriced attempt is
 admitted and recorded as unknown cost; `budget remaining` reports the unknown-cost attempts and
 their observed token volume. `--strict-unknown-cost` on `budget set` opts one limit into failing
 closed instead: unpriced attempts are rejected, recorded unknown-cost attempts block the limit even

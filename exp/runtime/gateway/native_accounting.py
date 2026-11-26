@@ -648,24 +648,24 @@ class NativeAttemptAccounting:
                 denied_pool = denied_destination_pool(exc, route.snapshot, candidate)
                 if denied_pool is not None:
                     entry.denied_destination_pools.add(denied_pool)
-                    last_failure = budget_quota_failure()
+                    last_failure = budget_quota_failure(exc)
                     forced_overflow = False
                     candidate = spill(candidate)
                     continue
                 if exc.scope_kind is not BudgetScopeKind.DEPLOYMENT:
                     error = (
-                        NativeBridgeError(budget_quota_protocol_error())
+                        NativeBridgeError(budget_quota_protocol_error(exc))
                         if self._budget_error_factory is None
                         else self._budget_error_factory(str(data.get("raw_key", "")))
                     )
-                    self.finish_request_quietly(entry.authorization, budget_quota_failure())
+                    self.finish_request_quietly(entry.authorization, budget_quota_failure(exc))
                     with self._lock:
                         discard_guardrails(self._fence.drop(self._inflight, request_id))
                     raise error from exc
                 # A route whose hard monthly allocation cannot admit this
                 # call is skipped; a later certified route may still serve.
                 last_failure = (
-                    budget_quota_failure()
+                    budget_quota_failure(exc)
                     if candidate == len(route.deployments) - 1
                     else all_routes_unavailable_failure()
                 )

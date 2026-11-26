@@ -202,6 +202,7 @@ class _RecordingLedger:
         self.finished_requests: list[GatewayFailure] = []
         self.request_search_meters: list[int] = []
         self.budget_rejections: dict[str, BudgetScopeKind] = {}
+        self.budget_messages: dict[str, str] = {}
         self.fail_finishes = 0
         self.priced: list[dict[str, object]] = []
         self.fail_prices = 0
@@ -235,7 +236,11 @@ class _RecordingLedger:
             raise AttemptRejectedError("root preflight required", failure=self.typed_rejection)
         scope = self.budget_rejections.get(deployment.deployment_id)
         if scope is not None:
-            raise BudgetReservationRejected(scope_kind=scope, reason="scripted")
+            raise BudgetReservationRejected(
+                scope_kind=scope,
+                reason="scripted",
+                public_message=self.budget_messages.get(deployment.deployment_id),
+            )
         self._counter += 1
         self.started_request_ids.add(snapshot.authorization.request_id)
         attempt_id = f"attempt-{self._counter}"
@@ -1236,6 +1241,81 @@ def test_non_deployment_budget_rejection_finalizes_with_quota() -> None:
         "quota_exceeded"
     ]
     assert registry.entry("request-one") is None
+
+
+@pytest.mark.parametrize(
+    ("scope", "sentence"),
+    [
+        (BudgetScopeKind.TEAM, "your team's monthly gateway budget is used up"),
+        (BudgetScopeKind.IDENTITY, "your monthly gateway budget for this caller is used up"),
+        (BudgetScopeKind.POOL, "the monthly gateway budget for this model is used up"),
+    ],
+)
+def test_a_budget_rejection_names_the_scope_that_refused(
+    scope: BudgetScopeKind, sentence: str
+) -> None:
+    """Without a ledger sentence, caller and request row read which monthly budget refused."""
+    registry, ledger, _entry = _registry()
+    ledger.budget_rejections["deployment-a"] = scope
+    with pytest.raises(NativeBridgeError) as excinfo:
+        _start(registry, ordinal=0)
+    payload = json.loads(excinfo.value.public_error_json)
+    assert (payload["status_code"], payload["code"]) == (429, "insufficient_quota")
+    message = payload["message"]
+    assert isinstance(message, str)
+    assert message.startswith(f"{sentence}. It resets at ")
+    assert message.endswith("ask the gateway operator to raise the monthly budget.")
+    assert [failure.safe_message for failure in ledger.finished_requests] == [sentence]
+
+
+_LEDGER_SENTENCE = (
+    "Your organization is out of credits. Add credits at https://example.test/credits, "
+    "or request vendor-model:free to use it for free."
+)
+
+
+def test_a_ledger_sentence_is_the_quota_answer_and_the_request_row() -> None:
+    """A rejection carrying its ledger's sentence answers it verbatim, with no monthly suffix."""
+    registry, ledger, _entry = _registry()
+    ledger.budget_rejections["deployment-a"] = BudgetScopeKind.TEAM
+    ledger.budget_messages["deployment-a"] = _LEDGER_SENTENCE
+    with pytest.raises(NativeBridgeError) as excinfo:
+        _start(registry, ordinal=0)
+    payload = json.loads(excinfo.value.public_error_json)
+    assert payload["status_code"] == 429
+    assert payload["code"] == "insufficient_quota"
+    assert payload["error_type"] == "insufficient_quota"
+    assert payload["message"] == _LEDGER_SENTENCE
+    assert payload["retry_after_seconds"] is None
+    assert [failure.safe_message for failure in ledger.finished_requests] == [_LEDGER_SENTENCE]
+
+
+def test_every_route_refused_by_a_deployment_limit_answers_its_ledger_sentence() -> None:
+    """The last rung's deployment refusal sentence is the exhausted answer and the request row."""
+    registry, ledger, _entry = _registry()
+    for deployment_id in ("deployment-a", "deployment-b"):
+        ledger.budget_rejections[deployment_id] = BudgetScopeKind.DEPLOYMENT
+    ledger.budget_messages["deployment-b"] = _LEDGER_SENTENCE
+    exhausted = _start(registry, ordinal=0)
+    assert exhausted["exhausted"] is True
+    assert exhausted["failure"] == {
+        "failure_class": "quota_exceeded",
+        "safe_message": _LEDGER_SENTENCE,
+    }
+    assert [failure.safe_message for failure in ledger.finished_requests] == [_LEDGER_SENTENCE]
+
+
+def test_every_route_refused_by_a_deployment_budget_says_so() -> None:
+    """Without a ledger sentence the exhausted answer names the routes' monthly budgets."""
+    registry, ledger, _entry = _registry()
+    for deployment_id in ("deployment-a", "deployment-b"):
+        ledger.budget_rejections[deployment_id] = BudgetScopeKind.DEPLOYMENT
+    exhausted = _start(registry, ordinal=0)
+    failure = exhausted["failure"]
+    assert isinstance(failure, dict)
+    assert failure["safe_message"] == (
+        "every route for this model has used up its monthly gateway budget"
+    )
 
 
 def test_exhaustion_finalizes_the_request_with_the_last_failure() -> None:

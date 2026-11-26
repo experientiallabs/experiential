@@ -50,7 +50,7 @@ def test_monthly_quota_failure_uses_openai_insufficient_quota_shape() -> None:
     assert error.json_body() == {
         "error": {
             "message": (
-                "monthly gateway allocation is exhausted. The allocation resets at "
+                "monthly gateway allocation is exhausted. It resets at "
                 "2026-09-01T00:00:00Z; retry after that time or ask the gateway "
                 "operator to raise the monthly budget."
             ),

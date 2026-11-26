@@ -202,7 +202,7 @@ def test_predispatch_failure_cancels_input_and_preserves_public_error(
         )
         assert "Content inspection is unavailable" not in response.text
         if denial == "quota":
-            assert "monthly gateway allocation is exhausted" in response.text
+            assert "your team's monthly gateway budget is used up" in response.text
         assert closed_seen.is_set()
         assert classifier.cancelled.wait(2), "orphaned classifier continued after admission ended"
         with sqlite3.connect(components.ledger.database_path) as db:
