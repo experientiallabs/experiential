@@ -49,6 +49,23 @@ def test_read_vendor_export_retains_malformed_jsonl_lines(tmp_path: Path) -> Non
     assert [issue.source_record for issue in export.issues] == ["line-2"]
 
 
+def test_read_vendor_export_retains_a_malformed_document_error(tmp_path: Path) -> None:
+    """An all-invalid fallback keeps one document error with its exact location.
+
+    Args:
+        tmp_path: Temporary directory receiving the malformed vendor document.
+    """
+    path = tmp_path / "export.json"
+    path.write_text('{\n  "spans": [\n', encoding="utf-8")
+
+    export = read_vendor_export(path, vendor="langfuse")
+
+    assert export.payloads == ()
+    assert len(export.issues) == 1
+    assert export.issues[0].source_record == "document"
+    assert export.issues[0].message == "invalid JSON document: Expecting value at line 3 column 1"
+
+
 def test_read_vendor_export_rejects_unreadable_files(tmp_path: Path) -> None:
     """A missing file and an undecodable file both fail loudly."""
     with pytest.raises(VendorTraceFormatError):

@@ -374,6 +374,23 @@ def test_jsonl_preserves_a_malformed_line_as_an_explicit_exclusion(tmp_path: Pat
     assert result.traces[0].source.identity.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def test_malformed_json_document_retains_the_original_error(tmp_path: Path) -> None:
+    """An all-invalid fallback reports one document error with its exact location.
+
+    Args:
+        tmp_path: Temporary directory receiving the malformed OTLP document.
+    """
+    path = tmp_path / "traces.json"
+    path.write_text('{\n  "resourceSpans": [\n', encoding="utf-8")
+
+    result = load_otlp_file(path)
+
+    assert result.traces == ()
+    assert len(result.issues) == 1
+    assert result.issues[0].source_record == "document"
+    assert result.issues[0].message == "invalid JSON document: Expecting value at line 3 column 1"
+
+
 def test_environment_capture_jsonl_normalizes_through_default_otlp_loader(tmp_path: Path) -> None:
     """The exact owned profile loads without a converter or source override.
 

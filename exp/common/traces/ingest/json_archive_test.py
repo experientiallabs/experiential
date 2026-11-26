@@ -42,6 +42,28 @@ def test_partial_bad_line_cannot_leak_nodes_into_next_record(tmp_path: Path) -> 
         assert len(archive.issues) == 1 and archive.issues[0].source_record == "line-2"
 
 
+def test_malformed_json_document_retains_the_incremental_parser_error(tmp_path: Path) -> None:
+    """An all-invalid fallback becomes one bounded document-level diagnostic.
+
+    Args:
+        tmp_path: Temporary directory receiving the malformed source and archive.
+    """
+    path = tmp_path / "input.json"
+    path.write_text('{\n  "records": [\n', encoding="utf-8")
+    directory = tmp_path / "scratch"
+    directory.mkdir()
+
+    with sqlite3.connect(directory / "archive.db") as connection:
+        archive = JsonArchive(path, directory, connection, "chat-json")
+
+        assert list(archive.documents()) == []
+        assert len(archive.issues) == 1
+        assert archive.issues[0].source_record == "document"
+        assert archive.issues[0].message.startswith(
+            "invalid JSON document: parse error: premature EOF"
+        )
+
+
 def test_utf8_failure_is_not_silently_replaced(tmp_path: Path) -> None:
     """Unrecoverable transport encoding fails before any normalized evidence is accepted."""
     path = tmp_path / "input.jsonl"

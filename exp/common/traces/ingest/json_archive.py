@@ -112,7 +112,7 @@ class JsonArchive:
         try:
             with snapshot.open("rb") as stream:
                 self._parse(stream)
-        except ijson.JSONError:
+        except ijson.JSONError as document_error:
             self.jsonl = True
             self.duplicate_keys = False
             database.execute("DELETE FROM json_nodes")
@@ -140,11 +140,15 @@ class JsonArchive:
                         )
                     finally:
                         database.execute("RELEASE json_line")
-            if (
-                not self.issues
-                and not database.execute("SELECT 1 FROM json_nodes LIMIT 1").fetchone()
-            ):
-                raise VendorTraceFormatError(f"{vendor} export contains no records") from None
+            has_documents = database.execute("SELECT 1 FROM json_nodes LIMIT 1").fetchone()
+            if not has_documents:
+                if not self.issues:
+                    raise VendorTraceFormatError(f"{vendor} export contains no records") from None
+                lines = str(document_error).strip().splitlines()
+                detail = lines[0] if lines else type(document_error).__name__
+                self.issues = [
+                    TraceNormalizationIssue("document", f"invalid JSON document: {detail}")
+                ]
         database.commit()
 
     def _parse(self, stream: BinaryIO) -> None:
