@@ -136,6 +136,8 @@ class GatewayRoute(ContractModel):
             least one rung from this route (``provider.only``, ``provider.ignore``, the two
             ``allow_fallbacks: false`` forms), default empty. A refusal names only these, so
             it never advises removing a control that excluded nothing.
+        manifest_version: The manifest cut of the indexed view this route was
+            resolved against, default ``None`` (the whole catalog document).
     """
 
     snapshot: ExecutionSnapshot
@@ -156,6 +158,7 @@ class GatewayRoute(ContractModel):
     """
     cache_placed_deployment_id: str | None = None
     caller_narrowing: tuple[str, ...] = ()
+    manifest_version: int | None = None
 
     @property
     def deployments(self) -> tuple[ExactModelDeployment, ...]:
@@ -196,6 +199,7 @@ class CatalogRouteResolver:
         *,
         project_resolver: ProjectTargetResolver | None = None,
         listing_pools: Mapping[tuple[str, str, str], str] | None = None,
+        manifest_pins: Mapping[tuple[str, str], int] | None = None,
     ) -> None:
         """Index one immutable catalog and optional learned-selection seam.
 
@@ -204,10 +208,12 @@ class CatalogRouteResolver:
             project_resolver: Optional resolver for project-backed targets.
             listing_pools: Direct-target pool IDs keyed by granted alias, revision,
                 and catalog digest. Project aliases are omitted and stay identity-only.
+            manifest_pins: Keys assembled from a byte-verified manifest, mapped to
+                their manifest version; indexed without re-deriving identity.
         """
         self._project_resolver = project_resolver
         self._listing_pools = dict(listing_pools or {})
-        self._catalogs = _index_catalogs(catalogs)
+        self._catalogs = _index_catalogs(catalogs, manifest_pins)
 
     def swap_catalogs(
         self,
@@ -215,6 +221,7 @@ class CatalogRouteResolver:
         *,
         project_resolver: ProjectTargetResolver | None,
         listing_pools: Mapping[tuple[str, str, str], str],
+        manifest_pins: Mapping[tuple[str, str], int] | None = None,
     ) -> None:
         """Atomically replace the served catalog index with one validated superset.
 
@@ -226,14 +233,20 @@ class CatalogRouteResolver:
             project_resolver: Replacement resolver covering all retained activations.
             listing_pools: Direct-target pool IDs keyed by granted alias, revision,
                 and catalog digest, covering the replacement generation.
+            manifest_pins: As in the constructor; ``None`` pins no key.
 
         Raises:
             ValueError: One catalog does not match its declared digest.
         """
-        indexed = _index_catalogs(catalogs)
+        indexed = _index_catalogs(catalogs, manifest_pins)
         self._project_resolver = project_resolver
         self._listing_pools = dict(listing_pools)
         self._catalogs = indexed
+
+    def manifest_version(self, revision_id: str, catalog_sha256: str) -> int | None:
+        """The manifest version this key's current view serves, ``None`` for a whole document."""
+        view = self._catalogs.get((revision_id, catalog_sha256))
+        return None if view is None else view.manifest_version
 
     def published_metadata(
         self,
@@ -526,6 +539,7 @@ class CatalogRouteResolver:
             route_reason=REASONING_CONTINUATION_ROUTE_REASON,
             fallback_reason=None,
             reasoning_pinned_deployment_id=deployment_id,
+            manifest_version=view.manifest_version,
         )
 
     def _authorize_project_deployment_hint(
@@ -612,6 +626,7 @@ class CatalogRouteResolver:
             fallback_deployments=tuple(deployments[1:]),
             route_reason=route_reason,
             fallback_reason=fallback_reason,
+            manifest_version=view.manifest_version,
         )
 
 

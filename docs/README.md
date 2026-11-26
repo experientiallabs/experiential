@@ -23,6 +23,7 @@ results, and plans do not live here.
 | `reference/gateway-google-protocol.md` | The Gemini generateContent surface: part decoding, function calls and signatures, thinking controls, Google's SSE and error envelope, and the model listing. |
 | `reference/gateway-media-surfaces.md` | The embeddings, images, speech, and transcription surfaces, how each lane bills, and the per-unit price card. |
 | `reference/gateway-egress.md` | Public HTTPS provider destinations, connection-time address checks, standalone defaults, and transport coverage boundaries. |
+| `reference/catalog-manifests.md` | Per-model catalog artifacts and manifests: byte verification, required features, dependency kinds, assembly refusals, the shared parse cache and manifest pins. |
 | `reference/model-chains.md` | Ordered cross-model stages, mandatory hosted authority, bounded recovery and unsupported local-chain serving. |
 | `reference/chat-logprobs.md` | Verified Chat probability admission, token records, and guardrail boundaries. |
 | `reference/responses-logprobs.md` | Native Responses probability selectors, lifecycle phases, and continuation behavior. |

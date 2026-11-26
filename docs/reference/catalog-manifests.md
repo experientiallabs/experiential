@@ -1,0 +1,148 @@
+# Catalog manifests and per-model artifacts
+
+A gateway catalog can be delivered in two forms that serve identically:
+
+1. The whole authored catalog document (`ModelCatalog`), read through
+   `exp.common.models.gateway_catalog`. This path is unchanged.
+2. A **manifest** (`CatalogManifest`): one consistent cut that maps each model
+   id to the sha256 of one **model artifact** (`ModelArtifact`). An artifact is a
+   self-contained slice of the same document: the connections, deployment
+   records, certified pools and model chains that one model needs.
+
+`exp.common.models.catalog_manifest` is the reader of the second form. It never
+writes artifacts, and it never re-normalizes a document or re-derives an
+identity to verify it. The capability is advertised as
+`MANIFEST_READER_VERSION` (currently `1`) so a host can tell which builds read
+manifests.
+
+## Verification
+
+`read_model_artifact(data, artifact_sha256=...)` checks, in order:
+
+| Check | Refusal reason |
+|---|---|
+| sha256 of the exact stored bytes equals the manifest's hash | `digest_mismatch` |
+| the bytes are a JSON object | `unreadable` |
+| `artifact_schema_version` is an integer in `SUPPORTED_MODEL_ARTIFACT_SCHEMA_VERSIONS` (the current schema and, once one exists, the previous) | `unsupported_schema` |
+| every name in `required_to_serve` is in `KNOWN_SERVING_FEATURES` | `unknown_required_feature` |
+| every price card is nano-USD (a micro-USD key would otherwise be dropped and the deployment served unpriced) | `unreadable` |
+| the forward-compatible parse validates | `unreadable` |
+
+Unknown optional fields are dropped and reported in
+`LoadedModelArtifact.dropped_fields`. A writer that adds a field an older
+reader must not silently drop (for example one that changes what a request
+costs) names a feature in `required_to_serve`; an older reader then refuses the
+artifact instead of serving it wrongly.
+
+`read_catalog_manifest` parses a manifest forward-compatibly and refuses a
+manifest schema marker that is not the integer `CATALOG_MANIFEST_SCHEMA_VERSION`;
+every version field must be a JSON integer (`true` or `1.0` are refused).
+It, and `assemble_manifest_catalog`, also refuse a manifest whose
+`snapshot_schema_version` is not this build's `SNAPSHOT_SCHEMA_VERSION`: pins
+skip the digest check, so a cut is served only by a build that normalizes
+exactly as its writer did, and during a cross-schema roll the host keeps
+serving the whole document.
+A manifest's `catalog_schema_version` must be a nano-USD schema (above the
+micro-USD schema 2): artifacts have no micro-USD upgrade path.
+
+## Dependencies
+
+Each artifact lists `dependencies`: `(kind, key, sha256)` triples naming what it
+was compiled from. Kinds in use are `model`, `account`, `name` and `card`.
+
+- `model` dependencies are verified: each must name a manifest entry carrying
+  exactly that artifact hash, and every model-reference rung in the artifact's
+  chains must be declared as one. A chain that enters another model therefore
+  always sees the version of that model it was compiled against.
+- Because a dependency names a content hash, model dependencies form an
+  acyclic graph: a self-reference or a reciprocal pair of model references
+  would need an artifact to contain its own hash. A catalog whose chains form
+  such a cycle has no manifest form; a writer refuses to split it and the host
+  keeps serving it as the whole document, which supports those back-edges.
+- Other kinds are opaque to the reader. They are part of the artifact bytes,
+  so a change to any of them changes the artifact hash.
+
+## Assembly
+
+`assemble_manifest_catalog(manifest, artifacts)` merges the verified artifacts
+into one `ModelCatalog` carrying `manifest.catalog_schema_version`. Problems
+with one entry never fail the whole manifest; they become `ArtifactRefusal`
+rows that a host reports (for example as a negative acknowledgement):
+
+| Reason | Meaning |
+|---|---|
+| `missing_bytes` | the artifact was not loaded |
+| `model_mismatch` | the artifact's `model_id` is not the entry's, it carries no deployment or chain, or a record, pool or chain in it belongs to another model (a deployment belongs to its pool's exact model, else its `gateway.exact_model_id`, else its own alias) |
+| `dependency_mismatch` | a `model` dependency is absent or at another hash |
+| `connection_conflict` | a connection name is defined differently by several accepted artifacts (identical copies merge) |
+| `deployment_conflict`, `pool_conflict`, `chain_conflict` | several accepted artifacts claim one deployment alias, pool id (an unpooled gateway deployment claims the singleton pool keyed by its alias) or chain key, or a chain names a pool another accepted artifact claims; which claimants are refused follows the round rule below |
+| `invalid_artifact` | the artifact would normalize to nothing servable (no gateway deployment survives normalization, which drops excluded providers and SFT sampling handles, and no chain marks the model unavailable), or the artifact, together with the models it depends on, fails catalog validation or normalization (for example a chain naming a pool it does not carry, or a provider that needs explicit capabilities without them) |
+| `dependency_refused` | a model this artifact depends on was refused (closed to a fixpoint) |
+
+Assembly is an explicit fixpoint over the set of accepted artifacts:
+
+1. **Each entry alone.** Its bytes were loaded, it serves exactly its own
+   model, normalization keeps something of it, its `model` dependencies are at
+   the manifest's hashes, and it validates and normalizes together with its
+   dependency closure (visited in dependency order). These are facts about the
+   artifact and the bytes it names, never about the rest of the manifest.
+2. **Rounds over the accepted set**, recomputed each round until nothing
+   changes, by one rule in priority order: refuse the dependents of a refused
+   model; else, among shared-name conflicts (a connection defined differently,
+   or a deployment alias, pool id or chain key claimed twice), refuse the
+   claimants in the most conflicts, all tied ones together, so an artifact
+   only in conflict with a refused one survives the next round; else refuse a
+   chain naming a pool another artifact claims, first where that owner names
+   no foreign pool itself, and all mutual references together.
+3. **Merge.** If the accepted set still fails to validate, its artifacts are
+   admitted one at a time (dependencies first, artifacts with deployments
+   before chain-only ones, then by model id) and each one that would break the
+   rest is refused as `invalid_artifact`.
+
+The result depends only on the set of entries and artifacts, never on their
+order: every accepted artifact's dependencies are accepted, no two accepted
+artifacts claim one name, and assembling the accepted entries alone yields the
+same catalog with no refusals (a seeded property test checks all four over
+random cuts with overlaps, mutual references and missing bytes). No
+per-artifact problem aborts the manifest.
+
+The catalog is `None` only when no connection survives.
+
+A manifest is the gateway's serving form, so it carries exactly what
+normalization reads: connections, deployment records, pools and chains. The
+catalog's local `roles` (candidate, judge, teacher and so on) are not part of
+it, and the assembled catalog carries default roles. Assembling a manifest
+written from a catalog therefore yields that catalog with default roles, whose
+normalized identity equals the whole document's (normalization never reads
+roles); `CatalogManifest.catalog_sha256` records that identity when the cut
+reproduces one.
+
+`ParsedArtifactCache` keeps parsed artifacts by hash across manifest versions
+(the bytes in hand are hashed on every `load`, so changed bytes for a cached
+hash are refused as `digest_mismatch`). Its store is the canonical bounded
+`VerifiedCache` (`PARSED_ARTIFACT_CACHE_MAXIMUM` entries by default), so memory
+stays bounded even without `retain`:
+an unchanged model keeps its hash, so it is parsed once and shared, and
+`retain` evicts hashes no held manifest names.
+
+## Manifest pins
+
+A request pins one manifest version. `CatalogRouteResolver` accepts
+`manifest_pins`, a mapping from `(revision_id, catalog_sha256)` keys to manifest
+versions (also on `swap_catalogs`). A pinned key was assembled by the host from
+byte-verified artifacts, so it is indexed without the identity check that every
+other same-schema key still gets; the version is stored on the
+key's indexed view, so every `GatewayRoute` resolved on it carries
+`manifest_version` from the same view it was resolved against, and
+`manifest_version(revision_id, catalog_sha256)` reads that view. Without pins the
+resolver behaves exactly as before.
+
+The pin is a host assertion: assembly never re-derives the assembled
+catalog's identity, so it cannot prove the cut reproduces the key's digest (a
+cut that holds or canaries a model intentionally does not). A host pins only
+keys it assembled itself from a manifest it verified.
+
+The version is provenance, not a clock the resolver enforces: the host owns the
+manifest pointer and its canary state, and a canary abort or a rollback
+legitimately returns a key to an earlier promoted cut. Each swap serves the
+versions the host passes, and every route records the one it used.
