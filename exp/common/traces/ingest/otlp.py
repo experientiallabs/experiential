@@ -45,6 +45,7 @@ GENAI_SEMANTIC_CONVENTION_VERSION = "1.37.0"
 
 _TRACE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _SPAN_ID_PATTERN = re.compile(r"^[0-9a-f]{16}$")
+_SIGNED_DECIMAL_PATTERN = re.compile(r"^-?[0-9]+$")
 _MODEL_OPERATIONS = frozenset(
     {"chat", "text_completion", "generate_content", "invoke_agent", "embeddings"}
 )
@@ -570,11 +571,11 @@ def _usage(attributes: JsonObject) -> Usage | None:
         raise OtlpTraceFormatError("GenAI usage needs both input and output token counts")
     cached = attributes.get("gen_ai.usage.cached_input_tokens")
     return Usage(
-        input_tokens=_integer(input_tokens, "gen_ai.usage.input_tokens"),
-        output_tokens=_integer(output_tokens, "gen_ai.usage.output_tokens"),
+        input_tokens=_nonnegative_integer(input_tokens, "gen_ai.usage.input_tokens"),
+        output_tokens=_nonnegative_integer(output_tokens, "gen_ai.usage.output_tokens"),
         cached_input_tokens=None
         if cached is None
-        else _integer(cached, "gen_ai.usage.cached_input_tokens"),
+        else _nonnegative_integer(cached, "gen_ai.usage.cached_input_tokens"),
     )
 
 
@@ -738,6 +739,17 @@ def _integer(value: JsonValue | None, label: str) -> int:
         raise OtlpTraceFormatError(f"{label} must be an integer")
     if isinstance(value, int):
         return value
-    if isinstance(value, str) and value.isdecimal():
-        return int(value)
+    if isinstance(value, str) and _SIGNED_DECIMAL_PATTERN.fullmatch(value):
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise OtlpTraceFormatError(f"{label} must be an integer") from exc
     raise OtlpTraceFormatError(f"{label} must be an integer")
+
+
+def _nonnegative_integer(value: JsonValue | None, label: str) -> int:
+    """Read an integer that must not be negative."""
+    integer = _integer(value, label)
+    if integer < 0:
+        raise OtlpTraceFormatError(f"{label} must be nonnegative")
+    return integer
