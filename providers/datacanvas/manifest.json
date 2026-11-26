@@ -1,0 +1,45 @@
+providers/datacanvas/manifest.json{
+  "schema_version": 1,
+  "provider": {
+    "slug": "datacanvas",
+    "display_name": "DataCanvas Co., Ltd.",
+    "family": "openai_compatible",
+    "base_url": "https://codingplan-staging.alayanew.com:26443/v1",
+    "auth_mode": "house_key",
+    "contact": {
+      "email": "gelh@zetyun.com"
+    },
+    "terms": {
+      "version": "2026-09-16",
+      "accepted_by": "Linhao Ge, Token Ecosystem Manager",
+      "accepted_at": "2026-10-21T17:04:00+08:00"
+    },
+    "data_policy": {
+      "retains_prompts": false,
+      "trains_on_data": false,
+      "zero_data_retention": true,
+      "policy_url": "https://www.alayanew.com/webapi/public/core/agreement/ops/agreements/2052352233865179136/objects/2091829878604386304/actions/preview"
+    }
+  },
+  "limits": {
+    "max_concurrency": 1000,
+    "advertised_tps": 2000000
+  },
+  "models": [
+    {
+      "wire_id": "glm-5.3",
+      "binding": {
+        "kind": "existing",
+        "slug": "glm-5.3"
+      },
+      "prices": {
+        "input_nano_usd_per_million": 1000000000,
+        "output_nano_usd_per_million": 3500000000
+      },
+      "capabilities": {
+        "supports_streaming": true
+      },
+      "context_window": 1048576
+    }
+  ]
+}
