@@ -125,6 +125,10 @@ fn settle_argument(
             if let Some(half_day) = usage.cache_creation_12h_input_tokens {
                 wire["cache_creation_12h_input_tokens"] = json!(half_day);
             }
+            // The provider's own charge (OpenRouter `usage.cost`), only when reported.
+            if let Some(cost) = usage.provider_reported_cost_nano_usd {
+                wire["provider_reported_cost_nano_usd"] = json!(cost);
+            }
             wire
         }),
         "tool_names": tool_names,
@@ -164,6 +168,13 @@ fn settle_argument(
             // request was retried (or why its one retry did not help).
             if failure.malformed_tool_call {
                 wire["malformed_tool_call"] = json!(true);
+            }
+            // A suspended provider account, so the host pulls it and can name
+            // the appeal URL to its owner.
+            if failure.account_suspended {
+                wire["provider_account_suspended"] = json!(true);
+                wire["provider_appeal_url"] =
+                    json!(crate::google_account_verdicts::appeal_url_of(failure));
             }
             // A customer-addressed origin's failure: health keeps no nameable
             // cause for it, so a later refusal cannot replay it.

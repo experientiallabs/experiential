@@ -206,7 +206,16 @@ def failure_from_boundary_payload(payload: object) -> GatewayFailure | None:
         ),
         provider_content_filter=data.get("provider_content_filter") is True,
         malformed_tool_call=data.get("malformed_tool_call") is True,
+        provider_account_suspended=data.get("provider_account_suspended") is True,
+        provider_appeal_url=_appeal_url(data.get("provider_appeal_url")),
     )
+
+
+def _appeal_url(value: object) -> str | None:
+    """Keep a boundary appeal URL only when it is a bounded https URL."""
+    if isinstance(value, str) and value.startswith("https://") and len(value) <= 200:
+        return value
+    return None
 
 
 def header_timeout_from_payload(value: object) -> GatewayHeaderTimeout | None:
@@ -428,6 +437,8 @@ def terminal_from_settlement(
             tenant_origin=failure_payload.get("tenant_origin") is True,
             provider_content_filter=failure_payload.get("provider_content_filter") is True,
             malformed_tool_call=failure_payload.get("malformed_tool_call") is True,
+            provider_account_suspended=failure_payload.get("provider_account_suspended") is True,
+            provider_appeal_url=_appeal_url(failure_payload.get("provider_appeal_url")),
         )
         if (
             failure.failure_class == GatewayFailureClass.THROTTLED
@@ -802,6 +813,9 @@ def _usage_from_payload(
         reasoning_tokens=_optional_count(payload.get("reasoning_tokens")),
         image_output_tokens=_optional_count(payload.get("image_output_tokens")),
         image_input_tokens=_optional_count(payload.get("image_input_tokens")),
+        provider_reported_cost_nano_usd=_optional_cost(
+            payload.get("provider_reported_cost_nano_usd")
+        ),
         tool_names=names,
         web_search_requests=web_search_requests,
         web_search_results=web_search_results,
@@ -816,6 +830,12 @@ def _optional_count(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
+
+
+def _optional_cost(value: object) -> int | None:
+    """Return one non-negative integer nano-USD charge, ``None`` when unreported or malformed."""
+    count = _optional_count(value)
+    return count if count is not None and count >= 0 else None
 
 
 def _optional_wait(value: object) -> int | None:

@@ -30,6 +30,7 @@ mod eventstream;
 mod execution_binding;
 mod execution_context;
 mod first_token_bound;
+mod google_account_verdicts;
 mod guardrails;
 mod image_output;
 mod logprobs;
@@ -603,6 +604,9 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .and_then(serde_json::Value::as_u64),
                 cache_creation_12h_input_tokens: object
                     .get("cache_creation_12h_input_tokens")
+                    .and_then(serde_json::Value::as_u64),
+                provider_reported_cost_nano_usd: object
+                    .get("provider_reported_cost_nano_usd")
                     .and_then(serde_json::Value::as_u64),
             }),
             "hosted_tool_item_started" => events::Event::HostedToolItemStarted {

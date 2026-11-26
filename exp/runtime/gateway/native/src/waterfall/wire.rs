@@ -152,6 +152,11 @@ pub struct DeploymentWire {
     /// `x-gateway-zdr-constrained: true` so the host can attest it.
     #[serde(default)]
     pub zdr_constrained: bool,
+    /// An Antigravity plan rung: the Cloud Code Assist backend nests every
+    /// streamed Gemini response under a top-level `response` object, which
+    /// the normalizer unwraps before reading it. Absent on every other rung.
+    #[serde(default)]
+    pub code_assist_envelope: bool,
     /// Failure tokens this rung serves as a failover for (see
     /// `fallback_rules`): a rung carrying a set is never the first dial and
     /// is dialed as a successor only when the failure being failed over from

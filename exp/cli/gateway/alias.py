@@ -7,7 +7,7 @@ from pathlib import Path
 
 import typer
 
-from exp.cli.gateway.capability_authority import retained_streaming_tool_arguments
+from exp.cli.gateway.capability_authority import retained_gateway_capabilities
 from exp.cli.gateway.receipts import GatewayReceipt, emit_items, emit_receipt
 from exp.cli.shared.options import ROOT_OPTION, usage_error
 from exp.common.core.artifacts import sha256_json
@@ -64,6 +64,11 @@ _BILLING_SOURCE_OPTION = typer.Option(None, "--billing-source")
 _STREAMING_TOOL_ARGUMENTS_OPTION = typer.Option(
     None,
     "--supports-streaming-tool-arguments/--no-supports-streaming-tool-arguments",
+)
+_VLLM_SAMPLING_OPTION = typer.Option(
+    None,
+    "--supports-vllm-sampling/--no-supports-vllm-sampling",
+    help="Declare min_p and repetition_penalty support on a vLLM endpoint.",
 )
 _IMAGE_INPUT_OPTION = typer.Option(False, "--supports-image-input")
 _IMAGE_URL_INPUT_OPTION = typer.Option(
@@ -328,6 +333,7 @@ def alias_create(
     supports_strict_tools: bool = typer.Option(False, "--supports-strict-tools"),
     supports_parallel_tool_calls: bool = typer.Option(False, "--supports-parallel-tool-calls"),
     supports_streaming_tool_arguments: bool | None = _STREAMING_TOOL_ARGUMENTS_OPTION,
+    supports_vllm_sampling: bool | None = _VLLM_SAMPLING_OPTION,
     supports_image_input: bool = _IMAGE_INPUT_OPTION,
     supports_image_url_input: bool | None = _IMAGE_URL_INPUT_OPTION,
     supports_video_input: bool = _VIDEO_INPUT_OPTION,
@@ -365,6 +371,7 @@ def alias_create(
             supports_strict_tools=supports_strict_tools,
             supports_parallel_tool_calls=supports_parallel_tool_calls,
             supports_streaming_tool_arguments=supports_streaming_tool_arguments,
+            supports_vllm_sampling=supports_vllm_sampling,
             supports_image_input=supports_image_input,
             supports_image_url_input=supports_image_url_input,
             supports_video_input=supports_video_input,
@@ -423,6 +430,7 @@ def alias_update(
     supports_strict_tools: bool = typer.Option(False, "--supports-strict-tools"),
     supports_parallel_tool_calls: bool = typer.Option(False, "--supports-parallel-tool-calls"),
     supports_streaming_tool_arguments: bool | None = _STREAMING_TOOL_ARGUMENTS_OPTION,
+    supports_vllm_sampling: bool | None = _VLLM_SAMPLING_OPTION,
     supports_image_input: bool = _IMAGE_INPUT_OPTION,
     supports_image_url_input: bool | None = _IMAGE_URL_INPUT_OPTION,
     supports_video_input: bool = _VIDEO_INPUT_OPTION,
@@ -460,6 +468,7 @@ def alias_update(
             supports_strict_tools=supports_strict_tools,
             supports_parallel_tool_calls=supports_parallel_tool_calls,
             supports_streaming_tool_arguments=supports_streaming_tool_arguments,
+            supports_vllm_sampling=supports_vllm_sampling,
             supports_image_input=supports_image_input,
             supports_image_url_input=supports_image_url_input,
             supports_video_input=supports_video_input,
@@ -541,6 +550,7 @@ def _activate(
     supports_strict_tools: bool,
     supports_parallel_tool_calls: bool,
     supports_streaming_tool_arguments: bool | None,
+    supports_vllm_sampling: bool | None,
     supports_image_input: bool,
     supports_image_url_input: bool | None,
     supports_video_input: bool,
@@ -561,6 +571,8 @@ def _activate(
         raise ValueError("choose exactly one of --deployment or --project")
     if deployment is None and billing_source is not None:
         raise ValueError("--billing-source applies only to direct --deployment aliases")
+    if deployment is None and supports_vllm_sampling is not None:
+        raise ValueError("--supports-vllm-sampling applies only to direct --deployment aliases")
     manager = GatewayManagement(root)
     manager.require_initialized()
     manager.migrate_legacy_provider_connections()
@@ -575,14 +587,28 @@ def _activate(
         if connection not in serving_connections:
             raise ValueError(f"deployment names unknown provider connection {connection!r}")
         provider = serving_connections[connection].provider
-        declared_streaming_tool_arguments = supports_streaming_tool_arguments
-        if declared_streaming_tool_arguments is None and replace:
-            declared_streaming_tool_arguments = retained_streaming_tool_arguments(
+        if supports_vllm_sampling and provider != "openai-compatible":
+            raise ValueError("vLLM sampling requires an openai-compatible provider")
+        retained = (
+            retained_gateway_capabilities(
                 manager,
                 alias_id=alias,
                 connection_id=connection,
                 connection=serving_connections[connection],
             )
+            if replace
+            else None
+        )
+        declared_vllm_sampling = (
+            supports_vllm_sampling
+            if supports_vllm_sampling is not None
+            else retained.supports_vllm_sampling
+            if retained is not None
+            else False
+        )
+        declared_streaming_tool_arguments = supports_streaming_tool_arguments
+        if declared_streaming_tool_arguments is None and retained is not None:
+            declared_streaming_tool_arguments = retained.supports_streaming_tool_arguments
         if declared_streaming_tool_arguments is None:
             declared_streaming_tool_arguments = provider_has_certified_capability(
                 provider,
@@ -608,6 +634,7 @@ def _activate(
             gateway_capabilities=GatewayDeploymentCapabilities(
                 supports_streaming=True,
                 supports_streaming_tool_arguments=declared_streaming_tool_arguments,
+                supports_vllm_sampling=declared_vllm_sampling,
                 supports_developer_messages=supports_developer_messages,
                 supports_strict_tools=supports_strict_tools,
                 supports_parallel_tool_calls=supports_parallel_tool_calls,

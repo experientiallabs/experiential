@@ -23,6 +23,11 @@ impl Normalizer {
         frame: &crate::sse::SseEvent,
     ) -> Result<Vec<Event>, Failure> {
         let payload = parse_object(&frame.data)?;
+        let payload = if self.code_assist_envelope {
+            unwrap_code_assist_frame(payload)?
+        } else {
+            payload
+        };
         if self.metadata_drain_started().is_some() {
             if let Some(raw) = payload.get("usageMetadata").filter(|raw| !raw.is_null()) {
                 self.observe_gemini_usage(raw)?;
@@ -379,6 +384,23 @@ fn gemini_block_reason(payload: &serde_json::Map<String, Value>) -> Option<Strin
         .map(str::to_string)
 }
 
+/// Take the Gemini response out of one Cloud Code Assist frame.
+///
+/// The backend wraps every streamed `GenerateContentResponse` as
+/// `{"response": {...}, "traceId": "..."}`; the usage the meter reads is the
+/// inner `usageMetadata`. A frame without `response` (an error envelope, a
+/// trace-only frame) is read as it is, so Google's top-level `error` keeps its
+/// classification and a trace-only frame folds to nothing.
+fn unwrap_code_assist_frame(
+    mut payload: serde_json::Map<String, Value>,
+) -> Result<serde_json::Map<String, Value>, Failure> {
+    match payload.remove("response") {
+        None | Some(Value::Null) => Ok(payload),
+        Some(Value::Object(inner)) => Ok(inner),
+        Some(_) => Err(malformed("Code Assist response must be an object")),
+    }
+}
+
 #[cfg(test)]
 #[path = "gemini_usage_tests.rs"]
 mod usage_tests;
@@ -386,3 +408,7 @@ mod usage_tests;
 #[cfg(test)]
 #[path = "gemini_tests.rs"]
 mod gemini_tests;
+
+#[cfg(test)]
+#[path = "gemini_code_assist_tests.rs"]
+mod code_assist_tests;

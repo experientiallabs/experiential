@@ -34,8 +34,10 @@ describe("default model", () => {
     expect(wants([])).toBe(false);
   });
 
-  it("prefers EXP_CODE_MODEL, else the first listed alias", () => {
+  it("prefers EXP_CODE_MODEL, else experiential-large-model when listed, else the first listed alias", () => {
     expect(defaultModelId(["a", "b"], undefined)).toBe("a");
+    expect(defaultModelId(["a", "experiential-small-model", "experiential-large-model"], undefined)).toBe("experiential-large-model");
+    expect(defaultModelId(["a", "experiential-large-model"], "a")).toBe("a");
     expect(defaultModelId(["a", "b"], " b ")).toBe("b");
     expect(defaultModelId([], undefined)).toBeUndefined();
     expect(modelArgs("a")).toEqual(["--model", "experiential/a"]);

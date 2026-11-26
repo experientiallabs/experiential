@@ -244,6 +244,19 @@ impl Normalizer {
         );
     }
 
+    /// Read the provider's own per-request charge from usage (OpenRouter's
+    /// `usage.cost`, see `provider_cost.rs`). Only the OpenAI-shaped wires
+    /// OpenRouter serves (Chat Completions and Responses) honour it.
+    pub fn set_provider_reported_cost(&mut self, reported: bool) {
+        self.openai_usage.set_provider_reported_cost(
+            reported
+                && matches!(
+                    self.dialect,
+                    Dialect::OpenAiCompatible | Dialect::OpenAiResponses
+                ),
+        );
+    }
+
     /// Record that this rung asked OpenAI for 12-hour cache writes, so writes
     /// reported without their lifetime split bill at 12 hours. Only a
     /// Responses normalizer honours it: no other wire carries the lifetime.
@@ -258,6 +271,13 @@ impl Normalizer {
     pub fn set_gemini_cache_writes(&mut self, written: Option<u64>) {
         self.gemini_cache_writes =
             written.filter(|_| self.dialect == Dialect::GeminiGenerateContent);
+    }
+
+    /// Read each frame's Gemini response from the Cloud Code Assist
+    /// envelope's top-level `response` object (an Antigravity plan rung).
+    /// Only a Gemini normalizer honours it.
+    pub fn set_code_assist_envelope(&mut self, enveloped: bool) {
+        self.code_assist_envelope = enveloped && self.dialect == Dialect::GeminiGenerateContent;
     }
 
     /// Whether the latest normalized meter replaces earlier ones instead of
@@ -510,6 +530,8 @@ pub struct Normalizer {
     // Tokens this attempt's own automatic Google cache create wrote; reported
     // cache reads up to this count settle as writes read back in the same call.
     gemini_cache_writes: Option<u64>,
+    // Frames arrive nested in the Cloud Code Assist envelope (`response`).
+    code_assist_envelope: bool,
     // Fireworks-only route identity authorizing reasoning_content capture.
     reasoning_content_route_sha256: Option<String>,
     // Caller-known label words (the dispatched model id) exempt from the
@@ -592,6 +614,7 @@ impl Normalizer {
             gemini_tool_index: 0,
             gemini: gemini::StreamState::default(),
             gemini_cache_writes: None,
+            code_assist_envelope: false,
             reasoning_content_route_sha256,
             request_words: Vec::new(),
             deferred_tool_failure: None,
@@ -788,7 +811,16 @@ impl Normalizer {
 /// Shared by the parity-fixture entry point and the golden-fixture tests so
 /// exactly one drive loop mirrors the server.
 pub fn drain_stream_fixture(dialect: Dialect, chunks: &[Vec<u8>]) -> (Vec<Value>, Option<Failure>) {
-    let mut normalizer = Normalizer::new(dialect);
+    drain_stream_fixture_with(Normalizer::new(dialect), dialect, chunks)
+}
+
+/// [`drain_stream_fixture`] through a caller-configured normalizer (a rung
+/// flag such as the Code Assist envelope set on it first).
+pub(crate) fn drain_stream_fixture_with(
+    mut normalizer: Normalizer,
+    dialect: Dialect,
+    chunks: &[Vec<u8>],
+) -> (Vec<Value>, Option<Failure>) {
     let mut decoder = FrameDecoder::new(dialect);
     let mut simplified = Vec::new();
     for chunk in chunks {

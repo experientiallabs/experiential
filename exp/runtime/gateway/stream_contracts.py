@@ -137,6 +137,10 @@ class GatewayUsage(ContractModel):
             vendor as one contents page), or None when the settlement named none.
         web_search_cost_nano_usd: The search vendor's own reported cost for those
             searches in whole nano-USD, or None when it reported none.
+        provider_reported_cost_nano_usd: What the model provider itself reported
+            charging for this attempt in whole nano-USD, rounded up, or None when it
+            reported none. Only OpenRouter reports one (its ``usage.cost`` on a
+            non-BYOK answer); every other provider leaves it None.
         tool_search_requests: Gateway-executed tool-search rounds billed to the attempt.
         billed_units: Media units priced by the deployment's unit card (characters,
             audio or video seconds, images), beside or instead of tokens; None on
@@ -171,6 +175,7 @@ class GatewayUsage(ContractModel):
     """The search vendor's own reported cost for this attempt's web searches
     (Exa ``costDollars.total``) in whole nano-USD; None when the vendor
     reported none. A host billing the true pass-through prefers it."""
+    provider_reported_cost_nano_usd: int | None = Field(default=None, ge=0)
     tool_search_requests: int = Field(default=0, ge=0)
     """Gateway-executed tool-search rounds billed to this attempt; never a
     provider meter and not a subset of any token total. Zero on every attempt
@@ -551,6 +556,12 @@ class GatewayFailure(ContractModel):
             makes the first one per request both failover-eligible and
             redialable; like ``TRANSPORT``, an untried sibling is preferred
             over the redial (``native_execution.next_route_candidate``).
+        provider_account_suspended: A ``PROVIDER_AUTHENTICATION`` failure on which the
+            provider said it SUSPENDED the account behind the rung (Google's
+            ``TOS_VIOLATION``): never redialed, and the host pulls the account instead of
+            waiting for it to recover.
+        provider_appeal_url: Where the suspended account's owner appeals, when the
+            provider said (an https URL of at most 200 characters).
     """
 
     failure_class: GatewayFailureClass
@@ -588,6 +599,8 @@ class GatewayFailure(ContractModel):
     context_window_limit_tokens: int | None = Field(default=None, ge=1)
     provider_content_filter: bool = False
     malformed_tool_call: bool = False
+    provider_account_suspended: bool = False
+    provider_appeal_url: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 def _validate_responses_probability_records(

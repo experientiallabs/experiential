@@ -337,6 +337,16 @@ pub struct Failure {
     /// The finish named the function call itself (`broken_tool_call`), not any malformed answer.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub malformed_function_call: bool,
+    /// The provider suspended the ACCOUNT behind this rung (Google's
+    /// `TOS_VIOLATION`): a credential-class failure the host reads to pull the
+    /// account rather than wait for it. Its appeal URL rides `provider_detail`
+    /// (`google_account_verdicts::appeal_url_of`).
+    #[serde(
+        default,
+        rename = "provider_account_suspended",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub account_suspended: bool,
 }
 
 impl Failure {
@@ -363,6 +373,7 @@ impl Failure {
             malformed_tool_call: false,
             validated_tool_redial: false,
             malformed_function_call: false,
+            account_suspended: false,
         }
     }
 
@@ -545,6 +556,7 @@ impl Failure {
         if self.customer_owned {
             let code = match self.failure_class {
                 FailureClass::ProviderQuota => "provider_account_quota",
+                _ if self.account_suspended => "provider_account_suspended",
                 _ => "provider_credential_rejected",
             };
             return PublicError::new(400, code, &self.safe_message, "invalid_request_error");

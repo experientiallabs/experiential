@@ -1,5 +1,5 @@
 /**
- * The exp-code Pi extension: cowork tools, the cowork prompt section, the document skills, and
+ * The exp-code extension: cowork tools, the cowork prompt section, the document skills, and
  * the Experiential gateway provider.
  *
  * The CLI and the headless runner load the same factory; they differ only in the options (where
@@ -9,8 +9,9 @@
 import { type BashOperations, createLocalBashOperations, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import type { GatewayConfig } from "../gateway/config.js";
 import { type GatewayProviderOptions, registerGatewayProvider } from "../gateway/provider.js";
+import { createPlatformTools, tracesSkillDir } from "../platform/index.js";
 import { createAskUserTool } from "./ask-user.js";
-import { addCoworkSection } from "./prompt.js";
+import { addCoworkSection, addDocsSection, withExpCodePreamble } from "./prompt.js";
 import { resolveSkillsDir } from "./skills.js";
 import { createTodoTool } from "./todo.js";
 import { createWebFetchTool } from "./web-fetch.js";
@@ -29,6 +30,13 @@ export interface ExpCodeExtensionOptions {
   searchModel?: string;
   /** Where bundled skills are written when they are embedded (the runner bundle). */
   skillsRoot?: string;
+  /**
+   * Register the read-only Experiential platform tools (request log, usage, models, evals) for a
+   * hosted gateway. Off unless set: they can read the organization's stored prompts, so a host
+   * enables them only where a prompt injection cannot quietly exfiltrate traces (the CLI turns
+   * them on, the runner only when asked; see platform/index.ts).
+   */
+  platformTools?: boolean;
 }
 
 /** Tool names this extension registers. */
@@ -43,15 +51,39 @@ export function createExpCodeExtension(options: ExpCodeExtensionOptions): Extens
       pi.registerTool(createWebSearchTool({ gateway: options.gateway, model: options.searchModel, fetch: options.provider?.fetch }));
       await registerGatewayProvider(pi, options.gateway, options.provider);
     }
+    const platformTools = options.platformTools === true && options.gateway !== null ? createPlatformTools(options.gateway, { fetch: options.provider?.fetch }) : [];
+    for (const tool of platformTools) pi.registerTool(tool);
     pi.on("before_agent_start", (event) => {
       addCoworkSection(event.systemPromptOptions);
+      addDocsSection(event.systemPromptOptions);
     });
-    pi.on("resources_discover", () => ({ skillPaths: [resolveSkillsDir(options.skillsRoot)] }));
+    pi.on("resources_discover", () => {
+      const skillPaths = [resolveSkillsDir(options.skillsRoot)];
+      // The traces skill describes the platform tools, so it is offered only with them.
+      if (platformTools.length > 0) skillPaths.push(tracesSkillDir(options.skillsRoot));
+      return { skillPaths };
+    });
     const problem = options.gatewayProblem;
     if (options.gateway === null && problem !== undefined) {
       pi.on("session_start", (_event, ctx) => {
         if (ctx.hasUI) ctx.ui.notify(problem, "warning");
       });
     }
+  };
+}
+
+/**
+ * The extension that gives the agent exp-code's name in the system prompt preamble.
+ *
+ * The upstream preamble is not a replaceable section, so the rendered prompt is replaced, which
+ * fixes its text for the turn. Load this factory LAST: a prompt edit from any extension loaded
+ * after it would be lost.
+ */
+export function createIdentityExtension(): ExtensionFactory {
+  return (pi) => {
+    pi.on("before_agent_start", (event) => {
+      const systemPrompt = withExpCodePreamble(event.systemPrompt);
+      return systemPrompt === undefined ? undefined : { systemPrompt };
+    });
   };
 }

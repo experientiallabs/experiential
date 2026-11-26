@@ -45,9 +45,9 @@ function events(): RunEvent[] {
   return readEventLog(join(runDir(), "events.jsonl"));
 }
 
-function run(turns: FakeTurn[], extra: { callbackToken?: string } = {}) {
+function run(turns: FakeTurn[], extra: { callbackToken?: string; platformTools?: boolean } = {}) {
   gateway.script(turns);
-  return runOnce({ sessionDir, workDir, runId, apiKey: "xpl_run", callbackToken: extra.callbackToken ?? "cb" });
+  return runOnce({ sessionDir, workDir, runId, apiKey: "xpl_run", callbackToken: extra.callbackToken ?? "cb", platformTools: extra.platformTools });
 }
 
 async function waitFor(predicate: (log: RunEvent[]) => boolean): Promise<void> {
@@ -226,6 +226,8 @@ describe("runner", () => {
     await run([{ text: "ok" }]);
     const system = JSON.stringify((gateway.completions()[0]?.messages as { content: unknown }[])[0]);
     expect(system).toContain("<cowork>");
+    expect(system).toContain("You are exp-code, the coding and cowork agent made by Experiential");
+    expect(system).not.toContain("running inside pi");
     for (const skill of ["docx", "xlsx", "pptx", "pdf", "charts", "data-analysis"]) expect(system).toContain(`<name>${skill}</name>`);
   });
 
@@ -326,6 +328,20 @@ describe("runner", () => {
     writeSpec({ webSearch: true });
     await run([{ text: "ok" }]);
     expect(names(gateway.completions()[1]!)).toContain("web_search");
+  });
+
+  it("keeps the Experiential platform tools off unless the host opts in", async () => {
+    const names = (body: Record<string, unknown>) => ((body.tools as { function: { name: string } }[]) ?? []).map((tool) => tool.function.name);
+    writeSpec();
+    await run([{ text: "ok" }]);
+    expect(names(gateway.completions()[0]!).filter((name) => name.startsWith("experiential_"))).toEqual([]);
+    expect(JSON.stringify(gateway.completions()[0]?.messages)).not.toContain("experiential-traces");
+    writeSpec();
+    await run([{ text: "ok" }], { platformTools: true });
+    expect(names(gateway.completions()[1]!)).toEqual(
+      expect.arrayContaining(["experiential_search_requests", "experiential_get_request", "experiential_usage", "experiential_models", "experiential_evals"])
+    );
+    expect(JSON.stringify(gateway.completions()[1]?.messages)).toContain("experiential-traces");
   });
 
   it("pushes events in seq order with the bearer and flushes run_end before exit", async () => {

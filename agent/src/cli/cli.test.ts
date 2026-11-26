@@ -42,11 +42,13 @@ describe("exp-code CLI", () => {
   it("prints its version and help", async () => {
     expect(existsSync(cli)).toBe(true);
     const version = await runCli(["--version"]);
-    expect(version.stdout).toMatch(new RegExp(`^exp-code ${EXP_CODE_VERSION.replaceAll(".", "\\.")} \\(pi-coding-agent \\d+\\.\\d+\\.\\d+\\)`));
+    expect(version.stdout.trim()).toBe(`exp-code ${EXP_CODE_VERSION}`);
     const help = await runCli(["--help"]);
     expect(help.code).toBe(0);
     expect(help.stdout).toContain("exp-code");
     expect(help.stdout).toContain("--mode");
+    expect(help.stdout).toContain("exp-code [options]");
+    expect(help.stdout).not.toMatch(/^\s*pi\s/m);
   });
 
   it("answers a print-mode prompt through a local gateway, with the exp-code tools and prompt", async () => {
@@ -60,11 +62,24 @@ describe("exp-code CLI", () => {
     const system = JSON.stringify((body.messages as { content: unknown }[])[0]);
     expect(system).toContain("<cowork>");
     expect(system).toContain("xlsx");
+    expect(system).toContain("You are exp-code");
+    expect(system).not.toContain("running inside pi");
     const listing = gateway.requests.find((request) => request.path === "/v1/models");
     expect(listing?.headers.authorization).toBe("Bearer local-key");
     // exp-code keeps its sessions under its own home, never Pi's.
     expect(readdirSync(join(home, ".exp-code", "agent", "sessions")).length).toBeGreaterThan(0);
     expect(existsSync(join(home, ".pi"))).toBe(false);
+  });
+
+  it("gives a hosted session the Experiential platform tools unless EXP_CODE_PLATFORM_TOOLS=0", async () => {
+    const names = () => ((gateway.completions().at(-1)!.tools as { function: { name: string } }[]) ?? []).map((tool) => tool.function.name);
+    const hostedEnv = { EXP_API_KEY: "xpl_test", EXP_CODE_BASE_URL: gateway.baseUrl, EXP_CODE_MODEL: "fake-model" };
+    gateway.script([{ text: "on" }]);
+    expect((await runCli(["-p", "hi"], hostedEnv)).stdout.trim()).toBe("on");
+    expect(names()).toEqual(expect.arrayContaining(["experiential_search_requests", "experiential_get_request", "experiential_usage", "experiential_models", "experiential_evals"]));
+    gateway.script([{ text: "off" }]);
+    expect((await runCli(["-p", "hi"], { ...hostedEnv, EXP_CODE_PLATFORM_TOOLS: "0" })).stdout.trim()).toBe("off");
+    expect(names().filter((name) => name.startsWith("experiential_"))).toEqual([]);
   });
 
   it("emits Pi's JSON event stream in --mode json", async () => {

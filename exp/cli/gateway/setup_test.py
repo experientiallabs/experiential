@@ -8,9 +8,11 @@ from pathlib import Path
 
 import pytest
 import typer
+from typer.testing import CliRunner
 
 import exp.runtime.gateway.sqlite.setup_authority as setup_authority
 import exp.runtime.gateway.sqlite.store as gateway_store
+from exp.cli.app import app
 from exp.cli.gateway import setup
 from exp.cli.gateway.guardrail_setup import (
     GUARDRAILS_STANDARD,
@@ -306,6 +308,28 @@ def test_gateway_setup_reconfigure_preserves_same_custom_endpoint_declaration(
     )
     first = setup.interactive_gateway_setup(tmp_path, console=ScriptedConsole("\ny\n"))
 
+    declared = CliRunner().invoke(
+        app,
+        [
+            "config",
+            "gateway",
+            "alias",
+            "update",
+            first.alias,
+            "--deployment",
+            "custom:custom-tools",
+            "--exact-model",
+            "custom-tools",
+            "--supports-tools",
+            "--supports-vllm-sampling",
+            "--root",
+            str(tmp_path),
+            "--non-interactive",
+            "--json",
+        ],
+    )
+    assert declared.exit_code == 0, declared.output
+
     console = ScriptedConsole(f"edit\n{first.alias}\ndefault\n50\noff\n\n")
     setup.interactive_gateway_setup(
         tmp_path,
@@ -317,6 +341,7 @@ def test_gateway_setup_reconfigure_preserves_same_custom_endpoint_declaration(
     assert authored.gateway is not None
     assert authored.gateway.capabilities.supports_streaming_tool_arguments
     assert "Does this custom endpoint stream tool-call arguments?" in console.output
+    assert authored.gateway.capabilities.supports_vllm_sampling
 
 
 def test_gateway_setup_marks_experiential_deployment_as_host_managed(

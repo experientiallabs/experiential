@@ -416,6 +416,9 @@ def _estimated(
         web_search_requests=0 if observed is None else observed.web_search_requests,
         web_search_results=None if observed is None else observed.web_search_results,
         web_search_cost_nano_usd=None if observed is None else observed.web_search_cost_nano_usd,
+        provider_reported_cost_nano_usd=(
+            None if observed is None else observed.provider_reported_cost_nano_usd
+        ),
         tool_search_requests=0 if observed is None else observed.tool_search_requests,
     )
     return terminal.model_copy(update={"usage": usage, "usage_estimated": True})

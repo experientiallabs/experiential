@@ -34,6 +34,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from exp.common.core.artifacts import ContractModel, JsonObject
+from exp.runtime.gateway.public_egress import provider_client
 from exp.runtime.gateway.stream_contracts import GatewayFailure, GatewayFailureClass
 from exp.runtime.gateway.video.contracts import VideoRequest, VideoStatus
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -136,8 +137,14 @@ HttpFactory = Callable[[], httpx.Client]
 
 
 def default_http_factory() -> httpx.Client:
-    """Build one bounded synchronous HTTP client for provider job calls."""
-    return httpx.Client(timeout=_TIMEOUT, follow_redirects=False)
+    """Build one bounded synchronous HTTP client for provider job calls.
+
+    While the gateway serves with ``public_upstreams_only`` it holds the
+    native transport's public HTTPS destination policy; otherwise it may reach
+    local or private servers. It never honors environment proxies or follows
+    redirects.
+    """
+    return provider_client(timeout=_TIMEOUT)
 
 
 def _bounded(text: object) -> str | None:

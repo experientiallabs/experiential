@@ -442,6 +442,7 @@ fn public_embeddings(
         cache_writes_read_back: false,
         image_output_tokens: None,
         image_input_tokens: None,
+        provider_reported_cost_nano_usd: None,
     };
     Ok((Value::Object(public), usage))
 }

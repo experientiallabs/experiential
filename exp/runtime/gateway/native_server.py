@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Protocol, cast
 
 from exp.runtime.gateway.guardrails.deterministic import NativeDetector
+from exp.runtime.gateway.public_egress import require_public_upstreams
 
 if TYPE_CHECKING:
     from exp_gateway_native import CaptureCollector, ExecutionBindings, ShutdownHandle
@@ -167,8 +168,11 @@ def serve_native_gateway(
         public_upstreams_only: Restrict native provider connections to public HTTPS
             addresses, including connection-time DNS checks and proxy bypass.
             Hosted embedders accepting customer endpoints must enable this. It
-            defaults to False for local/private model servers and does not cover
-            Python control-plane callbacks that make their own HTTP requests.
+            defaults to False for local/private model servers. True also holds the
+            gateway's own Python provider clients (video job submit and poll)
+            to the same policy for the rest of the process
+            (``public_egress.require_public_upstreams``; never undone). Other
+            Python callbacks that make their own HTTP requests are not covered.
         native_usage_enabled: Whether Rust owns ``/usage.json``. Hosted,
             multi-tenant callers should disable it so their own surface owns
             usage.
@@ -235,6 +239,10 @@ def serve_native_gateway(
     reserve = pre_first_byte_reserve_seconds()
     if reserve is not None:
         config["pre_first_byte_reserve_seconds"] = reserve
+    if public_upstreams_only:
+        # One-way: pollers and execution-bound planes outlive or overlap this
+        # call, so the policy is never restored (public_egress._ProcessPolicy).
+        require_public_upstreams()
     try:
         native.serve(
             cast("NativeControlPlane", control_plane),

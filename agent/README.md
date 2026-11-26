@@ -72,9 +72,10 @@ saved when neither key variable is set:
 | `EXP_GATEWAY_KEY` | Local gateway key. Selects the local gateway when no hosted key is set. |
 | `EXP_CODE_GATEWAY` | `hosted` or `local`, to choose explicitly. |
 | `EXP_CODE_BASE_URL` | Another base URL for the chosen gateway. |
-| `EXP_CODE_MODEL` | Default model alias (otherwise the first alias the gateway lists). |
+| `EXP_CODE_MODEL` | Default model alias (otherwise `experiential-large-model` when listed, else the first alias the gateway lists). |
 | `EXP_CODE_WIRE` | Force one wire API: `completions`, `responses`, or `messages`. |
 | `EXP_CODE_HOME` | Configuration directory (default `~/.exp-code`). |
+| `EXP_CODE_PLATFORM_TOOLS` | `0` (or `false`, `off`, `no`) turns off the tools that read your organization's Experiential data. See [Working with your Experiential data](#working-with-your-experiential-data). |
 | `EXP_PLATFORM_URL` | Platform origin `exp-code login` opens (default `https://platform.experientiallabs.ai`). |
 
 The model listing is cached for five minutes in `~/.exp-code/cache/` (keyed by a digest of the
@@ -87,7 +88,10 @@ settled cost, which exp-code shows as the cost of the turn.
 
 exp-code keeps its own configuration in `~/.exp-code/agent` (settings, saved credentials,
 sessions, extensions, skills). In a project it reads `AGENTS.md` for instructions and `.pi/`
-for project settings and resources. Telemetry and the update check are off.
+for project settings and resources. Telemetry and the update check are off. Before anything
+loads, exp-code points the harness at this directory (`PI_CODING_AGENT_DIR=~/.exp-code/agent`),
+so it never shares state with another agent install, and it leaves `PI_TELEMETRY` and
+`PI_SKIP_VERSION_CHECK` off unless you set them.
 
 ## Modes
 
@@ -100,8 +104,16 @@ exp-code --model experiential/<alias>     # pick a model
 exp-code -c                               # continue the last session
 ```
 
-The full flag list, and the JSON and RPC formats, are in the upstream docs linked under
-[Built on Pi](#built-on-pi).
+`exp-code --help` lists every flag. The JSON and RPC formats are described in the reference
+docs linked under [Acknowledgements](#acknowledgements).
+
+New sessions start on `experiential-large-model` when the gateway lists it (otherwise the first
+alias it lists). `EXP_CODE_MODEL`, `--model`, and a model you chose earlier with `/model` all
+take precedence. When a session's model is not a gateway model, `web_search` runs on
+`experiential-small-model` if the gateway lists it.
+
+The first interactive start installs the two file-search helpers (`fd` and `rg`) into
+`~/.exp-code/agent/bin` when they are not on your `PATH`, with one line of progress.
 
 ## The extension
 
@@ -114,7 +126,39 @@ The full flag list, and the JSON and RPC formats, are in the upstream docs linke
 | Cowork prompt | A `<cowork>` section: produce deliverables as files, verify them, explain results plainly. |
 | Skills | `docx`, `xlsx` (with live formulas), `pptx`, `pdf`, `charts`, and `data-analysis`, in the [Agent Skills](https://agentskills.io) format under `skills/`. The model loads one when a task matches. |
 
-The extension is also a library export (`createExpCodeExtension`) for SDK hosts.
+The extension is also a library export (`createExpCodeExtension`) for SDK hosts. It registers the
+platform tools below only when given `platformTools: true`.
+
+## Working with your Experiential data
+
+With a hosted gateway key, exp-code can read the organization the key belongs to: its gateway
+request log (traces), usage and spend, models and prices, and evaluations. Ask things like "find
+the failed requests from the last hour and tell me why", "why did this request cost $2", "what
+did we spend on each model this week", or "which model is cheapest with a 200k context". The
+tools only read; they never change anything.
+
+| Tool | What it reads |
+|---|---|
+| `experiential_search_requests` | The request log (`GET /api/orgs/{org}/usage/requests`): filters for time (`since` such as `1h`, or `start`/`end`), model, status (`error` means anything not completed), error class, conversation, API key, lane (`platform` or `byok`), end-user label, and cache hits, sorted newest first or by cost, latency or tokens. One compact row per request (time, model, outcome, tokens, cost, latency, conversation, request id), at most 50 per call, with an opaque cursor for the next page. Default: the last 24 hours. |
+| `experiential_get_request` | One request (`.../usage/requests/{id}?include_body=true` and `.../attempts`): the cost breakdown, every provider attempt with its error, and the stored prompt and response, cut to `max_chars` (default 12,000) with a visible marker. When the organization does not store prompt content, it says so. |
+| `experiential_usage` | Spend and usage over 24h, 7d or 30d (`.../usage/timeseries`, `by-provider`, `by-label`, `by-key`, `latency`), grouped by model, provider, API key, end-user label or time, with p50/p95 latency and time to first token; `group_by=day` reads daily history (`GET /api/gateway/usage/daily`). |
+| `experiential_models` | The models this key can call (`GET /v1/models`, including `experiential-small-model`, `experiential-medium-model` and `experiential-large-model`) joined with the catalog (`GET /api/models`): default provider, context window and limits, and list prices per million tokens. Search by words, filter by provider, context or input price, sort by price or context. |
+| `experiential_evals` | Imported eval results and A/B tests (`.../evaluations/results`, `.../evaluations/ab-tests`). |
+
+The org is found once per session with `GET /api/whoami`. A bundled `experiential-traces` skill
+tells the model how to debug with these tools; it is offered only when they are on. Refusals come
+back as plain messages: a key the API does not accept (401), a read the key may not make (403;
+per-key usage and evaluations need the organization's provisioning key), an unknown request
+(404), a busy or rate-limited API (429, with the retry delay), or a server problem (5xx). The key
+is sent only as the `Authorization` header and never appears in tool output.
+
+Safety defaults. These tools can read your organization's stored prompts and responses, so a
+prompt injection in something the agent reads (a web page, a file in the project) could try to
+make it fetch traces and copy them elsewhere. Tool output that carries stored content is marked
+as data, not instructions. The tools are on by default in the interactive CLI, where you watch the
+session and own the key; set `EXP_CODE_PLATFORM_TOOLS=0` to turn them off. They are off in the
+headless runner unless its host passes `--platform-tools`, and they are not registered for a
+local `exp` gateway, which has no platform API.
 
 ## Headless runner
 
@@ -123,8 +167,14 @@ copy into a sandbox:
 
 ```bash
 AGENT_GATEWAY_KEY=xpl_... AGENT_CALLBACK_TOKEN=... node runner.mjs <runId> \
-  [--session-dir /opt/agent/session] [--work-dir /home/user/work] [--user user]
+  [--session-dir /opt/agent/session] [--work-dir /home/user/work] [--user user] [--platform-tools]
 ```
+
+`--platform-tools` gives the model the read-only [Experiential data tools](#working-with-your-experiential-data)
+for the run's key. They are off by default: a run reads pages and files nobody reviewed, and a
+prompt injection there could otherwise read the organization's stored prompts and leak them
+through another tool (`web_fetch`, `bash`). Enable them only where the key's reach and the
+sandbox's network make that acceptable.
 
 The runner reads the two secrets once and deletes them from its environment. When it runs as
 root, every tool the model uses runs as the unprivileged `--user` account: its shell commands
@@ -182,15 +232,9 @@ attaches `exp-code-runner.mjs` (the self-contained sandbox runner), its `.sha256
 `exp-code-protocol.ts` (the runner protocol) to a GitHub release, so a host can pin a version
 and verify the file it runs. With an `NPM_TOKEN` secret configured it also publishes to npm.
 
-## Built on Pi
+## Acknowledgements
 
-exp-code is built on [Pi's coding agent](https://github.com/earendil-works/pi/tree/main/packages/coding-agent)
-(`@earendil-works/pi-coding-agent`, exact-pinned) and extends it with the Experiential gateway
-provider, the cowork tools and skills, and the sandbox runner. The terminal UI, sessions,
-compaction, extensions, skills, MCP and the print, JSON and RPC modes work as Pi documents
-them: see its [CLI](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/cli.md),
+exp-code is a fork of [Pi's coding agent](https://github.com/earendil-works/pi/tree/main/packages/coding-agent)
+(MIT), which it uses as an exact-pinned dependency; its [CLI](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/cli.md),
 [JSON](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/json.md), and
-[RPC](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md) docs.
-exp-code sets Pi's `PI_CODING_AGENT_DIR` to `~/.exp-code/agent` before Pi loads, so it never
-shares state with a Pi installation, and leaves `PI_TELEMETRY` and `PI_SKIP_VERSION_CHECK` off
-unless you set them.
+[RPC](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md) docs describe the formats exp-code keeps.

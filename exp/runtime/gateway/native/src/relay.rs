@@ -465,6 +465,11 @@ impl UpstreamRelay {
             .set_cache_writes_within_reads(writes_within_reads);
     }
 
+    /// Carry whether this rung's provider reports its own per-request charge (OpenRouter).
+    pub fn set_provider_reported_cost(&mut self, reported: bool) {
+        self.normalizer.set_provider_reported_cost(reported);
+    }
+
     /// Carry whether this rung asked for 12-hour cache writes into usage normalization.
     pub fn set_twelve_hour_cache_writes(&mut self, requested: bool) {
         self.normalizer.set_twelve_hour_cache_writes(requested);
@@ -473,6 +478,11 @@ impl UpstreamRelay {
     /// Carry the tokens this attempt's own automatic cache create wrote.
     pub fn set_gemini_cache_writes(&mut self, written: Option<u64>) {
         self.normalizer.set_gemini_cache_writes(written);
+    }
+
+    /// Read this rung's frames through the Cloud Code Assist envelope.
+    pub fn set_code_assist_envelope(&mut self, enveloped: bool) {
+        self.normalizer.set_code_assist_envelope(enveloped);
     }
 
     /// Carry the Codex native-tool inversion map (see

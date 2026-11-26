@@ -15,7 +15,7 @@ from rich.prompt import Confirm
 from rich.table import Table
 from rich.text import Text
 
-from exp.cli.gateway.capability_authority import retained_streaming_tool_arguments
+from exp.cli.gateway.capability_authority import retained_gateway_capabilities
 from exp.cli.gateway.guardrail_setup import (
     GUARDRAILS_OFF,
     GuardrailSetupPlan,
@@ -211,6 +211,16 @@ def interactive_gateway_setup(
     for endpoint in session.endpoints:
         selected_connections[endpoint.connection.name] = endpoint.connection.catalog_config()
     selected_provider = selected_connections[selected.connection].provider
+    retained = (
+        retained_gateway_capabilities(
+            manager,
+            alias_id=values.alias,
+            connection_id=selected.connection,
+            connection=selected_connections[selected.connection],
+        )
+        if reconfigure
+        else None
+    )
     supports_streaming_tool_arguments = provider_has_certified_capability(
         selected_provider,
         ProviderCapability.TOOL_ARGUMENT_STREAM,
@@ -218,20 +228,10 @@ def interactive_gateway_setup(
     if selected.connection == HOSTED_SETUP_PICKER:
         supports_streaming_tool_arguments = True
     elif selected_provider == "openai-compatible" and capabilities.supports_tools is not False:
-        existing_declaration = (
-            retained_streaming_tool_arguments(
-                manager,
-                alias_id=values.alias,
-                connection_id=selected.connection,
-                connection=selected_connections[selected.connection],
-            )
-            if reconfigure
-            else None
-        )
         try:
             supports_streaming_tool_arguments = Confirm.ask(
                 "Does this custom endpoint stream tool-call arguments?",
-                default=existing_declaration or False,
+                default=retained.supports_streaming_tool_arguments if retained else False,
                 console=console,
             )
         except (EOFError, KeyboardInterrupt) as exc:
@@ -281,6 +281,9 @@ def interactive_gateway_setup(
                         gateway_capabilities=GatewayDeploymentCapabilities(
                             supports_streaming=True,
                             supports_streaming_tool_arguments=supports_streaming_tool_arguments,
+                            supports_vllm_sampling=(
+                                retained.supports_vllm_sampling if retained else False
+                            ),
                         ),
                         prices=None,
                         pricing_source=None,

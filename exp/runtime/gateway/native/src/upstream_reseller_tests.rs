@@ -300,3 +300,59 @@ async fn a_relays_decode_failure_relays_the_upstream_error_it_embeds() {
         .as_deref()
         .is_some_and(|detail| detail.starts_with("Exceeded maximum number of images (50)")));
 }
+
+#[tokio::test]
+async fn code_assist_account_verdicts_classify_at_stream_open() {
+    use super::tests::open_dialect_against_body;
+    let gemini = Dialect::GeminiGenerateContent;
+    let suspended = open_dialect_against_body(
+        "403 Forbidden",
+        "{\"error\":{\"code\":403,\"status\":\"PERMISSION_DENIED\",\"message\":\"x\",\
+         \"details\":[{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\
+         \"reason\":\"TOS_VIOLATION\",\"metadata\":{\"appeal_url\":\"https://g.co/appeal\"}}]}}",
+        "gemini-3-flash",
+        gemini,
+    )
+    .await;
+    assert_eq!(
+        suspended.failure_class,
+        FailureClass::ProviderAuthentication
+    );
+    assert!(suspended.account_suspended);
+    assert_eq!(
+        crate::google_account_verdicts::appeal_url_of(&suspended),
+        Some("https://g.co/appeal")
+    );
+    let quota = open_dialect_against_body(
+        "429 Too Many Requests",
+        "{\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\",\"message\":\"x\",\
+         \"details\":[{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\
+         \"reason\":\"QUOTA_EXHAUSTED\",\"metadata\":{\"quotaResetDelay\":\"90s\"}}]}}",
+        "gemini-3-flash",
+        gemini,
+    )
+    .await;
+    assert_eq!(quota.failure_class, FailureClass::ProviderQuota);
+    assert_eq!(quota.retry_after_seconds, Some(90));
+    assert_eq!(
+        quota.provider_detail.as_deref(),
+        Some("http 429: QUOTA_EXHAUSTED")
+    );
+    let throttled = open_dialect_against_body(
+        "429 Too Many Requests",
+        "{\"error\":{\"code\":429,\"status\":\"RESOURCE_EXHAUSTED\",\"message\":\"x\",\
+         \"details\":[{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\
+         \"reason\":\"RATE_LIMIT_EXCEEDED\"},{\"@type\":\
+         \"type.googleapis.com/google.rpc.RetryInfo\",\"retryDelay\":\"4.2s\"}]}}",
+        "gemini-3-flash",
+        gemini,
+    )
+    .await;
+    assert_eq!(throttled.failure_class, FailureClass::Throttled);
+    assert!(!throttled.account_suspended);
+    assert_eq!(throttled.retry_after_seconds, Some(5));
+    assert_eq!(
+        throttled.provider_detail.as_deref(),
+        Some("http 429: RATE_LIMIT_EXCEEDED")
+    );
+}
