@@ -163,18 +163,70 @@ def test_explicit_flat_reasoning_effort_wins_over_translate_fields() -> None:
 
 
 @pytest.mark.parametrize(
-    "off_fields",
+    ("field", "value"),
     (
-        {"thinking": {"type": "disabled"}},
-        {"reasoning": {"enabled": False}},
-        {"chat_template_kwargs": {"enable_thinking": False}},
-        {"enable_thinking": False},
+        ("thinking", {"type": "disabled"}),
+        ("reasoning", {"enabled": False}),
+        ("chat_template_kwargs", {"enable_thinking": False}),
+        ("enable_thinking", False),
     ),
 )
-def test_flat_effort_cannot_override_an_explicit_off_setting(off_fields: JsonObject) -> None:
-    """An active flat effort conflicts with any caller's explicit off switch."""
+def test_active_flat_effort_overrides_an_off_switch_with_disclosure(
+    field: str, value: object
+) -> None:
+    """An active flat effort decides over a contradicting off switch and names the conflict."""
+    request = _decode(reasoning_effort="high", **{field: value})
+    assert request.reasoning_effort == "high"
+    assert request.thinking_default_enable is False
+    assert request.ignored_parameters == (f"{field}->ignored(conflicts_with_reasoning_effort)",)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("thinking", {"type": "enabled"}),
+        ("thinking", {"type": "adaptive"}),
+        ("reasoning", {"enabled": True}),
+        ("chat_template_kwargs", {"enable_thinking": True}),
+        ("enable_thinking", True),
+    ),
+)
+def test_flat_effort_none_overrides_an_on_switch_with_disclosure(field: str, value: object) -> None:
+    """``reasoning_effort: none`` turns thinking off over a contradicting on switch."""
+    request = _decode(reasoning_effort="none", **{field: value})
+    assert request.reasoning_effort == "none"
+    assert request.thinking_default_enable is False
+    assert request.ignored_parameters == (f"{field}->ignored(conflicts_with_reasoning_effort)",)
+
+
+def test_flat_effort_names_only_the_controls_that_contradict_it() -> None:
+    """Agreeing controls stay ``explicit_reasoning_effort``; only a contradicting one conflicts."""
+    request = _decode(
+        reasoning_effort="medium",
+        thinking={"type": "enabled"},
+        chat_template_kwargs={"enable_thinking": False},
+    )
+    assert request.reasoning_effort == "medium"
+    assert request.ignored_parameters == (
+        "thinking->ignored(explicit_reasoning_effort)",
+        "chat_template_kwargs->ignored(conflicts_with_reasoning_effort)",
+    )
+
+
+def test_template_thinking_switch_yields_to_flat_effort() -> None:
+    """The vLLM template ``thinking`` switch reaches the same resolution after its rewrite."""
+    request = _decode(reasoning_effort="high", chat_template_kwargs={"thinking": False})
+    assert request.reasoning_effort == "high"
+    assert "chat_template_kwargs->ignored(conflicts_with_reasoning_effort)" in (
+        request.ignored_parameters
+    )
+
+
+@pytest.mark.parametrize("effort", ("hgih", "maximum", ""))
+def test_unknown_flat_effort_beside_an_off_switch_is_still_refused(effort: str) -> None:
+    """A malformed effort is a caller error and keeps its named refusal."""
     with pytest.raises(OpenAIProtocolError) as error:
-        _decode(reasoning_effort="high", **off_fields)
+        _decode(reasoning_effort=effort, thinking={"type": "disabled"})
     assert error.value.detail.param == "reasoning_effort"
 
 
