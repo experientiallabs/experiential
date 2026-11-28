@@ -52,9 +52,23 @@ describe("exp-code CLI", () => {
     expect(help.stdout).not.toMatch(/\bPi\b|pi\.dev|~\/\.pi|\bPI_[A-Z]/);
     expect(help.stdout).toContain("EXP_CODE_OFFLINE");
     expect(help.stdout).not.toContain("GEMINI_API_KEY");
+    // Examples and commands name the gateway's models and exp-code's sign-in, not Pi's providers.
+    expect(help.stdout).not.toMatch(/openai|github-copilot|sonnet|haiku|gpt-4o|radius|auth <command>|print-api-key/);
+    expect(help.stdout).toContain("--model experiential-medium-model:high");
+    expect(help.stdout).toContain("exp-code login --status, whoami");
     const update = await runCli(["update", "--help"]);
     expect(update.stdout).toContain("Update exp-code, installed extensions, or model catalogs.");
     expect(update.stdout).not.toMatch(/\bpi\b/i);
+  });
+
+  it("answers `auth` with the sign-in commands and a bad EXP_CODE_WIRE with one line", async () => {
+    const auth = await runCli(["auth", "check", "--provider", "experiential"]);
+    expect(auth.code).toBe(2);
+    expect(auth.stderr).toMatch(/^exp-code has no `auth` command/);
+    expect(auth.stderr).toContain("exp-code login --status");
+    const wire = await runCli(["-p", "hi"], { EXP_GATEWAY_KEY: "local-key", EXP_CODE_BASE_URL: gateway.baseUrl, EXP_CODE_WIRE: "bogus" });
+    expect(wire.code).toBe(2);
+    expect(wire.stderr.trim()).toBe('exp-code: EXP_CODE_WIRE: Unknown wire API "bogus". Use completions, responses, or messages.');
   });
 
   it("offers only the gateway's models, whatever vendor keys the environment holds", async () => {

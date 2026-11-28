@@ -77,6 +77,54 @@ describe("command list and sign-in guidance", () => {
   });
 });
 
+describe("settings, footer and model list", () => {
+  const patched = (file: string) => patchSource(installedFile("pi-coding-agent", file), readFileSync(installedFile("pi-coding-agent", file), "utf8"));
+
+  it("offer no setting that does nothing in exp-code", () => {
+    const source = patched("modes/interactive/components/settings-selector.js");
+    expect(source).not.toContain('id: "share-destination"');
+    expect(source).not.toContain('id: "install-telemetry"');
+    expect(source).not.toContain("Radius");
+  });
+
+  it("list a 1,050,000-token window as 1.05M, like the footer", () => {
+    const source = patched("cli/list-models.js");
+    const body = source.slice(source.indexOf("function formatTokenCount(count) {"), source.indexOf("/**\n * List available models, optionally"));
+    const format = new Function(`${body}\nreturn formatTokenCount;`)() as (count: number) => string;
+    expect([format(1_050_000), format(1_048_576), format(1_000_000), format(200_000), format(131_072)]).toEqual(["1.05M", "1.05M", "1M", "200K", "131.1K"]);
+  });
+
+  it("move the model to its own footer line rather than cut its name", async () => {
+    const { FooterComponent, initTheme } = await import("@earendil-works/pi-coding-agent");
+    initTheme("dark");
+    const model = { provider: "experiential", id: "experiential-small-model", reasoning: true, contextWindow: 1_050_000 };
+    const session = {
+      state: { model, thinkingLevel: "low", messages: [] },
+      model,
+      sessionManager: {
+        getEntries: () => [],
+        getEntryCount: () => 0,
+        getLeafId: () => null,
+        getSessionId: () => "s",
+        getCwd: () => "/private/tmp/exp-qa/work3",
+        getSessionName: () => undefined
+      },
+      getContextUsage: () => ({ tokens: 0, contextWindow: 1_050_000, percent: 0 }),
+      modelRuntime: { isUsingSubscription: () => false },
+      routedModel: undefined
+    };
+    const data = { getGitBranch: () => null, getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1 };
+    const footer = new FooterComponent(session as never, data as never);
+    const strip = (line: string) => line.replace(/\x1b\[[0-9;]*m/g, "");
+    const narrow = footer.render(40).map(strip);
+    expect(narrow.some((line) => line.endsWith("experiential-small-model • low"))).toBe(true);
+    expect(narrow.every((line) => line.length <= 40)).toBe(true);
+    const wide = footer.render(100).map(strip);
+    expect(wide).toHaveLength(2);
+    expect(wide[1]).toMatch(/\(auto\)\s+experiential-small-model • low$/);
+  });
+});
+
 describe("Pi as tests load it", () => {
   it("is patched (the test setup installs the load hook)", async () => {
     const config = await import("@earendil-works/pi-coding-agent");

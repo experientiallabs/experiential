@@ -187,7 +187,7 @@ export async function loginStatus(io: Pick<AuthIo, "env" | "out">): Promise<numb
   return 0;
 }
 
-/** Parse `login` / `logout` / `whoami` invocations; `undefined` when the arguments are not one. */
+/** Parse `login` / `logout` / `whoami` (and `auth`) invocations; `undefined` when the arguments are not one. */
 export type AuthCommand = { kind: "login"; noBrowser: boolean } | { kind: "logout" } | { kind: "status" } | { kind: "help"; text: string };
 
 const LOGIN_HELP = `Usage:
@@ -201,8 +201,21 @@ EXP_GATEWAY_KEY in the environment take precedence over it. EXP_PLATFORM_URL poi
 another platform origin, EXP_CODE_BASE_URL at another gateway.
 `;
 
+/**
+ * What `exp-code auth` says. Pi's `auth` logs in to, prints and checks the credentials of its
+ * direct vendor providers; exp-code registers none, so every one of those answered "not_ready" or
+ * "Unknown provider" even with a working Experiential key.
+ */
+const AUTH_REPLACED = `exp-code has no \`auth\` command: every model runs through the Experiential gateway, so there are no provider credentials to manage. Use these instead:
+
+${LOGIN_HELP}`;
+
 export function parseAuthCommand(args: readonly string[]): AuthCommand | { kind: "error"; message: string } | undefined {
   const [first, ...rest] = args;
+  if (first === "auth") {
+    const help = rest.length === 0 || (rest.length === 1 && (rest[0] === "--help" || rest[0] === "-h"));
+    return help ? { kind: "help", text: AUTH_REPLACED } : { kind: "error", message: AUTH_REPLACED.trimEnd() };
+  }
   if (first === "whoami") return rest.length === 0 ? { kind: "status" } : { kind: "error", message: "exp-code whoami takes no options." };
   if (first === "logout") return rest.length === 0 ? { kind: "logout" } : { kind: "error", message: "exp-code logout takes no options." };
   if (first !== "login") return undefined;
