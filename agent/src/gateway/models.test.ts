@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { GatewayConfig } from "./config.js";
 import { type Api, getSupportedThinkingLevels, type Model } from "@earendil-works/pi-ai";
 import {
+  agentCanUse,
   cacheKey,
   chooseWireApi,
   clearModelCache,
@@ -59,6 +60,23 @@ describe("gateway models", () => {
       { id: "bad-limits" }
     ]);
     expect(() => parseModelListing({})).toThrow(/no data array/);
+  });
+
+  it("lists only aliases that serve chat with tools", () => {
+    // exp-code sends its tools on every turn: the gateway refuses these aliases with a 400
+    // (`unsupported_capability`) before any call, so the picker never offers them.
+    const listed = parseModelListing({
+      data: [
+        { id: "coder", supports_completions: true, supports_tools: true },
+        { id: "sonar", supports_completions: true, supports_tools: false },
+        { id: "tts-1", supports_completions: false, supports_tools: null },
+        { id: "text-embedding-3-small", supports_completions: false, supports_tools: false, supports_embeddings: true },
+        // A local gateway states neither: kept.
+        { id: "local-alias" }
+      ]
+    });
+    expect(listed.map((model) => model.id)).toEqual(["coder", "local-alias"]);
+    expect(agentCanUse({ id: "x", supports_tools: null, supports_completions: null })).toBe(true);
   });
 
   it("no longer reads the OpenRouter-style names neither gateway sends", () => {
