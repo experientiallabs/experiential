@@ -37,6 +37,15 @@ const LUNA = {
   reasoning_effort: "medium",
   supported_reasoning_efforts: ["none", "low", "medium"]
 };
+/** claude-sonnet-5.5 as the hosted gateway lists it: an effort ladder, no `none`. */
+const SONNET = {
+  id: "claude-sonnet-5.5",
+  context_window_tokens: 1_000_000,
+  maximum_output_tokens: 128_000,
+  supports_reasoning: true,
+  reasoning_effort: "high",
+  supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max"]
+};
 /** A model without reasoning. */
 const PLAIN = { id: "plain-model", context_window_tokens: 128_000, maximum_output_tokens: 16_000, supports_reasoning: false };
 
@@ -134,7 +143,7 @@ describe("the level reaches the request", () => {
   it("on every wire API", async () => {
     const { streamSimple } = await import("@earendil-works/pi-ai/compat");
     const payload = async (wire: GatewayWireApi, id: string, level: "off" | "medium") => {
-      const listed = parseListedModel([LUNA, ALWAYS_REASONS].find((entry) => entry.id === id))!;
+      const listed = parseListedModel([LUNA, ALWAYS_REASONS, SONNET].find((entry) => entry.id === id))!;
       // A closed port: the payload is built and handed to onPayload before the request fails.
       const [model] = gatewayProviderModels([listed], { kind: "hosted", baseUrl: "http://127.0.0.1:9/v1", apiKey: "xpl_test_key" }, wire);
       let sent: Record<string, unknown> | undefined;
@@ -153,5 +162,11 @@ describe("the level reaches the request", () => {
     expect((await payload("openai-responses", LUNA.id, "medium"))?.reasoning).toMatchObject({ effort: "medium" });
     expect((await payload("openai-responses", LUNA.id, "off"))?.reasoning).toEqual({ effort: "none" });
     expect((await payload("openai-completions", LUNA.id, "medium"))?.reasoning_effort).toBe("medium");
+    // Claude on the Messages lane: adaptive thinking with the effort, never a numeric budget
+    // (Claude 4.6 and later refuse `budget_tokens`).
+    const claude = await payload("anthropic-messages", SONNET.id, "medium");
+    expect(claude?.thinking).toMatchObject({ type: "adaptive" });
+    expect(claude?.thinking).not.toHaveProperty("budget_tokens");
+    expect(claude?.output_config).toEqual({ effort: "medium" });
   });
 });

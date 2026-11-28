@@ -108,6 +108,11 @@ describe("gateway models", () => {
   it("builds Pi models with defaults and the right base URL per wire", () => {
     expect(toProviderModel({ id: "plain" }, hosted)).toMatchObject({ id: "plain", api: "openai-completions", baseUrl: hosted.baseUrl, contextWindow: DEFAULT_CONTEXT_WINDOW, input: ["text"], reasoning: false });
     expect(toProviderModel({ id: "claude-x" }, hosted)).toMatchObject({ api: "anthropic-messages", baseUrl: "https://gw.example", reasoning: true });
+    // Pi's budget-based thinking is only for a Claude route with no stated ladder (a local gateway).
+    expect(toProviderModel({ id: "claude-x" }, hosted)).not.toHaveProperty("compat");
+    expect(toProviderModel({ id: "claude-x", reasoning: true, reasoningEfforts: ["low", "high"] }, hosted)).toMatchObject({ compat: { forceAdaptiveThinking: true } });
+    expect(toProviderModel({ id: "claude-x", reasoning: false, reasoningEfforts: [] }, hosted)).not.toHaveProperty("compat");
+    expect(toProviderModel({ id: "gpt-6-luna", reasoning: true, reasoningEfforts: ["none", "low"] }, hosted)).not.toHaveProperty("compat");
     expect(toProviderModel({ id: "m", contextWindow: 8_000, maxTokens: 50_000 }, hosted)).toMatchObject({ maxTokens: 4_000 });
   });
 
