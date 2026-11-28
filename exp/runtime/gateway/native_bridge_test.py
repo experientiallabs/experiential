@@ -6012,7 +6012,7 @@ def test_store_false_skips_continuation_retention(tmp_path: Path) -> None:
                 }
             )
         )
-        == "{}"
+        == '{"retained":false}'
     )
     response_id = stable_public_id("resp", _admitted_request_id(first))
     with pytest.raises(NativeBridgeError) as raised:
@@ -6163,7 +6163,7 @@ def test_keyed_store_false_never_reaches_the_continuation_store(tmp_path: Path) 
                 }
             )
         )
-        == "{}"
+        == '{"retained":false}'
     )
     response_id = stable_public_id("resp", _admitted_request_id(admission))
     # Direct store probe in the exact tenant namespace: nothing was retained.
