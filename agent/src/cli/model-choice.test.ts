@@ -47,7 +47,7 @@ describe("default model", () => {
   });
 
   it("starts on EXP_CODE_MODEL for this run, else the saved model, else the default", () => {
-    const listed = ["gpt-6-luna", "experiential-large-model"];
+    const listed = ["gpt-6-luna", "experiential-large-model", "deepseek-v4-flash"];
     const saved = { provider: "experiential", id: "gpt-6-luna" };
     expect(startModel(listed, " deepseek-v4-flash ", saved)).toEqual({ id: "deepseek-v4-flash" });
     // The saved model is Pi's to select: no --model is injected, so nothing overrides it.
@@ -65,6 +65,23 @@ describe("default model", () => {
     expect(startModel(undefined, undefined, { provider: "experiential", id: "retired" })).toEqual({});
     // A model from a user's own extension provider is not the gateway's to judge.
     expect(startModel(["experiential-large-model"], undefined, { provider: "my-ext", id: "x" })).toEqual({});
+  });
+
+  it("passes over an EXP_CODE_MODEL the gateway does not list, with a note, as it does a saved model", () => {
+    const listed = ["experiential-large-model", "gpt-6-luna", "thinker"];
+    expect(startModel(listed, "thinker:high", undefined)).toEqual({ id: "thinker:high" });
+    expect(startModel(listed, "experiential/gpt-6-luna", undefined)).toEqual({ id: "gpt-6-luna" });
+    expect(startModel(listed, "nope", undefined)).toEqual({ id: "experiential-large-model", note: "the gateway does not list nope (EXP_CODE_MODEL); using experiential-large-model" });
+    expect(startModel(listed, "nope", { provider: "experiential", id: "gpt-6-luna" })).toEqual({ note: "the gateway does not list nope (EXP_CODE_MODEL); using gpt-6-luna, your saved model" });
+    expect(startModel(listed, "nope", { provider: "experiential", id: "retired" })).toEqual({
+      id: "experiential-large-model",
+      note: "the gateway does not list nope (EXP_CODE_MODEL), nor retired, your saved model; using experiential-large-model"
+    });
+    // A failed listing proves nothing: EXP_CODE_MODEL is used as set.
+    expect(startModel(undefined, "nope", undefined)).toEqual({ id: "nope" });
+    // Nor is an unlisted EXP_CODE_MODEL the fallback for a moved direct-provider model.
+    expect(gatewayFallback("gemini-4-neon", listed, "nope")).toBe("experiential-large-model");
+    expect(gatewayFallback("gemini-4-neon", listed, "gpt-6-luna")).toBe("gpt-6-luna");
   });
 
   it("prefers EXP_CODE_MODEL, else experiential-large-model when listed, else the first listed alias", () => {

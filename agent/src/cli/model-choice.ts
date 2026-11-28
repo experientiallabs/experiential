@@ -2,12 +2,13 @@
  * The model a CLI invocation starts on.
  *
  * When the user names no model and is not resuming a session, the start model is, in order:
- * `EXP_CODE_MODEL` when set (for this run only, never saved); else the model saved in exp-code's
+ * `EXP_CODE_MODEL` when set and listed (for this run only, never saved); else the model saved in exp-code's
  * settings, which every explicit choice in the terminal UI writes (`/model`, Ctrl+P, see
  * pi-patches.ts); else `experiential-large-model` when the gateway lists it; else the first alias
  * it lists. A saved gateway model the gateway no longer lists falls back to that default with a
- * one-line note, and stays saved so it is used again once it is listed. `--model` always wins and
- * is never saved either.
+ * one-line note, and stays saved so it is used again once it is listed; an `EXP_CODE_MODEL` the
+ * gateway does not list is passed over the same way, with a note. `--model` always wins and is
+ * never saved either.
  *
  * Every model runs through the gateway: exp-code registers none of Pi's direct vendor providers
  * (see pi-patches.ts). A selection that still names one, such as `google/gemini-4-neon` saved by
@@ -52,16 +53,36 @@ export interface StartModel {
  * when the listing failed: a saved model is then left to Pi rather than replaced blind.
  */
 export function startModel(listed: string[] | undefined, configured: string | undefined, saved: { provider: string | undefined; id: string } | undefined): StartModel {
-  const wanted = configured?.trim();
-  if (wanted) return { id: wanted };
+  const wanted = configuredModelId(configured);
+  // EXP_CODE_MODEL is checked against the listing as `--model` is: an alias the gateway does not
+  // list would otherwise be sent as a custom model id and refused by the gateway (403) on every
+  // call. It falls back the way a saved model does, to the saved model or the default, with a note.
+  if (wanted !== undefined && (listed === undefined || isListed(wanted, listed))) return { id: wanted };
+  const rejected = wanted === undefined ? undefined : `the gateway does not list ${wanted} (EXP_CODE_MODEL)`;
+  const withNote = (start: StartModel, using: string | undefined): StartModel =>
+    rejected === undefined ? start : { ...start, note: start.note ?? `${rejected}; using ${using ?? "the default model"}` };
   // A model a user's own extension provides is not the gateway's to judge.
-  if (saved !== undefined && saved.provider !== undefined && saved.provider !== GATEWAY_PROVIDER_ID) return {};
+  if (saved !== undefined && saved.provider !== undefined && saved.provider !== GATEWAY_PROVIDER_ID) return withNote({}, `${saved.provider}/${saved.id}, your saved model`);
   if (saved !== undefined) {
-    if (listed === undefined || listed.includes(saved.id)) return {};
+    if (listed === undefined || isListed(saved.id, listed)) return withNote({}, `${saved.id}, your saved model`);
     const fallback = defaultModelId(listed, undefined);
-    return fallback === undefined ? {} : { id: fallback, note: `the gateway no longer lists ${saved.id}, your saved model; using ${fallback}` };
+    if (fallback === undefined) return {};
+    return { id: fallback, note: rejected !== undefined ? `${rejected}, nor ${saved.id}, your saved model; using ${fallback}` : `the gateway no longer lists ${saved.id}, your saved model; using ${fallback}` };
   }
-  return listed === undefined ? {} : { id: defaultModelId(listed, undefined) };
+  if (listed === undefined) return {};
+  const fallback = defaultModelId(listed, undefined);
+  return withNote({ id: fallback }, fallback);
+}
+
+/** The model EXP_CODE_MODEL names, without a leading `experiential/`; undefined when unset or blank. */
+export function configuredModelId(configured: string | undefined): string | undefined {
+  const wanted = configured?.trim().replace(new RegExp(`^${GATEWAY_PROVIDER_ID}/`), "");
+  return wanted ? wanted : undefined;
+}
+
+/** Whether the gateway lists `id`, with or without a `:level` thinking suffix. */
+function isListed(id: string, listed: string[]): boolean {
+  return listed.includes(id) || listed.includes(id.replace(/:[a-z]+$/, ""));
 }
 
 /** Pick the alias: the configured one when set, else the large model when listed, else the first listed. */
@@ -95,7 +116,9 @@ export function gatewayFallback(id: string, listed: string[] | undefined, config
   if (listed === undefined || listed.includes(id)) return id;
   const bare = id.replace(/:[a-z]+$/, "");
   if (bare !== id && listed.includes(bare)) return id;
-  return defaultModelId(listed, configured) ?? id;
+  // An EXP_CODE_MODEL the gateway does not list is no fallback either.
+  const wanted = configuredModelId(configured);
+  return defaultModelId(listed, wanted !== undefined && isListed(wanted, listed) ? wanted : undefined) ?? id;
 }
 
 /**

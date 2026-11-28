@@ -4,3 +4,4 @@ dist/
 .e2e-dist/
 .e2e-dist-ux/
 .e2e-dist-sessions/
+.e2e-dist-input/
