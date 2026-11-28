@@ -206,7 +206,11 @@ turn's summary and the branch summaries `/tree` writes.
 In the terminal UI, `/bug` opens a new GitHub issue for exp-code prefilled with your exp-code
 version, operating system, Node.js version and model (nothing is sent until you submit it), and
 `/changelog` links exp-code's release notes. There is no `/share`: it uploaded sessions to a
-service outside Experiential; `/export` saves a session as HTML or JSONL.
+service outside Experiential; `/export` saves a session as HTML or JSONL. `/help` lists the main
+commands and keys, and `/exit` quits like `/quit`. A line whose first word is an unknown command
+(`/foo`, or a typo such as `/modle`) is not sent to the model: exp-code says so, suggests the
+command it may have meant, and leaves the line in the editor. A line starting with a path
+(`/src/app.ts fails`) is sent as written.
 
 The first interactive start installs the two file-search helpers (`fd` and `rg`) into
 `~/.exp-code/agent/bin` when they are not on your `PATH`, with one line of progress.

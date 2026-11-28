@@ -46,6 +46,37 @@ describe("Pi patches", () => {
   });
 });
 
+describe("command list and sign-in guidance", () => {
+  const patched = (file: string) => patchSource(installedFile("pi-coding-agent", file), readFileSync(installedFile("pi-coding-agent", file), "utf8"));
+
+  it("tags no exp-code command or bundled skill in the autocomplete", async () => {
+    const { InteractiveMode } = await import("@earendil-works/pi-coding-agent");
+    const tag = (sourceInfo: unknown) => (InteractiveMode.prototype as unknown as { getAutocompleteSourceTag(info: unknown): string | undefined }).getAutocompleteSourceTag(sourceInfo);
+    // An exp-code command (inline extension) and a skill its extension discovers.
+    expect(tag({ path: "<inline:exp-code-commands>", source: "inline", scope: "temporary" })).toBeUndefined();
+    expect(tag({ path: "/pkg/skills/pdf/SKILL.md", source: "extension:inline:exp-code", scope: "temporary" })).toBeUndefined();
+    // A user's own extension or skill keeps its tag.
+    expect(tag({ path: "/home/u/.exp-code/agent/extensions/x.ts", source: "local", scope: "user" })).toBe("u");
+    expect(tag({ path: "/repo/skill/SKILL.md", source: "cli", scope: "temporary" })).toBe("t");
+  });
+
+  it("describe /logout for exp-code", () => {
+    expect(patched("core/slash-commands.js")).toContain('{ name: "logout", description: "Remove credentials saved by /login (exp-code logout forgets the Experiential key)" }');
+  });
+
+  it("point a missing key at exp-code login, not Pi's providers and docs", async () => {
+    const source = patched("core/auth-guidance.js");
+    expect(source).not.toContain("log into a provider");
+    expect(source).not.toContain("providers.md");
+    const { formatNoApiKeyFoundMessage } = (await import(`data:text/javascript,${encodeURIComponent(source.replace(/^import .*$/gm, ""))}`)) as {
+      formatNoApiKeyFoundMessage(provider: string): string;
+    };
+    expect(formatNoApiKeyFoundMessage("unknown")).toBe(
+      "No API key found for the selected model.\n\nRun `exp-code login` in a terminal to sign in to Experiential, or set EXP_API_KEY to an xpl_ key (EXP_GATEWAY_KEY for a local `exp` gateway).\n`exp-code login --status` shows which key is in use; `exp-code --list-models` lists the models it can call."
+    );
+  });
+});
+
 describe("Pi as tests load it", () => {
   it("is patched (the test setup installs the load hook)", async () => {
     const config = await import("@earendil-works/pi-coding-agent");

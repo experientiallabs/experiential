@@ -333,7 +333,8 @@ export const PI_PATCHES: FilePatch[] = [
       {
         find: '{ name: "login", description: "Configure provider authentication", argumentHint: "<provider>" }',
         replace: '{ name: "login", description: "Sign in to an MCP server (exp-code login signs in to Experiential)", argumentHint: "<server>" }'
-      }
+      },
+      { find: '{ name: "logout", description: "Remove provider authentication" }', replace: '{ name: "logout", description: "Remove credentials saved by /login (exp-code logout forgets the Experiential key)" }' }
     ]
   },
   {
@@ -391,6 +392,12 @@ export const PI_PATCHES: FilePatch[] = [
           '        if (!providerRef) {\n            this.showStatus("exp-code signs in to Experiential with `exp-code login` in a terminal (or EXP_API_KEY). /login <server> signs in to an MCP server that asks for it.");\n            return;\n        }'
       },
       { find: "Pi works best with csi-u.", replace: "exp-code works best with csi-u." },
+      // exp-code's own commands and skills come from inline extensions (run.ts); like Pi's built-in
+      // ones they carry no source tag, where Pi would show "[t]" (temporary) before each description.
+      {
+        find: 'if (!sourceInfo || sourceInfo.source === "builtin") {',
+        replace: 'if (!sourceInfo || sourceInfo.source === "builtin" || sourceInfo.source === "inline" || sourceInfo.source.startsWith("extension:inline:")) {'
+      },
       // Pi's own new-version notice is off (PI_SKIP_VERSION_CHECK); its link still names exp-code's releases.
       { find: 'const changelogUrl = "https://pi.dev/changelog";', replace: 'const changelogUrl = "https://github.com/experientiallabs/experiential/releases?q=exp-code";' },
       { find: "`pi-clipboard-${crypto.randomUUID()}.${ext}`", replace: "`exp-code-clipboard-${crypto.randomUUID()}.${ext}`" },
@@ -536,6 +543,20 @@ export const PI_PATCHES: FilePatch[] = [
     edits: [
       { find: '"pi-tui-crash.log"', replace: '"exp-code-crash.log"' },
       { find: '"pi-tui-debug.log"', replace: '"exp-code-tui-debug.log"' }
+    ]
+  },
+  {
+    // What Pi says when there is no model or no key: it pointed at /login for vendor providers and
+    // at Pi's provider docs inside node_modules. exp-code's models all come from the gateway key.
+    pkg: "pi-coding-agent",
+    file: "core/auth-guidance.js",
+    edits: [
+      {
+        from: "    return [\n        \"Use /login to log into a provider via OAuth or API key. See:\",",
+        to: "].join(\"\\n\");\n}\nexport function formatNoModelsAvailableMessage",
+        replace:
+          '    return [\n        "Run `exp-code login` in a terminal to sign in to Experiential, or set EXP_API_KEY to an xpl_ key (EXP_GATEWAY_KEY for a local `exp` gateway).",\n        "`exp-code login --status` shows which key is in use; `exp-code --list-models` lists the models it can call.",\n    '
+      }
     ]
   },
   {
