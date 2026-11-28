@@ -175,7 +175,14 @@ class _ScriptedClassifier:
         if answer is None:
             return ClassifierVerdict(flagged=False)
         scores = tuple(
-            CategoryScore(category=name, score=value, flagged=value >= _THRESHOLDS[name])
+            CategoryScore(
+                category=name,
+                score=value,
+                flagged=value >= _THRESHOLDS[name],
+                threshold=_THRESHOLDS[name],
+                aggregate="max",
+                question_scores={name: value},
+            )
             for name, value in answer.items()
         )
         return ScoredVerdict(
@@ -183,6 +190,7 @@ class _ScriptedClassifier:
             scores=scores,
             subject_sha256="d" * 64,
             cached=False,
+            configuration_digest="c" * 64,
         )
 
 

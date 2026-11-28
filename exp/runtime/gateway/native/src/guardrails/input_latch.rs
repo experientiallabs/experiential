@@ -150,7 +150,14 @@ impl InputLatch {
             .take();
         let mut began = None;
         let decision = match inspected {
-            Inspection::Denied(failure) => Err(failure),
+            Inspection::Denied(failure) => {
+                if let Some(capture) = capture {
+                    if crate::capture::python::begin_bytes(&capture.collector, &capture.bytes) {
+                        began = Some(capture.collector);
+                    }
+                }
+                Err(failure)
+            }
             Inspection::Allowed | Inspection::Expired => {
                 if let Some(capture) = capture {
                     let registered =
@@ -175,6 +182,14 @@ impl InputLatch {
                 collector.settle(&self.request_id, false, false);
             }
             return Ok(InputDecision::AdmissionClosed);
+        }
+        // Denial never exposes provider output and does not grant hosted retention.
+        // Cancellation may win during registration. Once this lock is held,
+        // input-only completion and the committed denial cannot be split by close.
+        if decision.is_err() {
+            if let Some(collector) = began {
+                collector.finish_unexposed(&self.request_id);
+            }
         }
         *release = Release::Ready(decision.clone());
         decision
@@ -468,14 +483,30 @@ mod tests {
 
     #[tokio::test]
     async fn completed_release_keeps_its_settlement_disposition_after_close() {
+        for verdict in [Inspection::Allowed, denial()] {
+            let input = latch();
+            input.publish(verdict);
+            let committed = input.wait(Instant::now()).await;
+            let before = input.decision_json();
+            input.close();
+            assert_eq!(input.decision_json(), before);
+            assert_eq!(
+                input.wait(Instant::now()).await.is_err(),
+                committed.is_err()
+            );
+            assert!(!input.publish(denial()));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_denial_commit_keeps_the_request_closed() {
         let input = latch();
-        input.publish(Inspection::Allowed);
+        assert!(input.publish(denial()));
+        input.close();
         assert!(matches!(
             input.wait(Instant::now()).await.unwrap(),
-            InputDecision::Allowed
+            InputDecision::AdmissionClosed
         ));
-        input.close();
-        assert_eq!(input.decision_json(), "{\"action\":\"allow\"}");
-        assert!(!input.publish(denial()));
+        assert_eq!(input.decision_json(), "{\"action\":\"closed\"}");
     }
 }

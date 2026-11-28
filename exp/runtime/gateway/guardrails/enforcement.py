@@ -41,6 +41,7 @@ from exp.runtime.gateway.guardrails.recording import (
     ClassificationRecord,
     ObservationRecord,
     ObservationRecorder,
+    classification_record,
 )
 from exp.runtime.gateway.guardrails.redaction import restored_provider_authority
 from exp.runtime.gateway.guardrails.session import GuardrailSession
@@ -794,8 +795,18 @@ class GuardrailEngine:
             return None
         elapsed = self._monotonic() - started
         outcome = GuardrailOutcome.FLAGGED if verdict.flagged else GuardrailOutcome.ALLOW
-        if isinstance(verdict, ScoredVerdict) and request_id is not None:
-            self._submit_classification(request_id, policy, check, outcome, verdict, elapsed)
+        classification = (
+            classification_record(request_id, policy, check, outcome, verdict, elapsed)
+            if isinstance(verdict, ScoredVerdict) and request_id is not None
+            else None
+        )
+        deferred = (
+            verdict.flagged
+            and defer_rejection is not None
+            and check.action in (GuardrailAction.BLOCK, GuardrailAction.ERROR)
+        )
+        if not deferred:
+            self._submit_classification(classification)
         if not verdict.flagged:
             self._decision(policy, check, GuardrailAction.ALLOW, outcome, elapsed)
             return None
@@ -803,36 +814,19 @@ class GuardrailEngine:
             GuardrailAction.BLOCK,
             GuardrailAction.ERROR,
         ):
-            defer_rejection(ObservationRecord(policy, check, outcome, elapsed))
+            defer_rejection(ObservationRecord(policy, check, outcome, elapsed, classification))
         else:
             self._decision(policy, check, check.action, outcome, elapsed)
         return verdict
 
     def _submit_classification(
         self,
-        request_id: str,
-        policy: GuardrailPolicy,
-        check: GuardrailCheck,
-        outcome: GuardrailOutcome,
-        verdict: ScoredVerdict,
-        latency_seconds: float,
+        record: ClassificationRecord | None,
     ) -> None:
         """Queue scores and the subject digest only; sink latency never enters serving."""
         records = self._classification_records
-        if records is None:
-            return
-        records.submit(
-            ClassificationRecord(
-                request_id=request_id,
-                policy=policy,
-                check=check,
-                outcome=outcome,
-                scores=verdict.scores,
-                subject_sha256=verdict.subject_sha256,
-                cached=verdict.cached,
-                latency_seconds=latency_seconds,
-            )
-        )
+        if records is not None and record is not None:
+            records.submit(record)
 
     def _uncertain(
         self,
@@ -856,6 +850,7 @@ class GuardrailEngine:
     def record_input_rejection(self, record: ObservationRecord) -> None:
         """Record one terminal action after its input gate commits the denial."""
         assert record.check is not None
+        self._submit_classification(record.classification)
         self._decision(
             record.policy, record.check, record.check.action, record.outcome, record.latency_seconds
         )

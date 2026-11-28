@@ -360,7 +360,7 @@ class CaptureController:
         *,
         session_id: str | None = None,
     ) -> bool:
-        """Prepare only an allowed identity's post-guardrail, expanded request."""
+        """Prepare an opted-in identity's expanded input, including rejected input."""
         prepared = self.prepare(authorization, request, model_id, session_id=session_id)
         return prepared is None or self.native.begin_bytes(prepared)
 
@@ -401,10 +401,10 @@ class CaptureController:
 
 @dataclass(frozen=True)
 class PendingCapture:
-    """Effective capture context held by admission until input approval.
+    """Effective capture context held by admission until the input decision.
 
     Attributes:
-        request: Expanded public request whose input must be approved before retention.
+        request: Expanded public request subject to the host's retention policy.
         session_id: Validated caller session identifier, or None when absent.
     """
 
@@ -447,6 +447,34 @@ def discard_capture(controller: CaptureController | None, request_id: str) -> No
         controller.native.settle(request_id, False, False)
     except Exception:  # noqa: BLE001 - preserve the closed request's sanitized outcome.
         _LOGGER.warning("capture.discard_failed request_id=%s", request_id)
+
+
+def finish_rejected_capture(
+    controller: CaptureController | None,
+    authorization: AuthorizationSnapshot,
+    failure: GatewayFailure,
+    pending: PendingCapture | None = None,
+    model_id: str | None = None,
+) -> None:
+    """Finish consented blocked input without retaining output or weakening its rejection.
+
+    Pending input still passes the ordinary host policy and collector budgets.
+    Hosted collectors wait for the ledger's independent retention verdict; local
+    collectors deliver the input-only record. Uncertain failures discard capture.
+    """
+    if controller is None:
+        return
+    if failure.failure_class is not GatewayFailureClass.GUARDRAIL:
+        discard_capture(controller, authorization.request_id)
+        return
+    if pending is not None and not begin_capture(
+        controller, authorization, pending.request, model_id, session_id=pending.session_id
+    ):
+        return
+    try:
+        controller.native.finish_unexposed(authorization.request_id)
+    except Exception:  # noqa: BLE001 - capture cannot change a moderation rejection.
+        _LOGGER.warning("capture.rejection_failed request_id=%s", authorization.request_id)
 
 
 def select_capture_model(

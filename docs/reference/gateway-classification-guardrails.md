@@ -216,11 +216,15 @@ engine = GuardrailEngine(store=store, client=client, monotonic=time.monotonic,
 ```
 
 Each record names the request, the policy's identity, mode and revision, the check, the
-outcome (`allow` or `flagged`), every category's score with whether it reached its threshold,
+outcome (`allow` or `flagged`), every category's score, threshold, aggregation method,
+per-question probabilities and whether it reached its threshold,
 the SHA-256 of the exact window text the model read, whether the answer came from the cache,
 and the latency. Read the policy through `policy_id`, `mode` and `revision`: in enforce mode
 `record.policy` carries only the check that ran. A blocked request produces a record too, so
-the application can act on what was refused.
+the application can investigate what was refused. `configuration_digest` identifies the
+exact endpoint, model, question bank and window configuration, while `decision` records
+the check's committed action. Optional native input refusals publish their scored record
+only when the gate commits the refusal; a verdict superseded by expiry is not a block.
 
 One check can produce more than one record for a request: the gateway inspects each distinct
 version of a request it prepares, and re-runs earlier checks after a later `modify` check

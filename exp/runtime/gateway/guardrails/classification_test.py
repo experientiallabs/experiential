@@ -357,6 +357,11 @@ def test_verdict_reports_every_category_score_and_the_digest_of_the_state_sent()
         ("off_topic", True),
     ]
     assert [score.score for score in first.scores] == pytest.approx([0.25, 0.8])
+    assert [score.threshold for score in first.scores] == [0.9, 0.8]
+    assert [score.aggregate for score in first.scores] == ["max", "mean"]
+    assert first.scores[1].question_scores == {"unrelated_task": 0.9, "unrelated_domain": 0.7}
+    assert len(first.configuration_digest) == 64
+    assert second.configuration_digest == first.configuration_digest
     assert first.subject_sha256 == hashlib.sha256(states[0].encode("utf-8")).hexdigest()
     assert not first.cached
     assert second.cached
