@@ -15,15 +15,25 @@
 //!   or answers with its own sentence, which is strictly more useful to the
 //!   caller than this one; a route with no other rung still surfaces the 400.
 //!
-//! Only the dialect's message field is read, so request text echoed elsewhere
-//! in the body cannot change routing.
+//! The sentence is read only from the dialect's message field, and a body
+//! whose structured fields name anything (a `param` or `field`, a parameter
+//! the dialect's own reader attributes, or a code token more specific than
+//! the family type) is never reasonless, however terse its sentence. Only a
+//! terminal correlation-id clause (`trace_id: 9f3c`, `(request_id=ab12)`) is
+//! ignored; a sentence that is ABOUT such a field (`trace_id is required`)
+//! keeps its reason.
+
+use serde_json::Value;
 
 use crate::dialects::Dialect;
 use crate::error_envelope::parse_error_document;
-use crate::param_attribution::error_message_field;
+use crate::param_attribution::{
+    error_message_field, generic_error_code, rejected_code, rejected_parameter,
+};
 
 /// Sentences that only restate that the request was rejected, compared after
-/// lowercasing, dropping a trailing `trace_id` clause and trailing punctuation.
+/// lowercasing, dropping a terminal correlation-id clause and trailing
+/// punctuation.
 const REASONLESS_SENTENCES: &[&str] = &[
     "invalid request error",
     "invalid request",
@@ -31,40 +41,142 @@ const REASONLESS_SENTENCES: &[&str] = &[
     "bad request",
 ];
 
+/// Correlation-id labels a relay appends to its sentence.
+const CORRELATION_LABELS: &[&str] = &["trace_id", "request_id"];
+
+/// Shortest correlation value read as an id rather than a word.
+const MINIMUM_CORRELATION_ID_LENGTH: usize = 4;
+
 /// Whether a 4xx body's sentence states no reason (see the module docs).
 pub fn rejected_without_reason(dialect: Dialect, body: &str) -> bool {
     let Some(value) = parse_error_document(body) else {
         return false;
     };
+    if names_a_structured_reason(dialect, &value, body) {
+        return false;
+    }
     error_message_field(dialect, &value).is_some_and(reasonless_sentence)
+}
+
+/// Whether the body's structured fields say more than "rejected": a named
+/// parameter or field, or a code token beyond the generic family type.
+fn names_a_structured_reason(dialect: Dialect, value: &Value, body: &str) -> bool {
+    let named_field = |object: Option<&Value>| {
+        object.is_some_and(|object| {
+            ["param", "field"].iter().any(|key| {
+                object
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| !name.trim().is_empty())
+            })
+        })
+    };
+    named_field(Some(value))
+        || named_field(value.get("error"))
+        || rejected_parameter(dialect, body).is_some()
+        || rejected_code(dialect, body).is_some_and(|code| !generic_error_code(&code))
 }
 
 /// Whether one provider sentence is a bare restatement of the rejection.
 fn reasonless_sentence(message: &str) -> bool {
     let lowered = message.trim().to_ascii_lowercase();
-    let head = lowered
-        .split_once("trace_id")
-        .map_or(lowered.as_str(), |(head, _)| head);
+    let head = without_correlation_suffix(&lowered);
     let head =
         head.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '.' | ',' | ';' | ':'));
     REASONLESS_SENTENCES.contains(&head)
+}
+
+/// `sentence` without a terminal correlation-id clause, or unchanged.
+///
+/// The clause is a label from [`CORRELATION_LABELS`] at a word boundary,
+/// then `:` or `=`, then one id-shaped value (ASCII letters, digits, `-` or
+/// `_`, at least [`MINIMUM_CORRELATION_ID_LENGTH`] long, containing a digit),
+/// optionally closed by `)` and a final `.`, and nothing after it.
+fn without_correlation_suffix(sentence: &str) -> &str {
+    for label in CORRELATION_LABELS {
+        let Some(at) = sentence.rfind(label) else {
+            continue;
+        };
+        let before = &sentence[..at];
+        if !before.is_empty() && !before.ends_with([' ', '(', ',', ';', '[']) {
+            continue;
+        }
+        let rest = sentence[at + label.len()..].trim_start();
+        let Some(rest) = rest.strip_prefix([':', '=']) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let id_end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
+            .unwrap_or(rest.len());
+        let (id, tail) = rest.split_at(id_end);
+        let tail = tail.trim_end();
+        let tail = tail.strip_suffix('.').unwrap_or(tail);
+        let tail = tail.strip_suffix([')', ']']).unwrap_or(tail);
+        let id_shaped =
+            id.len() >= MINIMUM_CORRELATION_ID_LENGTH && id.chars().any(|c| c.is_ascii_digit());
+        if id_shaped && tail.trim().is_empty() {
+            return before.trim_end_matches(['(', '[', ' ', ',', ';']);
+        }
+    }
+    sentence
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn reasonless(body: &str) -> bool {
+        rejected_without_reason(Dialect::OpenAiCompatible, body)
+    }
+
     #[test]
     fn a_relays_family_name_with_its_trace_id_is_reasonless() {
         // A reseller relay's flat envelope: the family name and its trace id.
-        let flat = r#"{"code":0,"message":"invalid request error trace_id: 9f3c2b7a1d4e","type":"invalid_request_error"}"#;
-        assert!(rejected_without_reason(Dialect::OpenAiCompatible, flat));
-        let nested =
-            r#"{"error":{"message":"Invalid request error.","type":"invalid_request_error"}}"#;
-        assert!(rejected_without_reason(Dialect::OpenAiCompatible, nested));
-        let bare =
-            r#"{"code":400,"reason":"INVALID_REQUEST_BODY","message":"Bad Request","metadata":{}}"#;
-        assert!(rejected_without_reason(Dialect::OpenAiCompatible, bare));
+        assert!(reasonless(
+            r#"{"code":0,"message":"invalid request error trace_id: 9f3c2b7a1d4e","type":"invalid_request_error"}"#
+        ));
+        assert!(reasonless(
+            r#"{"error":{"message":"Invalid request error.","type":"invalid_request_error"}}"#
+        ));
+        assert!(reasonless(
+            r#"{"code":400,"reason":"INVALID_REQUEST_BODY","message":"Bad Request","metadata":{}}"#
+        ));
+        assert!(reasonless(
+            r#"{"code":400,"message":"Bad Request (request_id=ab12cd34).","type":"invalid_request_error"}"#
+        ));
+    }
+
+    #[test]
+    fn a_terse_sentence_beside_a_named_field_or_specific_code_is_not_reasonless() {
+        // The sentence restates the rejection, but the structured fields say
+        // which parameter and why: that is the caller's error, not the lane's.
+        for body in [
+            r#"{"error":{"message":"Bad Request","type":"invalid_request_error","param":"temperature","code":"invalid_value"}}"#,
+            r#"{"error":{"message":"Bad Request","type":"invalid_request_error","param":"temperature"}}"#,
+            r#"{"error":{"message":"Bad Request","type":"invalid_request_error","code":"invalid_value"}}"#,
+            r#"{"code":400,"reason":"INVALID_PARAMETER","message":"invalid request error trace_id: 9f3c"}"#,
+            r#"{"code":400,"message":"Bad Request","type":"invalid_request_error","field":"messages[1].content"}"#,
+        ] {
+            assert!(!reasonless(body), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_sentence_about_a_correlation_field_keeps_its_reason() {
+        // Only a terminal id-shaped clause is dropped, never the first
+        // occurrence of the label.
+        for message in [
+            "Bad Request: trace_id is required",
+            "invalid request: trace_id must be a uuid",
+            "invalid request error trace_id: missing",
+            "Bad Request: request_id=abc1 is already in use",
+        ] {
+            let body =
+                serde_json::json!({"code": 400, "message": message, "type": "invalid_request_error"})
+                    .to_string();
+            assert!(!reasonless(&body), "{message}");
+        }
     }
 
     #[test]
@@ -76,25 +188,37 @@ mod tests {
             "invalid request: unknown parameter logit_bias",
         ] {
             let body = serde_json::json!({"code": 0, "message": message}).to_string();
-            assert!(
-                !rejected_without_reason(Dialect::OpenAiCompatible, &body),
-                "{message}"
-            );
+            assert!(!reasonless(&body), "{message}");
         }
         // A body without a message field, or not JSON, is never read as one.
-        assert!(!rejected_without_reason(
-            Dialect::OpenAiCompatible,
-            r#"{"error":{"type":"invalid_request_error"}}"#
-        ));
-        assert!(!rejected_without_reason(
-            Dialect::OpenAiCompatible,
-            "invalid request error"
-        ));
+        assert!(!reasonless(r#"{"error":{"type":"invalid_request_error"}}"#));
+        assert!(!reasonless("invalid request error"));
     }
 
     #[test]
     fn request_text_outside_the_message_field_cannot_make_a_body_reasonless() {
-        let echoed = r#"{"code":0,"message":"prompt too long","param":"invalid request error"}"#;
-        assert!(!rejected_without_reason(Dialect::OpenAiCompatible, echoed));
+        assert!(!reasonless(
+            r#"{"code":0,"message":"prompt too long","param":"invalid request error"}"#
+        ));
+    }
+
+    #[test]
+    fn only_a_terminal_id_shaped_clause_is_stripped() {
+        assert_eq!(
+            without_correlation_suffix("invalid request error trace_id: 9f3c2b7a1d4e"),
+            "invalid request error"
+        );
+        assert_eq!(
+            without_correlation_suffix("bad request (trace_id=ab-12_cd)."),
+            "bad request"
+        );
+        assert_eq!(
+            without_correlation_suffix("bad request: trace_id is required"),
+            "bad request: trace_id is required"
+        );
+        assert_eq!(
+            without_correlation_suffix("bad request x_trace_id: 9f3c"),
+            "bad request x_trace_id: 9f3c"
+        );
     }
 }
