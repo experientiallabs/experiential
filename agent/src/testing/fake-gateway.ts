@@ -25,9 +25,11 @@ export type FakeTurn =
       finishReason?: "stop" | "length";
       /** Prompt tokens the usage chunk reports (default 50). */
       promptTokens?: number;
+      /** Stream the text (and reasoning), then drop the connection before the turn ends. */
+      dropAfterContent?: boolean;
     }
-  | { calls: { name: string; arguments: Record<string, unknown> }[]; reasoning?: string; reasoningField?: ReasoningField; delayMs?: number }
-  | { status: number; error: string };
+  | { calls: { name: string; arguments: Record<string, unknown> }[]; reasoning?: string; reasoningField?: ReasoningField; delayMs?: number; dropAfterContent?: boolean }
+  | { status: number; error: string; headers?: Record<string, string> };
 
 export interface RecordedRequest {
   method: string;
@@ -143,8 +145,19 @@ export async function startFakeGateway(initial: FakeTurn[] = [], initialModels: 
         if (closed) return;
       }
       if ("status" in turn) {
-        response.writeHead(turn.status, { "content-type": "application/json" });
+        response.writeHead(turn.status, { "content-type": "application/json", ...turn.headers });
         response.end(JSON.stringify({ error: { message: turn.error, type: "invalid_request_error" } }));
+        return;
+      }
+      if ("dropAfterContent" in turn && turn.dropAfterContent === true) {
+        // The head of the stream, then the connection drops: no finish reason, no usage.
+        response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+        const chunks = turnChunks(turn, served).filter((chunk) => {
+          const choice = (chunk as { choices: { finish_reason?: string }[] }).choices[0];
+          return choice !== undefined && choice.finish_reason === undefined;
+        });
+        for (const chunk of chunks) response.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        setTimeout(() => response.socket?.destroy(), 20);
         return;
       }
       sse(response, turnChunks(turn, served));
