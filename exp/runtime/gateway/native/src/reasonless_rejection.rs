@@ -74,15 +74,17 @@ fn names_a_structured_reason(dialect: Dialect, value: &Value, body: &str) -> boo
     named_field(Some(value))
         || named_field(value.get("error"))
         || rejected_parameter(dialect, body).is_some()
-        || rejected_code(dialect, body).is_some_and(|code| !generic_error_code(&code))
+        // Spellings differ only by separator (xAI's `invalid-argument`).
+        || rejected_code(dialect, body)
+            .is_some_and(|code| !generic_error_code(&code.replace('-', "_")))
 }
 
 /// Whether one provider sentence is a bare restatement of the rejection.
 fn reasonless_sentence(message: &str) -> bool {
     let lowered = message.trim().to_ascii_lowercase();
     let head = without_correlation_suffix(&lowered);
-    let head =
-        head.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '.' | ',' | ';' | ':'));
+    let head = head
+        .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '.' | ',' | ';' | ':' | '!'));
     REASONLESS_SENTENCES.contains(&head)
 }
 
@@ -145,6 +147,11 @@ mod tests {
         assert!(reasonless(
             r#"{"code":400,"message":"Bad Request (request_id=ab12cd34).","type":"invalid_request_error"}"#
         ));
+        // xAI's documented envelope: a generic code spelled with a hyphen.
+        assert!(reasonless(
+            r#"{"code":"invalid-argument","error":"Bad Request"}"#
+        ));
+        assert!(reasonless(r#"{"code":400,"message":"Bad Request!"}"#));
     }
 
     #[test]
