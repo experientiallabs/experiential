@@ -2023,3 +2023,34 @@ def test_unscored_verdicts_deliver_no_score_record() -> None:
         session.inspect_input(_request("hello"))
     engine.close(timeout_seconds=2)
     assert records == []
+
+
+@pytest.mark.parametrize("same_adapter", [False, True])
+def test_observation_projection_preserves_adapter_instance_authority(
+    same_adapter: bool,
+) -> None:
+    """Different configured instances must not share a lossy input projection."""
+    first = _ProjectingClassifier()
+    second = first if same_adapter else _ProjectingClassifier()
+    policy = GuardrailPolicy(
+        policy_id="mixed-observers",
+        protected=True,
+        mode="observe",
+        checks=(
+            _check("first", adapter_id="first"),
+            _check("second", adapter_id="second"),
+        ),
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"first": first, "second": second})),
+        monotonic=time.monotonic,
+    )
+    try:
+        projection = engine._observation_projection((policy,))
+        if same_adapter:
+            assert projection == first.project_input
+        else:
+            assert projection is None
+    finally:
+        engine.close(timeout_seconds=2)
