@@ -7,7 +7,12 @@ Anthropic-style ``thinking:{type}`` (``enabled`` or ``adaptive``), the vLLM-nati
 ``chat_template_kwargs:{enable_thinking}``, and DashScope's top-level
 ``enable_thinking``. Bare enable controls translate to canonical
 ``reasoning_effort``; the route resolves level-less enables through
-``GatewayRequest.thinking_default_enable``. Explicit nested thinking budgets
+``GatewayRequest.thinking_default_enable``. An explicit flat
+``reasoning_effort`` is the OpenAI-standard control and always decides: every
+alternate field beside it is ignored and disclosed, and one that contradicts it
+(an off switch beside an active tier, or an on switch beside ``none``) is
+disclosed as conflicting rather than refused, since clients that set both
+usually stamp a provider switch from a fixed template. Explicit nested thinking budgets
 retain their numeric value for model-aware admission, while
 OpenRouter numeric budgets receive a named compatibility refusal.
 """
@@ -28,6 +33,7 @@ from exp.runtime.openai_protocol.wire_models import _ChatRequest
 # Disclosure tokens (unified path->action(reason) vocabulary).
 _TRANSLATED = "{path}->translated(reasoning_effort)"
 _IGNORED = "{path}->ignored(explicit_reasoning_effort)"
+_CONFLICT_IGNORED = "{path}->ignored(conflicts_with_reasoning_effort)"
 _EXCLUDE_DROPPED = "reasoning.exclude->dropped(not_carried)"
 
 CHAT_TEMPLATE_PRESERVE_THINKING_IGNORED = (
@@ -120,8 +126,9 @@ def translate_enable_thinking(
 def _translate_enable_thinking(request: _ChatRequest) -> _EnableThinkingResult:
     """Resolve the effective reasoning control from the flat and alternate fields.
 
-    The explicit flat ``reasoning_effort`` selects depth when enable controls agree;
-    contradictory on/off controls are refused. A level-less enable defers
+    The explicit flat ``reasoning_effort`` decides on/off and depth; each
+    alternate field beside it is ignored, and one whose on/off vote contradicts
+    it is disclosed as conflicting. A level-less enable defers
     to the model default (``thinking_default_enable``). Alternate fields that
     disagree on enable-vs-disable are a caller error and rejected by name.
     Nested Anthropic budgets are retained for model-aware route admission,
@@ -199,21 +206,25 @@ def _translate_enable_thinking(request: _ChatRequest) -> _EnableThinkingResult:
         ("enable_thinking", flat_enable_present),
     )
 
-    # Flat effort selects depth, but cannot override an explicit on/off constraint.
+    # The OpenAI-standard flat effort decides on/off and depth. Each alternate
+    # object is ignored WHOLE, so its inner fields are not separately reported
+    # as translated or dropped; one that votes the other way is named as a
+    # conflict so the caller can see its switch had no effect.
     if request.reasoning_effort is not None:
-        if any(
-            vote != (request.reasoning_effort != "none")
-            for vote in (reasoning_intent, thinking_enable, cck_enable, request.enable_thinking)
-            if vote is not None
-        ):
-            raise invalid_field(
-                "reasoning_effort",
-                "reasoning_effort conflicts with an enable-thinking control. "
-                "Use agreeing on/off settings or remove the conflicting control.",
+        effort_enables = request.reasoning_effort != "none"
+        votes_by_path = (
+            ("reasoning", reasoning_intent),
+            ("thinking", thinking_enable),
+            ("chat_template_kwargs", cck_enable),
+            ("enable_thinking", request.enable_thinking),
+        )
+        disclosures = [
+            (_IGNORED if vote is None or vote == effort_enables else _CONFLICT_IGNORED).format(
+                path=path
             )
-        # Each alternate object is ignored WHOLE, so its inner fields are not
-        # separately reported as translated or dropped.
-        disclosures = [_IGNORED.format(path=path) for path, present in alternates if present]
+            for (path, present), (_, vote) in zip(alternates, votes_by_path, strict=True)
+            if present
+        ]
         return _EnableThinkingResult(request.reasoning_effort, False, tuple(disclosures))
 
     # No explicit flat value: fold the alternate fields into one intent. Each

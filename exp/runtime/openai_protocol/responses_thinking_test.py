@@ -10,6 +10,7 @@ from exp.runtime.openai_protocol.client_field_repairs import THINKING_DISPLAY_DR
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.requests import decode_responses
 from exp.runtime.openai_protocol.responses_thinking import (
+    RESPONSES_THINKING_CONFLICT_IGNORED,
     RESPONSES_THINKING_IGNORED,
     RESPONSES_THINKING_TRANSLATED,
     translate_responses_thinking,
@@ -58,16 +59,16 @@ def test_responses_thinking_agreeing_with_an_explicit_effort_yields(kind: str, e
 
 
 @pytest.mark.parametrize(("kind", "effort"), (("enabled", "none"), ("disabled", "high")))
-def test_responses_thinking_contradicting_an_explicit_effort_is_a_named_400(
+def test_responses_thinking_contradicting_an_explicit_effort_yields_as_a_conflict(
     kind: str, effort: str
 ) -> None:
-    """An explicit effort that contradicts the switch is a 400 naming ``thinking``."""
-    with pytest.raises(OpenAIProtocolError) as error:
-        decode_responses(
-            {**_RESPONSES_BASE, "reasoning": {"effort": effort}, "thinking": {"type": kind}}
-        )
-    assert error.value.detail.code == "invalid_parameter"
-    assert error.value.detail.param == "thinking"
+    """An explicit effort decides a contradicting switch, which is disclosed as a conflict."""
+    decoded = decode_responses(
+        {**_RESPONSES_BASE, "reasoning": {"effort": effort}, "thinking": {"type": kind}}
+    )
+    assert decoded.request.reasoning_effort == effort
+    assert decoded.request.thinking_default_enable is False
+    assert decoded.request.ignored_parameters == (RESPONSES_THINKING_CONFLICT_IGNORED,)
 
 
 def test_responses_thinking_null_is_consumed_silently() -> None:

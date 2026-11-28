@@ -276,6 +276,12 @@ the order the model produced.
   `chat_template_kwargs.reasoning_effort` and `chat_template_kwargs.thinking` become
   `reasoning_effort` and `chat_template_kwargs.enable_thinking` (a value that contradicts the
   canonical field is a 400 naming the template field).
+- On Chat, an explicit `reasoning_effort` decides on-versus-off and depth over every alternate
+  enable-thinking control (`reasoning`, `thinking`, `chat_template_kwargs`, top-level
+  `enable_thinking`). An agreeing control is `<field>->ignored(explicit_reasoning_effort)`; one
+  that votes the other way (an off switch beside an active tier, an on switch beside `none`) is
+  `<field>->ignored(conflicts_with_reasoning_effort)`. An unknown effort value stays a 400 naming
+  `reasoning_effort`.
 - A Responses `reasoning.context` selector reaches only native Responses reasoning rungs; a route
   with none serves without it, disclosed as `reasoning.context->dropped(unsupported_by_provider)`,
   and per-rung narrowing prefers a rung that carries it.
@@ -285,11 +291,12 @@ the order the model produced.
   `adaptive` included), is folded into the Responses reasoning control as Chat already folds it
   into `reasoning_effort`: `disabled` becomes `reasoning.effort: "none"`, `enabled` and
   `adaptive` ask for the route's default depth (a level-less enable), each disclosed as
-  `thinking->translated(reasoning.effort)`. An explicit `reasoning.effort` that agrees decides
-  the request (`thinking->ignored(explicit_reasoning_effort)`); one that disagrees is a 400
-  naming `thinking`. `display` drops as on Chat, `budget_tokens` stays `unsupported_parameter`
-  on Responses, and any other shape is a 400 naming `thinking`, `thinking.type` or the unknown
-  key.
+  `thinking->translated(reasoning.effort)`. An explicit `reasoning.effort` decides the request:
+  an agreeing switch is `thinking->ignored(explicit_reasoning_effort)`, and one that votes the
+  other way on on-versus-off yields to it as
+  `thinking->ignored(conflicts_with_reasoning_effort)`. `display` drops as on Chat,
+  `budget_tokens` stays `unsupported_parameter` on Responses, and any other shape is a 400
+  naming `thinking`, `thinking.type` or the unknown key.
 - A Responses reasoning input item with neither `id` nor `encrypted_content` cannot be resolved
   by any provider, and its summary never reaches provider history, so it is removed,
   `input.reasoning->dropped(no_id_or_encrypted_content)`.

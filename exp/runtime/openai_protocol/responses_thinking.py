@@ -32,6 +32,14 @@ RESPONSES_THINKING_IGNORED = "thinking->ignored(explicit_reasoning_effort)"
 ``reasoning.effort`` already decides both the switch and the depth, so the
 agreeing ``thinking`` object adds nothing and yields to it."""
 
+RESPONSES_THINKING_CONFLICT_IGNORED = "thinking->ignored(conflicts_with_reasoning_effort)"
+"""Disclosure recorded when a Responses ``thinking`` switch contradicts an explicit effort.
+
+``reasoning.effort`` is the OpenAI-standard control and decides the request;
+a ``thinking`` switch voting the other way (``disabled`` beside an active
+tier, ``enabled`` beside ``none``) yields to it and is named as a conflict, so
+the caller can see the switch had no effect."""
+
 _RESPONSES_THINKING_KEYS = frozenset({"type", "budget_tokens", "display"})
 """Keys of the Anthropic/DeepSeek ``thinking`` object the Responses repair reads."""
 
@@ -50,9 +58,9 @@ def translate_responses_thinking(
     caller sent); ``enabled`` and ``adaptive`` ask for the route's default
     depth, returned as the level-less enable the Chat surface already uses
     (``GatewayRequest.thinking_default_enable``). An explicit
-    ``reasoning.effort`` that agrees on on-versus-off decides the request and
-    the switch yields to it with disclosure; one that disagrees is refused
-    naming ``thinking``. ``display`` is Anthropic's render preference and is
+    ``reasoning.effort`` decides the request and the switch yields to it with
+    disclosure, named as a conflict when it votes the other way on
+    on-versus-off. ``display`` is Anthropic's render preference and is
     dropped as on Chat. A numeric ``budget_tokens`` cannot be enforced on this
     surface and keeps a named refusal.
 
@@ -66,7 +74,7 @@ def translate_responses_thinking(
 
     Raises:
         OpenAIProtocolError: ``thinking`` is not an object, names an unknown
-            key or type, carries a budget, or contradicts ``reasoning.effort``.
+            key or type, or carries a budget.
     """
     if "thinking" not in payload:
         return payload, (), False
@@ -114,13 +122,9 @@ def translate_responses_thinking(
         # consumed so that refusal is the only one the caller sees.
         return remaining, display, False
     if effort is not None:
-        if (effort != "none") != enable:
-            raise invalid_field(
-                "thinking",
-                f"thinking.type '{kind}' conflicts with reasoning.effort. Use agreeing on/off "
-                "settings or remove thinking.",
-            )
-        return remaining, (*display, RESPONSES_THINKING_IGNORED), False
+        agrees = (effort != "none") == enable
+        ignored = RESPONSES_THINKING_IGNORED if agrees else RESPONSES_THINKING_CONFLICT_IGNORED
+        return remaining, (*display, ignored), False
     if enable:
         return remaining, (*display, RESPONSES_THINKING_TRANSLATED), True
     if reasoning is None:
