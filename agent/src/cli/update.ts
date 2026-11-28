@@ -17,6 +17,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { trimTrailingSlashes } from "../gateway/config.js";
 import { envFlag } from "./environment.js";
 
 export const PACKAGE_NAME = "@experiential-labs/exp-code";
@@ -184,7 +185,7 @@ function writeCache(path: string, cache: CheckCache): void {
 
 /** The registry's `latest` version of exp-code. */
 export async function fetchLatestVersion(registry: string, fetchImpl: typeof fetch = fetch, timeoutMs = CHECK_TIMEOUT_MS): Promise<string | undefined> {
-  const url = `${registry.replace(/\/+$/, "")}/-/package/${PACKAGE_NAME.replace("/", "%2F")}/dist-tags`;
+  const url = `${trimTrailingSlashes(registry)}/-/package/${PACKAGE_NAME.replaceAll("/", "%2F")}/dist-tags`;
   const response = await fetchImpl(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(timeoutMs) });
   if (!response.ok) return undefined;
   const latest = ((await response.json()) as { latest?: unknown }).latest;
