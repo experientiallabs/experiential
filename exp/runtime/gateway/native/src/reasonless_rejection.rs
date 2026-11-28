@@ -37,6 +37,7 @@ use crate::param_attribution::{
 const REASONLESS_SENTENCES: &[&str] = &[
     "invalid request error",
     "invalid request",
+    "invalid request body",
     "invalid_request_error",
     "bad request",
 ];
@@ -52,7 +53,13 @@ pub fn rejected_without_reason(dialect: Dialect, body: &str) -> bool {
     let Some(value) = parse_error_document(body) else {
         return false;
     };
-    if names_a_structured_reason(dialect, &value, body) {
+    // Gemini's streaming endpoints wrap the error in a one-element array.
+    let value = match value {
+        Value::Array(mut items) if items.len() == 1 && items[0].is_object() => items.remove(0),
+        value => value,
+    };
+    let document = value.to_string();
+    if names_a_structured_reason(dialect, &value, &document) {
         return false;
     }
     error_message_field(dialect, &value).is_some_and(reasonless_sentence)
@@ -91,11 +98,28 @@ fn names_a_structured_reason(dialect: Dialect, value: &Value, body: &str) -> boo
         || rejected_code(dialect, body).is_some_and(|code| specific_code(&code))
 }
 
-/// Whether one code token names more than the generic family type. Spellings
-/// that differ only by separator (xAI's `invalid-argument`) are the same token.
+/// Family-type tokens that say only "the request was rejected", compared
+/// lowercased with `_` and `-` removed (`invalid-argument`, `INVALID_ARGUMENT`,
+/// vLLM's `BadRequestError`).
+const FAMILY_TOKENS: &[&str] = &[
+    "invalidrequesterror",
+    "invalidrequest",
+    "invalidrequestbody",
+    "invalidargument",
+    "badrequest",
+    "badrequesterror",
+    "error",
+];
+
+/// Whether one code token names more than the generic family type.
 fn specific_code(token: &str) -> bool {
     let token = token.trim();
-    !token.is_empty() && !generic_error_code(&token.replace('-', "_"))
+    let folded: String = token
+        .chars()
+        .filter(|c| !matches!(c, '_' | '-'))
+        .collect::<String>()
+        .to_ascii_lowercase();
+    !token.is_empty() && !generic_error_code(token) && !FAMILY_TOKENS.contains(&folded.as_str())
 }
 
 /// Whether one provider sentence is a bare restatement of the rejection.
@@ -171,6 +195,18 @@ mod tests {
             r#"{"code":"invalid-argument","error":"Bad Request"}"#
         ));
         assert!(reasonless(r#"{"code":400,"message":"Bad Request!"}"#));
+        // vLLM's family class, API Management's flat sentence, and Gemini's
+        // streaming array envelope.
+        assert!(reasonless(
+            r#"{"object":"error","message":"Bad Request","type":"BadRequestError","param":null,"code":400}"#
+        ));
+        assert!(reasonless(
+            r#"{"statusCode":400,"message":"Invalid request body."}"#
+        ));
+        assert!(rejected_without_reason(
+            Dialect::GeminiGenerateContent,
+            r#"[{"error":{"code":400,"message":"Bad Request","status":"INVALID_ARGUMENT"}}]"#
+        ));
     }
 
     #[test]
