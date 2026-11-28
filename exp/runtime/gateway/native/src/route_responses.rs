@@ -414,7 +414,27 @@ async fn respond_from_responses_events(
     };
     if let Some(failure) = &aggregated.failure {
         let failure = failure.clone().boundary();
-        let error = failure.public_error();
+        let mut error = failure.public_error();
+        if failure.failure_class == FailureClass::Refusal {
+            let retained = state
+                .bridge
+                .call(
+                    "remember",
+                    crate::responses_retention::remember_input_denial_argument(
+                        &admission.request_id,
+                    ),
+                )
+                .await
+                .ok()
+                .and_then(|reply| serde_json::from_str::<Value>(&reply).ok())
+                .is_some_and(|reply| reply.get("retained") != Some(&Value::Bool(false)));
+            if retained {
+                error = error.with_response_id(crate::encode::stable_public_id(
+                    "resp",
+                    &admission.request_id,
+                ));
+            }
+        }
         guard
             .settle(
                 "failed",

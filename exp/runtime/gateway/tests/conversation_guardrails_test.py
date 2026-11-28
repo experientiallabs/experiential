@@ -16,8 +16,16 @@ from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.tests.guardrail_policy_integrity_test import _provider
 from exp.runtime.gateway.tests.guardrail_search_output_test import _frames
 from exp.runtime.gateway.tests.mandatory_guardrails_paths_test import _serving
-from exp.runtime.gateway.tests.native_waterfall_test import _content_chunk, _terminal_frames
+from exp.runtime.gateway.tests.native_gemini_thought_signature_test import (
+    _configure as _configure_gemini,
+)
+from exp.runtime.gateway.tests.native_waterfall_test import (
+    _content_chunk,
+    _sse_frame,
+    _terminal_frames,
+)
 from exp.runtime.gateway.tests.parallel_input_guardrails_test import _Classifier, _engine
+from exp.runtime.models import registry
 
 
 class _HistoryClassifier(_Classifier):
@@ -60,7 +68,9 @@ def test_denied_responses_turn_can_continue_without_losing_user_input(
                 },
             )
             assert denied.status_code == 400, denied.text
-            receipt = denied.json()["error"]["response_id"]
+            if not store:
+                assert "response_id" not in denied.json()["error"]
+            receipt = denied.json()["error"].get("response_id", "resp_not_retained")
             for followup in ("please", "continue"):
                 result = client.post(
                     "/v1/responses",
@@ -243,3 +253,109 @@ def test_refusal_retention_failure_preserves_original_outcome(
                 json={"model": "coding", "input": "benign fixture", "stream": stream},
             )
             assert allowed.status_code == 200, allowed.text
+
+
+@pytest.mark.parametrize("store", [False, True])
+def test_content_free_provider_refusal_retains_input(tmp_path: Path, store: bool) -> None:
+    """A provider content-filter terminal without refusal text can still continue."""
+    frames = (
+        _sse_frame({"choices": [{"index": 0, "delta": {}, "finish_reason": "content_filter"}]})
+        + b"data: [DONE]\n\n"
+    )
+    with _provider(frames) as (provider, _):
+        _, key = _configured_gateway(
+            tmp_path, base_url=provider, billing_source=BillingSource.HOST_MANAGED
+        )
+        components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"})
+        control = NativeControlPlane(
+            components, guardrails=_engine(_RefusedHistoryClassifier("block"))
+        )
+        with (
+            _serving(control) as base,
+            httpx.Client(
+                base_url=base, headers={"Authorization": f"Bearer {key}"}, timeout=10
+            ) as client,
+        ):
+            denied = client.post(
+                "/v1/responses",
+                json={"model": "coding", "input": "harmful fixture", "store": store},
+            )
+            assert denied.status_code == 200, denied.text
+            assert denied.json()["status"] == "completed"
+            receipt = denied.json()["id"]
+            followup = client.post(
+                "/v1/responses",
+                json={"model": "coding", "input": "please", "previous_response_id": receipt},
+            )
+            assert followup.status_code == 400, followup.text
+            expected = "content_filter" if store else "previous_response_not_found"
+            assert followup.json()["error"]["code"] == expected
+
+
+@pytest.mark.parametrize("store", [False, True])
+@pytest.mark.parametrize("storage_failure", [False, True])
+def test_gemini_safety_refusal_preserves_input_and_original_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store: bool, storage_failure: bool
+) -> None:
+    """A Gemini safety terminal retains only input without introducing availability errors."""
+
+    class RefusalControl(NativeControlPlane):
+        def remember(self, argument: str) -> str:
+            """Inject a storage failure only for refusal inputs."""
+            if storage_failure and json.loads(argument).get("refusal"):
+                raise RuntimeError("synthetic store failure")
+            return super().remember(argument)
+
+    frames = b"".join(
+        _sse_frame(item)
+        for item in [
+            {
+                "candidates": [
+                    {"content": {"role": "model", "parts": [{"text": "synthetic partial answer"}]}}
+                ]
+            },
+            {"candidates": [{"finishReason": "SAFETY"}]},
+        ]
+    )
+    with _provider(frames) as (provider, received):
+        factory, _ = registry._HTTP_PROVIDERS["gemini"]
+        monkeypatch.setattr(
+            registry,
+            "_HTTP_PROVIDERS",
+            {**registry._HTTP_PROVIDERS, "gemini": (factory, provider)},
+        )
+        key = _configure_gemini(tmp_path)
+        components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"})
+        control = RefusalControl(components, guardrails=_engine(_RefusedHistoryClassifier("block")))
+        with (
+            _serving(control) as base,
+            httpx.Client(
+                base_url=base, headers={"Authorization": f"Bearer {key}"}, timeout=10
+            ) as client,
+        ):
+            denied = client.post(
+                "/v1/responses",
+                json={
+                    "model": "gemini",
+                    "input": "harmful fixture",
+                    "store": store,
+                    "max_output_tokens": 64,
+                },
+            )
+            assert denied.status_code == 400, denied.text
+            assert denied.json()["error"]["code"] == "refusal"
+            assert len(received) == 1
+            if not store or storage_failure:
+                assert "response_id" not in denied.json()["error"]
+                return
+            followup = client.post(
+                "/v1/responses",
+                json={
+                    "model": "gemini",
+                    "input": "please",
+                    "max_output_tokens": 64,
+                    "previous_response_id": denied.json()["error"]["response_id"],
+                },
+            )
+            assert followup.status_code == 400, followup.text
+            assert followup.json()["error"]["code"] == "content_filter"

@@ -313,6 +313,8 @@ If that input-only retention fails, the provider refusal still completes normall
 client must resend history if its continuation is unavailable.
 An admitted parallel input denial returns HTTP 400 `content_filter` with an additional
 `error.response_id`; a client can send that ID as its next `previous_response_id`.
+A non-streaming provider safety error also includes this receipt when its input was retained.
+An explicit `store:false` input denial does not issue a receipt.
 The existing store and privacy policy still decide whether state can be retained:
 `store: false`, disabled retention, expired or missing state, and foreign namespaces remain
 unavailable. When continuation is unavailable, resend the full user conversation in `input`.

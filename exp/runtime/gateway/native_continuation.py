@@ -76,8 +76,10 @@ def remember_continuation(
     data = json.loads(argument)
     entry = accounting.entry(str(data["request_id"]))
     if entry is None or entry.continuation is None:
-        return "{}"
+        return '{"retained":false}'
     context = entry.continuation
+    if not context.retain:
+        return '{"retained":false}'
     route_binding = None
     if entry.active_attempt_id is not None:
         depth = entry.attempt_depths.get(entry.active_attempt_id)
