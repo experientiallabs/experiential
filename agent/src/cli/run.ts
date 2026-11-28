@@ -194,7 +194,7 @@ async function runCliWith(args: string[], env: NodeJS.ProcessEnv, earlyInput: Ea
   } else if (wantsDefaultModel(finalArgs, parsed)) {
     // The listing is shared with the gateway provider's registration (cached in memory and on
     // disk), so checking the saved model against it costs no extra request.
-    const start = startModel(env.EXP_CODE_MODEL?.trim() ? undefined : await listedIds(), env.EXP_CODE_MODEL, savedDefaultModel(agentDir));
+    const start = startModel(await listedIds(), env.EXP_CODE_MODEL, savedDefaultModel(agentDir));
     if (start.note !== undefined) note(start.note);
     if (start.id !== undefined) finalArgs = [...modelArgs(start.id), ...finalArgs];
   }

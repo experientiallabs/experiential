@@ -17,6 +17,7 @@
  */
 
 import { registerHooks } from "node:module";
+import { EMPTY_PROMPT_GUARD, PROMPT_SIZE_GUARD } from "./pi-input-patches.js";
 import { EXP_RETRY_POLICY, RETRY_PROVIDER_PATCHES } from "./pi-retry-patches.js";
 import { AGENT_SESSION_UX_EDITS, EDITOR_PATCH, INTERACTIVE_UX_EDITS, TERMINAL_PATCH } from "./pi-ux-patches.js";
 
@@ -232,6 +233,9 @@ const EXP_SESSION_ENV_GUIDELINE = '"You can inspect the EXP_CODE_SESSION_* envir
  * line carries a prompt or @file and no byte arrives within EXP_STDIN_WAIT_MS, exp-code stops
  * reading, says so on stderr, and runs the prompt alone. Input that starts arriving is still read
  * to its end, and a run with no prompt on the command line keeps waiting, as stdin is all it has.
+ * Input that is not text (a NUL byte, or bytes that are not UTF-8: an image, an archive, a
+ * compiled file) is refused with exit code 2: Pi decoded it into replacement characters and sent
+ * them to the model, which billed the call and could only guess.
  */
 const READ_PIPED_STDIN = `/** exp-code: how long a run with a prompt waits for the first byte of piped stdin. */
 const EXP_STDIN_WAIT_MS = 5000;
@@ -241,7 +245,7 @@ async function readPipedStdin(hasPrompt = false) {
         return undefined;
     }
     return new Promise((resolve) => {
-        let data = "";
+        const chunks = [];
         let idle;
         const finish = (value) => {
             clearTimeout(idle);
@@ -251,11 +255,24 @@ async function readPipedStdin(hasPrompt = false) {
             resolve(value);
         };
         const onData = (chunk) => {
-            data += chunk;
+            chunks.push(chunk);
             clearTimeout(idle);
         };
-        const onEnd = () => finish(data.trim() || undefined);
-        process.stdin.setEncoding("utf8");
+        const onEnd = () => {
+            const bytes = Buffer.concat(chunks);
+            let data;
+            try {
+                data = bytes.includes(0) ? undefined : new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+            }
+            catch {
+                data = undefined;
+            }
+            if (data === undefined) {
+                console.error(chalk.red(\`Error: stdin is not text (\${bytes.length} bytes that are not UTF-8 text), so exp-code did not send it. Pipe text, or name the file on the command line for the agent to read (exp-code -p "describe ./image.png").\`));
+                process.exit(2);
+            }
+            finish(data.trim() || undefined);
+        };
         process.stdin.on("data", onData);
         process.stdin.on("end", onEnd);
         process.stdin.on("error", onEnd);
@@ -389,6 +406,9 @@ export const PI_PATCHES: FilePatch[] = [
       { find: '"Error: PI_STARTUP_BENCHMARK only supports interactive mode"', replace: '"Error: EXP_CODE_STARTUP_BENCHMARK only supports interactive mode"' },
       { from: "/**\n * Read all content from piped stdin.", to: "function reportDiagnostics(diagnostics) {", replace: READ_PIPED_STDIN },
       { find: "stdinContent = await readPipedStdin();", replace: "stdinContent = await readPipedStdin(parsed.messages.length > 0 || parsed.fileArgs.length > 0);" },
+      // A print or JSON run with no prompt (`-p`, `-p ""`, nothing on stdin) exited 0 having done
+      // nothing, and a whitespace-only prompt was sent and billed. Both are refused with exit code 2.
+      { find: '    time("prepareInitialMessage");\n', replace: `    time("prepareInitialMessage");\n${EMPTY_PROMPT_GUARD}` },
       // `--session <id>` for a session of another folder asks whether to fork it here. With no
       // terminal to answer (stdin closed or piped, as in scripts and `-p` runs) the question was
       // never answered, and Node exited with code 13 and an "unsettled top-level await" warning.
@@ -698,7 +718,7 @@ export const PI_PATCHES: FilePatch[] = [
         replace:
           "                if (!aborted && model)\n                    this._autoCompactionPausedFor = this._autoCompactionKey(model);\n                const errorMessage = aborted\n                    ? undefined\n                    : reason === \"overflow\"\n                        ? `Context overflow recovery failed: ${message}${compactionFailureAdvice(message, model)}`\n                        : `Auto-compaction failed: ${message}${compactionFailureAdvice(message, model)}`;"
       },
-      { find: "export class AgentSession {", replace: `${COMPACTION_FAILURE_ADVICE}\n${EXP_RETRY_POLICY}export class AgentSession {` },
+      { find: "export class AgentSession {", replace: `${COMPACTION_FAILURE_ADVICE}\n${EXP_RETRY_POLICY}${PROMPT_SIZE_GUARD}export class AgentSession {` },
       // The retry policy (EXP_RETRY_POLICY) decides as a reply ends, after extensions have seen it
       // (exp-code's gateway extension rewrites a raw gateway error first) and before it is saved.
       {
@@ -711,6 +731,12 @@ export const PI_PATCHES: FilePatch[] = [
         replace: "    _isRetryableError(message) {\n        if (message.expRetry?.allowed === false)\n            return false;\n        // Context overflow is handled by compaction, not retry.\n"
       },
       { find: "        const delayMs = retryDelayMs(settings, this._retryAttempt);", replace: "        const delayMs = message.expRetry?.delayMs ?? retryDelayMs(settings, this._retryAttempt);" },
+      // A user prompt larger than the model's input budget is refused before it is sent.
+      {
+        find: '        return { messageType: "user", prompt: expandedText, images: currentImages };',
+        replace:
+          '        const tooLarge = expPromptTooLarge(expandedText, this.model);\n        if (tooLarge)\n            throw new Error(tooLarge);\n        return { messageType: "user", prompt: expandedText, images: currentImages };'
+      },
       ...AGENT_SESSION_UX_EDITS
     ]
   },

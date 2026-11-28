@@ -98,7 +98,7 @@ saved when neither key variable is set:
 | `EXP_GATEWAY_KEY` | Local gateway key. Selects the local gateway when no hosted key is set. |
 | `EXP_CODE_GATEWAY` | `hosted` or `local`, to choose explicitly. |
 | `EXP_CODE_BASE_URL` | Another base URL for the chosen gateway. |
-| `EXP_CODE_MODEL` | Default model alias (otherwise `experiential-large-model` when listed, else the first alias the gateway lists). |
+| `EXP_CODE_MODEL` | Default model alias (otherwise `experiential-large-model` when listed, else the first alias the gateway lists). An alias the gateway does not list is passed over with a one-line note, for your saved model or the default, as `--model` refuses it; when the listing cannot be read it is used as set. |
 | `EXP_CODE_WIRE` | Force one wire API: `completions`, `responses`, or `messages`. |
 | `EXP_CODE_HOME` | Configuration directory (default `~/.exp-code`). |
 | `EXP_CODE_PLATFORM_TOOLS` | `0` (or `false`, `off`, `no`) turns off the tools that read your organization's Experiential data. See [Working with your Experiential data](#working-with-your-experiential-data). |
@@ -175,6 +175,13 @@ Text piped into exp-code (`git diff | exp-code -p "Review this"`) is added befor
 When the prompt is on the command line and nothing arrives on a piped stdin within 5 seconds,
 exp-code warns on stderr and runs the prompt alone, so a script or CI step that leaves stdin open
 never hangs. Redirect stdin from `/dev/null` when there is nothing to pipe.
+
+exp-code refuses, before any call, what can only fail or be billed for nothing: a print or JSON
+run with no prompt, an empty one or one of only whitespace (exit code 2, with the usage), stdin
+that is not text (a NUL byte or bytes that are not UTF-8, such as an image or an archive; exit
+code 2: name the file in the prompt for the agent to read instead), and in every mode a prompt
+larger than the model's input budget (its window less the output it reserves, estimated at four
+characters a token), with the model's limits and what to do instead.
 
 `exp-code --help` lists every flag. The JSON and RPC formats are described in the reference
 docs linked under [Acknowledgements](#acknowledgements). `-p` and `--mode json` exit 1 when the

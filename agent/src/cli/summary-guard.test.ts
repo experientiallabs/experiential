@@ -181,9 +181,19 @@ describe("compaction on a session", () => {
     gateway.script([{ text: SUMMARY }, { text: SUMMARY }]);
     const result = await session.compact();
     expect(result.summary).toContain("Fix the failing parser test.");
-    // Pi ignores usage from a reply timestamped at or before the latest compaction; the delay keeps
-    // this fast fake reply from landing in the compaction's millisecond.
-    gateway.script([{ text: "Fifth answer.", promptTokens: OVER_THRESHOLD, delayMs: 20 }, { text: SUMMARY }, { text: SUMMARY }]);
+    // Pi ignores usage from a reply timestamped at or before the latest compaction, and a reply is
+    // timestamped when its request starts, not when the gateway answers: a delay on the gateway's
+    // side did not help, and a prompt sent in the compaction's millisecond (about one run in four
+    // on a busy machine) was taken for a pre-compaction reply and never compacted. The next prompt
+    // therefore starts after that millisecond.
+    const compactedAt = Math.max(
+      ...session.sessionManager
+        .getEntries()
+        .filter((entry) => entry.type === "compaction")
+        .map((entry) => new Date(entry.timestamp).getTime())
+    );
+    while (Date.now() <= compactedAt) await new Promise((resolve) => setTimeout(resolve, 1));
+    gateway.script([{ text: "Fifth answer.", promptTokens: OVER_THRESHOLD }, { text: SUMMARY }, { text: SUMMARY }]);
     await session.prompt("fifth question");
     expect(events.at(-1)).toMatchObject({ reason: "threshold", errorMessage: undefined });
     expect(events.at(-1)!.result).toBeDefined();
