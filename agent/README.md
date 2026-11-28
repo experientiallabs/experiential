@@ -149,7 +149,10 @@ These variables tune the terminal agent:
 
 Shell commands the agent runs see `EXP_CODE_AGENT=true`, `EXP_CODE_SESSION_ID`,
 `EXP_CODE_SESSION_FILE`, `EXP_CODE_SESSION_PROVIDER`, `EXP_CODE_SESSION_MODEL` and
-`EXP_CODE_SESSION_REASONING_LEVEL`.
+`EXP_CODE_SESSION_REASONING_LEVEL`. They never see the gateway key exp-code runs on
+(`EXP_API_KEY`, `EXP_GATEWAY_KEY` and `EXPLABS_API_KEY` are removed), so a test script, build
+step or injected instruction the agent runs cannot read it. Commands you run yourself with `!`
+keep your whole environment.
 
 ## Modes
 

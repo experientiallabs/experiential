@@ -183,6 +183,13 @@ const HELP_ENVIRONMENT =`\${chalk.bold("Environment Variables:")}
 
 `;
 
+/** Credential variables removed from the environment of every command the agent runs. */
+export const AGENT_COMMAND_UNSET = ["EXP_API_KEY", "EXP_GATEWAY_KEY", "EXPLABS_API_KEY"] as const;
+
+/** Pi's shell-tool guideline names its own variables; exp-code renames them (core/tools/bash.js). */
+const SESSION_ENV_GUIDELINE = '"You can inspect PI_* environment variables for current model and session details."';
+const EXP_SESSION_ENV_GUIDELINE = '"You can inspect the EXP_CODE_SESSION_* environment variables for the current model and session details."';
+
 /** The patch table for the pinned Pi release (1.5.1). */
 export const PI_PATCHES: FilePatch[] = [
   {
@@ -505,9 +512,15 @@ export const PI_PATCHES: FilePatch[] = [
       { find: "env.PI_SESSION_FILE", replace: "env.EXP_CODE_SESSION_FILE", count: 2 },
       { find: "env.PI_PROVIDER", replace: "env.EXP_CODE_SESSION_PROVIDER", count: 2 },
       { find: "env.PI_MODEL", replace: "env.EXP_CODE_SESSION_MODEL", count: 2 },
-      { find: "env.PI_REASONING_LEVEL", replace: "env.EXP_CODE_SESSION_REASONING_LEVEL", count: 2 }
+      { find: "env.PI_REASONING_LEVEL", replace: "env.EXP_CODE_SESSION_REASONING_LEVEL", count: 2 },
+      // The gateway key exp-code itself runs on stays out of the agent's commands: a test script,
+      // build step or prompt-injected command the agent runs could otherwise read and send it.
+      // Commands the user runs with `!` keep their whole environment.
+      { find: "    delete env.EXP_CODE_SESSION_REASONING_LEVEL;\n", replace: `    delete env.EXP_CODE_SESSION_REASONING_LEVEL;\n${AGENT_COMMAND_UNSET.map((name) => `    delete env.${name};\n`).join("")}` },
+      { find: SESSION_ENV_GUIDELINE, replace: EXP_SESSION_ENV_GUIDELINE }
     ]
   },
+  { pkg: "pi-coding-agent", file: "core/tools/powershell.js", edits: [{ find: SESSION_ENV_GUIDELINE, replace: EXP_SESSION_ENV_GUIDELINE }] },
   {
     // Temporary files whose paths the model and the user see (truncated tool output and the like).
     pkg: "pi-coding-agent",

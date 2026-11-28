@@ -185,6 +185,25 @@ describe("exp-code CLI", () => {
     expect(names().filter((name) => name.startsWith("experiential_"))).toEqual([]);
   });
 
+  it("keeps the gateway key out of the commands the agent runs", async () => {
+    const command = 'echo "key=[$EXP_GATEWAY_KEY] hosted=[$EXP_API_KEY] exp=[$EXPLABS_API_KEY] model=[$EXP_CODE_SESSION_MODEL] other=[$QA_OTHER]"';
+    gateway.script([{ calls: [{ name: "bash", arguments: { command } }] }, { text: "done" }]);
+    const result = await runCli(["-p", "show the environment"], {
+      EXP_GATEWAY_KEY: "local-secret-key",
+      EXPLABS_API_KEY: "xpl_launcher_secret",
+      EXP_CODE_BASE_URL: gateway.baseUrl,
+      QA_OTHER: "kept"
+    });
+    expect(result.stdout.trim()).toBe("done");
+    const sent = JSON.stringify(gateway.completions().at(-1)!.messages);
+    expect(sent).toContain("key=[] hosted=[] exp=[] model=[fake-model] other=[kept]");
+    expect(sent).not.toContain("local-secret-key");
+    expect(sent).not.toContain("xpl_launcher_secret");
+    // The shell tool's guideline names the variables commands actually see.
+    expect(sent).toContain("EXP_CODE_SESSION_* environment variables");
+    expect(sent).not.toContain("PI_* environment");
+  });
+
   it("emits Pi's JSON event stream in --mode json", async () => {
     gateway.script([{ text: "json mode" }]);
     const result = await runCli(["--mode", "json", "hi"], { EXP_GATEWAY_KEY: "local-key", EXP_CODE_BASE_URL: gateway.baseUrl });
