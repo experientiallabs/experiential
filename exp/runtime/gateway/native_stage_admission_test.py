@@ -1,6 +1,7 @@
 """Native admission consumes session evidence while respecting stage and host gates."""
 
 import json
+import logging
 import time
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
@@ -48,6 +49,7 @@ from exp.runtime.gateway.recovery import (
     FrozenRecoveryBinding,
     OperationalScope,
     RecoveryScope,
+    RecoverySkip,
     RecoverySnapshot,
     SessionCacheKey,
     SessionRecoveryRegistry,
@@ -130,6 +132,11 @@ class Host:
 
     credential: str = "credential"
 
+    def credential_for(self, deployment: ExactModelDeployment) -> str:
+        """The credential generation the host binds for one destination."""
+        del deployment
+        return self.credential
+
     def scope_for(self, deployment: ExactModelDeployment, organization_id: str) -> RecoveryScope:
         """Freeze a known credential scope per destination model."""
         return RecoveryScope(
@@ -137,7 +144,7 @@ class Host:
             exact_model_id=deployment.exact_model_id,
             endpoint_scope=deployment.connection_sha256,
             region_scope="region",
-            credential_scope=str(uuid5(NAMESPACE_URL, self.credential)),
+            credential_scope=str(uuid5(NAMESPACE_URL, self.credential_for(deployment))),
             organization_id=organization_id,
         )
 
@@ -172,7 +179,9 @@ def stage_affinity_ordered_rungs(
         for deployment, (profile, client) in zip(route.deployments, wires, strict=True):
             scope = host.scope_for(deployment, authorization.organization_id)
             profile = replace(profile, operational_region=scope.region_scope)
-            receipt = DispatchCredentialReceipt(uuid5(NAMESPACE_URL, host.credential))
+            receipt = DispatchCredentialReceipt(
+                uuid5(NAMESPACE_URL, host.credential_for(deployment))
+            )
             binding = FrozenRecoveryBinding(
                 deployment.deployment_id,
                 deployment.connection_sha256,
@@ -1651,3 +1660,157 @@ def test_an_unreordered_stage_keeps_its_authored_order() -> None:
         continuation=None,
     )
     assert ordered.snapshot.deployment_ids == ("house-openrouter", "ec-box")
+
+
+@dataclass
+class ObservingHost(Host):
+    """A host that also observes why admission kept a warm fallback."""
+
+    skips: list[tuple[str, str, tuple[str, ...]]] | None = None
+    fail: bool = False
+    rebound: frozenset[str] = frozenset()
+
+    def credential_for(self, deployment: ExactModelDeployment) -> str:
+        """A re-released receipt for the rebound destinations, else the original one."""
+        rebound = deployment.deployment_id in self.rebound
+        return f"{self.credential}-rereleased" if rebound else self.credential
+
+    def recovery_skipped(
+        self, request_id: str, retained_deployment_id: str, skipped: tuple[RecoverySkip, ...]
+    ) -> None:
+        """Record the declined routes, or raise to prove routing ignores observer faults."""
+        if self.fail:
+            raise RuntimeError("observer down")
+        if self.skips is None:
+            self.skips = []
+        self.skips.append((request_id, retained_deployment_id, tuple(s.code for s in skipped)))
+
+
+def _kept_fallback(
+    host: Host, *, lead_headroom: bool, rotate_credential: bool
+) -> tuple[AffinityPlacement, str, str, str]:
+    """Warm two rungs, depart the lead for capacity, and admit again six seconds later.
+
+    Returns:
+        The placement, the request id, and the lead and retained deployment ids.
+    """
+    route, wires = _affinity_fixture()
+    deployments = tuple(
+        d.model_copy(update={"gateway": d.gateway.model_copy(update={"dispatch": None})})
+        for d in route.deployments
+    )
+    route = route.model_copy(
+        update={"deployment": deployments[0], "fallback_deployments": deployments[1:]}
+    )
+    authorization = route.snapshot.authorization
+    request = GatewayRequest(
+        surface=authorization.surface,
+        messages=(GatewayMessage(role="user", content="prefix"),),
+        prompt_cache_key="session",
+        provider_prompt_cache_key="xpl-session",
+    )
+    clock = Clock()
+    accounting = NativeAttemptAccounting(
+        _RecordingLedger(), recovery_host=host, default_lane_bound=1
+    )
+    accounting.recovery = SessionRecoveryRegistry(clock=clock)
+    ordered, _, _ = stage_affinity_ordered_rungs(
+        route, wires, request, accounting=accounting, authorization=authorization, continuation=None
+    )
+    key = session_cache_key(InflightRequest(authorization, ordered, request, 10))
+    assert key is not None
+    lead, retained, _last = ordered.deployments
+    for deployment in (lead, retained):
+        accounting.recovery.record_success(
+            key,
+            deployment.deployment_id,
+            host.scope_for(deployment, authorization.organization_id),
+            cached_tokens=80,
+            cache_write_tokens=0,
+            retention_seconds=100,
+            sticky_seconds=60,
+        )
+    accounting.recovery.depart(
+        key,
+        lead.deployment_id,
+        host.scope_for(lead, authorization.organization_id),
+        "local_capacity",
+    )
+    clock.now += 6
+    if not lead_headroom:
+        accounting.loads.reserve(
+            rung_load_key(lead), organization_id="other", weight=1, bound=1, fair_share=False
+        )
+    if rotate_credential and isinstance(host, ObservingHost):
+        # The host re-released the lead's unchanged key under a new receipt (a
+        # cache renewal), while the retained lane's static binding kept its own.
+        host.rebound = frozenset({lead.deployment_id})
+    _, _, placement = stage_affinity_ordered_rungs(
+        route, wires, request, accounting=accounting, authorization=authorization, continuation=None
+    )
+    return placement, authorization.request_id, lead.deployment_id, retained.deployment_id
+
+
+def test_a_kept_fallback_reports_why_the_preferred_lane_was_not_recovered() -> None:
+    """The observing host learns the lead's failed check once per admission."""
+    host = ObservingHost()
+    placement, request_id, lead, retained = _kept_fallback(
+        host, lead_headroom=False, rotate_credential=False
+    )
+    assert placement.recovery_reason == "retained_warm_fallback"
+    assert host.skips == [(request_id, retained, ("no_local_headroom",))]
+    assert lead != retained
+
+
+def test_a_new_credential_receipt_alone_blocks_recovery_and_says_so() -> None:
+    """Same key, new receipt: the lead's warm evidence no longer matches its binding.
+
+    With headroom free and the cooldown elapsed the lead is recovered. When the
+    host re-binds the lead's unchanged credential under a new receipt, the warm
+    evidence's credential scope no longer matches and the warm fallback is kept,
+    naming the credential scope as the differing field. The receipt is the
+    credential generation: a host must keep it stable while the credential is.
+    """
+    recovered, _, lead, _ = _kept_fallback(
+        ObservingHost(), lead_headroom=True, rotate_credential=False
+    )
+    assert recovered.recovery_reason == "recovered_preferred_route"
+    assert recovered.verified_warm_deployment_id == lead
+    host = ObservingHost()
+    rotated, request_id, lead, retained = _kept_fallback(
+        host, lead_headroom=True, rotate_credential=True
+    )
+    assert rotated.recovery_reason == "retained_warm_fallback"
+    assert rotated.verified_warm_deployment_id == retained
+    assert host.skips == [(request_id, retained, ("warm_scope_mismatch:credential_scope",))]
+
+
+def test_an_observer_fault_never_changes_routing(caplog: pytest.LogCaptureFixture) -> None:
+    """A raising observer is logged and the kept fallback stands."""
+    placement, *_ = _kept_fallback(
+        ObservingHost(fail=True), lead_headroom=False, rotate_credential=False
+    )
+    assert placement.recovery_reason == "retained_warm_fallback"
+    assert "Recovery skip observation failed" in caplog.text
+
+
+def test_an_observer_fault_under_a_strict_log_handler_never_changes_routing() -> None:
+    """Even when the warning about a raising observer itself raises, routing stands."""
+
+    class Strict(logging.Handler):
+        """A handler that fails every record it is handed."""
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """Fail."""
+            raise RuntimeError("handler down")
+
+    target = logging.getLogger("exp.runtime.gateway.native_stage_admission")
+    handler = Strict()
+    target.addHandler(handler)
+    try:
+        placement, *_ = _kept_fallback(
+            ObservingHost(fail=True), lead_headroom=False, rotate_credential=False
+        )
+    finally:
+        target.removeHandler(handler)
+    assert placement.recovery_reason == "retained_warm_fallback"

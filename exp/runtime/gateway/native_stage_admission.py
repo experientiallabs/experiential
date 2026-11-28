@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import logging
 import time
@@ -26,7 +27,12 @@ from exp.runtime.gateway.native_execution import (
 from exp.runtime.gateway.native_fallback_rules import rung_rules
 from exp.runtime.gateway.native_recovery import recovery_prefix_digest
 from exp.runtime.gateway.native_responses import ContinuationContext
-from exp.runtime.gateway.recovery import SessionCacheKey
+from exp.runtime.gateway.recovery import (
+    RecoveryDecision,
+    RecoveryHost,
+    RecoverySkipObserver,
+    SessionCacheKey,
+)
 from exp.runtime.gateway.recovery_binding import validated_recovery_binding
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.sticky_affinity import AffinityPlacement
@@ -35,6 +41,22 @@ from exp.runtime.models.providers.prompt_cache_options import honors_markers
 from exp.runtime.models.providers.protocol import NativeWireClient
 
 _logger = logging.getLogger(__name__)
+
+
+def report_recovery_skips(host: RecoveryHost, request_id: str, decision: RecoveryDecision) -> None:
+    """Hand a kept fallback's declined routes to a host that observes them.
+
+    Advisory only: a host without the capability, or one that raises, leaves
+    routing exactly as decided.
+    """
+    if not isinstance(host, RecoverySkipObserver) or decision.deployment_id is None:
+        return
+    try:
+        host.recovery_skipped(request_id, decision.deployment_id, decision.skipped)
+    except Exception:  # noqa: BLE001 - an observer never changes serving.
+        # The warning is advisory too: a strict log handler may not abort admission.
+        with contextlib.suppress(Exception):
+            _logger.warning("Recovery skip observation failed; routing unchanged")
 
 
 def require_native_model_stage_contract(route: GatewayRoute) -> None:
@@ -175,9 +197,15 @@ def stage_affinity_ordered_rungs(
 
     def eligible(deployment_id: str) -> bool:
         """Require a first-dial route; historical failures never activate conditional rungs."""
-        return rung_rules(by_id[deployment_id]) is None and not accounting.health.suppressed(
-            deployment_health_key(authorization, by_id[deployment_id])
-        )
+        return ineligible(deployment_id) is None
+
+    def ineligible(deployment_id: str) -> str | None:
+        """Name why a route may not be a recovery target, or None when it may."""
+        if rung_rules(by_id[deployment_id]) is not None:
+            return "conditional_rung"
+        if accounting.health.suppressed(deployment_health_key(authorization, by_id[deployment_id])):
+            return "health_suppressed"
+        return None
 
     # Only token-window headroom needs BPE. Compute once outside the recovery
     # lock, never lazily from the callback choose invokes under that lock.
@@ -237,9 +265,22 @@ def stage_affinity_ordered_rungs(
                 for prior in range(depth)
             ):
                 allowed.add(deployment_id)
-        candidates = tuple(item for item in candidates if item[0] in allowed)
-        if not candidates:
+        if not allowed:
             return route, wires, placement
+        outranked = {deployment_id for deployment_id, _ in candidates} - allowed
+    else:
+        outranked = set()
+
+    def recovery_ineligible(deployment_id: str) -> str | None:
+        """Name why a route may not be this request's recovery target, or None."""
+        if deployment_id in outranked:
+            return "marker_wire_outranked"
+        return ineligible(deployment_id)
+
+    def recovery_eligible(deployment_id: str) -> bool:
+        """A route this request may recover to or keep (``recovery_ineligible`` is None)."""
+        return recovery_ineligible(deployment_id) is None
+
     decision_started = time.monotonic()
     try:
         observation = host.snapshot()
@@ -249,10 +290,13 @@ def stage_affinity_ordered_rungs(
     decision = registry.choose(
         key,
         candidates,
-        eligible=eligible,
+        eligible=recovery_eligible,
         snapshot=observation,
         local_capacity=headroom,
+        ineligible_reason=recovery_ineligible,
     )
+    if decision.skipped:
+        report_recovery_skips(host, authorization.request_id, decision)
     if decision.deployment_id is not None:
         start = next(
             i for i, d in enumerate(route.deployments) if d.deployment_id == decision.deployment_id

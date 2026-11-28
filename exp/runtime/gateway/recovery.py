@@ -7,16 +7,19 @@ Unix clock so timestamped fleet facts can be compared without monotonic-clock sk
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import Field, field_validator
 
 from exp.common.core.artifacts import ContractModel
+
+_logger = logging.getLogger(__name__)
 
 RecoveryCause = Literal["transport", "throttle", "credential", "local_capacity"]
 RecoveryReason = Literal[
@@ -26,6 +29,43 @@ RecoveryReason = Literal[
     "cache_expired",
     "recovery_trial_failed",
 ]
+# Why an earlier, preferred route was not recovered while a warm fallback was
+# kept. Content-free and closed: the first check the preferred route failed.
+RecoverySkipReason = Literal[
+    "no_warm_evidence",
+    "warm_evidence_expired",
+    "warm_scope_mismatch",
+    "no_departure_record",
+    "lane_ineligible",
+    "departure_scope_mismatch",
+    "cooldown_not_elapsed",
+    "no_local_headroom",
+    "newer_credential_failure",
+    "newer_throttle_failure",
+    "transport_snapshot_unavailable",
+    "transport_negative_evicted",
+    "no_transport_recovery_observation",
+    "transport_observation_unhealthy",
+    "no_recovery_lease",
+]
+# Which scope field differs when evidence and the current binding disagree.
+# A changed credential_scope means the host bound a new credential receipt.
+ScopeField = Literal[
+    "provider",
+    "exact_model_id",
+    "endpoint_scope",
+    "region_scope",
+    "credential_scope",
+    "organization_id",
+]
+_SCOPE_FIELDS: tuple[ScopeField, ...] = (
+    "provider",
+    "exact_model_id",
+    "endpoint_scope",
+    "region_scope",
+    "credential_scope",
+    "organization_id",
+)
 
 
 class OperationalScope(ContractModel):
@@ -179,6 +219,28 @@ class RecoveryHost(Protocol):
         ...
 
 
+@runtime_checkable
+class RecoverySkipObserver(Protocol):
+    """Optional recovery-host capability: learn why admission kept a warm fallback.
+
+    A host whose ``RecoveryHost`` also implements this is told, once per
+    admission that kept ``retained_warm_fallback``, which earlier preferred
+    routes were declined and the first check each failed, so its own ledger can
+    record the reason beside the request's attempts. A host without it (the
+    local engine) gets only the rate-limited log line.
+    """
+
+    def recovery_skipped(
+        self, request_id: str, retained_deployment_id: str, skipped: tuple[RecoverySkip, ...]
+    ) -> None:
+        """Record the declined routes; must be cheap, in memory, and never block.
+
+        Called on the admission path. Raising is safe: the failure is logged and
+        routing is unchanged.
+        """
+        ...
+
+
 @dataclass(frozen=True)
 class SessionCacheKey:
     """Tenant, caller session and namespaced prefix identity, containing no prompt.
@@ -239,6 +301,28 @@ class CacheEvidence:
 
 
 @dataclass(frozen=True)
+class RecoverySkip:
+    """Why one earlier, preferred route was not recovered; content-free.
+
+    Attributes:
+        deployment_id: The preferred route that was skipped.
+        reason: The first recovery check that route failed.
+        detail: A closed qualifier, or None: for a scope mismatch the first
+            differing ``ScopeField`` name (never its value); for an ineligible
+            lane the caller's ineligibility reason.
+    """
+
+    deployment_id: str
+    reason: RecoverySkipReason
+    detail: str | None = None
+
+    @property
+    def code(self) -> str:
+        """The disclosure code: the reason, then ``:<detail>`` when qualified."""
+        return self.reason if self.detail is None else f"{self.reason}:{self.detail}"
+
+
+@dataclass(frozen=True)
 class RecoveryDecision:
     """Between-request cursor selection; never permission for a within-request bounce.
 
@@ -247,12 +331,82 @@ class RecoveryDecision:
         reason: Content-free placement reason, default ``normal_selection``.
         trial: Whether this selection consumes a recovery trial, default False.
         warm_remaining_seconds: Nonnegative plausible residency remaining, default zero.
+        skipped: For ``retained_warm_fallback``, why each earlier preferred
+            route was declined, most preferred first; empty otherwise.
     """
 
     deployment_id: str | None = None
     reason: RecoveryReason = "normal_selection"
     trial: bool = False
     warm_remaining_seconds: float = 0
+    skipped: tuple[RecoverySkip, ...] = ()
+
+    @property
+    def skip_reason(self) -> str | None:
+        """The most preferred skipped route's code, or None when nothing was skipped."""
+        return self.skipped[0].code if self.skipped else None
+
+
+def _differing_field(left: RecoveryScope, right: RecoveryScope) -> ScopeField | None:
+    """Name the first scope field that differs, comparing private fields too."""
+    for name in _SCOPE_FIELDS:
+        if getattr(left, name) != getattr(right, name):
+            return name
+    return None
+
+
+class RecoverySkipLog:
+    """Rate-limited structured log of declined recoveries, at most once per lane and reason.
+
+    The line names the deployment id, the closed reason code and the scope field
+    name, never a scope value, credential, tenant or content. Bounded state.
+
+    Attributes:
+        overflowed: Skips not logged because every remembered key was still
+            inside its interval when a new key arrived.
+    """
+
+    def __init__(self, *, interval_seconds: float = 60, maximum_keys: int = 4096) -> None:
+        """Bind the per-lane interval and the bound on remembered lanes."""
+        self._interval = interval_seconds
+        self._maximum = maximum_keys
+        self._last: OrderedDict[tuple[str, str], float] = OrderedDict()
+        self._suppressed: dict[tuple[str, str], int] = {}
+        self._lock = threading.Lock()
+        self.overflowed = 0
+
+    def emit(self, skipped: tuple[RecoverySkip, ...], retained: str, *, now: float) -> None:
+        """Log each skip whose lane and reason were not logged within the interval.
+
+        A key is forgotten only once its interval has passed. When the bound is
+        full of keys still inside their interval, a new key is not logged at
+        all (counted in ``overflowed``), so the bound never lets a line repeat
+        within its minute.
+        """
+        for skip in skipped:
+            key = (skip.deployment_id, skip.code)
+            with self._lock:
+                last = self._last.get(key)
+                if last is not None and now - last < self._interval:
+                    self._suppressed[key] = self._suppressed.get(key, 0) + 1
+                    continue
+                if last is None and len(self._last) >= self._maximum:
+                    while self._last and now - next(iter(self._last.values())) >= self._interval:
+                        expired, _ = self._last.popitem(last=False)
+                        self._suppressed.pop(expired, None)
+                    if len(self._last) >= self._maximum:
+                        self.overflowed += 1
+                        continue
+                suppressed = self._suppressed.pop(key, 0)
+                self._last.pop(key, None)
+                self._last[key] = now
+            _logger.info(
+                "recovery_skipped deployment=%s reason=%s retained=%s suppressed=%d",
+                skip.deployment_id,
+                skip.code,
+                retained,
+                suppressed,
+            )
 
 
 @dataclass
@@ -329,6 +483,7 @@ class SessionRecoveryRegistry:
         self._consumed: dict[str, float] = {}
         self._negative: OrderedDict[tuple[str, ...], float] = OrderedDict()
         self._lock = threading.Lock()
+        self._skip_log = RecoverySkipLog()
 
     def observation_time(self) -> float:
         """Capture terminal arrival in the same clock domain as immutable recovery facts."""
@@ -548,12 +703,18 @@ class SessionRecoveryRegistry:
         eligible: Callable[[str], bool],
         snapshot: RecoverySnapshot | None,
         local_capacity: Callable[[str], bool] | None = None,
+        ineligible_reason: Callable[[str], str | None] | None = None,
     ) -> RecoveryDecision:
         """Choose once at admission using same-session warmth and original-cause recovery.
 
         A trial consumes a preallocated lease locally and cannot be renewed by repeated
         reads of the same immutable snapshot. Stale, future, disagreeing or missing
         evidence blocks recovery. Normal health-gated selection resumes on expiry.
+        A kept warm fallback names, per earlier route, the first check that route
+        failed (``RecoveryDecision.skipped``), logged at most once per lane and
+        reason per minute. ``ineligible_reason`` qualifies a ``lane_ineligible``
+        skip with the caller's closed reason; it is consulted only for a route
+        ``eligible`` refused.
         """
         now = self._clock()
         with self._lock:
@@ -580,85 +741,131 @@ class SessionRecoveryRegistry:
                 )
             ):
                 return RecoveryDecision()
+            skipped: list[RecoverySkip] = []
             for deployment_id, scope in candidates:
                 if deployment_id == retained:
                     break
-                warm = history.evidence.get(deployment_id)
-                departed = history.departures.get(deployment_id)
-                if (
-                    warm is None
-                    or warm.expires_at <= now
-                    or warm.scope != scope
-                    or departed is None
-                    or not eligible(deployment_id)
-                ):
-                    continue
-                if departed.scope != scope or now < departed.retry_at:
-                    continue
-                if local_capacity is not None and not local_capacity(deployment_id):
-                    continue
-                causes = set(departed.causes)
-                # Newer failures from another session are contrary evidence too,
-                # even below the deployment circuit's suppression threshold.
-                for cause in ("transport", "credential", "throttle"):
-                    negative = self._negative.get(_negative_key(scope, cause))
-                    if negative is not None and negative >= warm.observed_at:
-                        causes.add(cause)
-                if "credential" in causes or "throttle" in causes:
-                    continue
-                if "transport" not in causes:
-                    if local_capacity is not None and local_capacity(deployment_id):
-                        return RecoveryDecision(
-                            deployment_id,
-                            "recovered_preferred_route",
-                            True,
-                            warm.expires_at - now,
-                        )
-                    continue
-                if (
-                    snapshot is None
-                    or not 0 <= now - snapshot.loaded_at <= self._observation_lifetime
-                ):
-                    continue
-                negative_at = self._negative.get(_negative_key(scope, "transport"))
-                if negative_at is None:
-                    # Evicted local contrary evidence is uncertainty, not recovery.
-                    continue
-                observations = [
-                    o
-                    for o in snapshot.observations
-                    if o.cause == "transport"
-                    and _matches(scope, o.scope, "transport")
-                    and max(departed.failed_at, negative_at) < o.observed_at <= now
-                    and now - o.observed_at <= self._observation_lifetime
-                ]
-                if not observations:
-                    continue
-                latest = max(o.observed_at for o in observations)
-                newest = [o for o in observations if o.observed_at == latest]
-                if not all(
-                    o.healthy and (departed.cause != "credential" or o.authoritative)
-                    for o in newest
-                ):
-                    continue
-                self._consumed = {k: expiry for k, expiry in self._consumed.items() if expiry > now}
-                for lease in snapshot.leases:
-                    if (
-                        lease.lease_id not in self._consumed
-                        and lease.expires_at > now
-                        and scope.operational() == lease.scope
-                    ):
-                        if len(self._consumed) >= self._maximum:
-                            break
-                        self._consumed[lease.lease_id] = lease.expires_at
-                        return RecoveryDecision(
-                            deployment_id,
-                            "recovered_preferred_route",
-                            True,
-                            warm.expires_at - now,
-                        )
-            return RecoveryDecision(
+                outcome = self._try_recover(
+                    history,
+                    deployment_id,
+                    scope,
+                    now,
+                    eligible,
+                    snapshot,
+                    local_capacity,
+                    ineligible_reason,
+                )
+                if isinstance(outcome, RecoveryDecision):
+                    return outcome
+                skipped.append(outcome)
+            decision = RecoveryDecision(
                 retained,
                 "retained_warm_fallback",
                 warm_remaining_seconds=min(evidence.expires_at, history.retained_until) - now,
+                skipped=tuple(skipped),
             )
+        if decision.skipped:
+            try:
+                self._skip_log.emit(decision.skipped, retained, now=now)
+            except Exception:  # noqa: BLE001 - a diagnostic never changes routing.
+                pass
+        return decision
+
+    def _try_recover(
+        self,
+        history: _SessionHistory,
+        deployment_id: str,
+        scope: RecoveryScope,
+        now: float,
+        eligible: Callable[[str], bool],
+        snapshot: RecoverySnapshot | None,
+        local_capacity: Callable[[str], bool] | None,
+        ineligible_reason: Callable[[str], str | None] | None,
+    ) -> RecoveryDecision | RecoverySkip:
+        """Recover one earlier route, or name the first check it failed.
+
+        Caller holds the registry lock. The checks and their order are the
+        recovery policy itself; each refusal returns its closed reason instead
+        of silently moving on.
+        """
+
+        def skip(reason: RecoverySkipReason, detail: str | None = None) -> RecoverySkip:
+            """Name this route's failed check, with its closed qualifier."""
+            return RecoverySkip(deployment_id, reason, detail)
+
+        warm = history.evidence.get(deployment_id)
+        departed = history.departures.get(deployment_id)
+        if warm is None:
+            return skip("no_warm_evidence")
+        if warm.expires_at <= now:
+            return skip("warm_evidence_expired")
+        if warm.scope != scope:
+            return skip("warm_scope_mismatch", _differing_field(warm.scope, scope))
+        if departed is None:
+            return skip("no_departure_record")
+        if ineligible_reason is not None:
+            # One evaluation decides and names the refusal, so a health window
+            # closing between two calls cannot drop the qualifier.
+            if (why := ineligible_reason(deployment_id)) is not None:
+                return skip("lane_ineligible", why)
+        elif not eligible(deployment_id):
+            return skip("lane_ineligible")
+        if departed.scope != scope:
+            return skip("departure_scope_mismatch", _differing_field(departed.scope, scope))
+        if now < departed.retry_at:
+            return skip("cooldown_not_elapsed")
+        if local_capacity is not None and not local_capacity(deployment_id):
+            return skip("no_local_headroom")
+        causes = set(departed.causes)
+        # Newer failures from another session are contrary evidence too,
+        # even below the deployment circuit's suppression threshold.
+        for cause in ("transport", "credential", "throttle"):
+            negative = self._negative.get(_negative_key(scope, cause))
+            if negative is not None and negative >= warm.observed_at:
+                causes.add(cause)
+        if "credential" in causes:
+            return skip("newer_credential_failure")
+        if "throttle" in causes:
+            return skip("newer_throttle_failure")
+        if "transport" not in causes:
+            if local_capacity is not None and local_capacity(deployment_id):
+                return RecoveryDecision(
+                    deployment_id, "recovered_preferred_route", True, warm.expires_at - now
+                )
+            return skip("no_local_headroom")
+        if snapshot is None or not 0 <= now - snapshot.loaded_at <= self._observation_lifetime:
+            return skip("transport_snapshot_unavailable")
+        negative_at = self._negative.get(_negative_key(scope, "transport"))
+        if negative_at is None:
+            # Evicted local contrary evidence is uncertainty, not recovery.
+            return skip("transport_negative_evicted")
+        observations = [
+            o
+            for o in snapshot.observations
+            if o.cause == "transport"
+            and _matches(scope, o.scope, "transport")
+            and max(departed.failed_at, negative_at) < o.observed_at <= now
+            and now - o.observed_at <= self._observation_lifetime
+        ]
+        if not observations:
+            return skip("no_transport_recovery_observation")
+        latest = max(o.observed_at for o in observations)
+        newest = [o for o in observations if o.observed_at == latest]
+        if not all(
+            o.healthy and (departed.cause != "credential" or o.authoritative) for o in newest
+        ):
+            return skip("transport_observation_unhealthy")
+        self._consumed = {k: expiry for k, expiry in self._consumed.items() if expiry > now}
+        for lease in snapshot.leases:
+            if (
+                lease.lease_id not in self._consumed
+                and lease.expires_at > now
+                and scope.operational() == lease.scope
+            ):
+                if len(self._consumed) >= self._maximum:
+                    break
+                self._consumed[lease.lease_id] = lease.expires_at
+                return RecoveryDecision(
+                    deployment_id, "recovered_preferred_route", True, warm.expires_at - now
+                )
+        return skip("no_recovery_lease")
