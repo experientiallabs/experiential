@@ -17,6 +17,7 @@
  */
 
 import { registerHooks } from "node:module";
+import { AGENT_SESSION_UX_EDITS, EDITOR_PATCH, INTERACTIVE_UX_EDITS, TERMINAL_PATCH } from "./pi-ux-patches.js";
 
 /** One exact replacement: `find` must occur exactly `count` times (default 1). */
 export interface ExactEdit {
@@ -564,7 +565,8 @@ export const PI_PATCHES: FilePatch[] = [
         find: "    cycleThinkingLevel() {\n        const newLevel = this.session.cycleThinkingLevel();",
         replace:
           "    rememberThinkingLevel() {\n        const model = this.session.model;\n        if (model)\n            this.settingsManager.setModelThinkingLevel(model.provider, model.id, this.session.thinkingLevel);\n    }\n    cycleThinkingLevel() {\n        const newLevel = this.session.cycleThinkingLevel();"
-      }
+      },
+      ...INTERACTIVE_UX_EDITS
     ]
   },
   {
@@ -657,7 +659,8 @@ export const PI_PATCHES: FilePatch[] = [
         replace:
           "                if (!aborted && model)\n                    this._autoCompactionPausedFor = this._autoCompactionKey(model);\n                const errorMessage = aborted\n                    ? undefined\n                    : reason === \"overflow\"\n                        ? `Context overflow recovery failed: ${message}${compactionFailureAdvice(message, model)}`\n                        : `Auto-compaction failed: ${message}${compactionFailureAdvice(message, model)}`;"
       },
-      { find: "export class AgentSession {", replace: `${COMPACTION_FAILURE_ADVICE}\nexport class AgentSession {` }
+      { find: "export class AgentSession {", replace: `${COMPACTION_FAILURE_ADVICE}\nexport class AgentSession {` },
+      ...AGENT_SESSION_UX_EDITS
     ]
   },
   {
@@ -711,6 +714,8 @@ export const PI_PATCHES: FilePatch[] = [
   { pkg: "pi-coding-agent", file: "utils/clipboard.js", edits: [{ find: "`pi-wsl-clip-", replace: "`exp-code-wsl-clip-" }] },
   { pkg: "pi-coding-agent", file: "utils/clipboard-image.js", edits: [{ find: "`pi-wsl-clip-", replace: "`exp-code-wsl-clip-" }] },
   { pkg: "pi-coding-agent", file: "modes/interactive/external-editor.js", edits: [{ find: '"pi-editor-"', replace: '"exp-code-editor-"' }] },
+  EDITOR_PATCH,
+  TERMINAL_PATCH,
   {
     pkg: "pi-tui",
     file: "tui-main-screen.js",

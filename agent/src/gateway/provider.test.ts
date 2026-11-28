@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { GatewayConfig } from "./config.js";
-import { gatewayProviderConfig, gatewayProviderModels, literalApiKey, reportedBilling, reportedCost } from "./provider.js";
+import { gatewayProviderConfig, gatewayProviderModels, literalApiKey, registerGatewayProvider, reportedBilling, reportedCost } from "./provider.js";
 
 const local: GatewayConfig = { kind: "local", baseUrl: "http://127.0.0.1:8000/v1", apiKey: "k" };
 
@@ -45,5 +45,32 @@ describe("reportedBilling", () => {
     // A list figure at or below the charge is no saving.
     expect(reportedBilling({ usage: { cost: 0.003, cost_details: { list_cost: 0.003 } } })?.listUsd).toBeNull();
     expect(reportedBilling({ usage: { prompt_tokens: 1 } })).toBeUndefined();
+  });
+});
+
+describe("the model a gateway message names", () => {
+  /** Register the provider on a fake extension API and return its event handlers. */
+  async function handlers(): Promise<Map<string, (event: unknown) => unknown>> {
+    const on = new Map<string, (event: unknown) => unknown>();
+    const pi = { registerProvider() {}, on: (name: string, handler: (event: unknown) => unknown) => on.set(name, handler) };
+    await registerGatewayProvider(pi as never, local, { models: [{ id: "experiential-small-model" }] });
+    return on;
+  }
+  const answer = { role: "assistant", provider: "experiential", model: "experiential-small-model", responseModel: "experiential/gpt-6-luna", usage: { cost: { total: 0 } } };
+
+  it("is the model the user chose, not the one the gateway routed it to", async () => {
+    const on = await handlers();
+    const ended = on.get("message_end")!({ message: answer }) as { message: Record<string, unknown> };
+    expect(ended.message.model).toBe("experiential-small-model");
+    expect(ended.message).not.toHaveProperty("responseModel");
+  });
+
+  it("carries the settled cost on that model", async () => {
+    const on = await handlers();
+    on.get("message_start")!({ message: { role: "assistant" } });
+    on.get("provider_stream_event")!({ provider: "experiential", data: { usage: { cost: 0.25 } } });
+    const ended = on.get("message_end")!({ message: answer }) as { message: { usage: { cost: { total: number } }; responseModel?: string } };
+    expect(ended.message.usage.cost.total).toBe(0.25);
+    expect(ended.message.responseModel).toBeUndefined();
   });
 });

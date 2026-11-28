@@ -61,6 +61,26 @@ describe("exp-code CLI", () => {
     expect(update.stdout).not.toMatch(/\bpi\b/i);
   });
 
+  it("refuses an unknown subcommand instead of sending it to the model", async () => {
+    const env = { EXP_GATEWAY_KEY: "local-key", EXP_CODE_BASE_URL: gateway.baseUrl };
+    const before = gateway.completions().length;
+    const unknown = await runCli(["frobnicate"], env);
+    expect(unknown.code).toBe(2);
+    expect(unknown.stderr).toContain('exp-code: unknown command "frobnicate".');
+    expect(unknown.stderr).toContain("login, logout, whoami, update");
+    expect(unknown.stderr).toContain("exp-code -- frobnicate");
+    expect(gateway.completions()).toHaveLength(before);
+    // A quoted prompt, a file and `--` still go to the model; `help` is --help.
+    gateway.script([{ text: "one" }, { text: "two" }]);
+    expect((await runCli(["fix the parser", "-p"], env)).stdout).toContain("one");
+    expect((await runCli(["-p", "--", "frobnicate"], env)).stdout).toContain("two");
+    expect((await runCli(["help"])).stdout).toContain("exp-code [options]");
+    const { unknownSubcommandMessage } = await import("./run.js");
+    expect(unknownSubcommandMessage(["notes"], (path) => path === "notes")).toBeUndefined();
+    expect(unknownSubcommandMessage(["src/app.ts"])).toBeUndefined();
+    expect(unknownSubcommandMessage(["login"])).toBeUndefined();
+  });
+
   it("answers `auth` with the sign-in commands and a bad EXP_CODE_WIRE with one line", async () => {
     const auth = await runCli(["auth", "check", "--provider", "experiential"]);
     expect(auth.code).toBe(2);

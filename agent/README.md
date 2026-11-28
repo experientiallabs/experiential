@@ -184,12 +184,22 @@ gateway lists it (otherwise the first alias it lists). When the gateway no longe
 model, the session starts on that default with a one-line note, and your choice is used again once
 the model is listed.
 
+Ctrl+P (Shift+Ctrl+P backwards) cycles through `experiential-small-model`,
+`experiential-medium-model` and `experiential-large-model` when the gateway lists them, then any
+models you scoped with `/scoped-models`; with none of those it cycles through every listed model.
+Every model is shown and billed under the name you chose: the gateway's routing to the model that
+served a call (`experiential-small-model` answered by `experiential/gpt-6-luna`) appears nowhere,
+`/session` included.
+
 Each model's context window and output limit come from the gateway listing
 (`context_window_tokens`, `maximum_output_tokens`), and `/thinking` and Shift+Tab offer only the
 reasoning levels the model accepts (`supported_reasoning_efforts`). The footer shows the whole
 window (for example `1.05M`). That window includes the model's maximum output, which the provider
 reserves on every request, so automatic compaction runs before the prompt reaches the window less
-that output (about 906K tokens of prompt on a 1.05M window with 128K output). When a session's model is not a gateway model, `web_search` runs on
+that output (about 906K tokens of prompt on a 1.05M window with 128K output). After a compaction
+the footer shows an estimate of the compacted context until the next reply reports it. Models
+whose window is under 16K tokens are not offered: exp-code's own prompt and tools would leave them
+no room to answer. When a session's model is not a gateway model, `web_search` runs on
 `experiential-small-model` if the gateway lists it.
 
 Every model that reasons starts at `medium` thinking, or at the closest level its route accepts
@@ -217,11 +227,22 @@ report a full read as truncated.
 In the terminal UI, `/bug` opens a new GitHub issue for exp-code prefilled with your exp-code
 version, operating system, Node.js version and model (nothing is sent until you submit it), and
 `/changelog` links exp-code's release notes. There is no `/share`: it uploaded sessions to a
-service outside Experiential; `/export` saves a session as HTML or JSONL. `/help` lists the main
+service outside Experiential; `/export` saves a session as HTML or JSONL (`/export notes.html`,
+`/export notes.jsonl`; any other file name is refused, and no name writes HTML to the session
+folder). `/hotkeys` lists every key, exp-code's Ctrl+S included. `/help` lists the main
 commands and keys, and `/exit` quits like `/quit`. A line whose first word is an unknown command
 (`/foo`, or a typo such as `/modle`) is not sent to the model: exp-code says so, suggests the
 command it may have meant, and leaves the line in the editor. A line starting with a path
 (`/src/app.ts fails`) is sent as written.
+
+Enter on a line with a typed argument runs it as typed: a suggestion completes the line only when
+it was shown for the word you are typing (Tab, or Enter on the highlighted one), and an argument
+typed exactly (`/model experiential-small-model`) runs on the first Enter. Keys typed while
+exp-code starts are kept and run once the prompt is ready, so a command typed early is a command,
+not part of a message. On the command line, a first word that is not a command
+(`exp-code frobnicate`) is refused with the list of commands, so it never reaches the model as a
+paid prompt: quote a prompt (`exp-code "fix the parser"`), or put `--` before a one-word one
+(`exp-code -- refactor`). `exp-code help` is `exp-code --help`.
 
 The first interactive start installs the two file-search helpers (`fd` and `rg`) into
 `~/.exp-code/agent/bin` when they are not on your `PATH`, with one line of progress.

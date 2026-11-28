@@ -5,10 +5,14 @@
  * directory from its first access.
  */
 
+import { captureEarlyInput, mayOpenTerminalUi } from "./cli/early-input.js";
 import { applyCliEnvironment } from "./cli/environment.js";
 import { installPiPatches } from "./cli/pi-patches.js";
 
+const args = process.argv.slice(2);
+// Keys typed while exp-code loads are kept for the terminal UI (early-input.ts).
+const earlyInput = mayOpenTerminalUi(args, process.stdin, process.stdout) ? captureEarlyInput() : undefined;
 installPiPatches();
 applyCliEnvironment(process.env);
 const { runCli } = await import("./cli/run.js");
-await runCli(process.argv.slice(2));
+await runCli(args, process.env, earlyInput);

@@ -2,3 +2,4 @@ node_modules/
 dist/
 *.tsbuildinfo
 .e2e-dist/
+.e2e-dist-ux/
