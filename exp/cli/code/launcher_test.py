@@ -21,6 +21,7 @@ from exp.cli.code.launcher import (
     find_node,
     launch,
     parse_node_version,
+    python_install_tool,
     resolve_gateway_target,
 )
 
@@ -208,6 +209,30 @@ def test_child_environment_carries_the_gateway_and_puts_node_first() -> None:
     local = child_environment({}, NODE, GatewayTarget("local", "http://127.0.0.1:8000/v1", "v"))
     assert local["EXP_GATEWAY_KEY"] == "v"
     assert local["EXP_CODE_GATEWAY"] == "local"
+
+
+def test_child_environment_says_how_to_update_unless_running_a_checkout() -> None:
+    """exp-code learns it runs through the launcher, so its updates upgrade this package."""
+    launched = child_environment({"EXP_CODE_LAUNCHER": "stale"}, NODE, None)
+    assert launched["EXP_CODE_LAUNCHER"] == python_install_tool()
+    checkout = child_environment(
+        {"EXP_CODE_DIR": "/src/agent", "EXP_CODE_LAUNCHER": "pip"}, NODE, None
+    )
+    assert "EXP_CODE_LAUNCHER" not in checkout
+
+
+@pytest.mark.parametrize(
+    ("prefix", "tool"),
+    [
+        ("/home/me/.local/share/uv/tools/experiential", "uv-tool"),
+        ("/Users/me/.local/pipx/venvs/experiential", "pipx"),
+        ("/home/me/project/.venv", "pip"),
+        ("/usr", "pip"),
+    ],
+)
+def test_python_install_tool_reads_the_environment_prefix(prefix: str, tool: str) -> None:
+    """uv tool and pipx installs are recognized by their environment directory."""
+    assert python_install_tool(prefix) == tool
 
 
 def test_launch_runs_exp_code_and_returns_its_status() -> None:

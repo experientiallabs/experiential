@@ -18,7 +18,7 @@ import { createWebFetchTool } from "./web-fetch.js";
 import { createWebSearchTool } from "./web-search.js";
 
 export interface ExpCodeExtensionOptions {
-  /** The gateway to register as a provider; null runs without it (other Pi providers still work). */
+  /** The gateway to register as a provider; null runs without it (and so without models). */
   gateway: GatewayConfig | null;
   /** Why there is no gateway, shown once in interactive sessions. */
   gatewayProblem?: string;

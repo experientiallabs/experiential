@@ -15,6 +15,20 @@ for (const name of readdirSync(skillsDir)) {
   if (statSync(join(skillsDir, name)).isDirectory() && existsSync(file)) skills[name] = readFileSync(file, "utf8");
 }
 
+// The same Pi source patches the CLI applies at load time (src/cli/pi-patches.ts), applied here
+// as esbuild loads each Pi module, so the runner runs the same patched code.
+const compiled = await build({ entryPoints: [join(root, "src", "cli", "pi-patches.ts")], bundle: true, platform: "node", format: "esm", write: false, logLevel: "warning" });
+const { patchFor, patchSource } = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].contents).toString("base64")}`);
+const piPatches = {
+  name: "exp-code-pi-patches",
+  setup(builder) {
+    builder.onLoad({ filter: /[\\/]@earendil-works[\\/][^\\/]+[\\/]dist[\\/].*\.js$/ }, (args) => {
+      if (patchFor(args.path) === undefined) return undefined;
+      return { contents: patchSource(args.path, readFileSync(args.path, "utf8")), loader: "js", resolveDir: dirname(args.path) };
+    });
+  }
+};
+
 const outfile = join(root, "dist", "runner.mjs");
 const result = await build({
   entryPoints: [join(root, "src", "runner", "entry.ts")],
@@ -26,6 +40,7 @@ const result = await build({
   minify: true,
   legalComments: "eof",
   metafile: true,
+  plugins: [piPatches],
   logLevel: "warning",
   define: { __EXP_CODE_SKILLS__: JSON.stringify(skills), PI_BUNDLED_NODE: "true" },
   banner: {

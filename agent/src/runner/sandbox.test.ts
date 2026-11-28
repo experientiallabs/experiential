@@ -21,13 +21,13 @@ describe("sandbox operations", () => {
     expect(accountIds("nobody-here", passwd)).toBeUndefined();
   });
 
-  it("runs commands with only the scrubbed environment and Pi's session variables", async () => {
+  it("runs commands with only the scrubbed environment and the session variables", async () => {
     process.env.EXP_CODE_TEST_SECRET = "leak";
     const ops = sandboxBashOperations({ ...self, env: accountEnvironment("user", dir) });
     const chunks: Buffer[] = [];
-    const { exitCode } = await ops.exec("echo \"secret=${EXP_CODE_TEST_SECRET:-none} home=$HOME model=$PI_MODEL\"", dir, {
+    const { exitCode } = await ops.exec("echo \"secret=${EXP_CODE_TEST_SECRET:-none} home=$HOME model=$EXP_CODE_SESSION_MODEL\"", dir, {
       onData: (data) => chunks.push(data),
-      env: { ...process.env, PI_MODEL: "m" }
+      env: { ...process.env, EXP_CODE_SESSION_MODEL: "m" }
     });
     delete process.env.EXP_CODE_TEST_SECRET;
     expect(exitCode).toBe(0);

@@ -26,8 +26,14 @@ export interface SandboxAccount {
   env: NodeJS.ProcessEnv;
 }
 
-/** Variables Pi adds to describe the session; the only ones passed through from Pi. */
-const SESSION_VARIABLES = ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"];
+/** Variables that describe the session (exp-code's names, see cli/pi-patches.ts); the only ones passed through. */
+const SESSION_VARIABLES = [
+  "EXP_CODE_SESSION_ID",
+  "EXP_CODE_SESSION_FILE",
+  "EXP_CODE_SESSION_PROVIDER",
+  "EXP_CODE_SESSION_MODEL",
+  "EXP_CODE_SESSION_REASONING_LEVEL"
+];
 
 /** uid and gid of a local account, from /etc/passwd. */
 export function accountIds(name: string, passwd = "/etc/passwd"): { uid: number; gid: number; home: string } | undefined {

@@ -15,10 +15,21 @@ import { type GatewayResolution, resolveGateway } from "../gateway/config.js";
 import { fetchGatewayModels, parseWireApi } from "../gateway/models.js";
 import { platformToolsEnabled } from "../platform/index.js";
 import { EXP_CODE_VERSION } from "../version.js";
-import { createBrandingExtension, rebrandHelp } from "./branding.js";
+import { createBrandingExtension } from "./branding.js";
+import { createSupportCommandsExtension } from "./commands.js";
 import { expCodeHome } from "./environment.js";
-import { defaultModelId, modelArgs, wantsDefaultModel } from "./model-choice.js";
+import {
+  defaultModelId,
+  directProviderIds,
+  gatewayFallback,
+  gatewayModelArgs,
+  modelArgs,
+  repointSavedModel,
+  savedDirectModel,
+  wantsDefaultModel
+} from "./model-choice.js";
 import { ensureSearchTools, markUpstreamChangelogSeen } from "./startup.js";
+import { checkForUpdate, parseUpdateArgs, selfUpdate, UPDATE_HELP } from "./update.js";
 
 /** Where exp-code's documentation lives. */
 export const DOCS_URL = "https://github.com/experientiallabs/experiential/tree/main/agent#readme";
@@ -30,7 +41,8 @@ saves a key (\`exp-code login --status\` shows it, \`exp-code logout\` forgets i
 or EXP_GATEWAY_KEY (a local \`exp\` gateway) in the environment take precedence. EXP_CODE_MODEL picks the default model
 (otherwise experiential-large-model when the gateway lists it), EXP_CODE_WIRE (completions, responses, messages) forces the wire API, and EXP_CODE_HOME moves the
 configuration directory (default ~/.exp-code), and EXP_CODE_PLATFORM_TOOLS=0 turns off the tools that read
-your organization's Experiential data (request log, usage, models, evals). Documentation: ${DOCS_URL}
+your organization's Experiential data (request log, usage, models, evals). Every model runs through the
+gateway. \`exp-code update\` updates exp-code. Documentation: ${DOCS_URL}
 `;
 
 /** Run the CLI with the given arguments (without the node and script paths). */
@@ -38,6 +50,10 @@ export async function runCli(args: string[], env: NodeJS.ProcessEnv = process.en
   const auth = parseAuthCommand(args);
   if (auth !== undefined) {
     process.exitCode = await runAuthCommand(auth, env);
+    return;
+  }
+  if (args[0] === "update") {
+    process.exitCode = await runUpdateCommand(args.slice(1), env);
     return;
   }
   const parsed = parseArgs(args);
@@ -61,63 +77,89 @@ export async function runCli(args: string[], env: NodeJS.ProcessEnv = process.en
   }
   const wire = parseWireApi(env.EXP_CODE_WIRE);
   const cacheDir = join(home, "cache");
+  const gateway = resolution.config;
+  // The gateway's aliases, listed once and only when a choice below needs them.
+  let listing: Promise<string[] | undefined> | undefined;
+  const listedIds = (): Promise<string[] | undefined> => {
+    listing ??=
+      gateway === null
+        ? Promise.resolve(undefined)
+        : fetchGatewayModels(gateway, { cacheDir }).then(
+            (models) => models.map((model) => model.id),
+            (error: unknown) => {
+              console.error(`exp-code: ${(error as Error).message}`);
+              return undefined;
+            }
+          );
+    return listing;
+  };
+
+  // Selections that name one of Pi's direct providers move to the gateway.
+  const direct = directProviderIds();
   let finalArgs = args;
-  if (resolution.config === null) {
+  if (gatewayModelArgs(args, direct).moved.length > 0) {
+    const listed = await listedIds();
+    const pointed = gatewayModelArgs(args, direct, (id) => gatewayFallback(id, listed, env.EXP_CODE_MODEL));
+    for (const move of pointed.moved) console.error(`exp-code: every model runs through the Experiential gateway; using ${move.to} for ${move.from}`);
+    finalArgs = pointed.args;
+  }
+  const savedDirect = savedDirectModel(agentDir, direct);
+  if (savedDirect !== undefined) {
+    const alias = gatewayFallback(savedDirect, await listedIds(), env.EXP_CODE_MODEL);
+    repointSavedModel(agentDir, alias, direct);
+  }
+
+  if (gateway === null) {
     if (!parsed.help) console.error(`exp-code: ${resolution.problem}`);
-  } else if (wantsDefaultModel(args, parsed, agentDir)) {
-    try {
-      const listed = await fetchGatewayModels(resolution.config, { cacheDir });
-      const chosen = defaultModelId(
-        listed.map((model) => model.id),
-        env.EXP_CODE_MODEL
-      );
-      if (chosen !== undefined) finalArgs = [...modelArgs(chosen), ...args];
-    } catch (error) {
-      console.error(`exp-code: ${(error as Error).message}`);
-    }
+  } else if (wantsDefaultModel(finalArgs, parsed, agentDir)) {
+    const listed = await listedIds();
+    const chosen = listed === undefined ? undefined : defaultModelId(listed, env.EXP_CODE_MODEL);
+    if (chosen !== undefined) finalArgs = [...modelArgs(chosen), ...finalArgs];
   }
   process.title = "exp-code";
-  if (!parsed.help && isInteractiveStart(parsed)) {
+  const interactive = !parsed.help && isInteractiveStart(parsed);
+  // Started now, shown in the UI when it resolves; it never delays startup.
+  const updateNotice = interactive
+    ? checkForUpdate({ env, home, currentVersion: EXP_CODE_VERSION, interactive, offline: parsed.offline === true })
+    : Promise.resolve(undefined);
+  if (interactive) {
     markUpstreamChangelogSeen(agentDir);
     await ensureSearchTools(parsed.offline === true);
   }
-  const restoreOutput = wantsHelp(args) ? rewriteStdout(rebrandHelp) : () => {};
-  try {
-    await main(finalArgs, {
-      extensionFactories: [
-        {
-          name: "exp-code",
-          hidden: true,
-          factory: createExpCodeExtension({
-            gateway: resolution.config,
-            gatewayProblem: resolution.problem,
-            platformTools: platformToolsEnabled(env),
-            provider: { cacheDir, wire, onListingError: (error) => console.error(`exp-code: ${error.message}`) }
-          })
-        },
-        { name: "exp-code-branding", hidden: true, factory: createBrandingExtension(EXP_CODE_VERSION) },
-        // Last, so its preamble swap sees every other prompt edit.
-        { name: "exp-code-identity", hidden: true, factory: createIdentityExtension() }
-      ]
-    });
-  } finally {
-    restoreOutput();
+  await main(finalArgs, {
+    extensionFactories: [
+      {
+        name: "exp-code",
+        hidden: true,
+        factory: createExpCodeExtension({
+          gateway: resolution.config,
+          gatewayProblem: resolution.problem,
+          platformTools: platformToolsEnabled(env),
+          provider: { cacheDir, wire, onListingError: (error) => console.error(`exp-code: ${error.message}`) }
+        })
+      },
+      { name: "exp-code-branding", hidden: true, factory: createBrandingExtension(EXP_CODE_VERSION, updateNotice) },
+      { name: "exp-code-commands", hidden: true, factory: createSupportCommandsExtension({ version: EXP_CODE_VERSION }) },
+      // Last, so its preamble swap sees every other prompt edit.
+      { name: "exp-code-identity", hidden: true, factory: createIdentityExtension() }
+    ]
+  });
+}
+
+/** `exp-code update ...`: exp-code itself, then any extension or model update Pi performs. */
+async function runUpdateCommand(args: string[], env: NodeJS.ProcessEnv): Promise<number> {
+  const request = parseUpdateArgs(args);
+  if (request.help) {
+    process.stdout.write(UPDATE_HELP);
+    return 0;
   }
-}
-
-/** Whether the arguments ask for help (`--help`/`-h`, including on a subcommand). */
-function wantsHelp(args: string[]): boolean {
-  return args.some((arg) => arg === "--help" || arg === "-h");
-}
-
-/** Pass everything written to stdout through `transform` until the returned restore is called. */
-function rewriteStdout(transform: (text: string) => string): () => void {
-  const original = process.stdout.write.bind(process.stdout);
-  process.stdout.write = ((chunk: string | Uint8Array, ...rest: unknown[]) =>
-    original(typeof chunk === "string" ? transform(chunk) : chunk, ...(rest as []))) as typeof process.stdout.write;
-  return () => {
-    process.stdout.write = original;
-  };
+  let code = 0;
+  if (request.self) code = await selfUpdate({ env, currentVersion: EXP_CODE_VERSION });
+  if (request.packageArgs !== undefined && code === 0) {
+    await main(request.packageArgs);
+    code = typeof process.exitCode === "number" ? process.exitCode : 0;
+  }
+  return code;
 }
 
 /** Whether this run opens the interactive terminal UI on a real terminal. */

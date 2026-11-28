@@ -15,6 +15,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +46,11 @@ NODE_ENV = "EXP_CODE_NODE"
 CHECKOUT_ENV = "EXP_CODE_DIR"
 HOSTED_KEY_ENV = "EXP_API_KEY"
 LOCAL_KEY_ENV = "EXP_GATEWAY_KEY"
+# Tells exp-code it runs through this launcher and how the experiential package was installed,
+# so its update notice and ``exp-code update`` upgrade this package (which pins exp-code).
+LAUNCHER_ENV = "EXP_CODE_LAUNCHER"
+
+InstallTool = Literal["uv-tool", "pipx", "pip"]
 
 NodeVersion = tuple[int, int, int]
 
@@ -56,7 +62,7 @@ class CodeLaunchError(RuntimeError):
 class NoGatewayConfigured(CodeLaunchError):
     """Neither a local gateway key nor a hosted credential exists.
 
-    exp-code still starts (its help, version, and other providers work) and explains how to
+    exp-code still starts (its help and version work) and explains how to
     configure a gateway itself, so the launcher does not repeat the message.
     """
 
@@ -280,6 +286,23 @@ def exp_code_command(
     return [npx, "--yes", f"{EXP_CODE_PACKAGE}@{EXP_CODE_VERSION}", *arguments]
 
 
+def python_install_tool(prefix: str = sys.prefix) -> InstallTool:
+    """How the running ``experiential`` package was installed, from its environment prefix.
+
+    Args:
+        prefix: The Python environment prefix (``sys.prefix``).
+
+    Returns:
+        ``uv-tool`` for ``uv tool install``, ``pipx`` for pipx, otherwise ``pip``.
+    """
+    parts = Path(prefix).parts
+    if "tools" in parts and "uv" in parts[: parts.index("tools")]:
+        return "uv-tool"
+    if "venvs" in parts and "pipx" in parts[: parts.index("venvs")]:
+        return "pipx"
+    return "pip"
+
+
 def child_environment(
     environment: Mapping[str, str], node: NodeRuntime, target: GatewayTarget | None
 ) -> dict[str, str]:
@@ -297,6 +320,9 @@ def child_environment(
     child["PATH"] = os.pathsep.join(
         filter(None, [str(node.path.parent), environment.get("PATH", "")])
     )
+    child.pop(LAUNCHER_ENV, None)
+    if not environment.get(CHECKOUT_ENV):
+        child[LAUNCHER_ENV] = python_install_tool()
     if target is None:
         return child
     child["EXP_CODE_GATEWAY"] = target.kind

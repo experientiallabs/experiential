@@ -1,6 +1,7 @@
 /**
  * exp-code's own identity in the terminal UI: the startup header with Experiential's pixel mark and
- * exp-code's version, and exp-code wording in the command-line help.
+ * exp-code's version, and the notice when a newer exp-code release exists. (Pi's own name in
+ * its help and messages is patched at load time, see pi-patches.ts.)
  *
  * The header replaces the upstream one through the extension header slot, so the key hints and
  * the expand toggle (`ctrl+o`) behave exactly like the built-in header.
@@ -148,28 +149,21 @@ export class ExpCodeHeader extends Text {
   }
 }
 
-/** The extension that installs exp-code's header in the interactive terminal UI. */
-export function createBrandingExtension(version: string): ExtensionFactory {
+/**
+ * The extension that installs exp-code's header in the interactive terminal UI and shows the
+ * update notice (once, when `updateNotice` resolves to a line).
+ */
+export function createBrandingExtension(version: string, updateNotice: Promise<string | undefined> = Promise.resolve(undefined)): ExtensionFactory {
   return (pi) => {
+    let noticeShown = false;
     pi.on("session_start", (_event, ctx) => {
       if (!ctx.hasUI) return;
       ctx.ui.setHeader((_tui, theme) => new ExpCodeHeader(theme, { version, showMark: !isAppleTerminalSession() }));
+      if (noticeShown) return;
+      noticeShown = true;
+      void updateNotice.then((line) => {
+        if (line !== undefined) ctx.ui.notify(line, "info");
+      });
     });
   };
-}
-
-/**
- * Rewrite the upstream command-line help so it names exp-code: the command name in usage lines
- * and examples, and exp-code's configuration directory.
- * Environment variable names stay as they are, since they are what the program reads.
- */
-export function rebrandHelp(text: string): string {
-  const name = "exp-code";
-  return text
-    .replace(/^pi - AI coding assistant.*$/m, `${name} - Experiential's coding and cowork agent`)
-    .replace(/^( {2}pi update) \[source\|self\|pi\]( +)Update pi, extensions, or model catalogs$/m, (_m, head: string, gap: string) =>
-      `${head} [source]${gap}${" ".repeat(8)}Update installed extensions or model catalogs`
-    )
-    .replace(/~\/\.pi\/agent/g, "~/.exp-code/agent")
-    .replace(/(^|[\s`'"(])pi(?=[\s`'")]|$)/gm, `$1${name}`);
 }
