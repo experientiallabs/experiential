@@ -9,13 +9,13 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { type AgentSession, createAgentSession, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, createAgentSession, ModelRuntime, SessionManager, SettingsManager, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { GATEWAY_PROVIDER_ID, type GatewayConfig } from "../gateway/config.js";
 import { parseListedModel } from "../gateway/models.js";
 import { gatewayProviderConfig, gatewayProviderModels } from "../gateway/provider.js";
 import { type FakeGateway, startFakeGateway } from "../testing/fake-gateway.js";
-import { patchSource } from "./pi-patches.js";
+import { patchSource, SHORTENED_TOOL_OUTPUT, TURN_PREFIX_CONTINUES } from "./pi-patches.js";
 
 const compactionFile = fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js", import.meta.url));
 
@@ -68,6 +68,17 @@ describe("the patched completeSummarization", () => {
     expect(getSummaryProblem(answer("User said hi."), 300)).toBeUndefined();
     // Errors and aborts are Pi's to report.
     expect(getSummaryProblem({ ...answer(""), stopReason: "error" }, 400_000)).toBeUndefined();
+  });
+});
+
+describe("what the summarizer is told", () => {
+  it("marks tool output shortened for the summary request as seen in full by the assistant", () => {
+    const output = `M11000=7825\n${"x".repeat(3000)}\nM11139=9296`;
+    const text = serializeConversation([{ role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: output }], isError: false, timestamp: 0 }] as never);
+    expect(text).toContain("M11000=7825");
+    expect(text).not.toContain("M11139=9296");
+    expect(text).toContain(`[... ${output.length - 2000} more characters left out of this summary request; the assistant saw the whole output]`);
+    expect(text).not.toMatch(/characters truncated\]/);
   });
 });
 
@@ -175,6 +186,19 @@ describe("compaction on a session", () => {
     await session.prompt("fifth question");
     expect(events.at(-1)).toMatchObject({ reason: "threshold", errorMessage: undefined });
     expect(events.at(-1)!.result).toBeDefined();
+  });
+
+  it("tells a split turn's prefix summary that the kept messages continue the turn", async () => {
+    const { session, events } = await start();
+    await fill(session, [{ text: SUMMARY }, { text: SUMMARY }]);
+    expect(events[0]!.errorMessage).toBeUndefined();
+    const requests = summaryRequests();
+    // The cut falls inside the first turn here, so its prefix is the one summary.
+    expect(requests).toHaveLength(1);
+    const text = JSON.stringify(requests[0]!.messages);
+    expect(text).toContain("ongoing conversation");
+    expect(text).toContain(JSON.stringify(TURN_PREFIX_CONTINUES).slice(1, -1));
+    expect(text).toContain(JSON.stringify(SHORTENED_TOOL_OUTPUT).slice(1, -1));
   });
 
   it("reports a failed /compact with what to do next", async () => {
