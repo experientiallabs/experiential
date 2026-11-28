@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { GatewayConfig } from "./config.js";
-import { gatewayProviderConfig, gatewayProviderModels, literalApiKey, registerGatewayProvider, reportedBilling, reportedCost } from "./provider.js";
+import { gatewayProviderConfig, gatewayProviderModels, literalApiKey, readableGatewayError, registerGatewayProvider, reportedBilling, reportedCost } from "./provider.js";
 
 const local: GatewayConfig = { kind: "local", baseUrl: "http://127.0.0.1:8000/v1", apiKey: "k" };
 
@@ -9,6 +9,17 @@ describe("gateway provider", () => {
     expect(literalApiKey("xpl_abc")).toBe("xpl_abc");
     expect(literalApiKey("a$b")).toBe("a$$b");
     expect(literalApiKey("!cmd")).toBe("$!cmd");
+  });
+
+  it("turns a raw gateway error body into one readable line that keeps status, type and code", () => {
+    expect(
+      readableGatewayError('403: {"message":"The requested model alias is not granted to this identity.","type":"permission_error","param":"model","code":"model_not_granted"}')
+    ).toBe("403 (permission_error, model_not_granted): The requested model alias is not granted to this identity.");
+    expect(readableGatewayError('429: {"error":{"message":"Slow down.","type":"rate_limit_error"}}')).toBe("429 (rate_limit_error): Slow down.");
+    expect(readableGatewayError('500: {"message":"boom","type":"server_error","code":"server_error"}')).toBe("500 (server_error): boom");
+    expect(readableGatewayError("Connection error.")).toBeUndefined();
+    expect(readableGatewayError("502: <html>Bad Gateway</html>")).toBeUndefined();
+    expect(readableGatewayError('400: {"detail":"no message field"}')).toBeUndefined();
   });
 
   it("reads the settled cost from Chat Completions and Responses stream events", () => {

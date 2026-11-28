@@ -765,6 +765,32 @@ export const PI_PATCHES: FilePatch[] = [
     ]
   },
   {
+    // A JSON-mode run whose turn failed exits 1, as a text-mode run does, so a script can tell a
+    // refused or failed call from an answer without parsing the event stream.
+    pkg: "pi-coding-agent",
+    file: "modes/print-mode.js",
+    edits: [
+      {
+        find: "        return exitCode;\n    }\n    catch (error) {",
+        replace:
+          '        if (mode === "json") {\n            const last = session.state.messages[session.state.messages.length - 1];\n            if (last?.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted"))\n                exitCode = 1;\n        }\n        return exitCode;\n    }\n    catch (error) {'
+      }
+    ]
+  },
+  {
+    // An RPC prompt, steer or follow-up without a text `message` is refused by name instead of
+    // failing deep inside the session with a TypeError.
+    pkg: "pi-coding-agent",
+    file: "modes/rpc/rpc-mode.js",
+    edits: [
+      {
+        find: "        const id = command.id;\n        switch (command.type) {",
+        replace:
+          '        const id = command.id;\n        if ((command.type === "prompt" || command.type === "steer" || command.type === "follow_up") && typeof command.message !== "string")\n            return error(id, command.type, `${command.type} needs a "message" string`);\n        switch (command.type) {'
+      }
+    ]
+  },
+  {
     // The client name MCP servers see.
     pkg: "pi-coding-agent",
     file: "extensions/mcp/runtime.js",
