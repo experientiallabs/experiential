@@ -291,7 +291,8 @@ produce a classifier error, handled by the configured error policy.
 This mode reads only user messages from the canonical, continuation-expanded request.
 System, developer, assistant and tool messages are excluded, including native tool outputs
 carried by a protocol adapter as user-role items. It preserves chronological turn boundaries
-in a JSON state with `previous_user_requests` and `current_user_request`. The current turn
+with `[previous user]` and `[latest user]` labels. Each turn is a JSON-escaped string on
+one line, so embedded newlines cannot forge structural turn boundaries. The current turn
 has priority; recent preceding user turns fill the remaining budget. A boundary history
 turn keeps its marked tail. An oversized current turn keeps a marked head and tail;
 text omitted by this explicit truncation is not assessed. Selected state, heuristic/template

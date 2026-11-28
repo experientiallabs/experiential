@@ -119,9 +119,15 @@ class UserConversationWindow:
 
 
 def render_user_turns(turns: tuple[str, ...]) -> str:
-    """Preserve chronology and unambiguous turn boundaries inside user-supplied text."""
-    return json.dumps(
-        {"previous_user_requests": turns[:-1], "current_user_request": turns[-1] if turns else ""},
-        ensure_ascii=False,
-        separators=(",", ":"),
+    """Use classifier-compatible labels and JSON strings to preserve turn boundaries.
+
+    Each user value occupies one escaped JSON line, so embedded newlines or
+    role labels cannot introduce another structural turn. The latest-user
+    label preserves the input contract of existing classifier instructions.
+    """
+    values = turns or ("",)
+    return "\n\n".join(
+        f"{'[latest user]' if index == len(values) - 1 else '[previous user]'}\n"
+        + json.dumps(value, ensure_ascii=False)
+        for index, value in enumerate(values)
     )

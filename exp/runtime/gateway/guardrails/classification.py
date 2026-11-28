@@ -264,7 +264,7 @@ class DecisionModelClassifier:
                     "window": document.window.model_dump(mode="json"),
                     "user_conversation": (
                         {
-                            "version": "user-conversation-v1",
+                            "version": "user-conversation-v2",
                             "heuristic": user_conversation.identity,
                             "max_tokens": user_conversation.max_tokens,
                             "max_bytes": user_conversation.max_bytes,
