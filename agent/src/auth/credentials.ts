@@ -7,7 +7,7 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { chmod, mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { expCodeHome } from "../cli/environment.js";
 
@@ -43,19 +43,49 @@ export function parseCredentials(value: unknown): SavedCredentials | null {
   };
 }
 
-/** Read the saved login, or `null` when there is none (or it cannot be read). */
-export async function readCredentials(env: NodeJS.ProcessEnv): Promise<SavedCredentials | null> {
+/**
+ * The saved login and what is wrong with the file, if anything. `problem` explains a file that
+ * exists but cannot be used (unreadable, not JSON, no key), which would otherwise read as "not
+ * logged in"; `warning` notes a usable file other local users can read.
+ */
+export interface CredentialsReading {
+  credentials: SavedCredentials | null;
+  problem?: string;
+  warning?: string;
+}
+
+/** Read the saved login and say why an existing file is unusable or exposed. */
+export async function inspectCredentials(env: NodeJS.ProcessEnv): Promise<CredentialsReading> {
+  const path = credentialsPath(env);
   let text: string;
   try {
-    text = await readFile(credentialsPath(env), "utf8");
-  } catch {
-    return null;
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return { credentials: null };
+    return { credentials: null, problem: `The saved login ${path} cannot be read (${code ?? (error as Error).message}).` };
   }
+  let parsed: unknown;
   try {
-    return parseCredentials(JSON.parse(text));
+    parsed = JSON.parse(text);
   } catch {
-    return null;
+    return { credentials: null, problem: `The saved login ${path} is damaged (not JSON); run \`exp-code login\` to replace it.` };
   }
+  const credentials = parseCredentials(parsed);
+  if (credentials === null) return { credentials: null, problem: `The saved login ${path} holds no Experiential key; run \`exp-code login\` to replace it.` };
+  if (process.platform !== "win32") {
+    const mode = await stat(path).then(
+      (info) => info.mode,
+      () => 0
+    );
+    if ((mode & 0o077) !== 0) return { credentials, warning: `The saved login ${path} is readable by other users; run \`chmod 600 ${path}\`.` };
+  }
+  return { credentials };
+}
+
+/** Read the saved login, or `null` when there is none (or it cannot be used). */
+export async function readCredentials(env: NodeJS.ProcessEnv): Promise<SavedCredentials | null> {
+  return (await inspectCredentials(env)).credentials;
 }
 
 /** Save a login atomically with owner-only permissions. Returns the file path. */

@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -218,6 +218,57 @@ describe("exp-code logout and status", () => {
     expect(output).toContain("Using EXP_API_KEY from the environment: xpl_fromenv…");
     expect(output).toContain("not in use");
     expect(output).not.toContain("xpl_fromenvironment");
+  });
+});
+
+describe("a saved login that cannot be used", () => {
+  const posix = process.platform !== "win32" && process.getuid?.() !== 0;
+
+  it("status names a damaged or unreadable file instead of only 'not logged in'", async () => {
+    const env: NodeJS.ProcessEnv = { EXP_CODE_HOME: join(home, ".exp-code") };
+    const out = (t: string) => void (output += t);
+    await mkdir(join(home, ".exp-code", "agent"), { recursive: true });
+    const path = join(home, ".exp-code", "agent", "credentials.json");
+    await writeFile(path, '{"hostedKey": "xpl_trunc');
+    await expect(loginStatus({ env, out })).resolves.toBe(1);
+    expect(output).toContain(`The saved login ${path} is damaged (not JSON); run \`exp-code login\` to replace it.`);
+    if (!posix) return;
+    output = "";
+    await writeFile(path, JSON.stringify({ hostedKey: KEY }));
+    await chmod(path, 0o000);
+    await expect(loginStatus({ env, out })).resolves.toBe(1);
+    expect(output).toContain(`The saved login ${path} cannot be read (EACCES).`);
+    output = "";
+    await chmod(path, 0o644);
+    await expect(loginStatus({ env, out })).resolves.toBe(0);
+    expect(output).toContain(`Warning: The saved login ${path} is readable by other users`);
+    expect(output).not.toContain(KEY);
+  });
+
+  it("login and logout report a file system failure instead of crashing", async () => {
+    if (process.platform === "win32" || process.getuid?.() === 0) return;
+    const locked = join(home, ".exp-code");
+    await mkdir(locked, { recursive: true });
+    await chmod(locked, 0o500);
+    try {
+      const options = io({ openBrowser: approvingBrowser() });
+      await expect(login(options, { noBrowser: false })).resolves.toBe(1);
+      expect(errors).toContain(`Could not save the key to ${join(locked, "agent", "credentials.json")}: EACCES (mkdir). Nothing was saved.`);
+      expect(errors).not.toContain(KEY);
+    } finally {
+      await chmod(locked, 0o700);
+    }
+    const env = { EXP_CODE_HOME: locked };
+    await saveCredentials(env, { hostedKey: KEY, savedAt: "t", keyName: "k" });
+    await chmod(join(locked, "agent"), 0o500);
+    try {
+      errors = "";
+      await expect(logout({ env, out: (t) => void (output += t), err: (t) => void (errors += t) })).resolves.toBe(1);
+      expect(errors).toContain("Could not remove the saved key");
+      expect(errors).toContain("EACCES (unlink)");
+    } finally {
+      await chmod(join(locked, "agent"), 0o700);
+    }
   });
 });
 

@@ -9,7 +9,7 @@
 import { hostname as osHostname } from "node:os";
 import { GATEWAY_ENV, HOSTED_GATEWAY_BASE_URL, trimBaseUrl } from "../gateway/config.js";
 import { openBrowser } from "./browser.js";
-import { credentialsPath, deleteCredentials, maskKey, readCredentials, saveCredentials } from "./credentials.js";
+import { credentialsPath, deleteCredentials, inspectCredentials, maskKey, saveCredentials } from "./credentials.js";
 import { authorizeUrl, defaultKeyName, LOGIN_TIMEOUT_MS, LoopbackLogin, newState, platformUrl } from "./loopback.js";
 import { LoginCancelled, type MaskedInput, readMaskedLine } from "./masked-input.js";
 
@@ -135,12 +135,18 @@ export async function login(io: AuthIo, options: { noBrowser: boolean }): Promis
     return 1;
   }
   const savedName = pasted && !options.noBrowser ? "pasted key" : keyName;
-  const path = await saveCredentials(io.env, {
-    hostedKey: key,
-    ...(override !== "" ? { baseUrl } : {}),
-    savedAt: new Date().toISOString(),
-    keyName: savedName
-  });
+  let path: string;
+  try {
+    path = await saveCredentials(io.env, {
+      hostedKey: key,
+      ...(override !== "" ? { baseUrl } : {}),
+      savedAt: new Date().toISOString(),
+      keyName: savedName
+    });
+  } catch (error) {
+    io.err(`Could not save the key to ${credentialsPath(io.env)}: ${describeFsError(error)}. Nothing was saved.\n`);
+    return 1;
+  }
   io.out(`Logged in. Saved key "${savedName}" (${maskKey(key)}) to ${path}; ${models} model${models === 1 ? "" : "s"} available.\n`);
   if ((io.env[GATEWAY_ENV.hostedKey]?.trim() ?? "") !== "") {
     io.out(`Note: ${GATEWAY_ENV.hostedKey} is set in this environment and is used instead of the saved login.\n`);
@@ -148,9 +154,21 @@ export async function login(io: AuthIo, options: { noBrowser: boolean }): Promis
   return 0;
 }
 
+/** A file system error in words: its code and path-free reason (`EACCES: permission denied`). */
+function describeFsError(error: unknown): string {
+  const failure = error as NodeJS.ErrnoException;
+  return failure.code !== undefined ? `${failure.code}${failure.syscall !== undefined ? ` (${failure.syscall})` : ""}` : String(failure.message ?? error);
+}
+
 /** Forget the saved login. */
-export async function logout(io: Pick<AuthIo, "env" | "out">): Promise<number> {
-  const removed = await deleteCredentials(io.env);
+export async function logout(io: Pick<AuthIo, "env" | "out"> & Partial<Pick<AuthIo, "err">>): Promise<number> {
+  let removed: boolean;
+  try {
+    removed = await deleteCredentials(io.env);
+  } catch (error) {
+    (io.err ?? io.out)(`Could not remove the saved key ${credentialsPath(io.env)}: ${describeFsError(error)}.\n`);
+    return 1;
+  }
   if (!removed) {
     io.out("Not logged in; there was no saved key.\n");
     return 0;
@@ -169,8 +187,11 @@ export async function logout(io: Pick<AuthIo, "env" | "out">): Promise<number> {
 export async function loginStatus(io: Pick<AuthIo, "env" | "out">): Promise<number> {
   const hosted = io.env[GATEWAY_ENV.hostedKey]?.trim() ?? "";
   const local = io.env[GATEWAY_ENV.localKey]?.trim() ?? "";
-  const saved = await readCredentials(io.env);
+  const reading = await inspectCredentials(io.env);
+  const saved = reading.credentials;
   const path = credentialsPath(io.env);
+  if (reading.problem !== undefined) io.out(`${reading.problem}\n`);
+  if (reading.warning !== undefined) io.out(`Warning: ${reading.warning}\n`);
   if (hosted !== "") io.out(`Using ${GATEWAY_ENV.hostedKey} from the environment: ${maskKey(hosted)}\n`);
   else if (local !== "") io.out(`Using ${GATEWAY_ENV.localKey} from the environment (local gateway): ${maskKey(local)}\n`);
   if (saved !== null) {
@@ -259,7 +280,7 @@ export async function runAuthCommand(command: AuthCommand | { kind: "error"; mes
     case "status":
       return loginStatus({ env, out });
     case "logout":
-      return logout({ env, out });
+      return logout({ env, out, err: (text) => process.stderr.write(text) });
     case "login":
       return runLoginInTerminal(env, command.noBrowser);
   }
