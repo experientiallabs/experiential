@@ -306,6 +306,32 @@ describe("exp-code CLI", () => {
     expect(result.stderr).toMatch(/No Experiential gateway key found/);
   });
 
+  it("explains an unreachable gateway or an empty listing once, with exp-code's own guidance", async () => {
+    const down = await runCli(["-p", "--no-session", "hi"], { EXP_API_KEY: "xpl_unreachable1", EXP_CODE_BASE_URL: "http://127.0.0.1:9/v1" });
+    expect(down.code).not.toBe(0);
+    const reasons = down.stderr.split("\n").filter((line) => line.includes("Could not reach the gateway at http://127.0.0.1:9/v1 to list models"));
+    expect(reasons).toHaveLength(1);
+    expect(down.stderr).not.toMatch(/models\.json|\/login to log into a provider|node_modules/);
+    gateway.setModels([]);
+    try {
+      // Its own configuration directory: the other tests cached this gateway's listing.
+      const empty = await runCli(["-p", "--no-session", "hi"], { EXP_GATEWAY_KEY: "local-key", EXP_CODE_BASE_URL: gateway.baseUrl, EXP_CODE_HOME: join(home, "empty-listing") });
+      expect(empty.code).not.toBe(0);
+      expect(empty.stderr).toContain(`exp-code: The gateway at ${gateway.baseUrl} lists no models this key can call.`);
+      expect(empty.stderr).toContain("Run `exp-code login` in a terminal to sign in");
+    } finally {
+      gateway.setModels([{ id: "fake-model", object: "model", created: 0, owned_by: "exp" }]);
+    }
+  });
+
+  it("refuses a key on the command line", async () => {
+    const result = await runCli(["--api-key", "xpl_onthecommandline", "-p", "hi"], { EXP_GATEWAY_KEY: "local-key", EXP_CODE_BASE_URL: gateway.baseUrl });
+    expect(result.code).toBe(2);
+    expect(result.stderr).toContain("--api-key is not supported");
+    expect(result.stderr).not.toContain("xpl_onthecommandline");
+    expect((await runCli(["--help"])).stdout).not.toContain("--api-key");
+  });
+
   it("logs in, reports status, uses the saved key, and logs out", async () => {
     const status = await runCli(["login", "--status"]);
     expect(status.code).toBe(1);

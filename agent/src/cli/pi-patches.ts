@@ -326,6 +326,8 @@ export const PI_PATCHES: FilePatch[] = [
       { find: "'mcp__radius__*'", replace: "'mcp__github__*'" },
       { find: "Supports globs (anthropic/*, *sonnet*) and fuzzy matching", replace: "Supports globs (experiential-*, *-small-*) and fuzzy matching" },
       { find: "(same as PI_OFFLINE=1)", replace: "(same as EXP_CODE_OFFLINE=1)" },
+      // exp-code refuses --api-key (run.ts): the key comes from the environment or the saved login.
+      { find: "  --api-key <key>                API key (defaults to env vars)\n", replace: "" },
       // Pi lists the vendor key variables of its direct providers, which exp-code does not load.
       { from: '${chalk.bold("Environment Variables:")}', to: '${chalk.bold("Built-in Tool Names:")}', replace: HELP_ENVIRONMENT }
     ]
@@ -735,6 +737,12 @@ export const PI_PATCHES: FilePatch[] = [
         to: "].join(\"\\n\");\n}\nexport function formatNoModelsAvailableMessage",
         replace:
           '    return [\n        "Run `exp-code login` in a terminal to sign in to Experiential, or set EXP_API_KEY to an xpl_ key (EXP_GATEWAY_KEY for a local `exp` gateway).",\n        "`exp-code login --status` shows which key is in use; `exp-code --list-models` lists the models it can call.",\n    '
+      },
+      {
+        // The one provider is the gateway: with no usable model the cause is the key or the
+        // listing, which exp-code has already reported above this line.
+        find: "    return `No API key found for ${providerDisplay}.\\n\\n${getProviderLoginHelp()}`;",
+        replace: "    return `No gateway model is available (the reason is above).\\n\\n${getProviderLoginHelp()}`;"
       }
     ]
   },
@@ -761,6 +769,16 @@ export const PI_PATCHES: FilePatch[] = [
     pkg: "pi-coding-agent",
     file: "extensions/mcp/runtime.js",
     edits: [{ find: 'name: "pi",\n            version: VERSION,', replace: 'name: "exp-code",\n            version: VERSION,' }]
+  },
+  {
+    pkg: "pi-coding-agent",
+    file: "core/model-resolver.js",
+    edits: [
+      {
+        find: 'error: "No models available. Check your installation or add models to models.json.",',
+        replace: 'error: "No models are available from the Experiential gateway (the reason is above).",'
+      }
+    ]
   }
 ];
 

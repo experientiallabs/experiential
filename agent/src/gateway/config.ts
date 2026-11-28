@@ -76,6 +76,29 @@ export function trimBaseUrl(url: string): string {
 }
 
 /**
+ * Where a key has a character an HTTP header cannot carry (a space, a line break, a control or
+ * non-ASCII character, typically from a bad copy), described by position and kind only.
+ */
+export function unsendableCharacter(key: string): string | undefined {
+  for (let index = 0; index < key.length; index += 1) {
+    const code = key.charCodeAt(index);
+    if (code > 0x20 && code < 0x7f) continue;
+    const kind = code === 0x20 ? "a space" : code === 0x0a || code === 0x0d ? "a line break" : code < 0x20 || code === 0x7f ? "a control character" : "a non-ASCII character";
+    return `${kind} at position ${index + 1}`;
+  }
+  return undefined;
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Resolve the gateway from environment variables, then the saved login.
  *
  * An explicit `EXP_CODE_GATEWAY` wins. Otherwise a hosted key in the environment selects the
@@ -104,9 +127,23 @@ export function resolveGateway(env: NodeJS.ProcessEnv, saved: SavedGatewayKey | 
     const variable = kind === "hosted" ? GATEWAY_ENV.hostedKey : GATEWAY_ENV.localKey;
     return { config: null, problem: `${GATEWAY_ENV.kind}=${kind} needs ${variable}. ${MISSING_KEY_HELP}`, missingKey: true };
   }
+  const unsendable = unsendableCharacter(apiKey);
+  if (unsendable !== undefined) {
+    // The key itself is never repeated: the reason names only where the bad character is.
+    const where = source === "saved" ? "The key `exp-code login` saved" : kind === "hosted" ? GATEWAY_ENV.hostedKey : GATEWAY_ENV.localKey;
+    return {
+      config: null,
+      problem: `${where} has a character a key cannot contain (${unsendable}). Copy the key again${source === "saved" ? " and run `exp-code login`" : ""}.`,
+      missingKey: false
+    };
+  }
   const override = env[GATEWAY_ENV.baseUrl]?.trim() ?? "";
   const savedBase = source === "saved" ? (saved?.baseUrl?.trim() ?? "") : "";
   const fallback = kind === "hosted" ? HOSTED_GATEWAY_BASE_URL : LOCAL_GATEWAY_BASE_URL;
   const baseUrl = trimBaseUrl(override !== "" ? override : savedBase !== "" ? savedBase : fallback);
+  if (!isHttpUrl(baseUrl)) {
+    const from = override !== "" ? GATEWAY_ENV.baseUrl : "The saved login's gateway address";
+    return { config: null, problem: `${from} must be an http:// or https:// URL such as ${fallback}, not "${baseUrl}".`, missingKey: false };
+  }
   return { config: { kind, baseUrl, apiKey }, source };
 }

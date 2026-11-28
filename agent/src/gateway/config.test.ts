@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { HOSTED_GATEWAY_BASE_URL, LOCAL_GATEWAY_BASE_URL, resolveGateway } from "./config.js";
+import { HOSTED_GATEWAY_BASE_URL, LOCAL_GATEWAY_BASE_URL, resolveGateway, unsendableCharacter } from "./config.js";
 
 describe("gateway resolution", () => {
   it("uses the hosted gateway with an xpl key", () => {
@@ -26,6 +26,26 @@ describe("gateway resolution", () => {
     expect(resolveGateway({ EXP_CODE_GATEWAY: "cloud" }).missingKey).toBe(false);
     expect(resolveGateway({ EXP_CODE_GATEWAY: "local" }).problem).toMatch(/needs EXP_GATEWAY_KEY/);
     expect(resolveGateway({ EXP_CODE_GATEWAY: "cloud" }).problem).toMatch(/must be "hosted" or "local"/);
+  });
+
+  it("refuses a key a header cannot carry, without repeating the key", () => {
+    const resolution = resolveGateway({ EXP_API_KEY: "xpl_secretpart\nrest" });
+    expect(resolution.config).toBeNull();
+    expect(resolution.missingKey).toBe(false);
+    expect(resolution.problem).toBe("EXP_API_KEY has a character a key cannot contain (a line break at position 15). Copy the key again.");
+    expect(resolution.problem).not.toContain("secretpart");
+    expect(resolveGateway({ EXP_API_KEY: "xpl_ab\u20accd" }).problem).toMatch(/a non-ASCII character at position 7/);
+    expect(resolveGateway({ EXP_API_KEY: "xpl_a b" }).problem).toMatch(/a space at position 6/);
+    expect(resolveGateway({}, { hostedKey: "xpl_saved\u0007" }).problem).toMatch(/^The key `exp-code login` saved has a character a key cannot contain \(a control character at position 10\)\. Copy the key again and run `exp-code login`\.$/);
+    expect(unsendableCharacter("xpl_AZaz09-_.~")).toBeUndefined();
+  });
+
+  it("refuses a gateway address that is not an http or https URL", () => {
+    expect(resolveGateway({ EXP_API_KEY: "xpl_1", EXP_CODE_BASE_URL: "not a url" }).problem).toBe(
+      `EXP_CODE_BASE_URL must be an http:// or https:// URL such as ${HOSTED_GATEWAY_BASE_URL}, not "not a url".`
+    );
+    expect(resolveGateway({ EXP_API_KEY: "xpl_1", EXP_CODE_BASE_URL: "ftp://gw.example/v1" }).config).toBeNull();
+    expect(resolveGateway({ EXP_API_KEY: "xpl_1", EXP_CODE_BASE_URL: "http://127.0.0.1:9/v1" }).config?.baseUrl).toBe("http://127.0.0.1:9/v1");
   });
 
   describe("with a saved login", () => {

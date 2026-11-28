@@ -114,7 +114,11 @@ that way with `--model` moves to the gateway alias of the same id, or to the def
 gateway does not list it.
 
 The model listing is cached for five minutes in `~/.exp-code/cache/` (keyed by a digest of the
-endpoint and key; the key is never written). Each alias uses Chat Completions by default; OpenAI
+endpoint and key; the key is never written). When the gateway cannot answer the listing (it is
+unreachable, times out, or answers 408, 429 or 5xx) and an older listing is cached, exp-code starts
+on the older listing and says so; a refused key (401 or 403) never falls back. Keys go only in
+`EXP_API_KEY`, `EXP_GATEWAY_KEY` or the saved login: `--api-key` is refused, because a key on the
+command line is visible to other local users. Each alias uses Chat Completions by default; OpenAI
 reasoning families (`gpt-5*`, `gpt-6*`, `o*`, `codex*`) use the Responses API, and `claude*`
 aliases on the hosted gateway use the Anthropic Messages API. The gateway reports each call's
 settled cost, which exp-code shows as the cost of the turn.
