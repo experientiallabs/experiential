@@ -338,14 +338,21 @@ pub(crate) async fn remember_continuation(
     if retention.overflowed && !retention.refusal() {
         return Ok(());
     }
-    state
+    let result = state
         .bridge
         .call(
             "remember",
             remember_argument(request_id, retention, reasoning_content_carrier),
         )
         .await
-        .map(|_| ())
+        .map(|_| ());
+    if retention.refusal() {
+        // Input-only refusal retention must not turn a provider refusal into
+        // a new availability error. Normal successful-output retention stays strict.
+        Ok(())
+    } else {
+        result
+    }
 }
 #[cfg(test)]
 mod tests {

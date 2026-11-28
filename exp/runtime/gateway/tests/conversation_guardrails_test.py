@@ -187,3 +187,59 @@ def test_early_encrypted_input_denial_has_no_unbound_receipt(tmp_path: Path, str
             assert denied.status_code == 400, denied.text
             assert denied.json()["error"]["code"] == "content_filter", denied.text
             assert "response_id" not in denied.json()["error"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("provider_refusal", [False, True])
+def test_refusal_retention_failure_preserves_original_outcome(
+    tmp_path: Path, stream: bool, provider_refusal: bool
+) -> None:
+    """A failed denial receipt write never turns moderation into an availability error."""
+
+    class FailingRetentionControl(NativeControlPlane):
+        def remember(self, argument: str) -> str:
+            """Fail only refusal retention, leaving ordinary requests unchanged."""
+            if json.loads(argument).get("refusal"):
+                raise RuntimeError("synthetic continuation store failure")
+            return super().remember(argument)
+
+    frames = (
+        _frames("refusal", "synthetic refusal")
+        if provider_refusal
+        else _content_chunk("synthetic answer") + _terminal_frames()
+    )
+    classifier = (
+        _RefusedHistoryClassifier("block") if provider_refusal else _HistoryClassifier("block")
+    )
+    with _provider(frames) as (provider, _):
+        _, key = _configured_gateway(
+            tmp_path, base_url=provider, billing_source=BillingSource.HOST_MANAGED
+        )
+        components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"})
+        control = FailingRetentionControl(components, guardrails=_engine(classifier))
+        with (
+            _serving(control) as base,
+            httpx.Client(
+                base_url=base, headers={"Authorization": f"Bearer {key}"}, timeout=10
+            ) as client,
+        ):
+            denied = client.post(
+                "/v1/responses",
+                json={"model": "coding", "input": "harmful fixture", "stream": stream},
+            )
+            if provider_refusal:
+                assert denied.status_code == 200, denied.text
+                if stream:
+                    assert '"type":"response.completed"' in denied.text
+                    assert '"type":"error"' not in denied.text
+                else:
+                    assert denied.json()["status"] == "completed"
+            else:
+                assert denied.status_code == 400, denied.text
+                assert denied.json()["error"]["code"] == "content_filter"
+                assert "response_id" not in denied.json()["error"]
+            allowed = client.post(
+                "/v1/responses",
+                json={"model": "coding", "input": "benign fixture", "stream": stream},
+            )
+            assert allowed.status_code == 200, allowed.text

@@ -231,10 +231,10 @@ pub(crate) async fn acquire_guarded_attempt(
             // The guard retains witnessed usage for our cost, while the host
             // applies the input verdict to customer settlement.
             guard.fail_before_release(&failure.failure).await;
-            let retained = match retained {
-                Ok(retained) => retained,
-                Err(error) => return Won::Failed(error),
-            };
+            // Retention is best effort after an authoritative denial. A
+            // storage failure must not replace content_filter with a retryable
+            // availability error or advertise a receipt that was not stored.
+            let retained = retained.unwrap_or(false);
             let mut error = failure.public_error();
             if retained {
                 error =

@@ -309,13 +309,16 @@ with another request unless the caller supplies history or an authorized continu
 
 For Responses, `previous_response_id` expands only an authorized retained conversation.
 A provider refusal retains the incoming conversation without generated refusal content.
+If that input-only retention fails, the provider refusal still completes normally; the
+client must resend history if its continuation is unavailable.
 An admitted parallel input denial returns HTTP 400 `content_filter` with an additional
 `error.response_id`; a client can send that ID as its next `previous_response_id`.
 The existing store and privacy policy still decide whether state can be retained:
 `store: false`, disabled retention, expired or missing state, and foreign namespaces remain
 unavailable. When continuation is unavailable, resend the full user conversation in `input`.
 A fresh encrypted reasoning input denied before a route is bound also returns no receipt:
-its opaque content has no authorized replay route yet. Failures before admission do not
+its opaque content has no authorized replay route yet. If storing an input denial fails, the original HTTP 400 `content_filter` is preserved
+without a continuation ID; clients must resend history. Failures before admission do not
 issue a continuation ID. The receipt is not a grant to
 read another identity's history, and this feature introduces no new retention period.
 
