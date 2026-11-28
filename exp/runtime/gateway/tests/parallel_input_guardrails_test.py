@@ -450,6 +450,8 @@ def test_parallel_inspection_holds_text_tools_and_customer_settlement(
                 assert classifier.started.wait(2)
                 assert provider_started.wait(2), "generation waited for classification"
                 assert not headers_received.wait(0.05), "response escaped the pending input gate"
+                if provider_phase == "completed":
+                    assert provider_finished.wait(2), "upstream did not finish before inspection"
                 if outcome != "timeout":
                     classifier.release.set()
                 if outcome == "allow":

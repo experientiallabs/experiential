@@ -540,3 +540,40 @@ exits, but its quarantine and capacity cannot refuse a strict check using the
 same adapter. Native release expiry records each policy/check once, only when a
 required authenticated subject remains unchecked. Classifier outcomes arriving
 after that release cannot be reported as enforced actions or duplicate timeouts.
+
+### Durable input-check outcomes
+
+A host ledger can explicitly declare the optional `input_guardrail_outcomes`
+keyword on `finish_attempt` and `finish_request`. Terminal accounting supplies a
+tuple of JSON records with the authenticated request and organization IDs, policy
+ID and revision, check ID, input stage, mode, authored action, protected ownership,
+and the bounded execution outcome. Existing ledgers without this declared
+keyword keep their existing call contract.
+
+Outcomes are `allow`, `block`, `missed`, `unsupported`, or `not_started`. Only an
+executed enforcing check can report `missed`, with `deadline_expired`,
+`classifier_error`, or `result_unavailable`. An input rejection suppresses misses
+across the request while preserving completed `allow` and `unsupported` results.
+Excluded policies produce no record; optional observation and
+unstarted checks never authorize enforcement. These records contain no request
+text, response text, classifier payload, or credentials.
+
+`latest_user_window_sha256` identifies the labelled latest-user input window
+with 30,000 head/tail characters, zero system characters and zero prior messages,
+using `classification_window`. It is absent when inspection subjects disagree,
+including validation of a rewritten input. A retained original request cannot
+prove the contents of a different rewritten subject.
+A host recovering a policy that reads exactly that window must verify the
+retained source against this digest before acting. It grants no coverage of
+other text or other window definitions.
+
+The request collects this evidence synchronously, separately from the bounded
+telemetry recorder. It freezes once at terminal accounting and retains the same
+snapshot during write retries. Intermediate attempt settlements do not freeze
+it. Native deadline expiry wins over discarded late classifier results.
+
+Hosts decide whether and how to persist the records with their existing durable
+accounting transaction or outbox. This is evidence of the original input check,
+not permission to enforce a different policy or inspect generated output. The
+engine does not schedule retrospective classification. A process loss before a
+terminal write can leave no evidence; absence must never be interpreted as a miss.

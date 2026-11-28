@@ -35,7 +35,7 @@ from exp.runtime.gateway.failover_pass import (
     no_failure_claim,
     sideways_claim,
 )
-from exp.runtime.gateway.guardrails.session import discard_guardrails
+from exp.runtime.gateway.guardrails.session import GuardrailSession, discard_guardrails
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.lane_saturation import lane_saturated_failure, overflow_target
 from exp.runtime.gateway.ledger import AttemptRejectedError
@@ -65,6 +65,10 @@ from exp.runtime.gateway.native_execution import (
     dispatch_disclosure,
 )
 from exp.runtime.gateway.native_fallback_rules import eligible_ladder, rule_fallback_reason
+from exp.runtime.gateway.native_guardrail_outcomes import (
+    finish_request_quietly,
+    terminal_outcomes,
+)
 from exp.runtime.gateway.native_recovery import (
     observe_reserved_attempt,
     record_departure,
@@ -794,8 +798,7 @@ class NativeAttemptAccounting:
         parsed = terminal_from_settlement(data, surface=entry.authorization.surface)
         retain_recovery_observation_time(self.recovery, entry, attempt_id)
         terminal, failure = settled_terminal(data, entry, parsed=parsed, loads=self._loads)
-        # Missing response provenance stays unknown. A timeout sweep or a
-        # provider-shaped event cannot manufacture a native phase observation.
+        # Native phase provenance cannot be inferred from a provider event or a sweep.
         if isinstance(data.get("opened"), bool):
             terminal = terminal.with_attempt_observation(
                 stream_opened=data["opened"] is True,
@@ -807,6 +810,7 @@ class NativeAttemptAccounting:
                 terminal_event=terminal,
                 failure=failure,
                 finalize_request=finalize,
+                **terminal_outcomes(self._finish_attempt, entry, finalize=finalize),
                 **settlement_metadata(
                     data,
                     self._finish_attempt,
@@ -820,7 +824,6 @@ class NativeAttemptAccounting:
                 ),
             )
         except Exception as exc:  # noqa: BLE001 - the data plane retries.
-            # Both retry paths retain the original outcome, usage and tier evidence.
             with self._lock:
                 entry.pending_settlement = data
                 entry.settlement_write_failed = True
@@ -910,6 +913,7 @@ class NativeAttemptAccounting:
                         terminal_event=GatewayEvent.for_accounting_recovery(failure=failure),
                         failure=failure,
                         finalize_request=True,
+                        **terminal_outcomes(self._finish_attempt, entry),
                         **web_search_requests_kwarg(
                             self._finish_attempt, entry.web_search_requests
                         ),
@@ -918,6 +922,7 @@ class NativeAttemptAccounting:
                     self.request_settlements.finish(
                         entry.authorization,
                         failure,
+                        input_guardrail_outcomes=self.request_settlements.input_outcomes(entry),
                         web_search_requests=entry.web_search_requests
                         if not entry.total_attempts
                         else 0,
@@ -929,9 +934,7 @@ class NativeAttemptAccounting:
                     self._fence.sync(self._inflight, entry)
                 raise authority_error(exc) from exc
             with self._lock:
-                # A meter may arrive while the unknown cancellation is writing.
-                # A ledger can upgrade pending usage; a conflicting terminal
-                # owner must retain the evidence instead of reporting a drain.
+                # A racing meter retains ownership until its durable upgrade lands.
                 if entry.pending_settlement is not None:
                     return '{"terminalized":false}'
                 discard_guardrails(self._fence.drop(self._inflight, request_id))
@@ -946,20 +949,17 @@ class NativeAttemptAccounting:
         *,
         certify_no_effects: bool = False,
         web_search_requests: int = 0,
+        guardrails: GuardrailSession | None = None,
     ) -> bool:
         """Retain failed terminal writes and their exact meters for the existing sweep."""
-        entry = self.entry(authorization.request_id)
-        if entry is not None and not entry.total_attempts:
-            web_search_requests = max(web_search_requests, entry.web_search_requests)
-        try:
-            return self.request_settlements.finish(
-                authorization,
-                failure,
-                certify_no_effects=certify_no_effects,
-                web_search_requests=web_search_requests,
-            )
-        except Exception:  # noqa: BLE001 - the original sanitized admission error wins.
-            return False
+        return finish_request_quietly(
+            self,
+            authorization,
+            failure,
+            certify_no_effects=certify_no_effects,
+            web_search_requests=web_search_requests,
+            guardrails=guardrails,
+        )
 
     def _record_cache_fraction(
         self, entry: InflightRequest, attempt_id: str, terminal: GatewayEvent
