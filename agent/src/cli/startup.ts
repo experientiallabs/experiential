@@ -11,6 +11,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { VERSION as UPSTREAM_VERSION } from "@earendil-works/pi-coding-agent";
+import { envFlag } from "./environment.js";
 
 /** The upstream helpers that install `fd` and `rg` (internal to the pinned package). */
 export interface ToolsManager {
@@ -29,8 +30,7 @@ export async function loadToolsManager(): Promise<ToolsManager> {
  * for the UI to report when the helper is first needed.
  */
 export async function ensureSearchTools(offline: boolean, write: (text: string) => void = (text) => process.stderr.write(text)): Promise<void> {
-  const offlineEnv = process.env.PI_OFFLINE?.toLowerCase();
-  if (offline || offlineEnv === "1" || offlineEnv === "true" || offlineEnv === "yes") return;
+  if (offline || envFlag(process.env.EXP_CODE_OFFLINE)) return;
   const tools = await loadToolsManager();
   const missing = (["fd", "rg"] as const).filter((tool) => tools.getToolPath(tool) === null);
   if (missing.length === 0) return;

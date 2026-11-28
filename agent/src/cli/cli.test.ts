@@ -1,6 +1,6 @@
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -48,7 +48,69 @@ describe("exp-code CLI", () => {
     expect(help.stdout).toContain("exp-code");
     expect(help.stdout).toContain("--mode");
     expect(help.stdout).toContain("exp-code [options]");
-    expect(help.stdout).not.toMatch(/^\s*pi\s/m);
+    expect(help.stdout).not.toMatch(/(^|[\s`'"(])pi([\s`'")]|$)/m);
+    expect(help.stdout).not.toMatch(/\bPi\b|pi\.dev|~\/\.pi|\bPI_[A-Z]/);
+    expect(help.stdout).toContain("EXP_CODE_OFFLINE");
+    expect(help.stdout).not.toContain("GEMINI_API_KEY");
+    const update = await runCli(["update", "--help"]);
+    expect(update.stdout).toContain("Update exp-code, installed extensions, or model catalogs.");
+    expect(update.stdout).not.toMatch(/\bpi\b/i);
+  });
+
+  it("offers only the gateway's models, whatever vendor keys the environment holds", async () => {
+    const env = { EXP_GATEWAY_KEY: "local-key", EXP_CODE_BASE_URL: gateway.baseUrl, GEMINI_API_KEY: "g", OPENAI_API_KEY: "o", ANTHROPIC_API_KEY: "a", OPENROUTER_API_KEY: "r", GROQ_API_KEY: "q" };
+    const listed = await runCli(["--list-models"], env);
+    const providers = listed.stdout
+      .trim()
+      .split("\n")
+      .slice(1)
+      .map((line) => line.split(/\s+/)[0]);
+    expect(providers.length).toBeGreaterThan(0);
+    expect(new Set(providers)).toEqual(new Set(["experiential"]));
+  });
+
+  it("moves a saved direct-provider model to the gateway model of the same id", async () => {
+    const agentDir = join(home, ".exp-code", "agent");
+    await mkdir(agentDir, { recursive: true });
+    const settings = join(agentDir, "settings.json");
+    await writeFile(settings, JSON.stringify({ defaultProvider: "google", defaultModel: "gemini-4-neon" }));
+    // The five-minute listing cache of the other tests would answer with their model list.
+    const cache = join(home, ".exp-code", "cache");
+    await rm(cache, { recursive: true, force: true });
+    gateway.setModels([
+      { id: "experiential-large-model", object: "model", created: 0, owned_by: "exp" },
+      { id: "gemini-4-neon", object: "model", created: 0, owned_by: "exp" }
+    ]);
+    try {
+      gateway.script([{ text: "neon" }]);
+      const env = { EXP_GATEWAY_KEY: "local-key", EXP_CODE_BASE_URL: gateway.baseUrl, GEMINI_API_KEY: "g" };
+      expect((await runCli(["-p", "hi"], env)).stdout.trim()).toBe("neon");
+      expect(gateway.completions().at(-1)!.model).toBe("gemini-4-neon");
+      expect(JSON.parse(await readFile(settings, "utf8"))).toMatchObject({ defaultProvider: "experiential", defaultModel: "gemini-4-neon" });
+
+      gateway.script([{ text: "moved" }]);
+      const moved = await runCli(["--model", "google/gemini-4-neon", "-p", "hi"], env);
+      expect(moved.stdout.trim()).toBe("moved");
+      expect(moved.stderr).toContain("using experiential/gemini-4-neon for google/gemini-4-neon");
+    } finally {
+      await rm(settings, { force: true });
+      await rm(cache, { recursive: true, force: true });
+      gateway.setModels([{ id: "fake-model", object: "model", created: 0, owned_by: "exp" }]);
+    }
+  });
+
+  it("reads exp-code's variables and ignores Pi's", async () => {
+    const sessions = join(home, "exp-sessions");
+    const ignored = join(home, "pi-sessions");
+    gateway.script([{ text: "stored" }]);
+    await runCli(["-p", "hi"], { EXP_GATEWAY_KEY: "local-key", EXP_CODE_BASE_URL: gateway.baseUrl, EXP_CODE_SESSION_DIR: sessions, PI_CODING_AGENT_SESSION_DIR: ignored });
+    expect(readdirSync(sessions).length).toBeGreaterThan(0);
+    expect(existsSync(ignored)).toBe(false);
+  });
+
+  it("never runs Pi's own self-update", async () => {
+    const result = await runCli(["update", "pi"]);
+    expect(result.stderr + result.stdout).not.toContain("@earendil-works");
   });
 
   it("answers a print-mode prompt through a local gateway, with the exp-code tools and prompt", async () => {

@@ -71,7 +71,8 @@ export function docsSection(readmePath: string | undefined = expCodeReadmePath()
     `- Examples: ${getExamplesPath()} (extensions, custom tools, SDK)`,
     "- Resolve docs/... under the reference docs and examples/... under Examples, not the current working directory",
     "- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md)",
-    "- exp-code keeps its user configuration in ~/.exp-code/agent (settings.json, extensions/, skills/, sessions/), where these docs say ~/.pi/agent",
+    "- exp-code keeps its user configuration in ~/.exp-code/agent (settings.json, extensions/, skills/, sessions/) where these docs say ~/.pi/agent, reads project files from .exp-code/ where they say .pi/, and names its environment variables EXP_CODE_* where they say PI_* (the README lists them); call it exp-code, not pi",
+    "- Every model runs through the Experiential gateway: exp-code has no direct vendor providers, so the docs' provider API keys and /login providers do not apply",
     "- Before implementing changes to exp-code's own setup, read the relevant docs and examples in full."
   );
   return lines.join("\n");

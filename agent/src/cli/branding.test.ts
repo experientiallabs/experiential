@@ -1,6 +1,6 @@
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
-import { EXPERIENTIAL_MARK, ExpCodeHeader, headerTop, markLines, rebrandHelp } from "./branding.js";
+import { EXPERIENTIAL_MARK, ExpCodeHeader, headerTop, markLines, createBrandingExtension } from "./branding.js";
 
 const plain = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never;
 
@@ -32,25 +32,31 @@ describe("startup header", () => {
   });
 });
 
-describe("help text", () => {
-  it("names exp-code in usage, commands and examples, and keeps environment variable names", () => {
-    const upstream = [
-      "pi - AI coding assistant with read, bash, edit, write tools",
-      "  pi [options] [--] [@files...] [messages...]",
-      "  pi update [source|self|pi]   Update pi, extensions, or model catalogs",
-      "  pi install <source> [-l]     Install extension source",
-      '  pi -p "List all .ts files"',
-      "  pi --export ~/.pi/agent/sessions/x.jsonl",
-      "  PI_OFFLINE                       - Disable startup network operations"
-    ].join("\n");
-    expect(rebrandHelp(upstream).split("\n")).toEqual([
-      "exp-code - Experiential's coding and cowork agent",
-      "  exp-code [options] [--] [@files...] [messages...]",
-      "  exp-code update [source]           Update installed extensions or model catalogs",
-      "  exp-code install <source> [-l]     Install extension source",
-      '  exp-code -p "List all .ts files"',
-      "  exp-code --export ~/.exp-code/agent/sessions/x.jsonl",
-      "  PI_OFFLINE                       - Disable startup network operations"
-    ]);
+describe("update notice", () => {
+  /** Run the extension's session_start handler with a recording UI. */
+  function start(notice: Promise<string | undefined>, hasUI = true) {
+    const handlers: ((event: unknown, ctx: unknown) => void)[] = [];
+    const notified: string[] = [];
+    createBrandingExtension("1.0.0", notice)({ on: (_name: string, handler: (event: unknown, ctx: unknown) => void) => handlers.push(handler) } as never);
+    const ctx = { hasUI, ui: { setHeader: () => undefined, notify: (line: string) => notified.push(line) } };
+    return { notified, fire: () => handlers.forEach((handler) => handler({}, ctx)) };
+  }
+
+  it("shows the notice once, when the check resolves", async () => {
+    const { notified, fire } = start(Promise.resolve("exp-code 1.0.1 is available"));
+    fire();
+    fire();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notified).toEqual(["exp-code 1.0.1 is available"]);
+  });
+
+  it("shows nothing without a newer release or without a UI", async () => {
+    const none = start(Promise.resolve(undefined));
+    none.fire();
+    const headless = start(Promise.resolve("line"), false);
+    headless.fire();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(none.notified).toEqual([]);
+    expect(headless.notified).toEqual([]);
   });
 });

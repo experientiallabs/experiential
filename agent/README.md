@@ -53,6 +53,30 @@ npm install -g @experiential-labs/exp-code   # or installed globally
 `npx --yes @experiential-labs/exp-code@<version>`), points it at the right gateway, and passes every argument on.
 For development, `EXP_CODE_DIR=/path/to/agent exp code` runs a built checkout instead.
 
+### Updates
+
+Once a day, the interactive terminal UI asks the npm registry for the latest release in the
+background (a 3 second limit, silent on any failure) and, when it is newer than yours, shows one
+line such as:
+
+```
+exp-code 0.1.10 is available (you have 0.1.9). Update: npm install -g @experiential-labs/exp-code@latest
+```
+
+The answer is cached in `~/.exp-code/cache/update-check.json`. There is no check in print, JSON
+or RPC mode, in the headless runner, without a terminal, in CI (`CI` set), offline, or with
+`EXP_CODE_NO_UPDATE_CHECK=1`. `exp-code update` updates exp-code the way it was installed:
+
+| Installed with | `exp-code update` |
+|---|---|
+| `npm install -g` (or pnpm, bun) | Runs `npm install -g @experiential-labs/exp-code@latest` (or `pnpm add -g`, `bun add -g`). |
+| `exp code` | Runs `uv tool upgrade experiential` or `pipx upgrade experiential`, or prints `pip install -U experiential`: the `experiential` package pins the exp-code release `exp code` runs. |
+| `npx` | Prints `npx @experiential-labs/exp-code@latest`. |
+| A source checkout | Prints `git pull && npm ci && npm run build`. |
+
+`exp-code update --extensions`, `--models`, `--extension <source>` and `<source>` update installed
+extensions and model catalogs; `--all` updates exp-code and then the extensions.
+
 ## Gateway setup
 
 | Gateway | How exp-code finds it |
@@ -77,6 +101,15 @@ saved when neither key variable is set:
 | `EXP_CODE_HOME` | Configuration directory (default `~/.exp-code`). |
 | `EXP_CODE_PLATFORM_TOOLS` | `0` (or `false`, `off`, `no`) turns off the tools that read your organization's Experiential data. See [Working with your Experiential data](#working-with-your-experiential-data). |
 | `EXP_PLATFORM_URL` | Platform origin `exp-code login` opens (default `https://platform.experientiallabs.ai`). |
+| `EXP_CODE_NO_UPDATE_CHECK` | `1` turns off the daily check for a newer release. |
+| `EXP_CODE_NPM_REGISTRY` | Registry the update check reads (default `https://registry.npmjs.org`). |
+
+Every model runs through the gateway, which does the routing and fallback. exp-code does not
+load direct vendor providers, so vendor keys in your environment (`GEMINI_API_KEY`,
+`OPENAI_API_KEY`, ...) add no models, and `/model`, `--model` and `--list-models` show only the
+gateway's aliases. A model saved as a direct provider's (such as `google/gemini-4-neon`) or named
+that way with `--model` moves to the gateway alias of the same id, or to the default model when the
+gateway does not list it.
 
 The model listing is cached for five minutes in `~/.exp-code/cache/` (keyed by a digest of the
 endpoint and key; the key is never written). Each alias uses Chat Completions by default; OpenAI
@@ -87,11 +120,36 @@ settled cost, which exp-code shows as the cost of the turn.
 ## Configuration directory
 
 exp-code keeps its own configuration in `~/.exp-code/agent` (settings, saved credentials,
-sessions, extensions, skills). In a project it reads `AGENTS.md` for instructions and `.pi/`
-for project settings and resources. Telemetry and the update check are off. Before anything
-loads, exp-code points the harness at this directory (`PI_CODING_AGENT_DIR=~/.exp-code/agent`),
-so it never shares state with another agent install, and it leaves `PI_TELEMETRY` and
-`PI_SKIP_VERSION_CHECK` off unless you set them.
+sessions, extensions, skills). In a project it reads `AGENTS.md` for instructions and `.exp-code/`
+for project settings and resources (`.exp-code/settings.json`, `.exp-code/extensions/`,
+`.exp-code/skills/`, `.exp-code/prompts/`). Install telemetry is off.
+
+These variables tune the terminal agent:
+
+| Variable | Meaning |
+|---|---|
+| `EXP_CODE_SESSION_DIR` | Session storage directory (overridden by `--session-dir`). |
+| `EXP_CODE_OFFLINE` | `1` disables startup network operations, as `--offline` does. |
+| `EXP_CODE_CACHE_RETENTION` | `long` asks for long prompt-cache retention where the model supports it. |
+| `EXP_CODE_EXPERIMENTAL` | `1` turns on experimental features. |
+| `EXP_CODE_CODEMODE_MAX_WORKERS` | Maximum parallel codemode script workers. |
+| `EXP_CODE_CLIPBOARD_OSC52` | `1` also copies through the terminal (OSC 52), as over SSH. |
+| `EXP_CODE_HARDWARE_CURSOR` | `1` uses the terminal cursor instead of the drawn one. |
+| `EXP_CODE_CLEAR_ON_SHRINK` | `1` clears the screen when the UI shrinks. |
+| `EXP_CODE_TRUE_COLOR` | `1` or `0` overrides true-color detection. |
+| `EXP_CODE_HYPERLINKS` | `1` or `0` overrides terminal hyperlink detection. |
+| `EXP_CODE_IMAGE_PROTOCOL` | Inline image protocol (`kitty`, `iterm2`, or `none`). |
+| `EXP_CODE_PROGRAM_STATUS` | `1` or `0` states whether the terminal supports program status (OSC 7501) instead of asking it. |
+| `EXP_CODE_TUI_ESC_TIMEOUT` | Milliseconds to wait after Esc for an escape sequence. |
+| `EXP_CODE_TIMING` | `1` prints startup timings (debugging). |
+| `EXP_CODE_STARTUP_BENCHMARK` | `1` measures interactive startup and exits (debugging). |
+| `EXP_CODE_TUI_DEBUG` | `1` writes terminal UI debug logs. |
+| `EXP_CODE_TUI_DEBUG_REDRAW` | `1` logs full redraws (debugging). |
+| `EXP_CODE_TUI_WRITE_LOG` | File that receives every terminal write (debugging). |
+
+Shell commands the agent runs see `EXP_CODE_AGENT=true`, `EXP_CODE_SESSION_ID`,
+`EXP_CODE_SESSION_FILE`, `EXP_CODE_SESSION_PROVIDER`, `EXP_CODE_SESSION_MODEL` and
+`EXP_CODE_SESSION_REASONING_LEVEL`.
 
 ## Modes
 
@@ -111,6 +169,11 @@ New sessions start on `experiential-large-model` when the gateway lists it (othe
 alias it lists). `EXP_CODE_MODEL`, `--model`, and a model you chose earlier with `/model` all
 take precedence. When a session's model is not a gateway model, `web_search` runs on
 `experiential-small-model` if the gateway lists it.
+
+In the terminal UI, `/bug` opens a new GitHub issue for exp-code prefilled with your exp-code
+version, operating system, Node.js version and model (nothing is sent until you submit it), and
+`/changelog` links exp-code's release notes. There is no `/share`: it uploaded sessions to a
+service outside Experiential; `/export` saves a session as HTML or JSONL.
 
 The first interactive start installs the two file-search helpers (`fd` and `rg`) into
 `~/.exp-code/agent/bin` when they are not on your `PATH`, with one line of progress.
@@ -224,6 +287,14 @@ npm run build                  # dist/ for the CLI and library
 npm run bundle                 # dist/runner.mjs
 EXP_API_KEY=xpl_... npm run test:live   # optional live smoke against the hosted gateway
 ```
+
+exp-code runs its harness as an exact-pinned dependency and changes a few things the
+dependency has no option for (its name and wording, the `.exp-code/` project folder, the direct
+vendor providers, and commands that talk to the harness's own services) through a table of exact
+source edits in `src/cli/pi-patches.ts`. The CLI applies them with a Node.js module load hook
+before the harness loads, and `npm run bundle` applies the same table while bundling the runner.
+An edit that no longer matches fails the tests (`src/cli/pi-patches.test.ts`), so a dependency
+upgrade cannot ship unpatched text silently.
 
 Releases are tagged `exp-code-v<version>`. The version in `package.json` must equal
 `EXP_CODE_VERSION` in `src/version.ts` and in `exp/cli/code/launcher.py`; tests check both.
