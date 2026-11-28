@@ -331,7 +331,21 @@ export const PI_PATCHES: FilePatch[] = [
     edits: [
       { find: '"Error: PI_STARTUP_BENCHMARK only supports interactive mode"', replace: '"Error: EXP_CODE_STARTUP_BENCHMARK only supports interactive mode"' },
       { from: "/**\n * Read all content from piped stdin.", to: "function reportDiagnostics(diagnostics) {", replace: READ_PIPED_STDIN },
-      { find: "stdinContent = await readPipedStdin();", replace: "stdinContent = await readPipedStdin(parsed.messages.length > 0 || parsed.fileArgs.length > 0);" }
+      { find: "stdinContent = await readPipedStdin();", replace: "stdinContent = await readPipedStdin(parsed.messages.length > 0 || parsed.fileArgs.length > 0);" },
+      // `--session <id>` for a session of another folder asks whether to fork it here. With no
+      // terminal to answer (stdin closed or piped, as in scripts and `-p` runs) the question was
+      // never answered, and Node exited with code 13 and an "unsettled top-level await" warning.
+      // A closed stdin now counts as no answer, and the run says how to continue instead.
+      {
+        find: "        rl.question(`${message} [y/N] `, (answer) => {\n            rl.close();\n            resolve(answer.toLowerCase() === \"y\" || answer.toLowerCase() === \"yes\");\n        });",
+        replace:
+          "        let answered = false;\n        rl.on(\"close\", () => {\n            if (!answered) {\n                process.stdout.write(\"\\n\");\n                resolve(undefined);\n            }\n        });\n        rl.question(`${message} [y/N] `, (answer) => {\n            answered = true;\n            rl.close();\n            resolve(answer.toLowerCase() === \"y\" || answer.toLowerCase() === \"yes\");\n        });"
+      },
+      {
+        find: '                const shouldFork = await promptConfirm("Fork this session into current directory?");\n                if (!shouldFork) {',
+        replace:
+          '                const shouldFork = await promptConfirm("Fork this session into current directory?");\n                if (shouldFork === undefined) {\n                    console.error(chalk.red(`No answer: stdin closed. Run exp-code in ${resolved.cwd} to continue the session there, or pass --fork ${parsed.session} to copy it into this folder.`));\n                    process.exit(1);\n                }\n                if (!shouldFork) {'
+      }
     ]
   },
   {

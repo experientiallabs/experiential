@@ -15,12 +15,12 @@ let home: string;
 let gateway: FakeGateway;
 
 /** Run the built CLI with stdin closed and an isolated home. */
-function runCli(args: string[], env: NodeJS.ProcessEnv = {}): Promise<{ code: number; stdout: string; stderr: string }> {
+function runCli(args: string[], env: NodeJS.ProcessEnv = {}, cwd?: string): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const child = execFile(
       process.execPath,
       [cli, ...args],
-      { cwd: home, env: { PATH: process.env.PATH, HOME: home, EXP_CODE_HOME: join(home, ".exp-code"), ...env }, timeout: 60_000 },
+      { cwd: cwd ?? home, env: { PATH: process.env.PATH, HOME: home, EXP_CODE_HOME: join(home, ".exp-code"), ...env }, timeout: 60_000 },
       (error, stdout, stderr) => resolve({ code: error ? (typeof error.code === "number" ? error.code : 1) : 0, stdout, stderr })
     );
     child.stdin?.end();
@@ -161,6 +161,27 @@ describe("exp-code CLI", () => {
     await runCli(["-p", "hi"], { EXP_GATEWAY_KEY: "local-key", EXP_CODE_BASE_URL: gateway.baseUrl, EXP_CODE_SESSION_DIR: sessions, PI_CODING_AGENT_SESSION_DIR: ignored });
     expect(readdirSync(sessions).length).toBeGreaterThan(0);
     expect(existsSync(ignored)).toBe(false);
+  });
+
+  it("says how to continue a session of another folder when nobody can answer the fork question", async () => {
+    const env = { EXP_GATEWAY_KEY: "local-key", EXP_CODE_BASE_URL: gateway.baseUrl };
+    const first = join(home, "first-project");
+    const second = join(home, "second-project");
+    await mkdir(first, { recursive: true });
+    await mkdir(second, { recursive: true });
+    gateway.script([{ text: "stored" }]);
+    expect((await runCli(["-p", "hi"], env, first)).code).toBe(0);
+    const sessionsRoot = join(home, ".exp-code", "agent", "sessions");
+    const folder = readdirSync(sessionsRoot).find((name) => name.includes("first-project"))!;
+    const id = readdirSync(join(sessionsRoot, folder))[0]!.replace(/\.jsonl$/, "").split("_").at(-1)!;
+    // stdin is closed: the run used to end with Node's "unsettled top-level await" and code 13.
+    const result = await runCli(["--session", id.slice(0, 8), "-p", "again"], env, second);
+    expect(result.code).toBe(1);
+    // Print mode keeps stdout for the answer, so the question and the advice go to stderr.
+    expect(result.stderr).toContain("Fork this session into current directory? [y/N]");
+    expect(result.stderr).toMatch(/Run exp-code in \S*\/first-project to continue the session there/);
+    expect(result.stderr).toContain(`--fork ${id.slice(0, 8)}`);
+    expect(result.stderr).not.toContain("top-level await");
   });
 
   it("never runs Pi's own self-update", async () => {
