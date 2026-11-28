@@ -213,6 +213,43 @@ which the dashboard shows but `/usage` does not yet count. In the terminal UI th
 to the model; in RPC mode it arrives as a notice. `/session` still shows the session file and
 message counts.
 
+## Stash a prompt (Ctrl+S)
+
+Halfway through writing a prompt and need to ask something else first? Press **Ctrl+S**: the
+prompt is set aside and the input is cleared. Send your other message, and the stashed prompt comes
+back into the input by itself. It works the same as Claude Code's Ctrl+S.
+
+| You do | What happens |
+|---|---|
+| Ctrl+S with text in the input | The text is stashed exactly (new lines, spaces, emoji, large pastes, image and file paths, the cursor position) and the input is cleared. A line below the input shows what is stashed. |
+| Ctrl+S again with more text | It is stashed too. Stashed prompts stack, newest on top; nothing is replaced. |
+| Ctrl+S on an empty input | The newest stashed prompt comes back. Two quick presses put the text back where it was. |
+| Send a message (also a steer while the agent works, a follow-up, or a `!` command) | The newest stashed prompt comes back, but only into an empty input: if you have started typing again, it stays stashed and a hint says so. |
+| Built-in commands such as `/model` or `/settings` | Not a send: the stash stays. |
+| Ctrl+C, Escape, Up and Down | The stash stays. Stashing a message you recalled with Up brings back the draft it was hiding. |
+| `/new`, `/resume`, `/fork` | The stash belongs to the folder, not the session, so it stays. |
+| Exit (Ctrl+D, `/quit`) or a crash | The stash is already on disk (`~/.exp-code/agent/prompt-stash/`, readable only by you). The next exp-code started in that folder puts it back in the input and removes the file. |
+
+Input that is only spaces counts as empty. Undo after a stash cannot bring the text back a second
+time, and undo after a restore continues the prompt's own edits. Two exp-code windows in the same
+folder each keep their own stash (one file per running exp-code, written atomically); a stash is
+picked up by a new start only once the exp-code that made it has exited. A stash file that cannot
+be read is set aside (renamed `.corrupt`) and ignored.
+
+Ctrl+S reaches exp-code even in terminals that use it to pause output (XON/XOFF flow control):
+exp-code puts the terminal in raw mode, which turns that off while it runs and restores it on exit.
+To use another key, or none, set `exp-code.prompt.stash` in `~/.exp-code/agent/keybindings.json`,
+for example `{ "exp-code.prompt.stash": "alt+s" }` (a list binds several keys; `[]` binds none).
+Without a key, `/stash` does the same:
+
+| Command | What it does |
+|---|---|
+| `/stash <text>` | Stashes the text. |
+| `/stash` or `/stash pop` | Brings the newest stashed prompt back into the empty input. |
+| `/stash list` | Shows what is stashed, newest first. |
+| `/stash drop` | Discards the newest stashed prompt. |
+| `/stash help` | Explains the above. |
+
 ## The extension
 
 | Piece | What it does |
