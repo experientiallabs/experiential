@@ -233,4 +233,17 @@ describe("auth command parsing", () => {
     expect(parseAuthCommand(["-p", "login"])).toBeUndefined();
     expect(parseAuthCommand([])).toBeUndefined();
   });
+
+  it("answers Pi's provider `auth` command with the Experiential sign-in commands", () => {
+    for (const args of [["auth"], ["auth", "--help"], ["auth", "-h"]]) {
+      const parsed = parseAuthCommand(args);
+      expect(parsed?.kind).toBe("help");
+      expect(parsed && "text" in parsed ? parsed.text : "").toMatch(/^exp-code has no `auth` command: every model runs through the Experiential gateway/);
+    }
+    for (const args of [["auth", "check", "--provider", "experiential"], ["auth", "login", "experiential"], ["auth", "print-api-key", "--provider", "openai"]]) {
+      const parsed = parseAuthCommand(args);
+      expect(parsed?.kind).toBe("error");
+      expect(parsed && "message" in parsed ? parsed.message : "").toContain("exp-code login --status");
+    }
+  });
 });

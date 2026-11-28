@@ -190,6 +190,24 @@ export const AGENT_COMMAND_UNSET = ["EXP_API_KEY", "EXP_GATEWAY_KEY", "EXPLABS_A
 const SESSION_ENV_GUIDELINE = '"You can inspect PI_* environment variables for current model and session details."';
 const EXP_SESSION_ENV_GUIDELINE = '"You can inspect the EXP_CODE_SESSION_* environment variables for the current model and session details."';
 
+/** The model examples of `exp-code --help`, with gateway aliases. */
+const HELP_MODEL_EXAMPLES = `  # Use another model (exp-code --list-models lists them)
+  \${APP_NAME} --model experiential-small-model "Help me refactor this code"
+
+  # Use a model with a thinking level
+  \${APP_NAME} --model experiential-medium-model:high "Solve this complex problem"
+
+  # Limit Ctrl+P model cycling to some models
+  \${APP_NAME} --models experiential-small-model,experiential-medium-model,experiential-large-model
+
+  # Cycle models matching a pattern
+  \${APP_NAME} --models "experiential-*"
+
+  # Cycle models with fixed thinking levels
+  \${APP_NAME} --models experiential-medium-model:high,experiential-small-model:low
+
+`;
+
 /** The patch table for the pinned Pi release (1.5.1). */
 export const PI_PATCHES: FilePatch[] = [
   {
@@ -214,6 +232,19 @@ export const PI_PATCHES: FilePatch[] = [
     edits: [
       { find: "${chalk.bold(APP_NAME)} - AI coding assistant with read, bash, edit, write tools", replace: "${chalk.bold(APP_NAME)} - Experiential's coding and cowork agent" },
       { find: "update [source|self|pi]   Update pi, extensions, or model catalogs", replace: "update [source|self]      Update exp-code, extensions, or model catalogs" },
+      // Pi's `auth` manages vendor provider credentials, which exp-code has none of (run.ts answers
+      // it); the Experiential sign-in commands take its place.
+      {
+        find: "  ${APP_NAME} auth <command>            Log in or out, print credentials, or check provider readiness\n",
+        replace:
+          "  ${APP_NAME} login [--no-browser]      Sign in to Experiential and save a key\n  ${APP_NAME} login --status, whoami    Show which key exp-code uses\n  ${APP_NAME} logout                    Forget the saved key\n"
+      },
+      { find: "Show help for install/remove/uninstall/update/list/config/auth/mcp", replace: "Show help for install/remove/uninstall/update/list/config/login/mcp" },
+      // Pi's examples name its direct providers and their models; exp-code's come from the gateway.
+      { from: "  # Print a provider API key for an external client\n", to: "  # Interactive mode\n", replace: "" },
+      { from: "  # Use different model\n", to: "  # Start with a specific thinking level\n", replace: HELP_MODEL_EXAMPLES },
+      { find: "'mcp__radius__*'", replace: "'mcp__github__*'" },
+      { find: "Supports globs (anthropic/*, *sonnet*) and fuzzy matching", replace: "Supports globs (experiential-*, *-small-*) and fuzzy matching" },
       { find: "(same as PI_OFFLINE=1)", replace: "(same as EXP_CODE_OFFLINE=1)" },
       // Pi lists the vendor key variables of its direct providers, which exp-code does not load.
       { from: '${chalk.bold("Environment Variables:")}', to: '${chalk.bold("Built-in Tool Names:")}', replace: HELP_ENVIRONMENT }
@@ -302,6 +333,16 @@ export const PI_PATCHES: FilePatch[] = [
         replace: 'return model.provider === "experiential" ? model.id : `${model.id} ${theme.fg("muted", `[${model.provider}]`)}`;'
       },
       { find: "instead of Pi's drawn cursor", replace: "instead of the drawn cursor" },
+      // `/share` is gone (see core/slash-commands.js), and Pi's install ping is always off
+      // (environment.ts sets PI_TELEMETRY=0), so neither setting would do anything.
+      {
+        find: '            {\n                id: "share-destination",\n                label: "Session share destination",\n                description: "Where to upload sessions with /share (auto prefers Radius when authenticated, otherwise GitHub Gist)",\n                currentValue: config.sessionShareDestination,\n                values: ["auto", "gist", "radius"],\n            },\n',
+        replace: ""
+      },
+      {
+        find: '            {\n                id: "install-telemetry",\n                label: "Install telemetry",\n                description: "Send an anonymous version/update ping after changelog-detected updates",\n                currentValue: config.enableInstallTelemetry ? "true" : "false",\n                values: ["true", "false"],\n            },\n',
+        replace: ""
+      },
       { find: "${cycleThinkingKey} cycles in-session.`", replace: "${cycleThinkingKey} cycles them and remembers the level for the model.`" }
     ]
   },
@@ -508,7 +549,24 @@ export const PI_PATCHES: FilePatch[] = [
     // 1.05M, not 1.1M.
     pkg: "pi-coding-agent",
     file: "modes/interactive/components/footer.js",
-    edits: [{ find: "return `${(count / 1000000).toFixed(1)}M`;", replace: "return `${Number((count / 1000000).toFixed(2))}M`;" }]
+    edits: [
+      { find: "return `${(count / 1000000).toFixed(1)}M`;", replace: "return `${Number((count / 1000000).toFixed(2))}M`;" },
+      // When the stats and the model do not fit on one line (a narrow terminal), Pi cut the model
+      // name ("experiential-small-mo"). The model moves to a line of its own instead.
+      {
+        from: "            // Need to truncate right side\n            const availableForRight = width - statsLeftWidth - minPadding;",
+        to: "        // Apply dim to each part separately.",
+        replace: "            statsLine = statsLeft;\n            modelLine = truncateToWidth(rightSide, width, \"...\");\n        }\n"
+      },
+      { find: "        let statsLine;\n        if (totalNeeded <= width) {", replace: "        let statsLine;\n        let modelLine;\n        if (totalNeeded <= width) {" },
+      { find: "        const lines = [pwdLine, dimStatsLeft + dimRemainder];", replace: "        const lines = [pwdLine, dimStatsLeft + dimRemainder];\n        if (modelLine !== undefined)\n            lines.push(theme.fg(\"dim\", \" \".repeat(Math.max(0, width - visibleWidth(modelLine))) + modelLine));" }
+    ]
+  },
+  {
+    // --list-models shows a window the way the footer does: 1,050,000 tokens is 1.05M, not 1.1M.
+    pkg: "pi-coding-agent",
+    file: "cli/list-models.js",
+    edits: [{ find: "return millions % 1 === 0 ? `${millions}M` : `${millions.toFixed(1)}M`;", replace: "return `${Number(millions.toFixed(2))}M`;" }]
   },
   {
     // Variables a shell command sees about its session.

@@ -77,7 +77,15 @@ export async function runCli(args: string[], env: NodeJS.ProcessEnv = process.en
     }
     resolution = resolveGateway(env, await readCredentials(env));
   }
-  const wire = parseWireApi(env.EXP_CODE_WIRE);
+  let wire: ReturnType<typeof parseWireApi>;
+  try {
+    wire = parseWireApi(env.EXP_CODE_WIRE);
+  } catch (error) {
+    // A bad EXP_CODE_WIRE is a configuration mistake, not a crash with a stack trace.
+    console.error(`exp-code: EXP_CODE_WIRE: ${(error as Error).message}`);
+    process.exitCode = 2;
+    return;
+  }
   const cacheDir = join(home, "cache");
   const gateway = resolution.config;
   // The gateway's aliases, listed once and only when a choice below needs them.

@@ -38,6 +38,8 @@ approve. The key is checked against the gateway (`GET /v1/models`) and saved in
 Prefer an environment variable? Set `EXP_API_KEY=xpl_...` instead; `EXP_API_KEY` and
 `EXP_GATEWAY_KEY` always take precedence over the saved login. Starting the interactive UI with
 no key anywhere offers to log in first. `EXP_PLATFORM_URL` points login at another platform origin.
+There are no provider credentials to manage, so `exp-code auth` (the vendor-provider command of the
+agent exp-code is built on) only points at these commands.
 
 ## Install
 
@@ -122,7 +124,7 @@ settled cost, which exp-code shows as the cost of the turn.
 exp-code keeps its own configuration in `~/.exp-code/agent` (settings, saved credentials,
 sessions, extensions, skills). In a project it reads `AGENTS.md` for instructions and `.exp-code/`
 for project settings and resources (`.exp-code/settings.json`, `.exp-code/extensions/`,
-`.exp-code/skills/`, `.exp-code/prompts/`). Install telemetry is off.
+`.exp-code/skills/`, `.exp-code/prompts/`). Install telemetry is off, so `/settings` does not offer it.
 
 These variables tune the terminal agent:
 
