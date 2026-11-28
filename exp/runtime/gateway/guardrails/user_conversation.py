@@ -26,13 +26,13 @@ class UserConversationWindow:
     bytes_per_token: int = 3
 
     def __post_init__(self) -> None:
-        """Refuse a budget that cannot even represent an empty user turn."""
+        """Refuse a budget that cannot represent the mandatory truncated current turn."""
         if (
             self.max_tokens < 1
             or self.max_bytes < 1
             or self.bytes_per_token < 1
             or not self.identity
-            or not self._fits(("",))
+            or not self._fits(("\n[...]\n",))
         ):
             raise ValueError("classifier budget cannot hold a user turn and its framing")
 

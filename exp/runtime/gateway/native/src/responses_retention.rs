@@ -58,6 +58,12 @@ pub(crate) struct ResponsesRetention {
 
 impl ResponsesRetention {
     pub(crate) fn track(&mut self, event: &Event) {
+        // Refusal is content-free control state. Keep it even after output
+        // retention is exhausted so the incoming conversation can still survive.
+        self.refusal |= matches!(
+            event,
+            Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
+        ) || matches!(event, Event::Failed(failure) if failure.failure_class == FailureClass::Refusal);
         if self.overflowed {
             return;
         }
@@ -176,7 +182,6 @@ impl ResponsesRetention {
                     message.text.push_str(delta);
                 }
             }
-            Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. } => self.refusal = true,
             Event::ToolCallCompleted { index, call } => {
                 let provider_owned = self.provider_tools.contains(index);
                 let mut call = call.clone();
@@ -208,11 +213,7 @@ impl ResponsesRetention {
             Event::Completed | Event::StoppedAtSequence(_) => {
                 self.finish_open_items(ProviderOutputItemStatus::Completed)
             }
-            Event::Failed(failure) => {
-                self.refusal |= failure.failure_class == FailureClass::Refusal;
-                self.finish_open_items(ProviderOutputItemStatus::Incomplete);
-            }
-            Event::Incomplete => {
+            Event::Failed(_) | Event::Incomplete => {
                 self.finish_open_items(ProviderOutputItemStatus::Incomplete);
             }
             _ => {}
@@ -350,6 +351,31 @@ pub(crate) async fn remember_continuation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusal_signal_survives_retention_overflow() {
+        for event in [
+            Event::RefusalDelta("synthetic refusal".into()),
+            Event::Failed(crate::errors::Failure::new(
+                FailureClass::Refusal,
+                "refused",
+            )),
+        ] {
+            for overflowed in [false, true] {
+                let mut retention = ResponsesRetention {
+                    overflowed,
+                    retained_bytes: MAXIMUM_RETAINED_OUTPUT_BYTES,
+                    ..Default::default()
+                };
+                retention.track(&event);
+                assert!(retention.refusal());
+                let wire: Value =
+                    serde_json::from_str(&remember_argument("request", &retention, None)).unwrap();
+                assert_eq!(wire["refusal"], true);
+                assert_eq!(wire["text"], "");
+            }
+        }
+    }
 
     #[test]
     fn input_denial_wire_selects_input_only_retention() {

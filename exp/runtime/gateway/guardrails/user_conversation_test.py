@@ -1,5 +1,7 @@
 """User history, role isolation, heuristic budgets and deterministic truncation tests."""
 
+import pytest
+
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.gateway.guardrails.user_conversation import UserConversationWindow
 
@@ -202,3 +204,10 @@ def test_agent_authored_text_is_not_human_user_content() -> None:
     state = _window().state(request)
     assert "human request" in state and "continue" in state
     assert "AGENT OUTPUT" not in state
+
+
+@pytest.mark.parametrize("tokens,wire_bytes", [(55, 1000), (1000, 55)])
+def test_budget_must_fit_the_mandatory_truncation_marker(tokens: int, wire_bytes: int) -> None:
+    """Reject unusable budgets at configuration time, not during inspection."""
+    with pytest.raises(ValueError, match="classifier budget"):
+        UserConversationWindow(tokens, wire_bytes, "fixture", bytes_per_token=1)
