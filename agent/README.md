@@ -247,6 +247,19 @@ and never claims the work is unfinished. The summarizer reads each tool output s
 first 2,000 characters, and is told the assistant saw the whole output, so a summary does not
 report a full read as truncated.
 
+A failed model call is retried automatically only when that cannot cost twice for nothing. A
+reply that fails after it started streaming (text, reasoning or a tool call) is never sent again,
+since a retry re-sends and re-bills the whole prompt and discards what arrived: what arrived is
+kept and shown (in print mode, printed before the error, with exit code 1), the error says the
+reply was interrupted, and its text goes with your next message, so `continue` picks up where it
+stopped. Its tool calls never ran. A failure before any content (an overloaded or rate-limited
+gateway, a dropped connection) is retried up to 3 times, after the wait the gateway asked for
+(`Retry-After`, or the reset time of an exhausted `x-ratelimit-*` window) and otherwise after 2, 4
+and 8 seconds; Esc cancels the wait. A wait longer than 60 seconds (`retry.maxAgentDelayMs` in
+settings) is not waited out: the error says how long and until when, and you send the message
+again then. Compaction and branch summaries follow the same waits. Every attempt is saved in the
+session, so `/usage` and the footer count it.
+
 In the terminal UI, `/bug` opens a new GitHub issue for exp-code prefilled with your exp-code
 version, operating system, Node.js version and model (nothing is sent until you submit it), and
 `/changelog` links exp-code's release notes. There is no `/share`: it uploaded sessions to a

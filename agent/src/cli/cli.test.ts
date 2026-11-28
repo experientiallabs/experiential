@@ -313,6 +313,24 @@ describe("exp-code CLI", () => {
     expect(text.stderr.trim()).toMatch(/^402\b.*: Insufficient credits\.$/);
   });
 
+  it("prints what arrived of a reply that dropped mid-stream, sends it once, and honors a long Retry-After", async () => {
+    const env = { EXP_GATEWAY_KEY: "local-key", EXP_CODE_BASE_URL: gateway.baseUrl };
+    const before = gateway.completions().length;
+    gateway.script([{ text: "The first half of the answer", dropAfterContent: true }, { text: "a second, billed answer" }]);
+    const dropped = await runCli(["-p", "--no-session", "hi"], env);
+    expect(dropped.code).toBe(1);
+    expect(dropped.stdout).toBe("The first half of the answer\n");
+    expect(dropped.stderr).toContain("The reply was interrupted after it started.");
+    expect(gateway.completions()).toHaveLength(before + 1);
+    gateway.script([{ status: 429, error: "Rate limit reached.", headers: { "retry-after": "3600" } }, { text: "should not be sent" }]);
+    const started = Date.now();
+    const limited = await runCli(["-p", "--no-session", "hi"], env);
+    expect(Date.now() - started).toBeLessThan(20_000);
+    expect(limited.code).toBe(1);
+    expect(limited.stderr).toMatch(/^429\b.*: Rate limit reached\. The gateway asked to wait 1 hour before trying again \(until .+\), so exp-code did not retry\./m);
+    expect(gateway.completions()).toHaveLength(before + 2);
+  });
+
   it("refuses an RPC prompt without a message by name", async () => {
     const result = await new Promise<string>((resolve) => {
       const child = execFile(

@@ -81,6 +81,32 @@ describe.skipIf(python === undefined)("the terminal UI", () => {
     }
   }, 90_000);
 
+  it("keeps a reply that dropped mid-stream, and waits the Retry-After a failure before any content asks", async () => {
+    gateway.setModels([model("fake-model")]);
+    gateway.script([
+      { text: "The first half of the answer", dropAfterContent: true },
+      { status: 429, error: "Rate limit reached.", headers: { "retry-after": "2" } },
+      { text: "the rest of it" }
+    ]);
+    const before = gateway.completions().length;
+    const { terminal } = start();
+    try {
+      await terminal.waitForText("fake-model");
+      await terminal.type("hi\r");
+      let seen = await terminal.waitForText("The reply was interrupted after it started.");
+      expect(terminal.screen()).toContain("The first half of the answer");
+      await pause(500);
+      expect(gateway.completions()).toHaveLength(before + 1);
+      await terminal.type("continue\r");
+      seen = await terminal.waitForText("Retrying (1/3) in 2s", seen);
+      await terminal.waitForText("the rest of it", seen);
+      expect(gateway.completions()).toHaveLength(before + 3);
+      expect(JSON.stringify(gateway.completions().at(-1)!.messages)).toContain("The first half of the answer");
+    } finally {
+      terminal.kill();
+    }
+  }, 90_000);
+
   it("never applies a stale suggestion, runs an exact /model on one Enter, and checks /export names", async () => {
     gateway.setModels([model("fake-model"), model("fake-model-b"), model("fake-model-bb")]);
     const { terminal, project } = start();

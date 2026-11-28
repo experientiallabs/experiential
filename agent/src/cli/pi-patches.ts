@@ -17,6 +17,7 @@
  */
 
 import { registerHooks } from "node:module";
+import { EXP_RETRY_POLICY, RETRY_PROVIDER_PATCHES } from "./pi-retry-patches.js";
 import { AGENT_SESSION_UX_EDITS, EDITOR_PATCH, INTERACTIVE_UX_EDITS, TERMINAL_PATCH } from "./pi-ux-patches.js";
 
 /** One exact replacement: `find` must occur exactly `count` times (default 1). */
@@ -697,7 +698,19 @@ export const PI_PATCHES: FilePatch[] = [
         replace:
           "                if (!aborted && model)\n                    this._autoCompactionPausedFor = this._autoCompactionKey(model);\n                const errorMessage = aborted\n                    ? undefined\n                    : reason === \"overflow\"\n                        ? `Context overflow recovery failed: ${message}${compactionFailureAdvice(message, model)}`\n                        : `Auto-compaction failed: ${message}${compactionFailureAdvice(message, model)}`;"
       },
-      { find: "export class AgentSession {", replace: `${COMPACTION_FAILURE_ADVICE}\nexport class AgentSession {` },
+      { find: "export class AgentSession {", replace: `${COMPACTION_FAILURE_ADVICE}\n${EXP_RETRY_POLICY}export class AgentSession {` },
+      // The retry policy (EXP_RETRY_POLICY) decides as a reply ends, after extensions have seen it
+      // (exp-code's gateway extension rewrites a raw gateway error first) and before it is saved.
+      {
+        find: "        await this._emitExtensionEvent(event);\n        this._emit(event.type === \"agent_end\"",
+        replace:
+          "        await this._emitExtensionEvent(event);\n        if (event.type === \"message_end\" && event.message.role === \"assistant\" && event.message.stopReason === \"error\" && this._isRetryableError(event.message))\n            applyRetryPolicy(event.message, this.settingsManager.getRetrySettings());\n        this._emit(event.type === \"agent_end\""
+      },
+      {
+        find: "    _isRetryableError(message) {\n        // Context overflow is handled by compaction, not retry.\n",
+        replace: "    _isRetryableError(message) {\n        if (message.expRetry?.allowed === false)\n            return false;\n        // Context overflow is handled by compaction, not retry.\n"
+      },
+      { find: "        const delayMs = retryDelayMs(settings, this._retryAttempt);", replace: "        const delayMs = message.expRetry?.delayMs ?? retryDelayMs(settings, this._retryAttempt);" },
       ...AGENT_SESSION_UX_EDITS
     ]
   },
@@ -807,6 +820,12 @@ export const PI_PATCHES: FilePatch[] = [
     file: "modes/print-mode.js",
     edits: [
       {
+        // A reply that failed after it started prints what arrived, then the error.
+        find: '                if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {\n                    console.error(',
+        replace:
+          '                if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {\n                    for (const content of assistantMsg.content) {\n                        if (content.type === "text" && content.text.trim() !== "")\n                            writeRawStdout(`${content.text}\\n`);\n                    }\n                    console.error('
+      },
+      {
         find: "        return exitCode;\n    }\n    catch (error) {",
         replace:
           '        if (mode === "json") {\n            const last = session.state.messages[session.state.messages.length - 1];\n            if (last?.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted"))\n                exitCode = 1;\n        }\n        return exitCode;\n    }\n    catch (error) {'
@@ -846,6 +865,36 @@ export const PI_PATCHES: FilePatch[] = [
     pkg: "pi-coding-agent",
     file: "extensions/mcp/runtime.js",
     edits: [{ find: 'name: "pi",\n            version: VERSION,', replace: 'name: "exp-code",\n            version: VERSION,' }]
+  },
+  ...RETRY_PROVIDER_PATCHES,
+  {
+    // Summary calls (compaction, branch summaries) retry through retryAssistantCall: they wait what
+    // the gateway asked for too, and do not retry a wait longer than the cap (retry.maxAgentDelayMs).
+    pkg: "pi-ai",
+    file: "utils/retry.js",
+    edits: [
+      {
+        find: "        if (attempt >= maxAttempts || !isRetryableAssistantError(response)) {",
+        replace:
+          "        const expWaitMs = typeof response.retryAfterMs === \"number\" && Number.isFinite(response.retryAfterMs) ? Math.max(0, Math.ceil(response.retryAfterMs)) : undefined;\n        if (attempt >= maxAttempts || !isRetryableAssistantError(response) || (expWaitMs !== undefined && expWaitMs > (policy.maxAgentDelayMs ?? DEFAULT_MAX_AGENT_RETRY_DELAY_MS))) {"
+      },
+      { find: "        const delayMs = retryDelayMs(policy, attempt);", replace: "        const delayMs = expWaitMs ?? retryDelayMs(policy, attempt);" }
+    ]
+  },
+  {
+    // A reply kept after it was interrupted (EXP_RETRY_POLICY) is sent with the next prompt as the
+    // text that arrived, so "continue" picks up where it stopped. Pi drops every failed reply from
+    // the request; other failed replies still are, and so are the interrupted one's reasoning and
+    // unfinished tool calls.
+    pkg: "pi-ai",
+    file: "api/transform-messages.js",
+    edits: [
+      {
+        find: '            if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {\n                continue;\n            }',
+        replace:
+          '            if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {\n                const expKept = assistantMsg.expRetry?.reason === "interrupted" ? assistantMsg.content.filter((block) => block.type === "text" && block.text.trim() !== "") : [];\n                if (expKept.length > 0) {\n                    const { errorMessage: _expError, expRetry: _expRetry, retryAfterMs: _expWait, ...expRest } = assistantMsg;\n                    result.push({ ...expRest, content: expKept, stopReason: "stop" });\n                }\n                continue;\n            }'
+      }
+    ]
   },
   {
     pkg: "pi-coding-agent",
