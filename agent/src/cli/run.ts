@@ -14,6 +14,7 @@ import { createExpCodeExtension, createIdentityExtension } from "../extension/in
 import { type GatewayResolution, resolveGateway } from "../gateway/config.js";
 import { fetchGatewayModels, parseWireApi } from "../gateway/models.js";
 import { platformToolsEnabled } from "../platform/index.js";
+import { createPromptStashExtension } from "../stash/extension.js";
 import { EXP_CODE_VERSION } from "../version.js";
 import { createBrandingExtension } from "./branding.js";
 import { createSupportCommandsExtension } from "./commands.js";
@@ -140,6 +141,7 @@ export async function runCli(args: string[], env: NodeJS.ProcessEnv = process.en
       },
       { name: "exp-code-branding", hidden: true, factory: createBrandingExtension(EXP_CODE_VERSION, updateNotice) },
       { name: "exp-code-commands", hidden: true, factory: createSupportCommandsExtension({ version: EXP_CODE_VERSION }) },
+      { name: "exp-code-prompt-stash", hidden: true, factory: createPromptStashExtension({ agentDir }) },
       // Last, so its preamble swap sees every other prompt edit.
       { name: "exp-code-identity", hidden: true, factory: createIdentityExtension() }
     ]
