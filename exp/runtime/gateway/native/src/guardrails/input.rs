@@ -210,17 +210,16 @@ pub(crate) async fn acquire_guarded_attempt(
             let retains_input = failure.failure.failure_class == FailureClass::Guardrail
                 && ctx.output_less_retention.is_some();
             let retained = if retains_input {
-                if let Some(argument) = ctx.output_less_retention.as_ref() {
-                    tokio::time::timeout(
-                        remaining(ctx.deadline),
-                        ctx.bridge.call("remember", argument.clone()),
-                    )
-                    .await
-                    .unwrap_or_else(|_| Err(unavailable().public_error()))
-                    .map(|_| ())
-                } else {
-                    Ok(())
-                }
+                tokio::time::timeout(
+                    remaining(ctx.deadline),
+                    ctx.bridge.call(
+                        "remember",
+                        crate::responses_retention::remember_input_denial_argument(ctx.request_id),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| Err(unavailable().public_error()))
+                .map(|_| ())
             } else {
                 Ok(())
             };

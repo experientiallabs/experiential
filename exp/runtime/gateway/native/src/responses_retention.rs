@@ -309,6 +309,18 @@ pub(crate) fn remember_argument(
     }))
 }
 
+/// Retain only admitted input after a denial, including its prior route authority.
+pub(crate) fn remember_input_denial_argument(request_id: &str) -> String {
+    remember_argument(
+        request_id,
+        &ResponsesRetention {
+            refusal: true,
+            ..Default::default()
+        },
+        None,
+    )
+}
+
 /// Retain one finished Responses continuation before the terminal frames
 /// flush, mirroring the python service's ordering. Returns the public error
 /// when bounded retention fails closed.
@@ -338,6 +350,16 @@ pub(crate) async fn remember_continuation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_denial_wire_selects_input_only_retention() {
+        let argument: Value =
+            serde_json::from_str(&remember_input_denial_argument("request-one")).unwrap();
+        assert_eq!(argument["request_id"], "request-one");
+        assert_eq!(argument["refusal"], true);
+        assert_eq!(argument["text"], "");
+        assert_eq!(argument["tool_calls"], json!([]));
+    }
 
     #[test]
     fn retention_preserves_multi_message_status_phase_and_idless_call() {
