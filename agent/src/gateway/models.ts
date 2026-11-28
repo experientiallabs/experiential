@@ -111,6 +111,11 @@ const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", 
  * its gateway effort and every other level to null, which Pi reads as unsupported, so `/thinking`
  * and Shift+Tab offer only what the model takes. Efforts Pi has no level for (`ultra`) are left
  * out. Undefined when the listing states no efforts (a local gateway): Pi's defaults apply.
+ *
+ * `off` exists only when the route accepts `none`: the gateway refuses an effort a route does not
+ * list (`unsupported_parameter`), and a route without `none` reasons whatever is sent, so a model
+ * that always reasons never shows "thinking off". Pi then starts it at medium clamped to this map
+ * (pi-patches.ts keeps a switch from carrying another model's level).
  */
 export function thinkingLevelMap(efforts: string[] | undefined): ThinkingLevelMap | undefined {
   if (efforts === undefined) return undefined;

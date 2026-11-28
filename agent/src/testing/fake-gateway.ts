@@ -13,7 +13,19 @@ import type { AddressInfo } from "node:net";
 export type ReasoningField = "reasoning" | "reasoning_content";
 
 export type FakeTurn =
-  | { text: string; reasoning?: string; reasoningField?: ReasoningField; delayMs?: number; cost?: number; byokListUsd?: number; listUsd?: number }
+  | {
+      text: string;
+      reasoning?: string;
+      reasoningField?: ReasoningField;
+      delayMs?: number;
+      cost?: number;
+      byokListUsd?: number;
+      listUsd?: number;
+      /** `length` ends the turn as cut off at the output limit (default `stop`). */
+      finishReason?: "stop" | "length";
+      /** Prompt tokens the usage chunk reports (default 50). */
+      promptTokens?: number;
+    }
   | { calls: { name: string; arguments: Record<string, unknown> }[]; reasoning?: string; reasoningField?: ReasoningField; delayMs?: number }
   | { status: number; error: string };
 
@@ -70,8 +82,8 @@ function turnChunks(turn: Exclude<FakeTurn, { status: number }>, index: number):
     for (const word of words) chunks.push({ ...base, choices: [{ index: 0, delta: { role: "assistant", [field]: word } }] });
   }
   if ("text" in turn) {
-    chunks.push({ ...base, choices: [{ index: 0, delta: { role: "assistant", content: turn.text } }] });
-    chunks.push({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+    if (turn.text !== "") chunks.push({ ...base, choices: [{ index: 0, delta: { role: "assistant", content: turn.text } }] });
+    chunks.push({ ...base, choices: [{ index: 0, delta: {}, finish_reason: turn.finishReason ?? "stop" }] });
   } else {
     turn.calls.forEach((call, i) => {
       chunks.push({
@@ -94,7 +106,8 @@ function turnChunks(turn: Exclude<FakeTurn, { status: number }>, index: number):
       : "listUsd" in turn && turn.listUsd !== undefined
         ? { cost_details: { list_cost: turn.listUsd } }
         : {};
-  chunks.push({ ...base, choices: [], usage: { prompt_tokens: 50, completion_tokens: 5, total_tokens: 55, cost, ...byok } });
+  const promptTokens = "promptTokens" in turn && turn.promptTokens !== undefined ? turn.promptTokens : 50;
+  chunks.push({ ...base, choices: [], usage: { prompt_tokens: promptTokens, completion_tokens: 5, total_tokens: promptTokens + 5, cost, ...byok } });
   return chunks;
 }
 

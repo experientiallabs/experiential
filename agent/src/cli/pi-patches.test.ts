@@ -41,7 +41,7 @@ describe("Pi patches", () => {
   it("match module paths and file URLs, on any platform", () => {
     expect(patchFor("file:///x/node_modules/@earendil-works/pi-coding-agent/dist/config.js")?.file).toBe("config.js");
     expect(patchFor("C:\\x\\node_modules\\@earendil-works\\pi-tui\\dist\\tui-main-screen.js")?.pkg).toBe("pi-tui");
-    expect(patchFor("/x/node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.js")).toBeUndefined();
+    expect(patchFor("/x/node_modules/@earendil-works/pi-coding-agent/dist/core/sdk.js")).toBeUndefined();
     expect(patchSource("/x/other.js", "same")).toBe("same");
   });
 });
