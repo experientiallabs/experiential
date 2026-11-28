@@ -69,6 +69,31 @@ export function messageBilling(message: unknown): ReportedBilling | undefined {
   return (message as { gatewayBilling?: ReportedBilling }).gatewayBilling;
 }
 
+/**
+ * A gateway error the model SDK left as its raw body (`403: {"message":...,"code":...}`), as one
+ * readable line: `403 (permission_error, model_not_granted): The requested model...`. The line
+ * still starts with the status and keeps the error type and code, so everything that reads the
+ * message (Pi's retry decision, the runner's error codes) decides as before. Undefined when the text is not
+ * that shape.
+ */
+export function readableGatewayError(text: string): string | undefined {
+  const match = /^(\d{3}): (\{[\s\S]*\})$/.exec(text.trim());
+  if (match === null) return undefined;
+  let body: unknown;
+  try {
+    body = JSON.parse(match[2]!);
+  } catch {
+    return undefined;
+  }
+  if (typeof body !== "object" || body === null) return undefined;
+  const nested = (body as { error?: unknown }).error;
+  const error = (typeof nested === "object" && nested !== null ? nested : body) as { message?: unknown; type?: unknown; code?: unknown };
+  const message = typeof error.message === "string" ? error.message.trim() : "";
+  if (message === "") return undefined;
+  const labels = [error.type, error.code].filter((label, index, all): label is string => typeof label === "string" && label !== "" && all.indexOf(label) === index);
+  return `${match[1]}${labels.length > 0 ? ` (${labels.join(", ")})` : ""}: ${message}`;
+}
+
 /** Build the provider models for a listing. */
 export function gatewayProviderModels(listed: ListedModel[], config: GatewayConfig, wire?: GatewayWireApi): ProviderModelConfig[] {
   return listed.map((model) => toProviderModel(model, config, wire));
@@ -135,8 +160,10 @@ export async function registerGatewayProvider(pi: ExtensionAPI, config: GatewayC
   pi.on("message_end", (event) => {
     const message = event.message;
     if (message.role !== "assistant" || message.provider !== GATEWAY_PROVIDER_ID) return;
-    const { responseModel, ...requested } = message;
-    if (pending === undefined) return responseModel === undefined ? undefined : { message: requested };
+    const { responseModel, ...chosen } = message;
+    const readable = message.stopReason === "error" && message.errorMessage !== undefined ? readableGatewayError(message.errorMessage) : undefined;
+    const requested = readable === undefined ? chosen : { ...chosen, errorMessage: readable };
+    if (pending === undefined) return responseModel === undefined && readable === undefined ? undefined : { message: requested };
     const billing = pending;
     pending = undefined;
     return {

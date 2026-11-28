@@ -299,6 +299,40 @@ describe("exp-code CLI", () => {
       .split("\n")
       .map((line) => (JSON.parse(line) as { type: string }).type);
     expect(types).toContain("agent_end");
+    expect(result.code).toBe(0);
+  });
+
+  it("exits 1 in --mode json when the turn fails, and says what the gateway refused", async () => {
+    gateway.script([{ status: 402, error: "Insufficient credits." }]);
+    const json = await runCli(["--mode", "json", "--no-session", "hi"], { EXP_GATEWAY_KEY: "local-key", EXP_CODE_BASE_URL: gateway.baseUrl });
+    expect(json.code).toBe(1);
+    expect(json.stdout).toContain('"stopReason":"error"');
+    gateway.script([{ status: 402, error: "Insufficient credits." }]);
+    const text = await runCli(["-p", "--no-session", "hi"], { EXP_GATEWAY_KEY: "local-key", EXP_CODE_BASE_URL: gateway.baseUrl });
+    expect(text.code).toBe(1);
+    expect(text.stderr.trim()).toMatch(/^402\b.*: Insufficient credits\.$/);
+  });
+
+  it("refuses an RPC prompt without a message by name", async () => {
+    const result = await new Promise<string>((resolve) => {
+      const child = execFile(
+        process.execPath,
+        [cli, "--mode", "rpc", "--no-session"],
+        { cwd: home, env: { PATH: process.env.PATH, HOME: home, EXP_CODE_HOME: join(home, ".exp-code"), EXP_GATEWAY_KEY: "local-key", EXP_CODE_BASE_URL: gateway.baseUrl }, timeout: 60_000 },
+        (_error, stdout) => resolve(stdout)
+      );
+      child.stdin?.end('{"id":"a","type":"prompt"}\n{"id":"b","type":"follow_up","message":7}\n');
+    });
+    const responses = result
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { id?: string; success?: boolean; error?: string });
+    expect(responses).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "a", success: false, error: 'prompt needs a "message" string' }),
+        expect.objectContaining({ id: "b", success: false, error: 'follow_up needs a "message" string' })
+      ])
+    );
   });
 
   it("explains how to provide a gateway key when there is none", async () => {

@@ -173,7 +173,9 @@ exp-code warns on stderr and runs the prompt alone, so a script or CI step that 
 never hangs. Redirect stdin from `/dev/null` when there is nothing to pipe.
 
 `exp-code --help` lists every flag. The JSON and RPC formats are described in the reference
-docs linked under [Acknowledgements](#acknowledgements).
+docs linked under [Acknowledgements](#acknowledgements). `-p` and `--mode json` exit 1 when the
+turn fails (a refused or failed gateway call, or an abort) and 0 when it answers; a gateway
+refusal reads `Gateway error <status> (<type>, <code>): <message>`.
 
 exp-code remembers your choices. A model you pick (with `/model`, `/model <name>` or Ctrl+P) is
 the one the next session starts on, and a thinking level you pick (Shift+Tab or `/thinking`) is
