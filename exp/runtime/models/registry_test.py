@@ -982,6 +982,25 @@ def test_resolution_threads_system_messages_leading_only_to_compatible_rungs() -
     assert resolved.client.gateway_wire_profile().system_messages_leading_only is True
 
 
+@pytest.mark.parametrize(("declared", "refuses"), [(False, True), (True, False), (None, False)])
+def test_resolution_threads_a_forced_tool_choice_refusal_to_compatible_rungs(
+    declared: bool | None, refuses: bool
+) -> None:
+    """Only an explicit ``supports_forced_tool_choice = False`` marks the compatible rung."""
+    catalog = RuntimeModelCatalog(
+        _catalog(
+            provider="openai-compatible",
+            base_url="https://relay.example.test/v1",
+            capabilities=ModelCapabilities(supports_forced_tool_choice=declared),
+        ),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    resolved = catalog.resolve("fixture-model")
+    assert isinstance(resolved.client, OpenAICompatibleClient)
+    assert resolved.client.gateway_wire_profile().refuses_forced_tool_choice is refuses
+
+
 def test_anthropic_connection_geography_reaches_both_client_paths() -> None:
     """Catalog construction supplies both gateway and ordinary completion constraints."""
     catalog = _catalog(provider="anthropic")

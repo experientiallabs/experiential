@@ -595,6 +595,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         reasoning_output_exposed: bool = False,
         reasoning_content_native: bool = False,
         system_messages_leading_only: bool = False,
+        supports_forced_tool_choice: bool | None = None,
     ) -> None:
         """Create one compatible client with explicit model wire capabilities.
 
@@ -613,6 +614,10 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         beginning.`` for any other position, a second leading system turn
         included), so every other instruction turn is folded into user text
         before dispatch instead of 400ing the whole request.
+
+        ``supports_forced_tool_choice = False`` declares that this origin
+        refuses a ``required`` or named ``tool_choice``; the rung then declines
+        a forced choice before dispatch (``None`` forces as requested).
         """
         super().__init__(
             model=model,
@@ -654,6 +659,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
         # streaming wire profile and the buffered request builder read this.
         self._deepseek_reasoning_history = is_deepseek_base_url(self._base_url)
         self._system_messages_leading_only = system_messages_leading_only
+        self._refuses_forced_tool_choice = supports_forced_tool_choice is False
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
         """Return the Chat Completions wire profile for this connection."""
@@ -694,6 +700,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             # output exposure.
             deepseek_reasoning_history=self._deepseek_reasoning_history,
             system_messages_leading_only=self._system_messages_leading_only,
+            refuses_forced_tool_choice=self._refuses_forced_tool_choice,
             # Tencent's prefix cache is per node behind its load balancer;
             # prompt_cache_key pins a session to one node (verified live
             # 2026-09-05). The hint stays host-keyed: a rung declaring
