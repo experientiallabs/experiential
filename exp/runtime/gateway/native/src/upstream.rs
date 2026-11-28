@@ -664,8 +664,16 @@ async fn non_success_failure(
     let code = body
         .as_deref()
         .and_then(|body| rejected_code(dialect, body));
+    // A sentence that only restates the rejection (a relay's family name and
+    // trace id) explains nothing, so it is neither relayed nor trusted as the
+    // caller's verdict: the caller reads the fieldless copy and another rung
+    // gets the request (`reasonless_rejection`).
+    let reasonless = body
+        .as_deref()
+        .is_some_and(|body| crate::reasonless_rejection::rejected_without_reason(dialect, body));
     let detail = body
         .as_deref()
+        .filter(|_| !reasonless)
         .and_then(|body| rejected_detail(dialect, body, &request_words))
         // A sentence the identifier screen dropped still leaves the
         // provider's own code token: "invalid_value" beats "verify the
@@ -781,7 +789,7 @@ async fn non_success_failure(
         crate::context_window::rejected_context_window(dialect, code.as_deref(), body)
     });
     let failure = failure
-        .with_retry(false, lane_limitation)
+        .with_retry(false, lane_limitation || reasonless)
         .with_rejected_parameter(parameter)
         .with_provider_detail(detail);
     let failure = match context_window {

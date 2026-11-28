@@ -53,6 +53,29 @@ async fn a_resellers_flat_lane_limitation_400_fails_over() {
 }
 
 #[tokio::test]
+async fn a_resellers_reasonless_400_fails_over_without_relaying_its_trace() {
+    // A relay's family name plus its trace id names no field: the caller
+    // reads the fieldless copy, and another rung gets the request.
+    let failure = open_against_body(
+        "400 Bad Request",
+        "{\"code\":0,\"message\":\"invalid request error trace_id: 9f3c2b7a1d4e\",\
+         \"type\":\"invalid_request_error\"}",
+        "deepseek/deepseek-v4.1-flash",
+    )
+    .await;
+    assert_eq!(failure.failure_class, FailureClass::InvalidRequest);
+    assert!(
+        failure.failover_eligible,
+        "another rung can carry the request"
+    );
+    assert_eq!(failure.provider_detail, None);
+    assert!(failure
+        .public_error()
+        .message
+        .starts_with("The model's provider rejected the request without giving a reason."));
+}
+
+#[tokio::test]
 async fn a_resellers_flat_403_balance_verdict_is_provider_quota() {
     // Novita answers an unfunded account with 403 NOT_ENOUGH_BALANCE; a
     // status-only read filed it as a credential failure, which the house
