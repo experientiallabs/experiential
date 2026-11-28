@@ -204,11 +204,39 @@ pub(crate) async fn acquire_guarded_attempt(
     match outcome {
         Ok(won) => won,
         Err(failure) => {
+            // Responses input denials keep the admitted conversation under its
+            // ordinary consent-gated continuation ID before settlement releases
+            // the admission. Never persist speculative provider output.
+            let retains_input = failure.failure.failure_class == FailureClass::Guardrail
+                && ctx.output_less_retention.is_some();
+            let retained = if retains_input {
+                if let Some(argument) = ctx.output_less_retention.as_ref() {
+                    tokio::time::timeout(
+                        remaining(ctx.deadline),
+                        ctx.bridge.call("remember", argument.clone()),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(unavailable().public_error()))
+                    .map(|_| ())
+                } else {
+                    Ok(())
+                }
+            } else {
+                Ok(())
+            };
             // Dropping acquire/the committed relay closes upstream immediately.
             // The guard retains witnessed usage for our cost, while the host
             // applies the input verdict to customer settlement.
             guard.fail_before_release(&failure.failure).await;
-            Won::Failed(failure.public_error())
+            if let Err(error) = retained {
+                return Won::Failed(error);
+            }
+            let mut error = failure.public_error();
+            if retains_input {
+                error =
+                    error.with_response_id(crate::encode::stable_public_id("resp", ctx.request_id));
+            }
+            Won::Failed(error)
         }
     }
 }

@@ -38,6 +38,16 @@ pub struct PublicError {
     /// named no reason. Absent on every other error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal_reason: Option<RefusalReason>,
+    /// Native-issued Responses continuation after an admitted input denial.
+    /// Never accepted from a bridge or provider error payload.
+    #[serde(skip)]
+    response_id: Option<Box<ResponsesContinuationReceipt>>,
+}
+
+/// Keep the uncommon receipt out of the hot-path error's inline storage.
+#[derive(Debug, Clone)]
+struct ResponsesContinuationReceipt {
+    response_id: String,
 }
 
 fn default_error_type() -> String {
@@ -59,13 +69,21 @@ impl PublicError {
             retry_after_seconds: None,
             known_unbilled: false,
             refusal_reason: None,
+            response_id: None,
         }
+    }
+
+    /// Attach a receipt only after native admission has retained the user input.
+    pub(crate) fn with_response_id(mut self, response_id: String) -> Self {
+        self.response_id = Some(Box::new(ResponsesContinuationReceipt { response_id }));
+        self
     }
 
     /// The OpenAI error envelope body, matching `OpenAIProtocolError.json_body()`.
     ///
     /// A refusal adds the one additive `refusal_reason` field; every other
-    /// error keeps the exact four-field envelope.
+    /// error keeps the exact four-field envelope unless a native-issued
+    /// Responses continuation receipt accompanies an admitted input denial.
     pub fn json_body(&self) -> serde_json::Value {
         let mut body = json!({
             "error": {
@@ -77,6 +95,9 @@ impl PublicError {
         });
         if let Some(reason) = self.refusal_reason {
             body["error"]["refusal_reason"] = json!(reason.as_str());
+        }
+        if let Some(response_id) = self.response_id.as_ref() {
+            body["error"]["response_id"] = json!(response_id.response_id);
         }
         body
     }
@@ -656,6 +677,19 @@ impl Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuation_receipt_cannot_be_supplied_by_bridge_or_provider() {
+        let error: PublicError = serde_json::from_value(json!({
+            "status_code": 400, "code": "content_filter", "message": "denied",
+            "response_id": "resp_forged"
+        }))
+        .unwrap();
+        assert!(error.response_id.is_none());
+        assert!(error.json_body()["error"].get("response_id").is_none());
+        let native = error.with_response_id("resp_native".into());
+        assert_eq!(native.json_body()["error"]["response_id"], "resp_native");
+    }
 
     #[test]
     fn a_wire_copy_carries_the_tenant_origin_only_when_set() {

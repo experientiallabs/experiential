@@ -186,8 +186,9 @@ def remember_turn(
 ) -> None:
     """Retain one finished Responses continuation within strict bounds.
 
-    Retention is strict about content, not about completion: refusal output is
-    never retained, provider-identified message items retain their exact
+    Retention is strict about content, not about completion: a refused turn
+    retains its incoming conversation but never its refusal output.
+    Provider-identified message items retain their exact
     lifecycle metadata even when their visible text is empty, and a turn that
     produced no retainable output at all (thinking spent the whole output
     budget, so the response is ``incomplete`` with no items) is retained as the
@@ -216,6 +217,15 @@ def remember_turn(
         # shared previous_response_not_found error because it was never stored.
         return
     if bool(data.get("refusal")):
+        continuations.remember_now(
+            namespace=context.namespace,
+            response_id=context.response_id,
+            state=ContinuationState(
+                episode_key=context.episode_key,
+                messages=context.messages,
+                route_binding=context.required_route_binding,
+            ),
+        )
         return
     text = str(data.get("text") or "")
     raw_messages = data.get("message_outputs")

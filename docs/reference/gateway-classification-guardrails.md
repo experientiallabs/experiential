@@ -276,3 +276,55 @@ in `bearer_env`. Point the adapter at a decision-model server, never at this gat
 - It inspects input only; configure a separate output check for completions.
 - Counters returned by `telemetry()` live in the adapter's process and are not part of the
   gateway metrics endpoint.
+
+## User-only, token-budgeted conversation checks
+
+A Python embedder can supply `user_conversation=UserConversationWindow(...)` to
+`DecisionModelClassifier`. The window takes an exact `count_tokens(text)` callable,
+`max_tokens` for the state, `max_bytes` for its escaped JSON string, and an immutable
+encoder/template `identity`. Subtract the complete classifier template, question and
+option framing, special tokens, and any output reservation before choosing these limits.
+The tokenizer must have truncation disabled. A character count is not a token budget.
+
+This mode reads only user messages from the canonical, continuation-expanded request.
+System, developer, assistant and tool messages are excluded, including native tool outputs
+carried by a protocol adapter as user-role items. It preserves chronological turn boundaries
+in a JSON state with `previous_user_requests` and `current_user_request`. The current turn
+has priority; recent preceding user turns fill the remaining budget. A boundary history
+turn keeps its marked tail. An oversized current turn keeps a marked head and tail;
+text omitted by this explicit truncation is not assessed. Selected state, tokenizer/template
+identity and limits all contribute to the cache identity. Projection retains the same
+selected state, so coverage accounting cannot discard history before classification.
+
+Chat Completions, Anthropic Messages and Google GenerateContent callers must supply their
+conversation history, including denied user turns, on every request. No API key, user or
+organization is treated as one conversation. A bare `please` request cannot be associated
+with another request unless the caller supplies history or an authorized continuation.
+
+For Responses, `previous_response_id` expands only an authorized retained conversation.
+A provider refusal retains the incoming conversation without generated refusal content.
+An admitted parallel input denial returns HTTP 400 `content_filter` with an additional
+`error.response_id`; a client can send that ID as its next `previous_response_id`.
+The existing store and privacy policy still decide whether state can be retained:
+`store: false`, disabled retention, expired or missing state, and foreign namespaces remain
+unavailable. When continuation is unavailable, resend the full user conversation in `input`.
+Failures before admission do not issue a continuation ID. The receipt is not a grant to
+read another identity's history, and this feature introduces no new retention period.
+
+Example embedder composition (the counter and limits come from the verified classifier
+runtime, not from the model's advertised maximum):
+
+```python
+from exp.runtime.gateway.guardrails.classification import DecisionModelClassifier
+from exp.runtime.gateway.guardrails.user_conversation import UserConversationWindow
+
+classifier = DecisionModelClassifier(
+    document,
+    user_conversation=UserConversationWindow(
+        count_tokens=count_state_tokens,
+        max_tokens=available_state_tokens,
+        max_bytes=available_state_json_bytes,
+        identity=verified_tokenizer_and_template_digest,
+    ),
+)
+```

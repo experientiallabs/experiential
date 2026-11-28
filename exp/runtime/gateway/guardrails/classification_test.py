@@ -361,3 +361,57 @@ def test_verdict_reports_every_category_score_and_the_digest_of_the_state_sent()
     assert not first.cached
     assert second.cached
     assert (second.scores, second.subject_sha256) == (first.scores, first.subject_sha256)
+
+
+def test_user_conversation_cache_cannot_reuse_an_allowed_bare_followup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same current turn with harmful history has a distinct cached verdict."""
+    from exp.runtime.gateway.guardrails.user_conversation import UserConversationWindow
+
+    monkeypatch.setenv("DECISION_MODEL_BEARER", "fixture-credential")
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Use a deterministic fixture classifier to test gateway cache semantics."""
+        state = json.loads(request.content)["state"]
+        seen.append(state)
+        return httpx.Response(
+            200,
+            json=_answers(
+                overrides_instructions=1.0 if "harmful original" in state else 0.0,
+                unrelated_task=0.0,
+                unrelated_domain=0.0,
+            ),
+        )
+
+    async def scenario() -> None:
+        """Cache an allowed follow-up, then check and retry its denied conversation."""
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            adapter = DecisionModelClassifier(
+                DecisionModelAdapterDocument.model_validate(_document()),
+                client=client,
+                user_conversation=UserConversationWindow(len, 10000, 20000, "fixture-counter"),
+            )
+            bare = _request("please")
+            history = bare.model_copy(
+                update={
+                    "messages": (
+                        GatewayMessage(role="user", content="harmful original"),
+                        GatewayMessage(role="assistant", content="REFUSAL EXCLUDED"),
+                        GatewayMessage(role="user", content="please"),
+                    )
+                }
+            )
+            assert not (await adapter.inspect_input(request=bare, check=_CHECK)).flagged
+            denied = await adapter.inspect_input(request=history, check=_CHECK)
+            assert denied.flagged
+            repeated = await adapter.inspect_input(
+                request=adapter.project_input(history), check=_CHECK
+            )
+            assert isinstance(repeated, ScoredVerdict) and repeated.flagged and repeated.cached
+            assert not (await adapter.inspect_input(request=bare, check=_CHECK)).flagged
+
+    asyncio.run(scenario())
+    assert len(seen) == 2
+    assert all("REFUSAL EXCLUDED" not in state for state in seen)

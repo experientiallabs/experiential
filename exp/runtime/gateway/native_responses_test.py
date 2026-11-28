@@ -694,3 +694,23 @@ def test_remember_turn_retains_and_replays_a_tool_call_caller() -> None:
     payload_input = cast(list[JsonObject], payload["input"])
     assert payload_input[0]["caller"] == caller
     assert payload_input[1]["caller"] == caller
+
+
+def test_refused_turn_retains_input_only_and_honors_store_false() -> None:
+    """Denied input stays continuable without persisting any generated output."""
+    store = BoundedContinuationStore()
+    incoming = (GatewayMessage(role="user", content="original request"),)
+    context = replace(_context(), messages=incoming)
+    remember_turn(
+        store,
+        context=context,
+        data={"refusal": True, "text": "discard generated text", "tool_calls": []},
+    )
+    saved = store.resolve_now(namespace=context.namespace, previous_response_id=context.response_id)
+    assert saved.messages == incoming
+    private = replace(context, retain=False, response_id="not-stored")
+    remember_turn(store, context=private, data={"refusal": True})
+    from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+
+    with pytest.raises(OpenAIProtocolError):
+        store.resolve_now(namespace=private.namespace, previous_response_id=private.response_id)

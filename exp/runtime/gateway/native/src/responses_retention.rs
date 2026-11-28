@@ -319,7 +319,7 @@ pub(crate) async fn remember_continuation(
     retention: &ResponsesRetention,
     reasoning_content_carrier: Option<&str>,
 ) -> Result<(), PublicError> {
-    if retention.overflowed || retention.refusal() {
+    if retention.overflowed && !retention.refusal() {
         return Ok(());
     }
     state
