@@ -208,7 +208,11 @@ more, with the model's whole output limit and its lowest reasoning level. When t
 the conversation is kept as it was and exp-code says why; automatic compaction then pauses for that
 model in that session, so it is not retried before every call. Run `/compact` to try again, `/model`
 to switch to another model, or `/new` to start a fresh session. The same check guards a split
-turn's summary and the branch summaries `/tree` writes.
+turn's summary and the branch summaries `/tree` writes. When the cut falls inside a turn, the rest of
+that turn is kept as it was, so the summary of its beginning describes only what that part shows
+and never claims the work is unfinished. The summarizer reads each tool output shortened to its
+first 2,000 characters, and is told the assistant saw the whole output, so a summary does not
+report a full read as truncated.
 
 In the terminal UI, `/bug` opens a new GitHub issue for exp-code prefilled with your exp-code
 version, operating system, Node.js version and model (nothing is sent until you submit it), and

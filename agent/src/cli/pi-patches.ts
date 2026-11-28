@@ -147,6 +147,21 @@ export async function completeSummarization(model, context, options, streamFn, r
 }
 `;
 
+/**
+ * The turn-prefix summary (a cut inside one turn) describes only the turn's beginning, and the
+ * rest of the turn is kept verbatim after it. Pi's prompt asked for the "context needed to
+ * continue", so a prefix ending in tool results came back as "the answer has not been found yet,
+ * read the file again", placed in front of the kept reply that had already answered, and the
+ * model then believed the summary over its own answer. The appended rule keeps the summary to
+ * what the prefix shows.
+ */
+const TURN_PREFIX_LAST_LINE = "Only summarize information explicitly present above. Do not infer or recreate later messages.`;";
+export const TURN_PREFIX_CONTINUES =
+  "These messages are only the beginning of the turn: the turn continues in the later messages, which may already finish the request. Describe what these messages show. Never write that something has not been found, is still missing or unfinished, or has to be read, run or done again: the later messages may show otherwise, and they take precedence over this checkpoint.";
+/** What the summarizer's system prompt says about tool output shortened for the summary request. */
+export const SHORTENED_TOOL_OUTPUT =
+  "Long tool outputs are shortened in this request only (marked \"left out of this summary request\"); the assistant saw them in full. Do not report them as truncated, and do not say the assistant has not seen what was left out.";
+
 /** The automatic-compaction pause (core/agent-session.js): keyed by session and model. */
 const AUTO_COMPACTION_PAUSE_STATE = `    _overflowRecoveryAttempted = false;
     /** exp-code: the session and model whose automatic compaction failed; it is not retried for them. */
@@ -550,7 +565,26 @@ export const PI_PATCHES: FilePatch[] = [
     file: "core/compaction/compaction.js",
     edits: [
       { find: 'import { completeSimple } from "@earendil-works/pi-ai/compat";', replace: 'import { completeSimple, getSupportedThinkingLevels } from "@earendil-works/pi-ai/compat";' },
-      { from: "/**\n * Shared choke point for every compaction/branch-summary summarization call. Wraps the", to: "/**\n * Generate a summary of the conversation using the LLM.", replace: SUMMARY_GUARD }
+      { from: "/**\n * Shared choke point for every compaction/branch-summary summarization call. Wraps the", to: "/**\n * Generate a summary of the conversation using the LLM.", replace: SUMMARY_GUARD },
+      { find: TURN_PREFIX_LAST_LINE, replace: `${TURN_PREFIX_LAST_LINE.slice(0, -2)}\n\n${TURN_PREFIX_CONTINUES}\`;` }
+    ]
+  },
+  {
+    // The summarizer reads tool output cut to its first 2,000 characters, which the assistant saw
+    // in full. Pi's marker said only "truncated", so summaries reported the reads as truncated and
+    // the values after the cut as never seen. The marker and the summarizer's system prompt now
+    // say the cut belongs to the summary request alone.
+    pkg: "pi-coding-agent",
+    file: "core/compaction/utils.js",
+    edits: [
+      {
+        find: "return `${sliceHead(text, maxChars)}\\n\\n[... ${truncatedChars} more characters truncated]`;",
+        replace: "return `${sliceHead(text, maxChars)}\\n\\n[... ${truncatedChars} more characters left out of this summary request; the assistant saw the whole output]`;"
+      },
+      {
+        find: "ONLY output the structured summary.`;",
+        replace: `ONLY output the structured summary.\n\n${SHORTENED_TOOL_OUTPUT}\`;`
+      }
     ]
   },
   {
