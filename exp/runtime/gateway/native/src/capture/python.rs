@@ -62,8 +62,13 @@ struct PythonBatchSink {
     completion_references: bool,
     independent_retries: bool,
     bytes_output: bool,
+    /// Hand each record as `("facts", facts, record)` (`super::facts`).
+    facts_output: bool,
     spill: Option<Arc<super::spill::SpillStore>>,
 }
+
+/// The facts tag the destination matches before unpacking a record.
+const FACTS_TAG: &str = "facts";
 
 struct EncodedRecord {
     value: Py<PyAny>,
@@ -82,6 +87,11 @@ impl PythonBatchSink {
         maximum_bytes: usize,
     ) -> Result<EncodedRecord, ()> {
         let split = super::split::split(record, store, maximum_bytes).ok_or(())?;
+        let facts = if self.facts_output {
+            Some(super::facts::split_facts(record, &split).ok_or(())?)
+        } else {
+            None
+        };
         let bytes = split.skeleton.len();
         let retained_bytes = bytes
             + split.marker.len() * 4
@@ -90,7 +100,8 @@ impl PythonBatchSink {
                 .parts
                 .iter()
                 .map(|part| part.file.path().as_os_str().len() * 4 + part.file.heap_bytes() + 512)
-                .sum::<usize>();
+                .sum::<usize>()
+            + facts.as_ref().map_or(0, |facts| facts.len() + 256);
         Python::try_attach(|py| {
             let parts = split
                 .parts
@@ -119,8 +130,12 @@ impl PythonBatchSink {
                     pyo3::types::PyList::new(py, parts)?.into_any(),
                 ],
             )?;
+            let value = match &facts {
+                Some(facts) => tagged_with_facts(py, facts, value.into_any())?,
+                None => value.into_any(),
+            };
             Ok::<_, PyErr>(EncodedRecord {
-                value: value.into_any().unbind(),
+                value: value.unbind(),
                 bytes,
                 retained_bytes,
                 _parts: split.parts.into_iter().map(|part| part.file).collect(),
@@ -131,12 +146,51 @@ impl PythonBatchSink {
     }
 }
 
+impl PythonBatchSink {
+    /// Hand a whole record as `("facts", facts bytes, record bytes)`.
+    fn prepare_with_facts(encoded: &str, facts: &[u8]) -> Result<EncodedRecord, ()> {
+        let bytes = encoded.len();
+        Python::try_attach(|py| {
+            let record = PyBytes::new(py, encoded.as_bytes()).into_any();
+            let value = tagged_with_facts(py, facts, record)?;
+            Ok::<_, PyErr>(EncodedRecord {
+                value: value.unbind(),
+                bytes,
+                retained_bytes: bytes + facts.len() + 512,
+                _parts: Vec::new(),
+            })
+        })
+        .ok_or(())?
+        .map_err(|_| ())
+    }
+}
+
+/// `("facts", facts, record)`: the facts document beside the unchanged record value.
+fn tagged_with_facts<'py>(
+    py: Python<'py>,
+    facts: &[u8],
+    record: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    Ok(PyTuple::new(
+        py,
+        [
+            FACTS_TAG.into_pyobject(py)?.into_any(),
+            PyBytes::new(py, facts).into_any(),
+            record,
+        ],
+    )?
+    .into_any())
+}
+
 impl Sink for PythonBatchSink {
     type Prepared = EncodedRecord;
 
     fn preparation_bytes(maximum_record_bytes: usize) -> usize {
         // The last record may cross the soft batch target. Bound both strings
         // (up to four bytes per character) and the concurrent UTF-8 encoding.
+        // Facts output is bytes output only, whose payloads take one byte per
+        // byte: the four-fold string slack covers every facts document
+        // (at most `facts::MAXIMUM_FACTS_BYTES` each) many times over.
         (maximum_record_bytes + BATCH_BYTES) * 5 + BATCH_RECORDS * 256
     }
 
@@ -145,6 +199,21 @@ impl Sink for PythonBatchSink {
             if record.requires_split() {
                 return self.prepare_split(record, store, maximum_bytes);
             }
+        }
+        if self.facts_output {
+            return match super::facts::encode_with_facts(
+                record,
+                maximum_bytes,
+                self.completion_references,
+            ) {
+                Ok((encoded, facts)) => Self::prepare_with_facts(&encoded, &facts),
+                // Too large for one in-memory record: keep it whole as a split record.
+                Err(super::facts::Unencodable::Record) => match &self.spill {
+                    Some(store) => self.prepare_split(record, store, maximum_bytes),
+                    None => Err(()),
+                },
+                Err(super::facts::Unencodable::Facts) => Err(()),
+            };
         }
         let encoded = if self.completion_references {
             record.encode_update(maximum_bytes)
@@ -276,8 +345,12 @@ impl CaptureCollector {
     /// require a destination that retries until the prompt checkpoint is durable.
     /// Independent retries require idempotent, monotonic writes: delayed updates
     /// may arrive after newer updates, and must never overwrite their evidence.
+    /// Facts output (bytes output only) hands each record as
+    /// `("facts", facts, record)`, where `facts` is the content-free JSON
+    /// document of `capture::facts` and `record` is the value bytes output
+    /// would hand alone, so a destination frames records without parsing them.
     #[staticmethod]
-    #[pyo3(signature = (config_json, sink, *, completion_references=false, bytes_output=false, independent_retries=false))]
+    #[pyo3(signature = (config_json, sink, *, completion_references=false, bytes_output=false, independent_retries=false, facts_output=false))]
     fn batched(
         py: Python<'_>,
         config_json: &str,
@@ -285,9 +358,15 @@ impl CaptureCollector {
         completion_references: bool,
         bytes_output: bool,
         independent_retries: bool,
+        facts_output: bool,
     ) -> PyResult<Self> {
         if !sink.bind(py).is_callable() {
             return Err(PyValueError::new_err("capture batch sink must be callable"));
+        }
+        if facts_output && !bytes_output {
+            return Err(PyValueError::new_err(
+                "capture facts output requires bytes output",
+            ));
         }
         let config: Configuration = serde_json::from_str(config_json)
             .map_err(|_| PyValueError::new_err("invalid capture configuration"))?;
@@ -304,6 +383,7 @@ impl CaptureCollector {
                     completion_references,
                     independent_retries,
                     bytes_output,
+                    facts_output,
                     spill: spill.clone(),
                 },
                 spill,

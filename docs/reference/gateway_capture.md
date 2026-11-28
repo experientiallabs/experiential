@@ -218,6 +218,33 @@ storage boundary; the JSON, size limits and acknowledgement semantics are
 identical. Failed members retain the same bytes object across retries.
 Once preparation succeeds, the redundant decoded record tree is released before
 preparing the next member. Its admission charge remains until acknowledgement.
+A bytes destination can also set `facts_output=True` (advertised as
+`exp_gateway_native.CAPTURE_FACTS_VERSION`). Each member then arrives as
+`("facts", facts, record)`: `record` is exactly the value bytes output hands
+(record bytes or a split tuple) and `facts` is a small content-free JSON document
+(`exp/runtime/gateway/native_capture_facts.py`, `CaptureRecordFacts`) computed while
+the record is encoded: request id, scope, protocol, model and deployment ids,
+capture time, whether a response is present with its kind, status and loss flags,
+the record's byte length, and for a whole record the span of its request id
+(checked with the length before any splice, so facts paired with another
+request's record are refused) and the byte spans of the parts a storage plan
+may drop: the messages value and the `source_json`,
+`provider_context` and `wire_request` members (with one separating comma each)
+for the prompt; the response value, the response-derived fields the collector
+clears itself when response retention is denied (reasoning and its source, tool
+calls, metrics, Gemini parts and their source) and the `provider_logprobs` and
+`transport` members for the response (the collector delivers no relay evidence
+for a request whose response it may not keep; `wire_request` lies inside
+`transport`). A destination identifies and frames a record without
+decoding it, and `CaptureRecordFacts.planned` applies a plan as a byte splice
+whose result equals the decoded rewrite. Keeping the prompt out removes the
+conversation and every verbatim copy of the request but keeps the effective
+configuration (model, parameters, tool declarations, metadata); a destination
+that may not keep that either stores no record, as the collector does itself. Spans cost a position read per wrapped
+value during the one encoding the record needs anyway. A split skeleton carries
+no spans, and its response flags are read from the skeleton as delivered, so a
+spilled stream cut on the way to disk reports `truncated`. A facts document over 16 KiB refuses its
+record like an oversized payload.
 
 By default, batched storage retains complete schema-1 records. A destination that
 supports incremental updates can explicitly set `completion_references=True` to

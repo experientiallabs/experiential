@@ -725,6 +725,8 @@ fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<guardrails::input_latch::PyOptionalInputDecision>()?;
     module.add_class::<capture::python::CaptureCollector>()?;
     module.add_class::<capture::python::CaptureResponse>()?;
+    // Hosts feature-detect `CaptureCollector.batched(..., facts_output=True)`.
+    module.add("CAPTURE_FACTS_VERSION", capture::facts::FACTS_VERSION)?;
     module.add_function(wrap_pyfunction!(shutdown_handle, module)?)?;
     module.add_function(wrap_pyfunction!(thought_signature_issuer, module)?)?;
     module.add_function(wrap_pyfunction!(serve, module)?)?;

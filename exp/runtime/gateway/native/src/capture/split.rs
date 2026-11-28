@@ -81,6 +81,9 @@ pub(crate) struct SplitRecord {
     pub skeleton: String,
     pub marker: String,
     pub parts: Vec<Part>,
+    /// The skeleton's response flags as delivered, or None when it carries no
+    /// response (a spilled body that could not be read back leaves it null).
+    pub response: Option<super::facts::ResponseFacts>,
 }
 
 struct Builder<'a> {
@@ -231,6 +234,7 @@ pub(crate) fn split(
             wire.insert("body".into(), value);
         }
     }
+    let response = super::facts::ResponseFacts::of_skeleton(&skeleton["response"]);
     builder.extract_strings(&mut skeleton, store.part_threshold_bytes);
     if builder.lost {
         return None;
@@ -250,6 +254,7 @@ pub(crate) fn split(
         skeleton,
         marker: builder.marker,
         parts: builder.parts,
+        response,
     })
 }
 

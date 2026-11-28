@@ -232,7 +232,7 @@ impl<R> Record<R> {
 impl<R: Serialize> Serialize for Record<R> {
     /// Project only exceptional reasoning text; never clone the request or response.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.serialize_update(serializer, false)
+        self.serialize_update(serializer, false, None)
     }
 }
 
@@ -240,19 +240,23 @@ struct CompletionUpdate<'a, R>(&'a Record<R>);
 
 impl<R: Serialize> Serialize for CompletionUpdate<'_, R> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0.serialize_update(serializer, true)
+        self.0.serialize_update(serializer, true, None)
     }
 }
 
 impl<R: Serialize> Record<R> {
-    fn serialize_update<S: Serializer>(
+    /// Serialize one record or completion update. A `probe` records the byte
+    /// spans of the parts a storage plan may drop while the bytes are written
+    /// (`super::facts`); the output is byte-identical with or without it.
+    pub(super) fn serialize_update<S: Serializer>(
         &self,
         serializer: S,
         completion: bool,
+        probe: Option<&super::facts::Probe>,
     ) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
-        struct Reference<'a> {
-            request_id: &'a str,
+        struct Reference<'a, I: Serialize> {
+            request_id: I,
             scope: &'a Scope,
             protocol: Protocol,
             model_id: &'a Option<String>,
@@ -265,36 +269,106 @@ impl<R: Serialize> Record<R> {
             &if completion { 2 } else { self.schema_version },
         )?;
         if completion {
-            record.serialize_field(
-                "request",
-                &Reference {
-                    request_id: &self.request.request_id,
-                    scope: &self.request.scope,
-                    protocol: self.request.protocol,
-                    model_id: &self.request.model_id,
-                },
-            )?;
+            let request_id = self.request.request_id.as_str();
+            match probe {
+                Some(probe) => record.serialize_field(
+                    "request",
+                    &Reference {
+                        request_id: probe.request_id(request_id),
+                        scope: &self.request.scope,
+                        protocol: self.request.protocol,
+                        model_id: &self.request.model_id,
+                    },
+                )?,
+                None => record.serialize_field(
+                    "request",
+                    &Reference {
+                        request_id,
+                        scope: &self.request.scope,
+                        protocol: self.request.protocol,
+                        model_id: &self.request.model_id,
+                    },
+                )?,
+            }
+        } else if let Some(probe) = probe {
+            record.serialize_field("request", &probe.request(&self.request))?;
         } else {
             record.serialize_field("request", &self.request)?;
         }
-        record.serialize_field("response", &self.response)?;
-        if let Some(transport) = &self.transport {
-            record.serialize_field("transport", transport)?;
+        match probe {
+            Some(probe) => record.serialize_field("response", &probe.response(&self.response))?,
+            None => record.serialize_field("response", &self.response)?,
         }
-        record.serialize_field("provider_reasoning", &reasoning.text)?;
-        record.serialize_field("provider_reasoning_source_json", &reasoning.source_json)?;
-        record.serialize_field("provider_tool_calls_json", &self.provider_tool_calls_json)?;
-        record.serialize_field("deployment_id", &self.deployment_id)?;
-        record.serialize_field("metrics", &self.metrics)?;
-        record.serialize_field("gemini_thought_parts", &parts)?;
-        record.serialize_field("gemini_thought_parts_source_json", &parts_source)?;
+        if let Some(transport) = &self.transport {
+            match probe {
+                Some(probe) => {
+                    let start = probe.position.get();
+                    record.serialize_field("transport", &probe.transport(transport))?;
+                    probe.record_transport(start);
+                }
+                None => record.serialize_field("transport", transport)?,
+            }
+        }
+        match probe {
+            None => {
+                record.serialize_field("provider_reasoning", &reasoning.text)?;
+                record.serialize_field("provider_reasoning_source_json", &reasoning.source_json)?;
+                record
+                    .serialize_field("provider_tool_calls_json", &self.provider_tool_calls_json)?;
+                record.serialize_field("deployment_id", &self.deployment_id)?;
+                record.serialize_field("metrics", &self.metrics)?;
+                record.serialize_field("gemini_thought_parts", &parts)?;
+                record.serialize_field("gemini_thought_parts_source_json", &parts_source)?;
+            }
+            Some(probe) => {
+                // The response-derived fields a denied response retention clears.
+                use super::facts::ValueSlot::{GeminiThoughtParts, ResponseField};
+                record.serialize_field(
+                    "provider_reasoning",
+                    &probe.response_field(&reasoning.text, ResponseField, reasoning.text.is_some()),
+                )?;
+                record.serialize_field(
+                    "provider_reasoning_source_json",
+                    &probe.response_field(
+                        &reasoning.source_json,
+                        ResponseField,
+                        reasoning.source_json.is_some(),
+                    ),
+                )?;
+                record.serialize_field(
+                    "provider_tool_calls_json",
+                    &probe.response_field(
+                        &self.provider_tool_calls_json,
+                        ResponseField,
+                        self.provider_tool_calls_json.is_some(),
+                    ),
+                )?;
+                record.serialize_field("deployment_id", &self.deployment_id)?;
+                record.serialize_field(
+                    "metrics",
+                    &probe.response_field(&self.metrics, ResponseField, self.metrics.is_some()),
+                )?;
+                record.serialize_field(
+                    "gemini_thought_parts",
+                    &probe.response_field(&parts, GeminiThoughtParts, !parts.is_empty()),
+                )?;
+                record.serialize_field(
+                    "gemini_thought_parts_source_json",
+                    &probe.response_field(&parts_source, ResponseField, parts_source.is_some()),
+                )?;
+            }
+        }
         record.serialize_field("captured_at", &self.captured_at)?;
         if let Some(logprobs) = self
             .provider_logprobs
             .as_ref()
             .filter(|l| l.logprobs_injected)
         {
+            let start = probe.map(|probe| probe.position.get());
             record.serialize_field("provider_logprobs", logprobs)?;
+            if let (Some(probe), Some(start)) = (probe, start) {
+                probe.record_logprobs(start);
+            }
         }
         record.end()
     }

@@ -1,5 +1,6 @@
 //! Allocation-free JSON sizing and bounded final encoding for capture destinations.
 
+use std::cell::Cell;
 use std::io::{self, Write};
 
 use serde::Serialize;
@@ -88,11 +89,22 @@ pub(super) fn heap_bytes(value: &Value) -> usize {
 
 /// Stop the final serializer before an oversized payload can allocate without bound.
 pub(super) fn encode(value: &impl Serialize, maximum: usize) -> Option<String> {
-    struct Limited {
+    encode_tracked(value, maximum, None)
+}
+
+/// `encode`, publishing the byte length written so far into `position` after
+/// every write, so a serializer wrapper can read where its value starts and ends.
+pub(super) fn encode_tracked(
+    value: &impl Serialize,
+    maximum: usize,
+    position: Option<&Cell<usize>>,
+) -> Option<String> {
+    struct Limited<'a> {
         bytes: Vec<u8>,
         maximum: usize,
+        position: Option<&'a Cell<usize>>,
     }
-    impl Write for Limited {
+    impl Write for Limited<'_> {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             if bytes.len() > self.maximum.saturating_sub(self.bytes.len()) {
                 return Err(io::Error::other("capture record exceeds storage budget"));
@@ -110,6 +122,9 @@ pub(super) fn encode(value: &impl Serialize, maximum: usize) -> Option<String> {
                 self.bytes.reserve_exact(capacity - self.bytes.len());
             }
             self.bytes.extend_from_slice(bytes);
+            if let Some(position) = self.position {
+                position.set(self.bytes.len());
+            }
             Ok(bytes.len())
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -119,6 +134,7 @@ pub(super) fn encode(value: &impl Serialize, maximum: usize) -> Option<String> {
     let mut output = Limited {
         bytes: Vec::new(),
         maximum,
+        position,
     };
     serde_json::to_writer(&mut output, value).ok()?;
     String::from_utf8(output.bytes).ok()
