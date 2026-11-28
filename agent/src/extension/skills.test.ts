@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -57,5 +57,17 @@ describe("document skills", () => {
     mkdirSync(join(dir, "sticky"));
     chmodSync(join(dir, "sticky"), 0o1777);
     expect(existsSync(materializeSkills(skills, join(dir, "sticky")))).toBe(true);
+    // A link to an open directory is judged by where it points.
+    symlinkSync(join(dir, "open"), join(dir, "to-open"));
+    expect(() => materializeSkills(skills, join(dir, "to-open"))).toThrow(/refusing skills root/);
+  });
+
+  it("accepts a root that is a link to a safe directory, as /tmp is on macOS", () => {
+    mkdirSync(join(dir, "sticky"));
+    chmodSync(join(dir, "sticky"), 0o1777);
+    symlinkSync(join(dir, "sticky"), join(dir, "tmp"));
+    const skillsDir = materializeSkills({ pdf: "---\nname: pdf\n---\n" }, join(dir, "tmp"));
+    expect(skillsDir.startsWith(realpathSync(join(dir, "sticky")))).toBe(true);
+    expect(readFileSync(join(skillsDir, "pdf", "SKILL.md"), "utf8")).toContain("name: pdf");
   });
 });

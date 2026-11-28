@@ -58,10 +58,20 @@ export function createExpCodeExtension(options: ExpCodeExtensionOptions): Extens
       addCoworkSection(event.systemPromptOptions);
       addDocsSection(event.systemPromptOptions);
     });
-    pi.on("resources_discover", () => {
-      const skillPaths = [resolveSkillsDir(options.skillsRoot)];
+    pi.on("resources_discover", (_event, ctx) => {
       // The traces skill describes the platform tools, so it is offered only with them.
-      if (platformTools.length > 0) skillPaths.push(tracesSkillDir(options.skillsRoot));
+      const sources = [() => resolveSkillsDir(options.skillsRoot), ...(platformTools.length > 0 ? [() => tracesSkillDir(options.skillsRoot)] : [])];
+      const skillPaths: string[] = [];
+      for (const source of sources) {
+        // One directory that cannot be written or trusted costs only its own skills.
+        try {
+          skillPaths.push(source());
+        } catch (error) {
+          const message = `Some skills are unavailable: ${error instanceof Error ? error.message : String(error)}`;
+          if (ctx.hasUI) ctx.ui.notify(message, "warning");
+          else console.error(message);
+        }
+      }
       return { skillPaths };
     });
     const problem = options.gatewayProblem;

@@ -1,3 +1,6 @@
+import { chmodSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { GatewayConfig } from "../gateway/config.js";
 import { createExpCodeExtension, createIdentityExtension } from "./index.js";
@@ -34,6 +37,26 @@ describe("exp-code extension", () => {
     expect(options.sections.docs).toContain("exp-code README");
     const discovered = (await pi.handlers.get("resources_discover")?.[0]?.({}, {})) as { skillPaths: string[] };
     expect(discovered.skillPaths[0]).toMatch(/skills$/);
+  });
+
+  it("keeps the document skills when the traces skill cannot be written, and says why", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "exp-code-ext-"));
+    try {
+      // A root anyone can write to (and not sticky) is refused for the materialized traces skill.
+      const open = join(dir, "open");
+      mkdirSync(open);
+      chmodSync(open, 0o777);
+      const pi = fakePi();
+      const hosted: GatewayConfig = { kind: "hosted", baseUrl: "https://api.example.test/v1", apiKey: "xpl_test" };
+      await createExpCodeExtension({ gateway: hosted, provider: { models: [{ id: "m1" }] }, platformTools: true, skillsRoot: open })(pi.api as never);
+      const notes: string[] = [];
+      const discovered = (await pi.handlers.get("resources_discover")?.[0]?.({}, { hasUI: true, ui: { notify: (text: string) => notes.push(text) } })) as { skillPaths: string[] };
+      expect(discovered.skillPaths).toHaveLength(1);
+      expect(discovered.skillPaths[0]).toMatch(/skills$/);
+      expect(notes).toEqual([expect.stringMatching(/^Some skills are unavailable: refusing skills root /)]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("names the agent exp-code in the preamble, leaving a custom prompt alone", async () => {

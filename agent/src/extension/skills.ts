@@ -7,7 +7,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -58,11 +58,14 @@ function assertSafeRoot(path: string): void {
 /**
  * Write a skill map under `root`, in a directory named by its content so updates never mix. The
  * skills are world-readable (the model's tools may run as another account) and writable only by us.
+ * The root is judged by the directory it resolves to: on macOS the temporary directory without
+ * TMPDIR is `/tmp`, a symbolic link to the sticky `/private/tmp`.
  */
-export function materializeSkills(skills: Record<string, string>, root: string): string {
+export function materializeSkills(skills: Record<string, string>, requestedRoot: string): string {
   const digest = createHash("sha256").update(JSON.stringify(skills)).digest("hex").slice(0, 16);
+  mkdirSync(requestedRoot, { recursive: true, mode: 0o755 });
+  const root = realpathSync(requestedRoot);
   const dir = join(root, `exp-code-skills-${digest}`);
-  mkdirSync(root, { recursive: true, mode: 0o755 });
   assertSafeRoot(root);
   if (existsSync(dir)) {
     assertTrusted(dir);
