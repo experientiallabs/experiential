@@ -182,6 +182,24 @@ reserves on every request, so automatic compaction runs before the prompt reache
 that output (about 906K tokens of prompt on a 1.05M window with 128K output). When a session's model is not a gateway model, `web_search` runs on
 `experiential-small-model` if the gateway lists it.
 
+Every model that reasons starts at `medium` thinking, or at the closest level its route accepts
+(the next one up, else the next one down: a route offering `none`, `low` and `high` starts at
+`high`), unless you chose a level for that model or saved a default level. The level is sent with
+every request (`reasoning_effort` on Chat Completions, `reasoning.effort` on Responses), so the
+footer always names what the model was asked for. `thinking off` exists only on a route that
+accepts the `none` effort; a model that always reasons offers its lowest level instead. A model
+without reasoning shows no level.
+
+Compaction asks the model for a summary of the conversation and replaces the older part of the
+conversation with it, so exp-code checks the summary first. The request asks for at most 32K
+tokens of output (or the model's maximum, when smaller) at no more than `low` reasoning. A summary
+cut off at the output limit, empty, or implausibly short for the conversation is asked for once
+more, with the model's whole output limit and its lowest reasoning level. When that also fails,
+the conversation is kept as it was and exp-code says why; automatic compaction then pauses for that
+model in that session, so it is not retried before every call. Run `/compact` to try again, `/model`
+to switch to another model, or `/new` to start a fresh session. The same check guards a split
+turn's summary and the branch summaries `/tree` writes.
+
 In the terminal UI, `/bug` opens a new GitHub issue for exp-code prefilled with your exp-code
 version, operating system, Node.js version and model (nothing is sent until you submit it), and
 `/changelog` links exp-code's release notes. There is no `/share`: it uploaded sessions to a

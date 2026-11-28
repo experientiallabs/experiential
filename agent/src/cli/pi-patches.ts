@@ -47,7 +47,131 @@ export class PiPatchError extends Error {
   override name = "PiPatchError";
 }
 
-const HELP_ENVIRONMENT = `\${chalk.bold("Environment Variables:")}
+/**
+ * Pi's `completeSummarization`, guarded (core/compaction/compaction.js). Reasoning models spend
+ * output tokens thinking before they write, so a summary request that inherits the session's
+ * thinking level and the whole output limit can end at the cap with only a character of summary
+ * (a length stop Pi rejects), or stop with nothing usable (which Pi committed). The first attempt
+ * asks for at most 32K tokens at no more than low reasoning; a truncated, empty or implausibly
+ * short summary (under 400 characters, or under 1/50 of the summarized text when that is smaller)
+ * is retried once with the model's whole output limit and its lowest reasoning level. A second
+ * failure is returned as an error naming both, so every caller keeps what it would have replaced.
+ */
+const SUMMARY_GUARD = `const EXP_SUMMARY_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+/** exp-code: the first summary attempt's output limit, when the model allows that much. */
+export const EXP_SUMMARY_OUTPUT_TOKENS = 32768;
+function expSummaryRank(level) {
+    return EXP_SUMMARY_LEVELS.indexOf(level);
+}
+/** exp-code: the reasoning level of the first attempt (at most low) and of the retry (the lowest). */
+export function summaryThinkingLevels(model, requested) {
+    const supported = model.reasoning ? getSupportedThinkingLevels(model) : ["off"];
+    const lowest = supported.reduce((a, b) => (expSummaryRank(b) < expSummaryRank(a) ? b : a), supported[0] ?? "off");
+    const cap = Math.min(expSummaryRank(requested ?? "off"), expSummaryRank("low"));
+    const first = supported.filter((level) => expSummaryRank(level) <= cap).reduce((a, b) => (expSummaryRank(b) > expSummaryRank(a) ? b : a), lowest);
+    return { first, retry: lowest };
+}
+function expSummaryInputChars(context) {
+    let chars = 0;
+    for (const message of context.messages) {
+        if (typeof message.content === "string")
+            chars += message.content.length;
+        else if (Array.isArray(message.content))
+            for (const block of message.content)
+                if (block.type === "text")
+                    chars += block.text.length;
+    }
+    return chars;
+}
+/** exp-code: why a finished summary must not be committed, or undefined when it may. */
+export function getSummaryProblem(response, inputChars) {
+    if (response.stopReason === "error" || response.stopReason === "aborted")
+        return undefined;
+    if (response.content.some((block) => block.type === "toolCall"))
+        return undefined;
+    if (response.stopReason === "length")
+        return "the summary was cut off at the output limit";
+    const text = contentText(response.content).trim();
+    if (text === "")
+        return "the summary came back empty";
+    const minimum = Math.min(400, Math.floor(inputChars / 50));
+    if (text.length < minimum)
+        return \`the summary came back implausibly short (\${text.length} characters for \${inputChars} characters of conversation)\`;
+    return undefined;
+}
+function expSummaryOptions(options, level, maxTokens) {
+    const next = { ...options, maxTokens };
+    if (level === "off")
+        delete next.reasoning;
+    else
+        next.reasoning = level;
+    return next;
+}
+/**
+ * Shared choke point for every compaction/branch-summary summarization call. Each attempt is
+ * wrapped in {@link retryAssistantCall} so transient stream drops honor the configured retry
+ * policy. exp-code guards the answer: see getSummaryProblem and summaryThinkingLevels.
+ */
+export async function completeSummarization(model, context, options, streamFn, retry, callbacks) {
+    // Avoid cache writes for one-off summaries. Reuse caller-supplied routing when available;
+    // callers without a session ID, including branch summaries, receive a fresh routing ID.
+    const requestOptions = {
+        ...options,
+        cacheRetention: "none",
+        sessionId: options.sessionId ?? uuidv7(),
+    };
+    const produce = (attemptOptions) => async () => streamFn
+        ? (await streamFn(model, context, attemptOptions)).result()
+        : completeSimple(model, context, attemptOptions);
+    const levels = summaryThinkingLevels(model, requestOptions.reasoning);
+    const modelMax = model.maxTokens > 0 ? model.maxTokens : EXP_SUMMARY_OUTPUT_TOKENS;
+    const firstMax = Math.min(modelMax, EXP_SUMMARY_OUTPUT_TOKENS);
+    const retryMax = Math.max(firstMax, modelMax);
+    const inputChars = expSummaryInputChars(context);
+    const first = await retryAssistantCall(produce(expSummaryOptions(requestOptions, levels.first, firstMax)), retry, requestOptions.signal, callbacks);
+    const firstProblem = getSummaryProblem(first, inputChars);
+    if (firstProblem === undefined || requestOptions.signal?.aborted)
+        return first;
+    const second = await retryAssistantCall(produce(expSummaryOptions(requestOptions, levels.retry, retryMax)), retry, requestOptions.signal, callbacks);
+    const usage = first.usage && second.usage ? combineUsage(first.usage, second.usage) : second.usage;
+    const secondProblem = getSummaryProblem(second, inputChars);
+    if (secondProblem === undefined)
+        return { ...second, usage };
+    const reasoning = levels.retry === "off" ? "reasoning off" : \`\${levels.retry} reasoning\`;
+    return {
+        ...second,
+        usage,
+        stopReason: "error",
+        errorMessage: \`\${firstProblem}, and a retry with up to \${retryMax} output tokens and \${reasoning} failed too (\${secondProblem})\`,
+    };
+}
+`;
+
+/** The automatic-compaction pause (core/agent-session.js): keyed by session and model. */
+const AUTO_COMPACTION_PAUSE_STATE = `    _overflowRecoveryAttempted = false;
+    /** exp-code: the session and model whose automatic compaction failed; it is not retried for them. */
+    _autoCompactionPausedFor = undefined;
+    _autoCompactionKey(model) {
+        return \`\${this.sessionManager.getSessionId()}\\0\${model.provider}/\${model.id}\`;
+    }
+    _autoCompactionPaused() {
+        return this.model !== undefined && this._autoCompactionPausedFor === this._autoCompactionKey(this.model);
+    }
+    // Branch summarization state`;
+
+/** What a compaction failure tells the user (core/agent-session.js). `model` is set for automatic compaction. */
+const COMPACTION_FAILURE_ADVICE = `/** exp-code: what a failed compaction kept, and what to do next. */
+function compactionFailureAdvice(message, model) {
+    const stop = /[.!?]$/.test(message.trim()) ? "" : ".";
+    // Failures before any summary was asked for (nothing to compact, no key) change nothing either.
+    if (!/summarization failed/i.test(message))
+        return model ? \`\${stop} Automatic compaction is paused for \${model.id} in this session; run /compact to try again.\` : "";
+    const kept = \`\${stop} The conversation was kept unchanged.\`;
+    const paused = model ? \` Automatic compaction is paused for \${model.id} in this session.\` : "";
+    return \`\${kept}\${paused} Run /compact to try again, /model to switch to another model, or /new to start a fresh session.\`;
+}`;
+
+const HELP_ENVIRONMENT =`\${chalk.bold("Environment Variables:")}
   EXP_API_KEY                      - Hosted Experiential gateway key (or run exp-code login)
   EXP_GATEWAY_KEY                  - Key of a local exp gateway
   EXP_CODE_MODEL                   - Default model alias
@@ -308,6 +432,61 @@ export const PI_PATCHES: FilePatch[] = [
         replace:
           '    getCompactionReserveTokens(model) {\n        const reserveTokens = this.getCompactionTokenSetting("reserveTokens", model);\n        if (!model || !(model.contextWindow > 0) || !(model.maxTokens > 0))\n            return reserveTokens;\n        const promptBudget = Math.max(0, model.contextWindow - model.maxTokens);\n        return model.maxTokens + Math.min(reserveTokens, Math.floor(promptBudget / 4));\n    }'
       }
+    ]
+  },
+  {
+    // A summary replaces the conversation it summarizes (compaction, a split turn's prefix, a
+    // branch summary), so it is checked before Pi commits it. Every summary request goes through
+    // `completeSummarization`, which now asks for a bounded output (32K tokens, or the model's
+    // maximum when smaller) at low reasoning, rejects a truncated, empty or implausibly short
+    // answer, and retries once with the model's whole output allowance and its lowest reasoning
+    // level. When the retry fails too, it reports an error, so Pi keeps the conversation as it was.
+    pkg: "pi-coding-agent",
+    file: "core/compaction/compaction.js",
+    edits: [
+      { find: 'import { completeSimple } from "@earendil-works/pi-ai/compat";', replace: 'import { completeSimple, getSupportedThinkingLevels } from "@earendil-works/pi-ai/compat";' },
+      { from: "/**\n * Shared choke point for every compaction/branch-summary summarization call. Wraps the", to: "/**\n * Generate a summary of the conversation using the LLM.", replace: SUMMARY_GUARD }
+    ]
+  },
+  {
+    pkg: "pi-coding-agent",
+    file: "core/agent-session.js",
+    edits: [
+      {
+        // A model without a remembered level starts at the default level (medium unless the user
+        // saved another default), clamped to what the model accepts. Pi carried the previous model's
+        // level instead, so a level clamped to "off" on a model that cannot think stayed "off" on
+        // the next one, which then reasoned at its route's default while the footer said "thinking off".
+        find: "        return this.settingsManager.getDefaultThinkingLevel() ?? this.thinkingLevel ?? DEFAULT_THINKING_LEVEL;\n    }\n    _clampThinkingLevel(",
+        replace: "        return this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;\n    }\n    _clampThinkingLevel("
+      },
+      // A failed automatic compaction keeps the conversation, says so with what to do next, and
+      // pauses automatic compaction for that model in that session, so it is not retried (and
+      // paid for) before every later model call. A successful compaction or another model resumes it.
+      { find: "    _overflowRecoveryAttempted = false;\n    // Branch summarization state", replace: AUTO_COMPACTION_PAUSE_STATE },
+      {
+        find: "        const settings = this.settingsManager.getCompactionSettings(this.model);\n        if (!settings.enabled)\n            return false;\n        // Skip if message was aborted",
+        replace: "        const settings = this.settingsManager.getCompactionSettings(this.model);\n        if (!settings.enabled || this._autoCompactionPaused())\n            return false;\n        // Skip if message was aborted"
+      },
+      {
+        find: "        let cancelledByExtension = false;\n        try {\n            if (!model) {\n                return false;\n            }\n            const pathEntries = this.sessionManager.getBranch();",
+        replace: "        let cancelledByExtension = false;\n        try {\n            if (!model || this._autoCompactionPaused()) {\n                return false;\n            }\n            const pathEntries = this.sessionManager.getBranch();"
+      },
+      {
+        find: "            this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);",
+        replace: "            this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);\n            this._autoCompactionPausedFor = undefined;",
+        count: 2
+      },
+      {
+        find: "            const errorMessage = aborted ? undefined : `Compaction failed: ${message}`;",
+        replace: "            const errorMessage = aborted ? undefined : `Compaction failed: ${message}${compactionFailureAdvice(message, undefined)}`;"
+      },
+      {
+        find: "                const errorMessage = aborted\n                    ? undefined\n                    : reason === \"overflow\"\n                        ? `Context overflow recovery failed: ${message}`\n                        : `Auto-compaction failed: ${message}`;",
+        replace:
+          "                if (!aborted && model)\n                    this._autoCompactionPausedFor = this._autoCompactionKey(model);\n                const errorMessage = aborted\n                    ? undefined\n                    : reason === \"overflow\"\n                        ? `Context overflow recovery failed: ${message}${compactionFailureAdvice(message, model)}`\n                        : `Auto-compaction failed: ${message}${compactionFailureAdvice(message, model)}`;"
+      },
+      { find: "export class AgentSession {", replace: `${COMPACTION_FAILURE_ADVICE}\nexport class AgentSession {` }
     ]
   },
   {
