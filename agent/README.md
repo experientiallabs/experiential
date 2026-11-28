@@ -12,8 +12,8 @@ Experiential platform.
   search and page reading (`web_search`, `web_fetch`), and document skills for Word, Excel,
   PowerPoint, PDF, charts, and data analysis.
 - **A full terminal agent.** An interactive terminal UI, sessions you can continue, automatic
-  context compaction, `/model` to switch models, your own extensions, skills and MCP servers,
-  and print, JSON and RPC modes for scripts.
+  context compaction, `/model` to switch models, `/usage` for the session's tokens and cost,
+  your own extensions, skills and MCP servers, and print, JSON and RPC modes for scripts.
 - **A headless runner.** A file-protocol runner that executes one agent run inside a sandbox,
   for products that host agent sessions.
 
@@ -177,6 +177,41 @@ service outside Experiential; `/export` saves a session as HTML or JSONL.
 
 The first interactive start installs the two file-search helpers (`fd` and `rg`) into
 `~/.exp-code/agent/bin` when they are not on your `PATH`, with one line of progress.
+
+## Session usage
+
+`/usage` (or `/cost`) shows what the current session has used so far, in one block:
+
+```text
+Usage · session 01a21fa5, started 2026-11-28 00:54Z
+  Time          24.5s since start · model 814ms
+  Activity      2 prompts · 2 model calls
+  Tokens        7,300 input (3,800 cached) · 420 output (180 reasoning) · 7,720 total
+  Cost          $0.0533 charged · $0.000912 free (list value, not charged)
+  Context       4,380 / 128,000 tokens (3%) on fast-model
+
+  Model                     Calls  Input  Cached  Output     Cost  Out tok/s
+  experiential-large-model      1  3,100       0     240  $0.0533      586.8
+  fast-model                    1  4,200   3,800     180     free      444.4
+
+  Organization  Acme Labs · 1,734.57 credits left ($17.35) · today (UTC) $1.235 charged over 42 requests
+  History and per-request detail: https://platform.experientiallabs.ai/spend
+```
+
+| Line | Where it comes from |
+|---|---|
+| Time | Wall time since the session was created, plus the summed response time of every model call (`model`) and tool run (`tools`). A resumed session also says how long ago it was opened here and how many of its calls came before. |
+| Activity | Your prompts, and every model call the session file records on any branch, including failed calls, compaction summaries and cache warming. |
+| Tokens | Each call's reported usage: input is the whole prompt, with the cached part and any cache writes; output includes reasoning tokens when the model reports them. |
+| Cost | The settled cost the gateway reported on each call (`usage.cost`), summed exactly in nano-dollars. Calls on your own provider key and free or discounted calls show their list value separately; neither is charged. A call with no reported price is counted as unpriced, never estimated. |
+| Context | The same figure as the footer: tokens in the current context over the model's window. |
+| Model table | One row per model used (switch with `/model`); `Out tok/s` is output tokens over response time. |
+| Organization | With a hosted key: the credit balance (`GET /api/v1/credits`) and today's UTC spend (`GET /api/gateway/usage/daily`), read with the same key. It waits at most 3 seconds and turns into a one-line note when the read fails or the gateway is a local `exp` gateway. |
+
+A response still streaming is added when it finishes. A `web_search` makes its own gateway call,
+which the dashboard shows but `/usage` does not yet count. In the terminal UI the block is not sent
+to the model; in RPC mode it arrives as a notice. `/session` still shows the session file and
+message counts.
 
 ## The extension
 

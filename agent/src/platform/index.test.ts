@@ -12,9 +12,12 @@ const local: GatewayConfig = { kind: "local", baseUrl: "http://127.0.0.1:8000/v1
 
 function fakePi() {
   const tools: string[] = [];
+  const commands: string[] = [];
   const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
   const api = {
     registerTool: (tool: { name: string }) => tools.push(tool.name),
+    registerCommand: (name: string) => commands.push(name),
+    registerEntryRenderer: () => {},
     registerProvider: () => {},
     on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => handlers.set(event, [...(handlers.get(event) ?? []), handler])
   };
