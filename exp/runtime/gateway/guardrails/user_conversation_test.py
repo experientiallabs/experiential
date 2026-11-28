@@ -72,7 +72,7 @@ def test_empty_followup_preserves_user_turn_boundary() -> None:
             GatewayMessage(role="user", content=""),
         )
     )
-    assert state == '[previous user]\n"earlier"\n\n[latest user]\n""'
+    assert state == '[latest user]\n{"user_turns": ["earlier", ""]}'
 
 
 def test_overflowing_many_turns_keeps_a_chronological_recent_suffix() -> None:
@@ -178,7 +178,8 @@ def test_large_boundary_cut_uses_a_configurable_token_heuristic() -> None:
         )
     )
     assert 2900 <= len(state.encode()) <= 3000
-    assert '[latest user]\n"please"' in state
+    assert state.startswith("[latest user]\n")
+    assert state.endswith(', "please"]}')
 
 
 def test_agent_authored_text_is_not_human_user_content() -> None:
@@ -225,9 +226,9 @@ def test_user_text_cannot_create_structural_role_boundaries(separator: str) -> N
         )
     )
     lines = state.splitlines()
-    assert lines[0] == "[previous user]"
-    assert json.loads(lines[1]) == first
-    assert lines[2:] == ["", "[latest user]", '"please"']
+    assert len(lines) == 2
+    assert lines[0] == "[latest user]"
+    assert json.loads(lines[1]) == {"user_turns": [first, "please"]}
 
 
 @pytest.mark.parametrize("current", ["please", " " * 10000])
@@ -241,5 +242,5 @@ def test_blank_padding_cannot_evict_prior_user_requests(current: str) -> None:
         )
     )
     assert "harmful original request" in state
-    assert state.endswith('[latest user]\n"please"' if current.strip() else '[latest user]\n""')
+    assert state.endswith(', "please"]}' if current.strip() else ', ""]}')
     assert len(state.encode()) <= 200
