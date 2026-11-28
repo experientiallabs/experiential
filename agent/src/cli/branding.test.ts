@@ -34,10 +34,10 @@ describe("startup header", () => {
 
 describe("update notice", () => {
   /** Run the extension's session_start handler with a recording UI. */
-  function start(notice: Promise<string | undefined>, hasUI = true) {
+  function start(notice: Promise<string | undefined>, hasUI = true, notes: string[] = []) {
     const handlers: ((event: unknown, ctx: unknown) => void)[] = [];
     const notified: string[] = [];
-    createBrandingExtension("1.0.0", notice)({ on: (_name: string, handler: (event: unknown, ctx: unknown) => void) => handlers.push(handler) } as never);
+    createBrandingExtension("1.0.0", notice, notes)({ on: (_name: string, handler: (event: unknown, ctx: unknown) => void) => handlers.push(handler) } as never);
     const ctx = { hasUI, ui: { setHeader: () => undefined, notify: (line: string) => notified.push(line) } };
     return { notified, fire: () => handlers.forEach((handler) => handler({}, ctx)) };
   }
@@ -48,6 +48,14 @@ describe("update notice", () => {
     fire();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(notified).toEqual(["exp-code 1.0.1 is available"]);
+  });
+
+  it("shows the startup notes once, before the update notice", async () => {
+    const { notified, fire } = start(Promise.resolve("exp-code 1.0.1 is available"), true, ["the gateway no longer lists x, your saved model; using y"]);
+    fire();
+    fire();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(notified).toEqual(["the gateway no longer lists x, your saved model; using y", "exp-code 1.0.1 is available"]);
   });
 
   it("shows nothing without a newer release or without a UI", async () => {

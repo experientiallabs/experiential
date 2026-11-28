@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
 import { applyFilePatch, PI_PATCHES, PiPatchError, patchFor, patchSource } from "./pi-patches.js";
 
@@ -50,5 +50,52 @@ describe("Pi as tests load it", () => {
   it("is patched (the test setup installs the load hook)", async () => {
     const config = await import("@earendil-works/pi-coding-agent");
     expect(config.CONFIG_DIR_NAME).toBe(".exp-code");
+  });
+});
+
+describe("context window and compaction", () => {
+  // A gateway model as toProviderModel builds it: the whole window, and the output reservation.
+  const sol = { provider: "experiential", id: "experiential-large-model", contextWindow: 1_050_000, maxTokens: 128_000 };
+
+  it("compacts before the prompt reaches the window less the model's output reservation", async () => {
+    const { SettingsManager, shouldCompact } = await import("@earendil-works/pi-coding-agent");
+    const settings = SettingsManager.inMemory().getCompactionSettings(sol as never);
+    // 1,050,000 - 128,000 = 922,000 is all the provider accepts as prompt; Pi's 16,384 headroom
+    // sits below that.
+    expect(settings.reserveTokens).toBe(128_000 + 16_384);
+    expect(shouldCompact(905_616, sol.contextWindow, settings)).toBe(false);
+    expect(shouldCompact(905_617, sol.contextWindow, settings)).toBe(true);
+    // Unpatched Pi compacted only above 1,033,616, past the 922,000-token prompt budget.
+    expect(shouldCompact(922_001, sol.contextWindow, settings)).toBe(true);
+  });
+
+  it("keeps a configured headroom, capped so a small window still holds a conversation", async () => {
+    const { SettingsManager } = await import("@earendil-works/pi-coding-agent");
+    expect(SettingsManager.inMemory({ compaction: { reserveTokens: 50_000 } }).getCompactionSettings(sol as never).reserveTokens).toBe(178_000);
+    // 32k window, 16k output: a 16k prompt budget keeps a quarter of it as headroom.
+    expect(SettingsManager.inMemory().getCompactionSettings({ ...sol, contextWindow: 32_768, maxTokens: 16_384 } as never).reserveTokens).toBe(16_384 + 4_096);
+    expect(SettingsManager.inMemory().getCompactionSettings(undefined).reserveTokens).toBe(16_384);
+  });
+
+  it("shows a 1,050,000-token window as 1.05M in the footer", async () => {
+    const footer = await import(pathToFileURL(installedFile("pi-coding-agent", "modes/interactive/components/footer.js")).href);
+    expect(footer.formatTokens(1_050_000)).toBe("1.05M");
+    expect(footer.formatTokens(1_048_576)).toBe("1.05M");
+    expect(footer.formatTokens(1_000_000)).toBe("1M");
+    expect(footer.formatTokens(128_000)).toBe("128k");
+  });
+});
+
+describe("remembered choices", () => {
+  const patched = (file: string) => patchSource(installedFile("pi-coding-agent", file), readFileSync(installedFile("pi-coding-agent", file), "utf8"));
+
+  it("save a model picked with Enter, /model <name> or Ctrl+P, and a thinking level for its model", () => {
+    const source = patched("modes/interactive/interactive-mode.js");
+    expect(source).not.toContain("setModel(model, { persist: false })");
+    expect(source).not.toContain("setModel(model, { persist })");
+    expect(source).toContain("this.session.cycleModel(direction, { persist: true })");
+    expect(source.match(/this\.rememberThinkingLevel\(\);/g)).toHaveLength(2);
+    expect(source).toContain("this.settingsManager.setModelThinkingLevel(model.provider, model.id, this.session.thinkingLevel)");
+    expect(patched("modes/interactive/components/model-selector.js")).toContain("to select (remembered for next time)");
   });
 });

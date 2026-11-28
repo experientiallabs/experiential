@@ -1,26 +1,32 @@
 /**
  * The gateway's model catalog, as Pi model definitions.
  *
- * `GET /v1/models` lists the aliases the key may call. The hosted and local gateways return plain
- * OpenAI model objects (`id`, `object`, `created`, `owned_by`); optional limits and modalities are
- * read when a listing carries them, with conservative defaults otherwise. Listings are cached
- * briefly in memory and, when a cache directory is given, on disk, so startup does not wait on the
- * network every time.
+ * `GET /v1/models` lists the aliases the key may call. The hosted and local gateways return OpenAI
+ * model objects (`id`, `object`, `created`, `owned_by`) extended with the catalog's facts:
+ * `context_window_tokens`, `maximum_output_tokens`, `supports_reasoning`, `supports_image_input`,
+ * and on the hosted gateway `supported_reasoning_efforts`. Each is read when the listing carries
+ * it, with conservative defaults otherwise. Listings are cached briefly in memory and, when a
+ * cache directory is given, on disk, so startup does not wait on the network every time.
  */
 
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { ThinkingLevelMap } from "@earendil-works/pi-ai";
 import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import type { GatewayConfig, GatewayKind } from "./config.js";
 
 /** One callable alias and whatever limits its listing states. */
 export interface ListedModel {
   id: string;
+  /** The whole window: prompt plus the model's maximum output (`context_window_tokens`). */
   contextWindow?: number;
+  /** The model's maximum output (`maximum_output_tokens`). */
   maxTokens?: number;
   vision?: boolean;
   reasoning?: boolean;
+  /** The reasoning efforts the route accepts (`supported_reasoning_efforts`); absent when unstated. */
+  reasoningEfforts?: string[];
 }
 
 /** Wire APIs the gateway serves that Pi can speak. */
@@ -31,6 +37,11 @@ export const DEFAULT_MAX_TOKENS = 32_000;
 /** How long a listing is reused before the gateway is asked again. */
 export const MODEL_CACHE_TTL_MS = 5 * 60_000;
 const LISTING_TIMEOUT_MS = 10_000;
+/**
+ * Bumped when the cached shape changes, so a listing an older release cached (without the limits
+ * this one reads) is fetched again instead of reused.
+ */
+const LISTING_CACHE_VERSION = "v2";
 
 const WIRE_ALIASES: Record<string, GatewayWireApi> = {
   completions: "openai-completions",
@@ -80,20 +91,35 @@ function record(value: unknown): Record<string, unknown> | undefined {
 export function parseListedModel(entry: unknown): ListedModel | undefined {
   const object = record(entry);
   if (object === undefined || typeof object.id !== "string" || object.id.trim() === "") return undefined;
-  const topProvider = record(object.top_provider);
-  const architecture = record(object.architecture);
-  const modalities = object.input_modalities ?? architecture?.input_modalities;
   const model: ListedModel = { id: object.id };
-  const contextWindow = positiveInteger(object.context_window) ?? positiveInteger(object.context_length);
-  const maxTokens =
-    positiveInteger(object.max_output_tokens) ??
-    positiveInteger(object.max_completion_tokens) ??
-    positiveInteger(topProvider?.max_completion_tokens);
+  const contextWindow = positiveInteger(object.context_window_tokens);
+  const maxTokens = positiveInteger(object.maximum_output_tokens);
   if (contextWindow !== undefined) model.contextWindow = contextWindow;
   if (maxTokens !== undefined) model.maxTokens = maxTokens;
-  if (Array.isArray(modalities)) model.vision = modalities.includes("image");
+  if (typeof object.supports_image_input === "boolean") model.vision = object.supports_image_input;
   if (typeof object.supports_reasoning === "boolean") model.reasoning = object.supports_reasoning;
+  const efforts = object.supported_reasoning_efforts;
+  if (Array.isArray(efforts) && efforts.length > 0 && efforts.every((effort) => typeof effort === "string")) model.reasoningEfforts = efforts;
   return model;
+}
+
+/** Pi's thinking levels in order; `off` is the gateway's `none` effort. */
+const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+/**
+ * The Pi thinking-level map for a route's supported efforts: each level the route accepts maps to
+ * its gateway effort and every other level to null, which Pi reads as unsupported, so `/thinking`
+ * and Shift+Tab offer only what the model takes. Efforts Pi has no level for (`ultra`) are left
+ * out. Undefined when the listing states no efforts (a local gateway): Pi's defaults apply.
+ */
+export function thinkingLevelMap(efforts: string[] | undefined): ThinkingLevelMap | undefined {
+  if (efforts === undefined) return undefined;
+  const map: ThinkingLevelMap = {};
+  for (const level of PI_THINKING_LEVELS) {
+    const effort = level === "off" ? "none" : level;
+    map[level] = efforts.includes(effort) ? effort : null;
+  }
+  return map;
 }
 
 /** Parse a `GET /v1/models` body into listed models, dropping malformed entries. */
@@ -111,6 +137,9 @@ export function toProviderModel(listed: ListedModel, config: GatewayConfig, wire
   // its whole window as output can never fit the agent's prompt. Reserve at most half the window,
   // whatever the listing allows.
   const maxTokens = Math.max(1, Math.min(listed.maxTokens ?? DEFAULT_MAX_TOKENS, Math.floor(contextWindow / 2)));
+  const levels = thinkingLevelMap(listed.reasoningEfforts);
+  // A route whose only effort is `none` cannot think, whatever `supports_reasoning` says.
+  const thinks = levels === undefined ? (listed.reasoning ?? api !== "openai-completions") : listed.reasoning !== false && Object.entries(levels).some(([level, effort]) => level !== "off" && effort !== null);
   return {
     type: "chat",
     id: listed.id,
@@ -118,10 +147,16 @@ export function toProviderModel(listed: ListedModel, config: GatewayConfig, wire
     api,
     // The Anthropic SDK appends /v1/messages itself, so its base is the gateway origin.
     baseUrl: api === "anthropic-messages" ? config.baseUrl.replace(/\/v1$/, "") : config.baseUrl,
-    reasoning: listed.reasoning ?? api !== "openai-completions",
+    reasoning: thinks,
+    ...(thinks && levels !== undefined ? { thinkingLevelMap: levels } : {}),
     input: listed.vision === true ? ["text", "image"] : ["text"],
     // The gateway reports the settled cost of every call; catalog prices are not needed.
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    // The whole window, as the gateway states it: the footer shows it (1.05M for a 1,050,000-token
+    // model). It is NOT the prompt budget: the provider counts the model's whole output reservation
+    // inside the window, so a prompt may only grow to `contextWindow - maxTokens`. Auto-compaction
+    // reserves `maxTokens` on top of its own headroom (see the settings-manager edit in
+    // pi-patches.ts), so it runs before the prompt reaches that budget.
     contextWindow,
     maxTokens
   };
@@ -176,10 +211,11 @@ async function writeDiskCache(dir: string, path: string, listing: CachedListing)
     // Stored in the parsed shape so a later read goes through the same validation.
     const models = listing.models.map((model) => ({
       id: model.id,
-      context_window: model.contextWindow,
-      max_output_tokens: model.maxTokens,
-      input_modalities: model.vision === undefined ? undefined : model.vision ? ["text", "image"] : ["text"],
-      supports_reasoning: model.reasoning
+      context_window_tokens: model.contextWindow,
+      maximum_output_tokens: model.maxTokens,
+      supports_image_input: model.vision,
+      supports_reasoning: model.reasoning,
+      supported_reasoning_efforts: model.reasoningEfforts
     }));
     await writeFile(temp, JSON.stringify({ fetchedAt: listing.fetchedAt, models }), { mode: 0o600 });
     await rename(temp, path);
@@ -214,7 +250,7 @@ export async function fetchGatewayModels(config: GatewayConfig, options: FetchMo
   const fresh = (entry: CachedListing | undefined) => entry !== undefined && now() - entry.fetchedAt < ttl;
   const memory = memoryCache.get(key);
   if (fresh(memory)) return memory!.models;
-  const diskPath = options.cacheDir === undefined ? undefined : join(options.cacheDir, `models-${key}.json`);
+  const diskPath = options.cacheDir === undefined ? undefined : join(options.cacheDir, `models-${LISTING_CACHE_VERSION}-${key}.json`);
   if (diskPath !== undefined) {
     const disk = await readDiskCache(diskPath);
     if (fresh(disk)) {

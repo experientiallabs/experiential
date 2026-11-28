@@ -1,10 +1,13 @@
 /**
- * The default model for a CLI invocation.
+ * The model a CLI invocation starts on.
  *
- * When the user names no model and is not resuming a session, exp-code starts on a gateway
- * model: `EXP_CODE_MODEL` when set, otherwise `experiential-large-model` when the gateway lists
- * it, otherwise the first alias the gateway lists. A model saved in exp-code's settings (chosen
- * earlier with `/model`) or named with `--model` always wins.
+ * When the user names no model and is not resuming a session, the start model is, in order:
+ * `EXP_CODE_MODEL` when set (for this run only, never saved); else the model saved in exp-code's
+ * settings, which every explicit choice in the terminal UI writes (`/model`, Ctrl+P, see
+ * pi-patches.ts); else `experiential-large-model` when the gateway lists it; else the first alias
+ * it lists. A saved gateway model the gateway no longer lists falls back to that default with a
+ * one-line note, and stays saved so it is used again once it is listed. `--model` always wins and
+ * is never saved either.
  *
  * Every model runs through the gateway: exp-code registers none of Pi's direct vendor providers
  * (see pi-patches.ts). A selection that still names one, such as `google/gemini-4-neon` saved by
@@ -21,23 +24,44 @@ import { GATEWAY_PROVIDER_ID, LARGE_MODEL_ALIAS } from "../gateway/config.js";
 /** Pi subcommands that take no model. */
 const SUBCOMMANDS = new Set(["auth", "install", "remove", "uninstall", "update", "list", "config", "mcp"]);
 
-/** Whether this invocation should get an injected `--model`. */
-export function wantsDefaultModel(args: string[], parsed: Args, agentDir: string): boolean {
+/** Whether this invocation picks its own start model (it names none and resumes no session). */
+export function wantsDefaultModel(args: string[], parsed: Args): boolean {
   if (args[0] !== undefined && SUBCOMMANDS.has(args[0])) return false;
   if (parsed.help || parsed.version || parsed.export !== undefined || parsed.listModels !== undefined) return false;
   if (parsed.model !== undefined || parsed.provider !== undefined || (parsed.models?.length ?? 0) > 0) return false;
   if (parsed.continue || parsed.resume || parsed.session !== undefined || parsed.sessionId !== undefined || parsed.fork !== undefined) return false;
-  return savedDefaultModel(agentDir) === undefined;
+  return true;
 }
 
-/** The `defaultModel` saved in exp-code's global settings, if any. */
-export function savedDefaultModel(agentDir: string): string | undefined {
-  try {
-    const settings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf8")) as { defaultModel?: unknown };
-    return typeof settings.defaultModel === "string" && settings.defaultModel !== "" ? settings.defaultModel : undefined;
-  } catch {
-    return undefined;
+/** The model saved in exp-code's global settings, if any. */
+export function savedDefaultModel(agentDir: string): { provider: string | undefined; id: string } | undefined {
+  const settings = readSettings(agentDir);
+  const id = settings?.defaultModel;
+  if (typeof id !== "string" || id === "") return undefined;
+  return { provider: typeof settings?.defaultProvider === "string" ? settings.defaultProvider : undefined, id };
+}
+
+/** What to start on: a gateway alias to pass as `--model` (none leaves Pi on the saved model), and a note to print. */
+export interface StartModel {
+  id?: string;
+  note?: string;
+}
+
+/**
+ * Choose the start model (see the module comment). `listed` is the gateway's aliases, undefined
+ * when the listing failed: a saved model is then left to Pi rather than replaced blind.
+ */
+export function startModel(listed: string[] | undefined, configured: string | undefined, saved: { provider: string | undefined; id: string } | undefined): StartModel {
+  const wanted = configured?.trim();
+  if (wanted) return { id: wanted };
+  // A model a user's own extension provides is not the gateway's to judge.
+  if (saved !== undefined && saved.provider !== undefined && saved.provider !== GATEWAY_PROVIDER_ID) return {};
+  if (saved !== undefined) {
+    if (listed === undefined || listed.includes(saved.id)) return {};
+    const fallback = defaultModelId(listed, undefined);
+    return fallback === undefined ? {} : { id: fallback, note: `the gateway no longer lists ${saved.id}, your saved model; using ${fallback}` };
   }
+  return listed === undefined ? {} : { id: defaultModelId(listed, undefined) };
 }
 
 /** Pick the alias: the configured one when set, else the large model when listed, else the first listed. */
