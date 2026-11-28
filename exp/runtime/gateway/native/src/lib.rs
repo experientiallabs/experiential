@@ -44,6 +44,7 @@ mod permit_queue;
 mod rate_limit_headers;
 mod reasoning_display;
 mod reasoning_estimate;
+mod reasonless_rejection;
 mod rejection_shapes;
 mod relay;
 mod relayed_gemini_block;
