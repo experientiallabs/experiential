@@ -3,7 +3,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { GatewayConfig } from "./config.js";
-import { cacheKey, chooseWireApi, clearModelCache, DEFAULT_CONTEXT_WINDOW, fetchGatewayModels, parseModelListing, parseWireApi, toProviderModel } from "./models.js";
+import { type Api, getSupportedThinkingLevels, type Model } from "@earendil-works/pi-ai";
+import {
+  cacheKey,
+  chooseWireApi,
+  clearModelCache,
+  DEFAULT_CONTEXT_WINDOW,
+  fetchGatewayModels,
+  parseModelListing,
+  parseWireApi,
+  thinkingLevelMap,
+  toProviderModel
+} from "./models.js";
 
 const hosted: GatewayConfig = { kind: "hosted", baseUrl: "https://gw.example/v1", apiKey: "xpl_secret" };
 
@@ -15,22 +26,71 @@ beforeEach(async () => {
 afterEach(() => rm(dir, { recursive: true, force: true }));
 
 describe("gateway models", () => {
-  it("parses plain OpenAI listings and optional limits", () => {
+  it("parses plain OpenAI listings and the gateway's limits and capabilities", () => {
     const listed = parseModelListing({
       object: "list",
       data: [
         { id: "plain", object: "model", created: 0, owned_by: "exp" },
-        { id: "rich", context_window: 200_000, max_output_tokens: 8_000, input_modalities: ["text", "image"], supports_reasoning: true },
-        { id: "openrouter-shape", context_length: 64_000, top_provider: { max_completion_tokens: 4_000 } },
+        {
+          id: "experiential-large-model",
+          context_window_tokens: 1_050_000,
+          maximum_output_tokens: 128_000,
+          supports_reasoning: false,
+          reasoning_effort: null,
+          supported_reasoning_efforts: []
+        },
+        {
+          id: "gpt-6-luna",
+          context_window_tokens: 1_050_000,
+          maximum_output_tokens: 128_000,
+          supports_image_input: true,
+          supports_reasoning: true,
+          reasoning_effort: "medium",
+          supported_reasoning_efforts: ["none", "low", "medium", "high", "xhigh", "max"]
+        },
+        { id: "bad-limits", context_window_tokens: -5, maximum_output_tokens: 1.5, supported_reasoning_efforts: ["high", 3] },
         { object: "model" }
       ]
     });
     expect(listed).toEqual([
       { id: "plain" },
-      { id: "rich", contextWindow: 200_000, maxTokens: 8_000, vision: true, reasoning: true },
-      { id: "openrouter-shape", contextWindow: 64_000, maxTokens: 4_000 }
+      { id: "experiential-large-model", contextWindow: 1_050_000, maxTokens: 128_000, reasoning: false },
+      { id: "gpt-6-luna", contextWindow: 1_050_000, maxTokens: 128_000, vision: true, reasoning: true, reasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"] },
+      { id: "bad-limits" }
     ]);
     expect(() => parseModelListing({})).toThrow(/no data array/);
+  });
+
+  it("no longer reads the OpenRouter-style names neither gateway sends", () => {
+    // Both gateways exp-code talks to (hosted, and a local `exp` gateway) publish
+    // context_window_tokens / maximum_output_tokens; reading these names silently left every
+    // model on the 128k default.
+    expect(
+      parseModelListing({ data: [{ id: "legacy", context_window: 200_000, context_length: 64_000, max_output_tokens: 8_000, top_provider: { max_completion_tokens: 4_000 } }] })
+    ).toEqual([{ id: "legacy" }]);
+  });
+
+  it("states the gateway's window and output reservation on the Pi model", () => {
+    const [large] = parseModelListing({ data: [{ id: "experiential-large-model", context_window_tokens: 1_050_000, maximum_output_tokens: 128_000, supports_reasoning: false, supported_reasoning_efforts: [] }] });
+    expect(toProviderModel(large!, hosted)).toMatchObject({ contextWindow: 1_050_000, maxTokens: 128_000, reasoning: false });
+    expect(toProviderModel(large!, hosted)).not.toHaveProperty("thinkingLevelMap");
+  });
+
+  it("offers only the thinking levels a route accepts", () => {
+    const levels = (efforts: string[] | undefined, reasoning = true) => {
+      const model = { ...toProviderModel({ id: "m", reasoning, reasoningEfforts: efforts }, hosted), provider: "experiential" } as unknown as Model<Api>;
+      return getSupportedThinkingLevels(model);
+    };
+    expect(levels(["none", "low", "medium", "high", "xhigh", "max"])).toEqual(["off", "low", "medium", "high", "xhigh", "max"]);
+    expect(levels(["none", "high", "max"])).toEqual(["off", "high", "max"]);
+    // No `none`: thinking cannot be turned off on this route.
+    expect(levels(["high", "max", "ultra"])).toEqual(["high", "max"]);
+    expect(levels(["none"])).toEqual(["off"]);
+    expect(levels([], false)).toEqual(["off"]);
+    // A local gateway states no efforts: Pi's own levels apply.
+    expect(levels(undefined)).toEqual(["off", "minimal", "low", "medium", "high"]);
+    expect(thinkingLevelMap(["none", "high"])).toEqual({ off: "none", minimal: null, low: null, medium: null, high: "high", xhigh: null, max: null });
+    expect(toProviderModel({ id: "m", reasoning: true, reasoningEfforts: ["none"] }, hosted)).toMatchObject({ reasoning: false });
   });
 
   it("chooses a wire API per model, with an override", () => {
@@ -58,13 +118,17 @@ describe("gateway models", () => {
       calls += 1;
       auth = (init?.headers as Record<string, string>).authorization ?? "";
       expect(url).toBe("https://gw.example/v1/models");
-      return new Response(JSON.stringify({ data: [{ id: "a" }, { id: "b" }] }));
+      return new Response(
+        JSON.stringify({ data: [{ id: "a", context_window_tokens: 1_050_000, maximum_output_tokens: 128_000, supports_reasoning: true, supported_reasoning_efforts: ["none", "high"] }, { id: "b" }] })
+      );
     }) as typeof globalThis.fetch;
-    expect((await fetchGatewayModels(hosted, { fetch, cacheDir: dir })).map((m) => m.id)).toEqual(["a", "b"]);
+    const first = await fetchGatewayModels(hosted, { fetch, cacheDir: dir });
+    expect(first.map((m) => m.id)).toEqual(["a", "b"]);
     expect(auth).toBe("Bearer xpl_secret");
     await fetchGatewayModels(hosted, { fetch, cacheDir: dir });
     clearModelCache();
-    await fetchGatewayModels(hosted, { fetch, cacheDir: dir });
+    // The disk copy keeps every field, so a cached start states the same limits as a fresh one.
+    expect(await fetchGatewayModels(hosted, { fetch, cacheDir: dir })).toEqual(first);
     expect(calls).toBe(1);
     const [file] = await readdir(dir);
     expect(await readFile(join(dir, file!), "utf8")).not.toContain("xpl_secret");

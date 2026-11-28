@@ -150,10 +150,16 @@ export class ExpCodeHeader extends Text {
 }
 
 /**
- * The extension that installs exp-code's header in the interactive terminal UI and shows the
- * update notice (once, when `updateNotice` resolves to a line).
+ * The extension that installs exp-code's header in the interactive terminal UI and shows, once,
+ * the startup notes (`startNotes`, such as a saved model the gateway no longer lists: the terminal
+ * UI would cover a line printed before it starts) and the update notice when `updateNotice`
+ * resolves to a line.
  */
-export function createBrandingExtension(version: string, updateNotice: Promise<string | undefined> = Promise.resolve(undefined)): ExtensionFactory {
+export function createBrandingExtension(
+  version: string,
+  updateNotice: Promise<string | undefined> = Promise.resolve(undefined),
+  startNotes: string[] = []
+): ExtensionFactory {
   return (pi) => {
     let noticeShown = false;
     pi.on("session_start", (_event, ctx) => {
@@ -161,6 +167,7 @@ export function createBrandingExtension(version: string, updateNotice: Promise<s
       ctx.ui.setHeader((_tui, theme) => new ExpCodeHeader(theme, { version, showMark: !isAppleTerminalSession() }));
       if (noticeShown) return;
       noticeShown = true;
+      for (const note of startNotes) ctx.ui.notify(note, "info");
       void updateNotice.then((line) => {
         if (line !== undefined) ctx.ui.notify(line, "info");
       });

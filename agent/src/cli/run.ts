@@ -20,13 +20,14 @@ import { createBrandingExtension } from "./branding.js";
 import { createSupportCommandsExtension } from "./commands.js";
 import { expCodeHome } from "./environment.js";
 import {
-  defaultModelId,
   directProviderIds,
   gatewayFallback,
   gatewayModelArgs,
   modelArgs,
   repointSavedModel,
+  savedDefaultModel,
   savedDirectModel,
+  startModel,
   wantsDefaultModel
 } from "./model-choice.js";
 import { ensureSearchTools, markUpstreamChangelogSeen } from "./startup.js";
@@ -39,8 +40,8 @@ const HELP_PREFACE = `exp-code ${EXP_CODE_VERSION}: Experiential's coding and co
 
 Models come from the Experiential gateway. \`exp-code login\` signs in through your browser and
 saves a key (\`exp-code login --status\` shows it, \`exp-code logout\` forgets it); EXP_API_KEY (hosted)
-or EXP_GATEWAY_KEY (a local \`exp\` gateway) in the environment take precedence. EXP_CODE_MODEL picks the default model
-(otherwise experiential-large-model when the gateway lists it), EXP_CODE_WIRE (completions, responses, messages) forces the wire API, and EXP_CODE_HOME moves the
+or EXP_GATEWAY_KEY (a local \`exp\` gateway) in the environment take precedence. EXP_CODE_MODEL picks the start model for a run
+(otherwise the model you last chose, else experiential-large-model when the gateway lists it), EXP_CODE_WIRE (completions, responses, messages) forces the wire API, and EXP_CODE_HOME moves the
 configuration directory (default ~/.exp-code), and EXP_CODE_PLATFORM_TOOLS=0 turns off the tools that read
 your organization's Experiential data (request log, usage, models, evals). Every model runs through the
 gateway. \`exp-code update\` updates exp-code. Documentation: ${DOCS_URL}
@@ -95,13 +96,21 @@ export async function runCli(args: string[], env: NodeJS.ProcessEnv = process.en
     return listing;
   };
 
+  // One-line notes about the start model: on stderr, or in the terminal UI, which would cover them.
+  const interactive = !parsed.help && isInteractiveStart(parsed);
+  const startNotes: string[] = [];
+  const note = (line: string): void => {
+    if (interactive) startNotes.push(line);
+    else console.error(`exp-code: ${line}`);
+  };
+
   // Selections that name one of Pi's direct providers move to the gateway.
   const direct = directProviderIds();
   let finalArgs = args;
   if (gatewayModelArgs(args, direct).moved.length > 0) {
     const listed = await listedIds();
     const pointed = gatewayModelArgs(args, direct, (id) => gatewayFallback(id, listed, env.EXP_CODE_MODEL));
-    for (const move of pointed.moved) console.error(`exp-code: every model runs through the Experiential gateway; using ${move.to} for ${move.from}`);
+    for (const move of pointed.moved) note(`every model runs through the Experiential gateway; using ${move.to} for ${move.from}`);
     finalArgs = pointed.args;
   }
   const savedDirect = savedDirectModel(agentDir, direct);
@@ -112,13 +121,14 @@ export async function runCli(args: string[], env: NodeJS.ProcessEnv = process.en
 
   if (gateway === null) {
     if (!parsed.help) console.error(`exp-code: ${resolution.problem}`);
-  } else if (wantsDefaultModel(finalArgs, parsed, agentDir)) {
-    const listed = await listedIds();
-    const chosen = listed === undefined ? undefined : defaultModelId(listed, env.EXP_CODE_MODEL);
-    if (chosen !== undefined) finalArgs = [...modelArgs(chosen), ...finalArgs];
+  } else if (wantsDefaultModel(finalArgs, parsed)) {
+    // The listing is shared with the gateway provider's registration (cached in memory and on
+    // disk), so checking the saved model against it costs no extra request.
+    const start = startModel(env.EXP_CODE_MODEL?.trim() ? undefined : await listedIds(), env.EXP_CODE_MODEL, savedDefaultModel(agentDir));
+    if (start.note !== undefined) note(start.note);
+    if (start.id !== undefined) finalArgs = [...modelArgs(start.id), ...finalArgs];
   }
   process.title = "exp-code";
-  const interactive = !parsed.help && isInteractiveStart(parsed);
   // Started now, shown in the UI when it resolves; it never delays startup.
   const updateNotice = interactive
     ? checkForUpdate({ env, home, currentVersion: EXP_CODE_VERSION, interactive, offline: parsed.offline === true })
@@ -139,7 +149,7 @@ export async function runCli(args: string[], env: NodeJS.ProcessEnv = process.en
           provider: { cacheDir, wire, onListingError: (error) => console.error(`exp-code: ${error.message}`) }
         })
       },
-      { name: "exp-code-branding", hidden: true, factory: createBrandingExtension(EXP_CODE_VERSION, updateNotice) },
+      { name: "exp-code-branding", hidden: true, factory: createBrandingExtension(EXP_CODE_VERSION, updateNotice, startNotes) },
       { name: "exp-code-commands", hidden: true, factory: createSupportCommandsExtension({ version: EXP_CODE_VERSION }) },
       { name: "exp-code-prompt-stash", hidden: true, factory: createPromptStashExtension({ agentDir }) },
       // Last, so its preamble swap sees every other prompt edit.

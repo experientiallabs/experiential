@@ -99,6 +99,47 @@ describe("exp-code CLI", () => {
     }
   });
 
+  it("starts on the saved model and its thinking level; --model and EXP_CODE_MODEL are never saved", async () => {
+    const agentDir = join(home, ".exp-code", "agent");
+    await mkdir(agentDir, { recursive: true });
+    const settings = join(agentDir, "settings.json");
+    const saved = { defaultProvider: "experiential", defaultModel: "thinker", modelThinkingLevels: { "experiential/thinker": "high" } };
+    await writeFile(settings, JSON.stringify(saved));
+    const cache = join(home, ".exp-code", "cache");
+    await rm(cache, { recursive: true, force: true });
+    const model = (id: string) => ({ id, object: "model", created: 0, owned_by: "exp", context_window_tokens: 1_050_000, maximum_output_tokens: 128_000 });
+    const thinker = { ...model("thinker"), supports_reasoning: true, supported_reasoning_efforts: ["none", "high", "max"] };
+    gateway.setModels([model("experiential-large-model"), model("other"), thinker]);
+    const env = { EXP_GATEWAY_KEY: "local-key", EXP_CODE_BASE_URL: gateway.baseUrl };
+    const ask = async (args: string[], extra: NodeJS.ProcessEnv = {}) => {
+      gateway.script([{ text: "ok" }]);
+      const result = await runCli([...args, "-p", "hi"], { ...env, ...extra });
+      return { ...result, body: gateway.completions().at(-1)! };
+    };
+    try {
+      const start = await ask([]);
+      expect(start.body.model).toBe("thinker");
+      expect(start.body.reasoning_effort).toBe("high");
+
+      expect((await ask(["--model", "experiential/other"])).body.model).toBe("other");
+      expect((await ask([], { EXP_CODE_MODEL: "other" })).body.model).toBe("other");
+      expect(JSON.parse(await readFile(settings, "utf8"))).toMatchObject(saved);
+
+      // The gateway stops listing the saved model: the default model, with a note, and the saved
+      // choice is kept for when it is listed again.
+      await rm(cache, { recursive: true, force: true });
+      gateway.setModels([model("experiential-large-model"), model("other")]);
+      const gone = await ask([]);
+      expect(gone.body.model).toBe("experiential-large-model");
+      expect(gone.stderr).toContain("exp-code: the gateway no longer lists thinker, your saved model; using experiential-large-model");
+      expect(JSON.parse(await readFile(settings, "utf8"))).toMatchObject(saved);
+    } finally {
+      await rm(settings, { force: true });
+      await rm(cache, { recursive: true, force: true });
+      gateway.setModels([{ id: "fake-model", object: "model", created: 0, owned_by: "exp" }]);
+    }
+  });
+
   it("reads exp-code's variables and ignores Pi's", async () => {
     const sessions = join(home, "exp-sessions");
     const ignored = join(home, "pi-sessions");

@@ -165,9 +165,21 @@ exp-code -c                               # continue the last session
 `exp-code --help` lists every flag. The JSON and RPC formats are described in the reference
 docs linked under [Acknowledgements](#acknowledgements).
 
-New sessions start on `experiential-large-model` when the gateway lists it (otherwise the first
-alias it lists). `EXP_CODE_MODEL`, `--model`, and a model you chose earlier with `/model` all
-take precedence. When a session's model is not a gateway model, `web_search` runs on
+exp-code remembers your choices. A model you pick (with `/model`, `/model <name>` or Ctrl+P) is
+the one the next session starts on, and a thinking level you pick (Shift+Tab or `/thinking`) is
+kept for that model and used again whenever you select it. Settings changed in `/settings` are
+saved as you change them. `--model` and `EXP_CODE_MODEL` choose the model for one run and are
+never saved. With no saved choice, new sessions start on `experiential-large-model` when the
+gateway lists it (otherwise the first alias it lists). When the gateway no longer lists your saved
+model, the session starts on that default with a one-line note, and your choice is used again once
+the model is listed.
+
+Each model's context window and output limit come from the gateway listing
+(`context_window_tokens`, `maximum_output_tokens`), and `/thinking` and Shift+Tab offer only the
+reasoning levels the model accepts (`supported_reasoning_efforts`). The footer shows the whole
+window (for example `1.05M`). That window includes the model's maximum output, which the provider
+reserves on every request, so automatic compaction runs before the prompt reaches the window less
+that output (about 906K tokens of prompt on a 1.05M window with 128K output). When a session's model is not a gateway model, `web_search` runs on
 `experiential-small-model` if the gateway lists it.
 
 In the terminal UI, `/bug` opens a new GitHub issue for exp-code prefilled with your exp-code

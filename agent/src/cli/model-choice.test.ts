@@ -11,7 +11,9 @@ import {
   gatewayModelArgs,
   modelArgs,
   repointSavedModel,
+  savedDefaultModel,
   savedDirectModel,
+  startModel,
   wantsDefaultModel
 } from "./model-choice.js";
 
@@ -21,7 +23,7 @@ beforeEach(async () => {
 });
 afterEach(() => rm(agentDir, { recursive: true, force: true }));
 
-const wants = (args: string[]) => wantsDefaultModel(args, parseArgs(args), agentDir);
+const wants = (args: string[]) => wantsDefaultModel(args, parseArgs(args));
 
 describe("default model", () => {
   it("is injected for plain prompts and every mode", () => {
@@ -37,10 +39,32 @@ describe("default model", () => {
     }
   });
 
-  it("is left to Pi when a model was saved with /model", () => {
+  it("reads the saved model and its provider", () => {
+    expect(savedDefaultModel(agentDir)).toBeUndefined();
     mkdirSync(agentDir, { recursive: true });
     writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ defaultProvider: "experiential", defaultModel: "saved" }));
-    expect(wants([])).toBe(false);
+    expect(savedDefaultModel(agentDir)).toEqual({ provider: "experiential", id: "saved" });
+  });
+
+  it("starts on EXP_CODE_MODEL for this run, else the saved model, else the default", () => {
+    const listed = ["gpt-6-luna", "experiential-large-model"];
+    const saved = { provider: "experiential", id: "gpt-6-luna" };
+    expect(startModel(listed, " deepseek-v4-flash ", saved)).toEqual({ id: "deepseek-v4-flash" });
+    // The saved model is Pi's to select: no --model is injected, so nothing overrides it.
+    expect(startModel(listed, undefined, saved)).toEqual({});
+    expect(startModel(listed, undefined, undefined)).toEqual({ id: "experiential-large-model" });
+    expect(startModel(undefined, undefined, undefined)).toEqual({});
+  });
+
+  it("falls back to the default with a note when the gateway no longer lists the saved model", () => {
+    expect(startModel(["experiential-large-model", "a"], undefined, { provider: "experiential", id: "retired" })).toEqual({
+      id: "experiential-large-model",
+      note: "the gateway no longer lists retired, your saved model; using experiential-large-model"
+    });
+    // A failed listing proves nothing: the saved model stays.
+    expect(startModel(undefined, undefined, { provider: "experiential", id: "retired" })).toEqual({});
+    // A model from a user's own extension provider is not the gateway's to judge.
+    expect(startModel(["experiential-large-model"], undefined, { provider: "my-ext", id: "x" })).toEqual({});
   });
 
   it("prefers EXP_CODE_MODEL, else experiential-large-model when listed, else the first listed alias", () => {

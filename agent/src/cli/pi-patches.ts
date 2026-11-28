@@ -143,7 +143,12 @@ export const PI_PATCHES: FilePatch[] = [
         find: 'const providerBadge = theme.fg("muted", `[${item.provider}]`);',
         replace: 'const providerBadge = item.provider === "experiential" ? "" : theme.fg("muted", ` [${item.provider}]`);'
       },
-      { find: "${modelText}${nameText} ${providerBadge}${defaultBadge}", replace: "${modelText}${nameText}${providerBadge}${defaultBadge}" }
+      { find: "${modelText}${nameText} ${providerBadge}${defaultBadge}", replace: "${modelText}${nameText}${providerBadge}${defaultBadge}" },
+      // Enter remembers the model too (interactive-mode.js below), so the separate key is not offered.
+      {
+        find: '`  ${keyDisplayText("tui.select.confirm")} to select · ${keyDisplayText("app.models.save")} to set as default · ${keyDisplayText("tui.select.cancel")} to cancel`',
+        replace: '`  ${keyDisplayText("tui.select.confirm")} to select (remembered for next time) · ${keyDisplayText("tui.select.cancel")} to cancel`'
+      }
     ]
   },
   {
@@ -165,7 +170,22 @@ export const PI_PATCHES: FilePatch[] = [
         find: 'return `${model.id} ${theme.fg("muted", `[${model.provider}]`)}`;',
         replace: 'return model.provider === "experiential" ? model.id : `${model.id} ${theme.fg("muted", `[${model.provider}]`)}`;'
       },
-      { find: "instead of Pi's drawn cursor", replace: "instead of the drawn cursor" }
+      { find: "instead of Pi's drawn cursor", replace: "instead of the drawn cursor" },
+      { find: "${cycleThinkingKey} cycles in-session.`", replace: "${cycleThinkingKey} cycles them and remembers the level for the model.`" }
+    ]
+  },
+  {
+    // Enter remembers the level for the current model (interactive-mode.js below); the save key
+    // also makes it the default for models without a remembered level.
+    pkg: "pi-coding-agent",
+    file: "modes/interactive/components/thinking-selector.js",
+    edits: [
+      { find: '`${keyDisplayText("app.thinking.cycle")} cycles thinking levels in-session`', replace: '`${keyDisplayText("app.thinking.cycle")} cycles thinking levels`' },
+      {
+        find: '`  ${keyDisplayText("tui.select.confirm")} to select · ${keyDisplayText("app.thinking.save")} to set as default · ${keyDisplayText("tui.select.cancel")} to cancel`',
+        replace:
+          '`  ${keyDisplayText("tui.select.confirm")} to select (remembered for this model) · ${keyDisplayText("app.thinking.save")} to also make it the default · ${keyDisplayText("tui.select.cancel")} to cancel`'
+      }
     ]
   },
   {
@@ -242,8 +262,60 @@ export const PI_PATCHES: FilePatch[] = [
       { find: "Pi works best with csi-u.", replace: "exp-code works best with csi-u." },
       // Pi's own new-version notice is off (PI_SKIP_VERSION_CHECK); its link still names exp-code's releases.
       { find: 'const changelogUrl = "https://pi.dev/changelog";', replace: 'const changelogUrl = "https://github.com/experientiallabs/experiential/releases?q=exp-code";' },
-      { find: "`pi-clipboard-${crypto.randomUUID()}.${ext}`", replace: "`exp-code-clipboard-${crypto.randomUUID()}.${ext}`" }
+      { find: "`pi-clipboard-${crypto.randomUUID()}.${ext}`", replace: "`exp-code-clipboard-${crypto.randomUUID()}.${ext}`" },
+      // Every explicit choice is remembered for the next start. Pi saves a model only through the
+      // selector's "set as default" key and a thinking level only as the global default from its
+      // selector; picking with Enter, `/model <name>`, Ctrl+P or Shift+Tab lasted one session.
+      // A model choice is saved as the default model; a thinking level is saved for the model it
+      // was chosen on (Pi's per-model thinking levels, applied when that model is selected again).
+      // `--model` and EXP_CODE_MODEL select at startup and are never saved.
+      { find: "await this.session.setModel(model, { persist });", replace: "await this.session.setModel(model, { persist: true });" },
+      {
+        find: "this.showStatus(persist ? `Default model: ${model.provider}/${model.id}` : `Model: ${model.id}`);",
+        replace: "this.showStatus(`Model: ${model.id}`);"
+      },
+      { find: "await this.session.setModel(model, { persist: false });", replace: "await this.session.setModel(model, { persist: true });" },
+      { find: "const result = await this.session.cycleModel(direction);", replace: "const result = await this.session.cycleModel(direction, { persist: true });" },
+      {
+        find: "this.showStatus(`Thinking level: ${newLevel}`);",
+        replace: "this.rememberThinkingLevel();\n            this.showStatus(`Thinking level: ${newLevel}`);"
+      },
+      {
+        find: "this.session.setThinkingLevel(level, { persist });",
+        replace: "this.session.setThinkingLevel(level, { persist });\n            this.rememberThinkingLevel();"
+      },
+      {
+        find: "    cycleThinkingLevel() {\n        const newLevel = this.session.cycleThinkingLevel();",
+        replace:
+          "    rememberThinkingLevel() {\n        const model = this.session.model;\n        if (model)\n            this.settingsManager.setModelThinkingLevel(model.provider, model.id, this.session.thinkingLevel);\n    }\n    cycleThinkingLevel() {\n        const newLevel = this.session.cycleThinkingLevel();"
+      }
     ]
+  },
+  {
+    // Auto-compaction runs when the context exceeds `contextWindow - reserveTokens`. A gateway
+    // model's window is prompt plus its maximum output, and the provider counts that whole output
+    // reservation inside the window whatever a request asks for, so the prompt budget is
+    // `contextWindow - maxTokens`. Compacting against the whole window (1.05M less 16K) let a
+    // session grow past that budget until every request, compaction's own included, was refused
+    // with context_length_exceeded. The reserve therefore adds the model's output reservation to
+    // Pi's headroom, the headroom capped at a quarter of the prompt budget so a small window still
+    // leaves room for a conversation. 1,050,000 / 128,000 compacts above 905,616 tokens.
+    pkg: "pi-coding-agent",
+    file: "core/settings-manager.js",
+    edits: [
+      {
+        find: '    getCompactionReserveTokens(model) {\n        return this.getCompactionTokenSetting("reserveTokens", model);\n    }',
+        replace:
+          '    getCompactionReserveTokens(model) {\n        const reserveTokens = this.getCompactionTokenSetting("reserveTokens", model);\n        if (!model || !(model.contextWindow > 0) || !(model.maxTokens > 0))\n            return reserveTokens;\n        const promptBudget = Math.max(0, model.contextWindow - model.maxTokens);\n        return model.maxTokens + Math.min(reserveTokens, Math.floor(promptBudget / 4));\n    }'
+      }
+    ]
+  },
+  {
+    // Token counts between 1M and 10M keep two significant decimals: a 1,050,000-token window reads
+    // 1.05M, not 1.1M.
+    pkg: "pi-coding-agent",
+    file: "modes/interactive/components/footer.js",
+    edits: [{ find: "return `${(count / 1000000).toFixed(1)}M`;", replace: "return `${Number((count / 1000000).toFixed(2))}M`;" }]
   },
   {
     // Variables a shell command sees about its session.
