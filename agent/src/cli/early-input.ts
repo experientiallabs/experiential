@@ -13,6 +13,12 @@
 /** Where the terminal mode exp-code found is left for the terminal UI to restore (pi-ux-patches.ts). */
 export const STDIN_WAS_RAW = Symbol.for("exp-code.stdin-was-raw");
 
+/**
+ * Where the remover of the early capture's SIGINT handler is left for the terminal UI, which
+ * installs its own when it starts (pi-ux-patches.ts).
+ */
+export const EARLY_SIGINT = Symbol.for("exp-code.early-sigint");
+
 /** The commands and options that never open the terminal UI. */
 const NOT_INTERACTIVE_COMMANDS = new Set(["login", "logout", "whoami", "auth", "update", "install", "uninstall", "remove", "list", "mcp", "help"]);
 const NOT_INTERACTIVE_OPTIONS = new Set(["-p", "--print", "--mode", "-h", "--help", "-v", "--version", "--list-models", "--export"]);
@@ -34,10 +40,25 @@ export interface EarlyInput {
 type RawInput = Pick<NodeJS.ReadStream, "isRaw" | "on" | "removeListener" | "pause" | "unshift"> & { setRawMode(mode: boolean): unknown };
 
 /** Start keeping the keys typed on an interactive terminal. */
-export function captureEarlyInput(stdin: RawInput = process.stdin as RawInput, interrupt: () => void = () => process.kill(process.pid, "SIGINT")): EarlyInput {
+export function captureEarlyInput(
+  stdin: RawInput = process.stdin as RawInput,
+  interrupt: () => void = () => process.kill(process.pid, "SIGINT"),
+  signals: Pick<NodeJS.Process, "on" | "removeListener"> = process
+): EarlyInput {
   const wasRaw = stdin.isRaw === true;
   const chunks: Buffer[] = [];
   let done = false;
+  // A SIGINT from another process (`kill -INT`) before the terminal UI takes over: Node would die
+  // with the terminal still in the raw mode set here. Restore the mode, then die of the signal.
+  const onSigint = (): void => {
+    removeSigint();
+    stdin.setRawMode(wasRaw);
+    interrupt();
+  };
+  const removeSigint = (): void => {
+    signals.removeListener("SIGINT", onSigint);
+    delete (process as unknown as Record<symbol, unknown>)[EARLY_SIGINT];
+  };
   const stop = (): void => {
     done = true;
     stdin.removeListener("data", onData);
@@ -48,6 +69,7 @@ export function captureEarlyInput(stdin: RawInput = process.stdin as RawInput, i
   const release = (): void => {
     if (done) return;
     stop();
+    removeSigint();
     stdin.setRawMode(wasRaw);
   };
   function onData(chunk: Buffer | string): void {
@@ -63,11 +85,14 @@ export function captureEarlyInput(stdin: RawInput = process.stdin as RawInput, i
   }
   stdin.setRawMode(true);
   stdin.on("data", onData);
+  signals.on("SIGINT", onSigint);
+  (process as unknown as Record<symbol, unknown>)[EARLY_SIGINT] = removeSigint;
   return {
     release,
     handOff() {
       if (done) return;
       stop();
+      // The terminal stays raw until the UI starts; the SIGINT handler stays until it takes over.
       (process as unknown as Record<symbol, boolean>)[STDIN_WAS_RAW] = wasRaw;
     }
   };

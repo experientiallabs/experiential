@@ -181,6 +181,23 @@ docs linked under [Acknowledgements](#acknowledgements). `-p` and `--mode json` 
 turn fails (a refused or failed gateway call, or an abort) and 0 when it answers; a gateway
 refusal reads `Gateway error <status> (<type>, <code>): <message>`.
 
+In RPC mode, closing stdin ends the process once the running turn and every command still being
+handled have finished, so `echo '{"type":"prompt","message":"..."}' | exp-code --mode rpc` writes
+the whole turn. A dialog an extension opens after stdin has closed is answered as cancelled.
+
+A session is open in one exp-code at a time. Each process claims the session file it opens
+(`~/.exp-code/agent/session-locks/`, with its pid and start time) and releases it when it moves to
+another session or exits. Opening a session that another exp-code has open (`-c` in a second
+terminal, `--session`, `/resume`) is refused in print, JSON and RPC modes (exit code 1) and inside
+the terminal UI; starting the terminal UI on one asks whether to continue in a copy of it (a fork
+with its history), start a new session, or quit. `exp-code --fork <session id>` copies a session
+that is open elsewhere. The lock of a process that crashed (its pid is gone, or now belongs to a
+process started at another time) is cleared on the next start.
+
+The terminal UI restores the terminal on SIGINT, SIGTERM and SIGHUP from another process
+(`kill -INT <pid>` exits with code 130); Ctrl+C inside it stays a key (clear, then quit), and
+Ctrl+Z still suspends.
+
 exp-code remembers your choices. A model you pick (with `/model`, `/model <name>` or Ctrl+P) is
 the one the next session starts on, and a thinking level you pick (Shift+Tab or `/thinking`) is
 kept for that model and used again whenever you select it. Settings changed in `/settings` are

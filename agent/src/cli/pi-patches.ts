@@ -270,6 +270,41 @@ async function readPipedStdin(hasPrompt = false) {
 }
 `;
 
+/**
+ * The session claim at startup (main.js): the session Pi opened (`-c`, `-r`, `--session`,
+ * `--session-id`) is claimed for this process (session-lock.ts). A session another exp-code holds
+ * is refused outside the terminal UI, and in it the user chooses to fork it into a new session
+ * (its history is kept), start a new session, or quit.
+ */
+const CLAIM_SESSION = `    if (parsed.name !== undefined) {`;
+const CLAIM_SESSION_REPLACE = `    const expSessionLock = process[Symbol.for("exp-code.session-lock")];
+    const expSessionHolder = expSessionLock?.claim(sessionManager.getSessionFile());
+    if (expSessionHolder) {
+        if (appMode !== "interactive") {
+            console.error(chalk.red(expSessionLock.refusal(expSessionHolder, sessionManager.getSessionId())));
+            process.exit(1);
+        }
+        const choice = await showStartupSelector(startupSettingsManager, expSessionLock.describe(expSessionHolder), [
+            { label: "Continue in a copy of this session (fork it)", value: "fork" },
+            { label: "Start a new session", value: "new" },
+            { label: "Quit", value: undefined },
+        ]);
+        if (!choice) {
+            process.exit(0);
+        }
+        const heldFile = sessionManager.getSessionFile();
+        const heldCwd = sessionManager.getCwd();
+        try {
+            sessionManager = choice === "fork" ? SessionManager.forkFrom(heldFile, heldCwd, sessionDir) : SessionManager.create(heldCwd, sessionDir);
+        }
+        catch {
+            // Nothing written to the session yet: there is nothing to copy.
+            sessionManager = SessionManager.create(heldCwd, sessionDir);
+        }
+        expSessionLock.claim(sessionManager.getSessionFile());
+    }
+    if (parsed.name !== undefined) {`;
+
 /** The model examples of `exp-code --help`, with gateway aliases. */
 const HELP_MODEL_EXAMPLES = `  # Use another model (exp-code --list-models lists them)
   \${APP_NAME} --model experiential-small-model "Help me refactor this code"
@@ -366,7 +401,8 @@ export const PI_PATCHES: FilePatch[] = [
         find: '                const shouldFork = await promptConfirm("Fork this session into current directory?");\n                if (!shouldFork) {',
         replace:
           '                const shouldFork = await promptConfirm("Fork this session into current directory?");\n                if (shouldFork === undefined) {\n                    console.error(chalk.red(`No answer: stdin closed. Run exp-code in ${resolved.cwd} to continue the session there, or pass --fork ${parsed.session} to copy it into this folder.`));\n                    process.exit(1);\n                }\n                if (!shouldFork) {'
-      }
+      },
+      { find: CLAIM_SESSION, replace: CLAIM_SESSION_REPLACE }
     ]
   },
   {
@@ -787,6 +823,21 @@ export const PI_PATCHES: FilePatch[] = [
         find: "        const id = command.id;\n        switch (command.type) {",
         replace:
           '        const id = command.id;\n        if ((command.type === "prompt" || command.type === "steer" || command.type === "follow_up") && typeof command.message !== "string")\n            return error(id, command.type, `${command.type} needs a "message" string`);\n        switch (command.type) {'
+      },
+      // Closing stdin right after a prompt (`echo '{"type":"prompt",...}' | exp-code --mode rpc`)
+      // exited before the turn ran: end of input shut down at once. It now waits until no command
+      // is being handled and the session is idle, as an extension's shutdown request does, so the
+      // running turn finishes and its events are written (a last line without a line feed included). A dialog an extension opens after the
+      // end of input cannot be answered and is cancelled.
+      {
+        find: "    const onInputEnd = () => {\n        void shutdown();\n    };",
+        replace:
+          "    const onInputEnd = () => {\n        expInputEnded = true;\n        shutdownRequested = true;\n        for (const pending of [...pendingExtensionRequests.values()])\n            pending.resolve({ type: \"extension_ui_response\", cancelled: true });\n        // After the line reader's own end handler, which hands over a last line without a line feed.\n        setImmediate(checkShutdownRequested);\n    };"
+      },
+      { find: "    let shutdownRequested = false;\n", replace: "    let shutdownRequested = false;\n    /** exp-code: stdin has ended; nothing can answer a dialog any more. */\n    let expInputEnded = false;\n" },
+      {
+        find: "        if (opts?.signal?.aborted)\n            return Promise.resolve(defaultValue);\n        const id = crypto.randomUUID();",
+        replace: "        if (opts?.signal?.aborted || expInputEnded)\n            return Promise.resolve(defaultValue);\n        const id = crypto.randomUUID();"
       }
     ]
   },
