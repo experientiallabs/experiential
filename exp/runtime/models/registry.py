@@ -462,6 +462,7 @@ class RuntimeModelCatalog:
                     reasoning_effort=capabilities.reasoning_effort,
                     chat_max_tokens_field=capabilities.chat_max_tokens_field,
                     sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
+                    supports_forced_tool_choice=capabilities.supports_forced_tool_choice,
                 )
                 return ResolvedModel(
                     alias,
@@ -633,6 +634,7 @@ class RuntimeModelCatalog:
                 reasoning_effort=capabilities.reasoning_effort,
                 chat_max_tokens_field=capabilities.chat_max_tokens_field,
                 sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
+                supports_forced_tool_choice=capabilities.supports_forced_tool_choice,
             )
             return ResolvedModel(
                 alias,
