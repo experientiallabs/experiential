@@ -35,6 +35,7 @@ from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.legacy_functions import translate_legacy_functions
 from exp.runtime.openai_protocol.manifest import RESPONSES_REASONING_EFFORTS_ACCEPTED
 from exp.runtime.openai_protocol.official_schema import stream_requested
+from exp.runtime.openai_protocol.responses_flat_effort import translate_responses_flat_effort
 from exp.runtime.openai_protocol.responses_probe import drop_gateway_web_search_items
 from exp.runtime.openai_protocol.unknown_message_fields import (
     drop_unknown_chat_message_fields,
@@ -935,11 +936,13 @@ def repair_responses(
     """Apply every Responses repair, appending its disclosures to ``disclosures``.
 
     The gateway's own rendered web search items are removed first
-    (``responses_probe.drop_gateway_web_search_items``).
+    (``responses_probe.drop_gateway_web_search_items``); a Chat-spelled flat
+    ``reasoning_effort`` is folded into ``reasoning.effort`` last
+    (:mod:`exp.runtime.openai_protocol.responses_flat_effort`).
 
     Raises:
-        OpenAIProtocolError: ``stream_options`` is malformed, or ``background``
-            is true or not a boolean.
+        OpenAIProtocolError: ``stream_options`` is malformed, ``background``
+            is true or not a boolean, or a flat ``reasoning_effort`` names no tier.
     """
     payload, items = drop_responses_client_items(drop_gateway_web_search_items(payload))
     payload, markers = drop_unanchored_output_markers(payload)
@@ -947,4 +950,5 @@ def repair_responses(
     payload, unknown = drop_unknown_responses_message_fields(payload)
     payload, hints = drop_unforwarded_hints(payload)
     payload, stream = accept_responses_stream_options(accept_foreground_responses(payload))
-    return payload, (*disclosures, *items, *markers, *arguments, *unknown, *hints, *stream)
+    payload, effort = translate_responses_flat_effort(payload)
+    return payload, (*disclosures, *items, *markers, *arguments, *unknown, *hints, *stream, *effort)
