@@ -24,6 +24,8 @@ The experiential_* tools read the organization behind the Experiential key exp-c
 
 Reading the figures:
 - Cost: charged = platform credits; own-key est. = list value of calls on the organization's own provider keys (not charged); free value = promotional usage (not charged). "unpriced" means the price was unknown, not that the call was free.
+- The log covers every key of the organization, not only this session. Each row names its key; "my requests" means the rows of the key the user means (filter by api_key_id), so say which keys you counted.
+- A row's model is the model that served the call. Global names (experiential-small-model, experiential-medium-model, experiential-large-model) never appear there; search by the model they resolved to.
 - A failed request with zero attempts was refused before any provider was called (credits, limits, an invalid request). Failures after attempts are provider-side; check each attempt's error.
 - High input tokens with many cached tokens usually means a long conversation reusing its prompt cache; compare cached against total input.
 - Latency includes the whole call; time to first token (ttft) isolates queueing and prompt processing.
