@@ -59,6 +59,7 @@ from exp.runtime.gateway.guardrails.http_json import (
     validate_bearer_env_name,
     validate_classifier_url,
 )
+from exp.runtime.gateway.guardrails.user_conversation import UserConversationWindow
 
 _logger = logging.getLogger(__name__)
 
@@ -233,6 +234,7 @@ class DecisionModelClassifier:
         *,
         client: httpx.AsyncClient | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        user_conversation: UserConversationWindow | None = None,
     ) -> None:
         """Bind one validated adapter document.
 
@@ -240,11 +242,13 @@ class DecisionModelClassifier:
             document: Endpoint, model, categories, window, and cache settings.
             client: Optional injected client. ``None`` uses the shared pool.
             monotonic: Clock for cache expiry and latency, in seconds.
+            user_conversation: Optional heuristic user-only input budget.
         """
         self._document = document
         self._questions = document.questions
         self._client = client
         self._monotonic = monotonic
+        self._user_conversation = user_conversation
         self._cache = VerdictCache(document.cache, monotonic=monotonic)
         self._telemetry = ClassificationTelemetry(tuple(document.categories))
         self._digest = sha256(
@@ -258,12 +262,25 @@ class DecisionModelClassifier:
                         for name, category in document.categories.items()
                     },
                     "window": document.window.model_dump(mode="json"),
+                    "user_conversation": (
+                        {
+                            "version": "user-conversation-v3",
+                            "heuristic": user_conversation.identity,
+                            "max_tokens": user_conversation.max_tokens,
+                            "max_bytes": user_conversation.max_bytes,
+                            "bytes_per_token": user_conversation.bytes_per_token,
+                        }
+                        if user_conversation
+                        else None
+                    ),
                 }
             )
         ).hexdigest()
 
     def project_input(self, request: GatewayRequest) -> GatewayRequest:
         """Return the bounded subject this check reads identically to ``request``."""
+        if self._user_conversation is not None:
+            return self._user_conversation.project_input(request)
         return window_projection(request)
 
     @property
@@ -290,7 +307,11 @@ class DecisionModelClassifier:
         Raises:
             ClassifierProtocolError: The decision call did not return a valid answer.
         """
-        state = classification_window(request, self._document.window)
+        state = (
+            self._user_conversation.state(request)
+            if self._user_conversation is not None
+            else classification_window(request, self._document.window)
+        )
         if not state:
             return ClassifierVerdict(flagged=False)
         key = sha256(self._digest.encode() + b"\n" + state.encode("utf-8")).digest()

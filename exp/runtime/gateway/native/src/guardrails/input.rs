@@ -204,11 +204,43 @@ pub(crate) async fn acquire_guarded_attempt(
     match outcome {
         Ok(won) => won,
         Err(failure) => {
+            // Responses input denials keep the admitted conversation under its
+            // ordinary consent-gated continuation ID before settlement releases
+            // the admission. Never persist speculative provider output.
+            let retains_input = failure.failure.failure_class == FailureClass::Guardrail
+                && ctx.output_less_retention.is_some();
+            let retained = if retains_input {
+                tokio::time::timeout(
+                    remaining(ctx.deadline),
+                    ctx.bridge.call(
+                        "remember",
+                        crate::responses_retention::remember_input_denial_argument(ctx.request_id),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| Err(unavailable().public_error()))
+                .and_then(|reply| {
+                    serde_json::from_str::<serde_json::Value>(&reply)
+                        .map(|value| value.get("retained") != Some(&serde_json::Value::Bool(false)))
+                        .map_err(|_| unavailable().public_error())
+                })
+            } else {
+                Ok(false)
+            };
             // Dropping acquire/the committed relay closes upstream immediately.
             // The guard retains witnessed usage for our cost, while the host
             // applies the input verdict to customer settlement.
             guard.fail_before_release(&failure.failure).await;
-            Won::Failed(failure.public_error())
+            // Retention is best effort after an authoritative denial. A
+            // storage failure must not replace content_filter with a retryable
+            // availability error or advertise a receipt that was not stored.
+            let retained = retained.unwrap_or(false);
+            let mut error = failure.public_error();
+            if retained {
+                error =
+                    error.with_response_id(crate::encode::stable_public_id("resp", ctx.request_id));
+            }
+            Won::Failed(error)
         }
     }
 }

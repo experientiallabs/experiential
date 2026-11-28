@@ -276,3 +276,68 @@ in `bearer_env`. Point the adapter at a decision-model server, never at this gat
 - It inspects input only; configure a separate output check for completions.
 - Counters returned by `telemetry()` live in the adapter's process and are not part of the
   gateway metrics endpoint.
+
+## User-only conversation checks with heuristic budgets
+
+A Python embedder can supply `user_conversation=UserConversationWindow(...)` to
+`DecisionModelClassifier`. The window takes an approximate `max_tokens` budget for
+the state, a UTF-8 `bytes_per_token` heuristic (default 3), an exact `max_bytes` cap
+for its escaped JSON string, and an immutable heuristic/template `identity`. Reserve
+classifier template, questions, special tokens and output headroom before choosing
+these limits. Packing and truncation never tokenize request text. The estimate is
+not an exact context guarantee: unusual text can exceed the model token limit and
+produce a classifier error, handled by the configured error policy.
+
+This mode reads only user messages from the canonical, continuation-expanded request.
+System, developer, assistant and tool messages are excluded, including native tool outputs
+carried by a protocol adapter as user-role items. It preserves chronological turn boundaries
+as a JSON `user_turns` array inside one `[latest user]` classifier-input boundary. This
+keeps all selected requests in the scope of existing classifier instructions, including
+when the current turn is only a follow-up. JSON escaping prevents embedded newlines from
+forging structural turn boundaries. The current turn
+has priority; recent preceding user turns fill the remaining budget. Whitespace-only prior
+turns are omitted, and a whitespace-only current turn keeps an empty boundary. A boundary history
+turn keeps its marked tail. An oversized current turn keeps a marked head and tail;
+text omitted by this explicit truncation is not assessed. Selected state, heuristic/template
+identity and limits all contribute to the cache identity. Projection retains the same
+selected state, so coverage accounting cannot discard history before classification.
+
+Chat Completions, Anthropic Messages and Google GenerateContent callers must supply their
+conversation history, including denied user turns, on every request. No API key, user or
+organization is treated as one conversation. A bare `please` request cannot be associated
+with another request unless the caller supplies history or an authorized continuation.
+
+For Responses, `previous_response_id` expands only an authorized retained conversation.
+A provider refusal retains the incoming conversation without generated refusal content.
+If that input-only retention fails, the provider refusal still completes normally; the
+client must resend history if its continuation is unavailable.
+An admitted parallel input denial returns HTTP 400 `content_filter` with an additional
+`error.response_id`; a client can send that ID as its next `previous_response_id`.
+A non-streaming provider safety error also includes this receipt when its input was retained.
+An explicit `store:false` input denial does not issue a receipt.
+The existing store and privacy policy still decide whether state can be retained:
+`store: false`, disabled retention, expired or missing state, and foreign namespaces remain
+unavailable. When continuation is unavailable, resend the full user conversation in `input`.
+A fresh encrypted reasoning input denied before a route is bound also returns no receipt:
+its opaque content has no authorized replay route yet. If storing an input denial fails, the original HTTP 400 `content_filter` is preserved
+without a continuation ID; clients must resend history. Failures before admission do not
+issue a continuation ID. The receipt is not a grant to
+read another identity's history, and this feature introduces no new retention period.
+
+Example embedder composition (the heuristic and limits come from the classifier
+runtime, not from the model's advertised maximum):
+
+```python
+from exp.runtime.gateway.guardrails.classification import DecisionModelClassifier
+from exp.runtime.gateway.guardrails.user_conversation import UserConversationWindow
+
+classifier = DecisionModelClassifier(
+    document,
+    user_conversation=UserConversationWindow(
+        bytes_per_token=3,
+        max_tokens=available_state_tokens,
+        max_bytes=available_state_json_bytes,
+        identity=heuristic_and_template_digest,
+    ),
+)
+```

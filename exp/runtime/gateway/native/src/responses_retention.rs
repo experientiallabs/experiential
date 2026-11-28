@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 use crate::dialects::MAXIMUM_RETAINED_OUTPUT_BYTES;
 use crate::encode::compact_json;
-use crate::errors::PublicError;
+use crate::errors::{FailureClass, PublicError};
 use crate::events::{
     CompletedToolCall, Event, ProviderAssistantMessagePhase, ProviderOutputItemKind,
     ProviderOutputItemStatus,
@@ -58,6 +58,12 @@ pub(crate) struct ResponsesRetention {
 
 impl ResponsesRetention {
     pub(crate) fn track(&mut self, event: &Event) {
+        // Refusal is content-free control state. Keep it even after output
+        // retention is exhausted so the incoming conversation can still survive.
+        self.refusal |= matches!(
+            event,
+            Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. }
+        ) || matches!(event, Event::Failed(failure) if failure.failure_class == FailureClass::Refusal);
         if self.overflowed {
             return;
         }
@@ -176,7 +182,6 @@ impl ResponsesRetention {
                     message.text.push_str(delta);
                 }
             }
-            Event::RefusalDelta(_) | Event::ProviderRefusalDelta { .. } => self.refusal = true,
             Event::ToolCallCompleted { index, call } => {
                 let provider_owned = self.provider_tools.contains(index);
                 let mut call = call.clone();
@@ -208,7 +213,7 @@ impl ResponsesRetention {
             Event::Completed | Event::StoppedAtSequence(_) => {
                 self.finish_open_items(ProviderOutputItemStatus::Completed)
             }
-            Event::Incomplete | Event::Failed(_) => {
+            Event::Failed(_) | Event::Incomplete => {
                 self.finish_open_items(ProviderOutputItemStatus::Incomplete);
             }
             _ => {}
@@ -305,6 +310,17 @@ pub(crate) fn remember_argument(
     }))
 }
 
+/// Retain only admitted input after a denial, including its prior route authority.
+pub(crate) fn remember_input_denial_argument(request_id: &str) -> String {
+    compact_json(&json!({
+        "request_id": request_id,
+        "refusal": true,
+        "input_denial": true,
+        "text": "",
+        "tool_calls": [],
+    }))
+}
+
 /// Retain one finished Responses continuation before the terminal frames
 /// flush, mirroring the python service's ordering. Returns the public error
 /// when bounded retention fails closed.
@@ -319,21 +335,64 @@ pub(crate) async fn remember_continuation(
     retention: &ResponsesRetention,
     reasoning_content_carrier: Option<&str>,
 ) -> Result<(), PublicError> {
-    if retention.overflowed || retention.refusal() {
+    if retention.overflowed && !retention.refusal() {
         return Ok(());
     }
-    state
+    let result = state
         .bridge
         .call(
             "remember",
             remember_argument(request_id, retention, reasoning_content_carrier),
         )
         .await
-        .map(|_| ())
+        .map(|_| ());
+    if retention.refusal() {
+        // Input-only refusal retention must not turn a provider refusal into
+        // a new availability error. Normal successful-output retention stays strict.
+        Ok(())
+    } else {
+        result
+    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusal_signal_survives_retention_overflow() {
+        for event in [
+            Event::RefusalDelta("synthetic refusal".into()),
+            Event::Failed(crate::errors::Failure::new(
+                FailureClass::Refusal,
+                "refused",
+            )),
+        ] {
+            for overflowed in [false, true] {
+                let mut retention = ResponsesRetention {
+                    overflowed,
+                    retained_bytes: MAXIMUM_RETAINED_OUTPUT_BYTES,
+                    ..Default::default()
+                };
+                retention.track(&event);
+                assert!(retention.refusal());
+                let wire: Value =
+                    serde_json::from_str(&remember_argument("request", &retention, None)).unwrap();
+                assert_eq!(wire["refusal"], true);
+                assert_eq!(wire["text"], "");
+            }
+        }
+    }
+
+    #[test]
+    fn input_denial_wire_selects_input_only_retention() {
+        let argument: Value =
+            serde_json::from_str(&remember_input_denial_argument("request-one")).unwrap();
+        assert_eq!(argument["request_id"], "request-one");
+        assert_eq!(argument["refusal"], true);
+        assert_eq!(argument["input_denial"], true);
+        assert_eq!(argument["text"], "");
+        assert_eq!(argument["tool_calls"], json!([]));
+    }
 
     #[test]
     fn retention_preserves_multi_message_status_phase_and_idless_call() {

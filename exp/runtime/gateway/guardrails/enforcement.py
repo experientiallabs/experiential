@@ -448,7 +448,9 @@ class GuardrailEngine:
                     shared = projection
                 elif getattr(projection, "__func__", projection) is not getattr(
                     shared, "__func__", shared
-                ):
+                ) or getattr(projection, "__self__", None) is not getattr(shared, "__self__", None):
+                    # Bound methods can depend on each adapter's mode and budget.
+                    # Sharing their function alone can discard another check's history.
                     return None
         return shared
 

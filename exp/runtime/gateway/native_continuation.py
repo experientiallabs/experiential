@@ -76,13 +76,28 @@ def remember_continuation(
     data = json.loads(argument)
     entry = accounting.entry(str(data["request_id"]))
     if entry is None or entry.continuation is None:
-        return "{}"
+        return '{"retained":false}'
     context = entry.continuation
+    if not context.retain:
+        return '{"retained":false}'
     route_binding = None
     if entry.active_attempt_id is not None:
         depth = entry.attempt_depths.get(entry.active_attempt_id)
         if depth is not None and depth < len(context.route_bindings):
             route_binding = context.route_bindings[depth]
+    if (
+        data.get("input_denial") is True
+        and route_binding is None
+        and context.required_route_binding is None
+        and any(
+            block.kind == "encrypted_reasoning"
+            for message in context.messages
+            for block in message.provider_reasoning
+        )
+    ):
+        # A fresh encrypted input has no replay authority until a route wins.
+        # Preserve the moderation denial without advertising an unusable receipt.
+        return '{"retained":false}'
     remember_turn(
         continuations,
         context=context,

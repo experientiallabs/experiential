@@ -11,13 +11,13 @@ reason = "Source-confirmed false positive for block-buffer 0.10.4: its cursor is
 
 [[IgnoredVulns]]
 id = "GHSA-xrqw-3rrv-vx5w"
-ignoreUntil = 2026-11-28
-reason = "Extended 2026-11-21 one week while the upstream pin still blocks the fix (exposure unchanged). transformers 5.5.4, sft extra only. The pinned tinker-cookbook 0.4.3 caps transformers at 5.5.4, so the fix (5.10.0+) waits on the tinker-cookbook 0.5 upgrade."
+ignoreUntil = 2026-12-05
+reason = "Owner-approved temporary risk acceptance on 2026-11-28 through 2026-12-05 for transformers 5.5.4 in the optional sft extra. The pinned tinker-cookbook 0.4.3 caps Transformers below the fixed releases; a compatible upgrade must preserve Windows installation. This exception accepts the existing advisory, does not fix it, and does not suppress new advisories."
 
 [[IgnoredVulns]]
 id = "GHSA-x9r9-c232-4q39"
-ignoreUntil = 2026-11-28
-reason = "Extended 2026-11-21 one week while the upstream pin still blocks the fix (exposure unchanged). transformers 5.5.4, sft extra only. The pinned tinker-cookbook 0.4.3 caps transformers at 5.5.4, so the fix (5.10.0+) waits on the tinker-cookbook 0.5 upgrade."
+ignoreUntil = 2026-12-05
+reason = "Owner-approved temporary risk acceptance on 2026-11-28 through 2026-12-05 for transformers 5.5.4 in the optional sft extra. The pinned tinker-cookbook 0.4.3 caps Transformers below the fixed releases; a compatible upgrade must preserve Windows installation. This exception accepts the existing advisory, does not fix it, and does not suppress new advisories."
 
 [[IgnoredVulns]]
 id = "GHSA-9v8h-qqgm-4m35"
@@ -28,23 +28,3 @@ reason = "brotli 1.2.0, capture on Python 3.13+. exp-mitmproxy 12.2.3.post2 caps
 id = "PYSEC-2026-4322"
 ignoreUntil = 2026-11-07
 reason = "Same brotli 1.2.0 advisory as GHSA-9v8h-qqgm-4m35, published separately by PyPA."
-
-[[IgnoredVulns]]
-id = "GHSA-pcg2-g6cj-q92c"
-ignoreUntil = 2026-11-28
-reason = "Extended 2026-11-21 one week while the upstream pin still blocks the fix (exposure unchanged). tornado 6.5.10, capture extra only (via exp-mitmproxy): the advisories are in tornado.web request handling, which nothing here serves. exp-mitmproxy 12.2.3.post3 pins tornado==6.5.10 exactly, so the fix (6.6.1) needs an exp-mitmproxy release relaxing that pin, and 6.6.1 (2026-11-09) leaves the lock's 7-day exclude-newer span on 2026-11-16; then relock, take 6.6.1 and delete this entry and the next three."
-
-[[IgnoredVulns]]
-id = "GHSA-pw9p-v7r6-gx4p"
-ignoreUntil = 2026-11-28
-reason = "Extended 2026-11-21 one week while the upstream pin still blocks the fix (exposure unchanged). Same tornado 6.5.10 capture-only exposure as GHSA-pcg2-g6cj-q92c."
-
-[[IgnoredVulns]]
-id = "GHSA-r4j5-9xpp-3985"
-ignoreUntil = 2026-11-28
-reason = "Extended 2026-11-21 one week while the upstream pin still blocks the fix (exposure unchanged). Same tornado 6.5.10 capture-only exposure as GHSA-pcg2-g6cj-q92c."
-
-[[IgnoredVulns]]
-id = "GHSA-5cjw-f85j-cv6r"
-ignoreUntil = 2026-11-28
-reason = "Extended 2026-11-21 one week while the upstream pin still blocks the fix (exposure unchanged). Same tornado 6.5.10 capture-only exposure as GHSA-pcg2-g6cj-q92c (open redirect in tornado.web redirects, which nothing here serves). Its fix (6.6.1) cannot be relocked yet: exp-mitmproxy 12.2.3.post3 pins tornado==6.5.10 exactly, and 6.6.1 (2026-11-09) is inside the lock's 7-day exclude-newer span."

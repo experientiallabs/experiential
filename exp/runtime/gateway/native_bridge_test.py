@@ -5271,8 +5271,7 @@ def test_responses_admission_drops_effort_on_a_reasoning_less_route(tmp_path: Pa
 
 
 def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> None:
-    """Retained history is prepended on continuation; unknown, refused, and
-    cross-namespace continuations fail closed with the shared public error."""
+    """Retained input survives refusals; unknown and cross-namespace IDs fail closed."""
     control, raw_key = _control_plane(tmp_path)
     first = _admit_responses(control, raw_key, _responses_body())
     remembered = control.remember(
@@ -5313,17 +5312,15 @@ def test_responses_continuation_round_trip_and_fail_closed(tmp_path: Path) -> No
         )
         == "{}"
     )
-    with pytest.raises(NativeBridgeError) as after_refusal:
-        _admit_responses(
-            control,
-            raw_key,
-            _responses_body(
-                previous_response_id=stable_public_id("resp", _admitted_request_id(refused))
-            ),
-        )
-    assert (
-        json.loads(after_refusal.value.public_error_json)["code"] == "previous_response_not_found"
+    after_refusal = _admit_responses(
+        control,
+        raw_key,
+        _responses_body(
+            previous_response_id=stable_public_id("resp", _admitted_request_id(refused))
+        ),
     )
+    assert [message["role"] for message in _payload_messages(after_refusal)] == ["user", "user"]
+    assert "partial" not in json.dumps(_payload_messages(after_refusal))
 
     foreign = ProtocolNamespace(
         organization_id="other-org",
@@ -6015,7 +6012,7 @@ def test_store_false_skips_continuation_retention(tmp_path: Path) -> None:
                 }
             )
         )
-        == "{}"
+        == '{"retained":false}'
     )
     response_id = stable_public_id("resp", _admitted_request_id(first))
     with pytest.raises(NativeBridgeError) as raised:
@@ -6166,7 +6163,7 @@ def test_keyed_store_false_never_reaches_the_continuation_store(tmp_path: Path) 
                 }
             )
         )
-        == "{}"
+        == '{"retained":false}'
     )
     response_id = stable_public_id("resp", _admitted_request_id(admission))
     # Direct store probe in the exact tenant namespace: nothing was retained.
