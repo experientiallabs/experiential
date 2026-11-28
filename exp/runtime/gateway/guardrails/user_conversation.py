@@ -1,9 +1,8 @@
-"""Deterministic user-only conversation packing under an exact classifier budget."""
+"""Deterministic user-only conversation packing with a byte-based token heuristic."""
 
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from dataclasses import dataclass
 
 from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
@@ -15,28 +14,34 @@ class UserConversationWindow:
     """Pack recent user turns without retaining content between requests.
 
     Attributes:
-        count_tokens: Exact state encoder used by the classifier, without framing.
-        max_tokens: Available state tokens after template, questions and output reserve.
+        max_tokens: Estimated state token budget after template and output reserve.
+        bytes_per_token: Heuristic UTF-8 bytes per token; no tokenizer runs here.
         max_bytes: Available UTF-8 JSON state bytes after the remaining request fields.
-        identity: Immutable tokenizer, template and budget identity for verdict caches.
+        identity: Immutable heuristic, template and budget identity for verdict caches.
     """
 
-    count_tokens: Callable[[str], int]
     max_tokens: int
     max_bytes: int
     identity: str
+    bytes_per_token: int = 3
 
     def __post_init__(self) -> None:
         """Refuse a budget that cannot even represent an empty user turn."""
-        if not self.identity or not self._fits(("",)):
+        if (
+            self.max_tokens < 1
+            or self.max_bytes < 1
+            or self.bytes_per_token < 1
+            or not self.identity
+            or not self._fits(("",))
+        ):
             raise ValueError("classifier budget cannot hold a user turn and its framing")
 
     def _fits(self, turns: tuple[str, ...]) -> bool:
-        """Check the exact rendered state against both independent wire limits."""
+        """Apply the heuristic state budget and exact serialized request-byte cap."""
         state = render_user_turns(turns)
         return (
-            len(json.dumps(state, ensure_ascii=False).encode("utf-8")) <= self.max_bytes
-            and self.count_tokens(state) <= self.max_tokens
+            len(state.encode("utf-8")) <= self.max_tokens * self.bytes_per_token
+            and len(json.dumps(state, ensure_ascii=False).encode("utf-8")) <= self.max_bytes
         )
 
     def project_input(self, request: GatewayRequest) -> GatewayRequest:
@@ -45,22 +50,22 @@ class UserConversationWindow:
         Native agent messages and function outputs are excluded even when a
         protocol adapter carries them with a user role. An oversized current
         turn keeps its head and tail, marked explicitly. An older boundary turn
-        keeps its tail. Every chosen candidate is checked with the real encoder;
-        binary search only chooses deterministic character cuts, never estimates
-        a token count. No conversation lookup or durable write occurs here.
+        keeps its tail. UTF-8 size estimates token use; no tokenization occurs
+        during packing or truncation. The model may tokenize unusual text above
+        the estimate. No conversation lookup or durable write occurs here.
         """
         turns = tuple(
             message_text(message)
             for message in request.messages
             if message.role == "user" and message.provider_native_item is None
         )
-        # Most conversations fit. Count them once instead of repeatedly encoding
+        # Most conversations fit. Check once instead of repeatedly serializing
         # each growing suffix, which would be quadratic in the number of turns.
         if turns and self._fits(turns):
             return self._request(request, turns)
-        # Find the largest whole-turn suffix in logarithmically many exact
-        # encodes. This bounds preparation for thousands of short old turns.
-        low, high = 0, len(turns)
+        # Find the largest whole-turn suffix in logarithmically many byte
+        # checks. This bounds preparation for thousands of short old turns.
+        low, high = 0, len(turns) - 1
         count = 0
         while low <= high:
             middle = (low + high) // 2
@@ -74,16 +79,19 @@ class UserConversationWindow:
         if count < len(turns):
             text = turns[-count - 1]
             current = not kept
+
+            def excerpt(size: int) -> str:
+                """Mark a deterministic head/tail or tail-only character cut."""
+                if current:
+                    tail = size // 2
+                    return text[: size - tail] + "\n[...]\n" + (text[-tail:] if tail else "")
+                return "[...]\n" + (text[-size:] if size else "")
+
             low, high = 0, len(text)
             best = kept
             while low <= high:
                 size = (low + high) // 2
-                if current:
-                    tail = size // 2
-                    excerpt = text[: size - tail] + "\n[...]\n" + (text[-tail:] if tail else "")
-                else:
-                    excerpt = "[...]\n" + (text[-size:] if size else "")
-                candidate = (excerpt, *kept)
+                candidate = (excerpt(size), *kept)
                 if self._fits(candidate):
                     best = candidate
                     low = size + 1

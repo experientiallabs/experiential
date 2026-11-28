@@ -391,7 +391,7 @@ def test_user_conversation_cache_cannot_reuse_an_allowed_bare_followup(
             adapter = DecisionModelClassifier(
                 DecisionModelAdapterDocument.model_validate(_document()),
                 client=client,
-                user_conversation=UserConversationWindow(len, 10000, 20000, "fixture-counter"),
+                user_conversation=UserConversationWindow(10000, 20000, "fixture-heuristic"),
             )
             bare = _request("please")
             history = bare.model_copy(

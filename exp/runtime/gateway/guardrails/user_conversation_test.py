@@ -1,4 +1,4 @@
-"""User history, role isolation, exact budgets and deterministic truncation tests."""
+"""User history, role isolation, heuristic budgets and deterministic truncation tests."""
 
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.gateway.guardrails.user_conversation import UserConversationWindow
@@ -10,8 +10,8 @@ def _request(*messages: GatewayMessage) -> GatewayRequest:
 
 
 def _window(budget: int = 10000) -> UserConversationWindow:
-    """Use a byte tokenizer so Unicode costs more than one token per character."""
-    return UserConversationWindow(lambda text: len(text.encode()), budget, 20000, f"bytes:{budget}")
+    """Use one byte per estimated token to exercise Unicode byte boundaries."""
+    return UserConversationWindow(budget, 20000, f"bytes:{budget}", bytes_per_token=1)
 
 
 def test_history_survives_refusals_and_many_intervening_roles() -> None:
@@ -33,7 +33,7 @@ def test_history_survives_refusals_and_many_intervening_roles() -> None:
 
 
 def test_oversized_unicode_turn_is_bounded_and_projection_is_idempotent() -> None:
-    """Exact encoding bounds every cut and projection preserves cache identity."""
+    """The byte heuristic bounds every cut and projection preserves cache identity."""
     window = _window(200)
     request = _request(GatewayMessage(role="user", content="start " + "😺漢字" * 1000 + " end"))
     state = window.state(request)
@@ -74,21 +74,14 @@ def test_empty_followup_preserves_user_turn_boundary() -> None:
     assert '"current_user_request":""' in state
 
 
-def test_overflowing_many_turns_uses_bounded_encoder_calls() -> None:
-    """An overflowing history must not repeatedly encode each growing suffix."""
-    calls = 0
-
-    def count(text: str) -> int:
-        """Count deterministic synthetic tokens and preparation work."""
-        nonlocal calls
-        calls += 1
-        return len(text)
-
-    window = UserConversationWindow(count, 10000, 1000000, "fixture")
-    request = _request(*(GatewayMessage(role="user", content="hello") for _ in range(10000)))
+def test_overflowing_many_turns_keeps_a_chronological_recent_suffix() -> None:
+    """Thousands of short turns stay bounded without losing the latest user turn."""
+    window = UserConversationWindow(10000, 1000000, "fixture", bytes_per_token=1)
+    request = _request(*(GatewayMessage(role="user", content=f"turn {i}") for i in range(10000)))
     state = window.state(request)
-    assert len(state) <= 10000
-    assert calls < 30
+    assert len(state.encode()) <= 10000
+    assert '"turn 9999"' in state and '"turn 0"' not in state
+    assert window.state(window.project_input(request)) == state
 
 
 def test_protocol_adapters_keep_tool_output_out_of_user_history() -> None:
@@ -172,3 +165,16 @@ def test_protocol_adapters_keep_tool_output_out_of_user_history() -> None:
         state = _window().state(request)
         assert "earlier" in state and "please" in state
         assert "EXCLUDED" not in state
+
+
+def test_large_boundary_cut_uses_a_configurable_token_heuristic() -> None:
+    """A byte-per-token estimate packs text without a tokenizer dependency."""
+    window = UserConversationWindow(1000, 1000000, "fixture", bytes_per_token=3)
+    state = window.state(
+        _request(
+            GatewayMessage(role="user", content="earlier " * 20000),
+            GatewayMessage(role="user", content="please"),
+        )
+    )
+    assert 2900 <= len(state.encode()) <= 3000
+    assert '"current_user_request":"please"' in state

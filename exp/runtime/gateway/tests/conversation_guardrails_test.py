@@ -26,7 +26,7 @@ class _HistoryClassifier(_Classifier):
     ) -> ClassifierVerdict:
         """Flag only the synthetic original user request, including on follow-ups."""
         del check
-        window = UserConversationWindow(len, 10000, 20000, "fixture")
+        window = UserConversationWindow(10000, 20000, "fixture")
         return ClassifierVerdict(flagged="harmful fixture" in window.state(request))
 
 

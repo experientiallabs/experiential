@@ -242,7 +242,7 @@ class DecisionModelClassifier:
             document: Endpoint, model, categories, window, and cache settings.
             client: Optional injected client. ``None`` uses the shared pool.
             monotonic: Clock for cache expiry and latency, in seconds.
-            user_conversation: Optional exact-token user-only input budget.
+            user_conversation: Optional heuristic user-only input budget.
         """
         self._document = document
         self._questions = document.questions
@@ -265,9 +265,10 @@ class DecisionModelClassifier:
                     "user_conversation": (
                         {
                             "version": "user-conversation-v1",
-                            "encoder": user_conversation.identity,
+                            "heuristic": user_conversation.identity,
                             "max_tokens": user_conversation.max_tokens,
                             "max_bytes": user_conversation.max_bytes,
+                            "bytes_per_token": user_conversation.bytes_per_token,
                         }
                         if user_conversation
                         else None

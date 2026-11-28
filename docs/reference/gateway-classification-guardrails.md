@@ -277,14 +277,16 @@ in `bearer_env`. Point the adapter at a decision-model server, never at this gat
 - Counters returned by `telemetry()` live in the adapter's process and are not part of the
   gateway metrics endpoint.
 
-## User-only, token-budgeted conversation checks
+## User-only conversation checks with heuristic budgets
 
 A Python embedder can supply `user_conversation=UserConversationWindow(...)` to
-`DecisionModelClassifier`. The window takes an exact `count_tokens(text)` callable,
-`max_tokens` for the state, `max_bytes` for its escaped JSON string, and an immutable
-encoder/template `identity`. Subtract the complete classifier template, question and
-option framing, special tokens, and any output reservation before choosing these limits.
-The tokenizer must have truncation disabled. A character count is not a token budget.
+`DecisionModelClassifier`. The window takes an approximate `max_tokens` budget for
+the state, a UTF-8 `bytes_per_token` heuristic (default 3), an exact `max_bytes` cap
+for its escaped JSON string, and an immutable heuristic/template `identity`. Reserve
+classifier template, questions, special tokens and output headroom before choosing
+these limits. Packing and truncation never tokenize request text. The estimate is
+not an exact context guarantee: unusual text can exceed the model token limit and
+produce a classifier error, handled by the configured error policy.
 
 This mode reads only user messages from the canonical, continuation-expanded request.
 System, developer, assistant and tool messages are excluded, including native tool outputs
@@ -292,7 +294,7 @@ carried by a protocol adapter as user-role items. It preserves chronological tur
 in a JSON state with `previous_user_requests` and `current_user_request`. The current turn
 has priority; recent preceding user turns fill the remaining budget. A boundary history
 turn keeps its marked tail. An oversized current turn keeps a marked head and tail;
-text omitted by this explicit truncation is not assessed. Selected state, tokenizer/template
+text omitted by this explicit truncation is not assessed. Selected state, heuristic/template
 identity and limits all contribute to the cache identity. Projection retains the same
 selected state, so coverage accounting cannot discard history before classification.
 
@@ -311,7 +313,7 @@ unavailable. When continuation is unavailable, resend the full user conversation
 Failures before admission do not issue a continuation ID. The receipt is not a grant to
 read another identity's history, and this feature introduces no new retention period.
 
-Example embedder composition (the counter and limits come from the verified classifier
+Example embedder composition (the heuristic and limits come from the classifier
 runtime, not from the model's advertised maximum):
 
 ```python
@@ -321,10 +323,10 @@ from exp.runtime.gateway.guardrails.user_conversation import UserConversationWin
 classifier = DecisionModelClassifier(
     document,
     user_conversation=UserConversationWindow(
-        count_tokens=count_state_tokens,
+        bytes_per_token=3,
         max_tokens=available_state_tokens,
         max_bytes=available_state_json_bytes,
-        identity=verified_tokenizer_and_template_digest,
+        identity=heuristic_and_template_digest,
     ),
 )
 ```
