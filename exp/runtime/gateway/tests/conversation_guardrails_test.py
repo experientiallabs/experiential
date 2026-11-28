@@ -143,3 +143,47 @@ def test_provider_refusal_preserves_input_for_the_next_moderation_check(
             )
             assert followup.status_code == 400, followup.text
             assert followup.json()["error"]["code"] == "content_filter"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_early_encrypted_input_denial_has_no_unbound_receipt(tmp_path: Path, stream: bool) -> None:
+    """An input verdict before route acquisition stays a denial, not a retention error."""
+    import time
+
+    class SlowStartControl(NativeControlPlane):
+        def start_attempt(self, argument: str) -> str:
+            """Allow the input classifier to finish before a route is registered."""
+            time.sleep(0.5)
+            return super().start_attempt(argument)
+
+    with _provider(_content_chunk("synthetic answer") + _terminal_frames()) as (provider, _):
+        _, key = _configured_gateway(
+            tmp_path, base_url=provider, billing_source=BillingSource.HOST_MANAGED
+        )
+        components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"})
+        control = SlowStartControl(components, guardrails=_engine(_HistoryClassifier("block")))
+        with (
+            _serving(control) as base,
+            httpx.Client(
+                base_url=base, headers={"Authorization": f"Bearer {key}"}, timeout=10
+            ) as client,
+        ):
+            denied = client.post(
+                "/v1/responses",
+                json={
+                    "model": "coding",
+                    "input": [
+                        {
+                            "type": "reasoning",
+                            "id": "rs_fixture",
+                            "encrypted_content": "fixture",
+                            "summary": [],
+                        },
+                        {"role": "user", "content": "harmful fixture"},
+                    ],
+                    "stream": stream,
+                },
+            )
+            assert denied.status_code == 400, denied.text
+            assert denied.json()["error"]["code"] == "content_filter", denied.text
+            assert "response_id" not in denied.json()["error"]

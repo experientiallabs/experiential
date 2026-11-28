@@ -219,19 +219,24 @@ pub(crate) async fn acquire_guarded_attempt(
                 )
                 .await
                 .unwrap_or_else(|_| Err(unavailable().public_error()))
-                .map(|_| ())
+                .and_then(|reply| {
+                    serde_json::from_str::<serde_json::Value>(&reply)
+                        .map(|value| value.get("retained") != Some(&serde_json::Value::Bool(false)))
+                        .map_err(|_| unavailable().public_error())
+                })
             } else {
-                Ok(())
+                Ok(false)
             };
             // Dropping acquire/the committed relay closes upstream immediately.
             // The guard retains witnessed usage for our cost, while the host
             // applies the input verdict to customer settlement.
             guard.fail_before_release(&failure.failure).await;
-            if let Err(error) = retained {
-                return Won::Failed(error);
-            }
+            let retained = match retained {
+                Ok(retained) => retained,
+                Err(error) => return Won::Failed(error),
+            };
             let mut error = failure.public_error();
-            if retains_input {
+            if retained {
                 error =
                     error.with_response_id(crate::encode::stable_public_id("resp", ctx.request_id));
             }

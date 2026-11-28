@@ -314,7 +314,9 @@ An admitted parallel input denial returns HTTP 400 `content_filter` with an addi
 The existing store and privacy policy still decide whether state can be retained:
 `store: false`, disabled retention, expired or missing state, and foreign namespaces remain
 unavailable. When continuation is unavailable, resend the full user conversation in `input`.
-Failures before admission do not issue a continuation ID. The receipt is not a grant to
+A fresh encrypted reasoning input denied before a route is bound also returns no receipt:
+its opaque content has no authorized replay route yet. Failures before admission do not
+issue a continuation ID. The receipt is not a grant to
 read another identity's history, and this feature introduces no new retention period.
 
 Example embedder composition (the heuristic and limits come from the classifier

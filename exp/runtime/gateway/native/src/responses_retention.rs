@@ -312,14 +312,13 @@ pub(crate) fn remember_argument(
 
 /// Retain only admitted input after a denial, including its prior route authority.
 pub(crate) fn remember_input_denial_argument(request_id: &str) -> String {
-    remember_argument(
-        request_id,
-        &ResponsesRetention {
-            refusal: true,
-            ..Default::default()
-        },
-        None,
-    )
+    compact_json(&json!({
+        "request_id": request_id,
+        "refusal": true,
+        "input_denial": true,
+        "text": "",
+        "tool_calls": [],
+    }))
 }
 
 /// Retain one finished Responses continuation before the terminal frames
@@ -383,6 +382,7 @@ mod tests {
             serde_json::from_str(&remember_input_denial_argument("request-one")).unwrap();
         assert_eq!(argument["request_id"], "request-one");
         assert_eq!(argument["refusal"], true);
+        assert_eq!(argument["input_denial"], true);
         assert_eq!(argument["text"], "");
         assert_eq!(argument["tool_calls"], json!([]));
     }
