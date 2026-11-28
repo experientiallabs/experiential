@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
 from exp.runtime.gateway.guardrails.classification_window import message_text
 
+_JSON_LINE_ESCAPES = str.maketrans({"\u0085": r"\u0085", "\u2028": r"\u2028", "\u2029": r"\u2029"})
+
 
 @dataclass(frozen=True)
 class UserConversationWindow:
@@ -59,6 +61,12 @@ class UserConversationWindow:
             for message in request.messages
             if message.role == "user" and message.provider_native_item is None
         )
+        if turns:
+            # Blank padding contains no classifiable request. Keep the current
+            # boundary even when it is blank, without spending history on it.
+            turns = tuple(text for text in turns[:-1] if text.strip()) + (
+                turns[-1] if turns[-1].strip() else "",
+            )
         # Most conversations fit. Check once instead of repeatedly serializing
         # each growing suffix, which would be quadratic in the number of turns.
         if turns and self._fits(turns):
@@ -128,6 +136,6 @@ def render_user_turns(turns: tuple[str, ...]) -> str:
     values = turns or ("",)
     return "\n\n".join(
         f"{'[latest user]' if index == len(values) - 1 else '[previous user]'}\n"
-        + json.dumps(value, ensure_ascii=False)
+        + json.dumps(value, ensure_ascii=False).translate(_JSON_LINE_ESCAPES)
         for index, value in enumerate(values)
     )

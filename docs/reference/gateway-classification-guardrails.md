@@ -293,7 +293,8 @@ System, developer, assistant and tool messages are excluded, including native to
 carried by a protocol adapter as user-role items. It preserves chronological turn boundaries
 with `[previous user]` and `[latest user]` labels. Each turn is a JSON-escaped string on
 one line, so embedded newlines cannot forge structural turn boundaries. The current turn
-has priority; recent preceding user turns fill the remaining budget. A boundary history
+has priority; recent preceding user turns fill the remaining budget. Whitespace-only prior
+turns are omitted, and a whitespace-only current turn keeps an empty boundary. A boundary history
 turn keeps its marked tail. An oversized current turn keeps a marked head and tail;
 text omitted by this explicit truncation is not assessed. Selected state, heuristic/template
 identity and limits all contribute to the cache identity. Projection retains the same
