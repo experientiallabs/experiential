@@ -18,6 +18,7 @@ from exp.runtime.gateway.disconnect_estimate import (
     bill_within_output_ceiling,
     estimate_disconnect_usage,
     estimate_unreported_truncation_usage,
+    hold_output_subsets,
 )
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.ledger_valuation import estimated_cost_nano_usd
@@ -553,3 +554,17 @@ def test_meters_within_or_without_a_ceiling_are_billed_as_reported(
         else GatewayEvent(kind=GatewayEventKind.INCOMPLETE, sequence_number=0)
     )
     assert bill_within_output_ceiling(terminal, output_ceiling=ceiling) is terminal
+
+
+def test_reasoning_reported_above_output_is_held_to_the_output_total() -> None:
+    """Azure DeepSeek V4.1 Flash reported 21 reasoning of 20 output on a cut answer."""
+    held = hold_output_subsets(
+        _completed(GatewayUsage(input_tokens=12, output_tokens=20, reasoning_tokens=21)),
+        deployment_id="deployment-a",
+    ).usage
+    assert held is not None
+    assert (held.output_tokens, held.reasoning_tokens, held.input_tokens) == (20, 20, 12)
+    consistent = _completed(GatewayUsage(input_tokens=12, output_tokens=20, reasoning_tokens=5))
+    assert hold_output_subsets(consistent) is consistent
+    unknown = _completed(GatewayUsage(input_tokens=12, output_tokens=None, reasoning_tokens=5))
+    assert hold_output_subsets(unknown) is unknown

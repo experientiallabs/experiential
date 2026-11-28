@@ -110,6 +110,7 @@ def settled_terminal(
         output_ceiling=_dispatched_output_ceiling(data, entry),
         deployment_id=_attempt_deployment_id(data, entry),
     )
+    terminal = hold_output_subsets(terminal, deployment_id=_attempt_deployment_id(data, entry))
     if terminal.usage_estimated and terminal.usage is not None:
         terminal = terminal.model_copy(
             update={
@@ -250,6 +251,47 @@ def bill_within_output_ceiling(
                 }
             )
         }
+    )
+
+
+def hold_output_subsets(
+    terminal: GatewayEvent, *, deployment_id: str | None = None
+) -> GatewayEvent:
+    """Hold the reasoning and generated-image subsets inside the reported output total.
+
+    ``GatewayUsage`` defines reasoning as a SUBSET of the output, but some
+    providers report a cut-short answer otherwise: Azure Foundry's DeepSeek
+    V4.1 Flash reported ``reasoning_tokens`` above ``completion_tokens`` on
+    43 incomplete attempts in one production hour (2026-11-28, e.g. 21
+    reasoning of 20 output), and the response's usage then read as more
+    reasoning than output. The output total is what the attempt bills, so it
+    is kept and the subset is held to it; input legs are untouched.
+
+    Args:
+        terminal: The normalized terminal, estimates and the ceiling applied.
+        deployment_id: The attempt's deployment, named in the clamp log.
+
+    Returns:
+        The terminal with its output subsets held to the output total, or the
+        terminal unchanged.
+    """
+    usage = terminal.usage
+    if usage is None or usage.output_tokens is None:
+        return terminal
+    output = usage.output_tokens
+    reasoning = usage.reasoning_tokens
+    if reasoning is None or reasoning <= output:
+        return terminal
+    _logger.warning(
+        "provider reported more reasoning than output; reasoning held to the output total",
+        extra={
+            "deployment_id": deployment_id,
+            "reported_output_tokens": output,
+            "reported_reasoning_tokens": reasoning,
+        },
+    )
+    return terminal.model_copy(
+        update={"usage": usage.model_copy(update={"reasoning_tokens": output})}
     )
 
 
