@@ -679,7 +679,10 @@ async fn non_success_failure(
         // provider's own code token: "invalid_value" beats "verify the
         // request fields" for the caller and the ledger alike. A generic
         // family type or bare status adds nothing and is not relayed.
-        .or_else(|| code.clone().filter(|token| !generic_error_code(token)));
+        .or_else(|| code.clone().filter(|token| !generic_error_code(token)))
+        // A reasonless body relays no token either: the caller reads the
+        // fieldless copy, never a bare family code.
+        .filter(|_| !reasonless);
     // A relay that could not decode the UPSTREAM error it received (Novita's
     // Go relay on a numeric `error.code`) answers its own 400 whose
     // sentence embeds that upstream document: the class and the sentence

@@ -76,6 +76,21 @@ async fn a_resellers_reasonless_400_fails_over_without_relaying_its_trace() {
 }
 
 #[tokio::test]
+async fn a_reasonless_body_with_a_hyphenated_family_code_relays_no_token() {
+    // xAI's documented envelope: the generic code spelled with a hyphen must
+    // not ride out as detail in place of the fieldless copy.
+    let failure = open_against_body(
+        "400 Bad Request",
+        "{\"code\":\"invalid-argument\",\"error\":\"Bad Request\"}",
+        "m",
+    )
+    .await;
+    assert_eq!(failure.failure_class, FailureClass::InvalidRequest);
+    assert!(failure.failover_eligible);
+    assert_eq!(failure.provider_detail, None);
+}
+
+#[tokio::test]
 async fn a_resellers_flat_403_balance_verdict_is_provider_quota() {
     // Novita answers an unfunded account with 403 NOT_ENOUGH_BALANCE; a
     // status-only read filed it as a credential failure, which the house

@@ -59,24 +59,43 @@ pub fn rejected_without_reason(dialect: Dialect, body: &str) -> bool {
 }
 
 /// Whether the body's structured fields say more than "rejected": a named
-/// parameter or field, or a code token beyond the generic family type.
+/// parameter or field, or ANY code-like token (`code`, `type`, `reason`,
+/// `status`, at the top level or under `error`, or the dialect's own code
+/// reader) beyond the generic family type. Every token is read, not only the
+/// one an envelope reader prefers, so a specific `type` beside a numeric
+/// `code` still counts.
 fn names_a_structured_reason(dialect: Dialect, value: &Value, body: &str) -> bool {
-    let named_field = |object: Option<&Value>| {
-        object.is_some_and(|object| {
-            ["param", "field"].iter().any(|key| {
-                object
-                    .get(*key)
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| !name.trim().is_empty())
-            })
+    let objects = [
+        Some(value),
+        value.get("error").filter(|error| error.is_object()),
+    ];
+    let named_field = objects.iter().flatten().any(|object| {
+        ["param", "field"].iter().any(|key| {
+            object
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.trim().is_empty())
         })
-    };
-    named_field(Some(value))
-        || named_field(value.get("error"))
+    });
+    let specific_token = objects.iter().flatten().any(|object| {
+        ["code", "type", "reason", "status"].iter().any(|key| {
+            object
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(specific_code)
+        })
+    });
+    named_field
+        || specific_token
         || rejected_parameter(dialect, body).is_some()
-        // Spellings differ only by separator (xAI's `invalid-argument`).
-        || rejected_code(dialect, body)
-            .is_some_and(|code| !generic_error_code(&code.replace('-', "_")))
+        || rejected_code(dialect, body).is_some_and(|code| specific_code(&code))
+}
+
+/// Whether one code token names more than the generic family type. Spellings
+/// that differ only by separator (xAI's `invalid-argument`) are the same token.
+fn specific_code(token: &str) -> bool {
+    let token = token.trim();
+    !token.is_empty() && !generic_error_code(&token.replace('-', "_"))
 }
 
 /// Whether one provider sentence is a bare restatement of the rejection.
@@ -164,6 +183,8 @@ mod tests {
             r#"{"error":{"message":"Bad Request","type":"invalid_request_error","code":"invalid_value"}}"#,
             r#"{"code":400,"reason":"INVALID_PARAMETER","message":"invalid request error trace_id: 9f3c"}"#,
             r#"{"code":400,"message":"Bad Request","type":"invalid_request_error","field":"messages[1].content"}"#,
+            // A specific `type` beside a numeric `code` the envelope reader prefers.
+            r#"{"code":400,"type":"invalid_value","message":"Bad Request"}"#,
         ] {
             assert!(!reasonless(body), "{body}");
         }
