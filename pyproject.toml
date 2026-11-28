@@ -50,7 +50,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Persisted supervised fine-tuning uses the native Tinker SDK and cookbook renderer surface.
-sft = ["tinker==0.35.0", "tinker-cookbook==0.5.9", "transformers==5.23.0"]
+sft = ["tinker==0.23.4", "tinker-cookbook==0.4.3"]
 # Native artifact materialization: typed workbook edits on immutable input bytes.
 artifact-edits = ["openpyxl==3.1.5", "et-xmlfile==2.0.0"]
 dev = [
