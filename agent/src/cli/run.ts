@@ -9,7 +9,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { main, parseArgs } from "@earendil-works/pi-coding-agent";
-import { readCredentials } from "../auth/credentials.js";
+import { inspectCredentials, readCredentials } from "../auth/credentials.js";
 import { parseAuthCommand, runAuthCommand, runLoginInTerminal } from "../auth/login.js";
 import { createExpCodeExtension, createIdentityExtension } from "../extension/index.js";
 import { type GatewayResolution, resolveGateway } from "../gateway/config.js";
@@ -117,7 +117,11 @@ async function runCliWith(args: string[], env: NodeJS.ProcessEnv, earlyInput: Ea
 
   const home = expCodeHome(env);
   const agentDir = join(home, "agent");
-  let resolution: GatewayResolution = resolveGateway(env, await readCredentials(env));
+  const reading = await inspectCredentials(env);
+  let resolution: GatewayResolution = resolveGateway(env, reading.credentials);
+  // A saved login that exists but cannot be used (unreadable, damaged) would read as "no key".
+  if (resolution.missingKey === true && reading.problem !== undefined) resolution = { ...resolution, problem: `${reading.problem} ${resolution.problem}` };
+  if (resolution.missingKey === true && reading.problem !== undefined && !parsed.help && isInteractiveStart(parsed)) console.error(`exp-code: ${reading.problem}`);
   // An interactive start with no key anywhere offers to log in rather than starting keyless.
   if (resolution.missingKey === true && !parsed.help && isInteractiveStart(parsed)) earlyInput?.release();
   if (resolution.missingKey === true && !parsed.help && isInteractiveStart(parsed) && (await confirmLogin())) {

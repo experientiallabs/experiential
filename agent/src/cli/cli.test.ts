@@ -366,6 +366,16 @@ describe("exp-code CLI", () => {
     expect((await runCli(["--help"])).stdout).not.toContain("--api-key");
   });
 
+  it("names a damaged saved login instead of only 'no key'", async () => {
+    const configHome = join(home, "damaged-login");
+    await mkdir(join(configHome, "agent"), { recursive: true });
+    await writeFile(join(configHome, "agent", "credentials.json"), "{not json");
+    const result = await runCli(["-p", "hi"], { EXP_CODE_HOME: configHome });
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain(`The saved login ${join(configHome, "agent", "credentials.json")} is damaged (not JSON)`);
+    expect(result.stderr).toMatch(/No Experiential gateway key found/);
+  });
+
   it("logs in, reports status, uses the saved key, and logs out", async () => {
     const status = await runCli(["login", "--status"]);
     expect(status.code).toBe(1);
