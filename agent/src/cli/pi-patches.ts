@@ -56,6 +56,9 @@ export class PiPatchError extends Error {
  * short summary (under 400 characters, or under 1/50 of the summarized text when that is smaller)
  * is retried once with the model's whole output limit and its lowest reasoning level. A second
  * failure is returned as an error naming both, so every caller keeps what it would have replaced.
+ * Each attempt also keeps the `usage.cost` its provider reported in the stream: summary calls do
+ * not pass through the agent's message events, where exp-code records the cost of replies, so a
+ * compaction or branch summary was otherwise listed as unpriced in /usage.
  */
 const SUMMARY_GUARD = `const EXP_SUMMARY_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 /** exp-code: the first summary attempt's output limit, when the model allows that much. */
@@ -120,9 +123,24 @@ export async function completeSummarization(model, context, options, streamFn, r
         cacheRetention: "none",
         sessionId: options.sessionId ?? uuidv7(),
     };
-    const produce = (attemptOptions) => async () => streamFn
-        ? (await streamFn(model, context, attemptOptions)).result()
-        : completeSimple(model, context, attemptOptions);
+    const produce = (attemptOptions) => async () => {
+        // exp-code: keep the cost the provider reported in the stream (\`usage.cost\`), which Pi
+        // records only for providers it knows, so /usage prices summaries like replies.
+        let reported;
+        const onProviderStreamEvent = (data, eventModel) => {
+            const usage = data?.usage ?? data?.response?.usage;
+            if (typeof usage?.cost === "number" && Number.isFinite(usage.cost) && usage.cost >= 0)
+                reported = usage.cost;
+            return attemptOptions.onProviderStreamEvent?.(data, eventModel);
+        };
+        const observed = { ...attemptOptions, onProviderStreamEvent };
+        const response = await (streamFn
+            ? (await streamFn(model, context, observed)).result()
+            : completeSimple(model, context, observed));
+        if (reported === undefined || !response.usage || response.usage.cost?.totalFromProvider === true)
+            return response;
+        return { ...response, usage: { ...response.usage, cost: { ...response.usage.cost, total: reported, totalFromProvider: true } } };
+    };
     const levels = summaryThinkingLevels(model, requestOptions.reasoning);
     const modelMax = model.maxTokens > 0 ? model.maxTokens : EXP_SUMMARY_OUTPUT_TOKENS;
     const firstMax = Math.min(modelMax, EXP_SUMMARY_OUTPUT_TOKENS);

@@ -15,6 +15,7 @@ import { GATEWAY_PROVIDER_ID, type GatewayConfig } from "../gateway/config.js";
 import { parseListedModel } from "../gateway/models.js";
 import { gatewayProviderConfig, gatewayProviderModels } from "../gateway/provider.js";
 import { type FakeGateway, startFakeGateway } from "../testing/fake-gateway.js";
+import { summarizeSession } from "../usage/aggregate.js";
 import { patchSource, SHORTENED_TOOL_OUTPUT, TURN_PREFIX_CONTINUES } from "./pi-patches.js";
 
 const compactionFile = fileURLToPath(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js", import.meta.url));
@@ -199,6 +200,23 @@ describe("compaction on a session", () => {
     expect(text).toContain("ongoing conversation");
     expect(text).toContain(JSON.stringify(TURN_PREFIX_CONTINUES).slice(1, -1));
     expect(text).toContain(JSON.stringify(SHORTENED_TOOL_OUTPUT).slice(1, -1));
+  });
+
+  it("records the cost the gateway reported for each summary attempt", async () => {
+    const { session } = await start();
+    await fill(session, [
+      { text: "`", finishReason: "length", cost: 0.0011 },
+      { text: SUMMARY, cost: 0.0023 }
+    ]);
+    const compaction = session.sessionManager.getEntries().find((entry) => entry.type === "compaction");
+    expect(compaction?.type).toBe("compaction");
+    const cost = compaction?.type === "compaction" ? compaction.usage?.cost : undefined;
+    // Both attempts were billed, so the entry carries their sum as a provider-reported price.
+    expect(cost?.totalFromProvider).toBe(true);
+    expect(cost?.total).toBeCloseTo(0.0034, 10);
+    const usage = summarizeSession(session.sessionManager.getEntries(), { sessionId: "s" });
+    const summary = usage.models.find((model) => model.model === "(compaction)");
+    expect(summary).toMatchObject({ calls: 1, unpricedCalls: 0, chargedNano: 3_400_000 });
   });
 
   it("reports a failed /compact with what to do next", async () => {

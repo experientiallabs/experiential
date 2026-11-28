@@ -251,7 +251,7 @@ Usage · session 01a21fa5, started 2026-11-28 00:54Z
 | Time | Wall time since the session was created, plus the summed response time of every model call (`model`) and tool run (`tools`). A resumed session also says how long ago it was opened here and how many of its calls came before. |
 | Activity | Your prompts, and every model call the session file records on any branch, including failed calls, compaction summaries and cache warming. |
 | Tokens | Each call's reported usage: input is the whole prompt, with the cached part and any cache writes; output includes reasoning tokens when the model reports them. |
-| Cost | The settled cost the gateway reported on each call (`usage.cost`), summed exactly in nano-dollars. Calls on your own provider key and free or discounted calls show their list value separately; neither is charged. A call with no reported price is counted as unpriced, never estimated. |
+| Cost | The settled cost the gateway reported on each call (`usage.cost`), compaction and branch summaries included, summed exactly in nano-dollars. Calls on your own provider key and free or discounted calls show their list value separately; neither is charged. A call with no reported price is counted as unpriced, never estimated. |
 | Context | The same figure as the footer: tokens in the current context over the model's window. |
 | Model table | One row per model used (switch with `/model`); `Out tok/s` is output tokens over response time. |
 | Organization | With a hosted key: the credit balance (`GET /api/v1/credits`) and today's UTC spend (`GET /api/gateway/usage/daily`), read with the same key. It waits at most 3 seconds and turns into a one-line note when the read fails or the gateway is a local `exp` gateway. |
