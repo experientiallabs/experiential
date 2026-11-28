@@ -65,6 +65,13 @@ export class Terminal {
     this.exited = new Promise((resolve) => this.child.once("exit", (code) => resolve(code ?? -1)));
   }
 
+  /** The pid of exp-code itself (the relay's child in the pseudo-terminal). */
+  cliPid(): number {
+    const pid = Number(execFileSync("pgrep", ["-P", String(this.child.pid)], { encoding: "utf8" }).trim().split("\n")[0]);
+    if (!Number.isInteger(pid) || pid <= 0) throw new Error("exp-code is not running in the pseudo-terminal");
+    return pid;
+  }
+
   send(keys: string): void {
     this.child.stdin.write(keys);
   }

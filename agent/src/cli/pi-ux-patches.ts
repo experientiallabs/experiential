@@ -13,6 +13,9 @@ export const HOTKEYS_KEY = 'Symbol.for("exp-code.hotkeys")';
 /** The process-wide key the terminal's mode before exp-code's early input capture is kept under (early-input.ts). */
 export const STDIN_WAS_RAW_KEY = 'Symbol.for("exp-code.stdin-was-raw")';
 
+/** The process-wide key of the early input capture's SIGINT handler remover (early-input.ts). */
+export const EARLY_SIGINT_KEY = 'Symbol.for("exp-code.early-sigint")';
+
 /** The models Ctrl+P cycles through when the gateway lists them, in this order. */
 export const CYCLE_MODEL_IDS = ["experiential-small-model", "experiential-medium-model", "experiential-large-model"] as const;
 
@@ -105,6 +108,27 @@ export const INTERACTIVE_UX_EDITS: Edit[] = [
     find: "    handleStartupSubmit(text) {",
     replace:
       "    /** exp-code: stop holding input and replay what was typed while startup completed. */\n    expReplayHeldInput() {\n        const held = this.expHeldInput ?? [];\n        this.expHeldInput = undefined;\n        this.expHoldInputRemove?.();\n        this.expHoldInputRemove = undefined;\n        for (const data of held)\n            this.ui.handleTerminalInput(data);\n    }\n    handleStartupSubmit(text) {"
+  },
+  // `kill -INT <pid>` from outside left the terminal in raw mode (on the alternate screen when it
+  // is on): the TUI turns Ctrl+C into a key, so a SIGINT only comes from another process, and with
+  // no handler Node died without restoring the terminal. SIGINT now shuts down like SIGTERM and
+  // SIGHUP (exit code 130), a second one exits at once, and one received while suspended with
+  // Ctrl+Z is still ignored. The early input capture's SIGINT handler (early-input.ts) gives way.
+  {
+    find: '        const signals = ["SIGTERM"];\n        if (process.platform !== "win32") {\n            signals.push("SIGHUP");\n        }\n        for (const signal of signals) {\n            const handler = () => {',
+    replace:
+      `        const signals = ["SIGTERM"];\n        if (process.platform !== "win32") {\n            signals.push("SIGHUP", "SIGINT");\n        }\n        process[${EARLY_SIGINT_KEY}]?.();\n        for (const signal of signals) {\n            const handler = () => {\n                if (signal === "SIGINT" && this.expSuspended)\n                    return;\n                if (signal === "SIGINT" && this.isShuttingDown) {\n                    try {\n                        this.ui.stop();\n                    }\n                    catch { }\n                    process.exit(130);\n                }`
+  },
+  { find: "                void this.shutdown({ fromSignal: true });", replace: '                void this.shutdown({ fromSignal: true, exitCode: signal === "SIGINT" ? 130 : 0 });' },
+  {
+    find: "            await this.ui.terminal.drainInput(1000);\n            this.stop();\n            process.exit(0);\n        }",
+    replace: "            await this.ui.terminal.drainInput(1000);\n            this.stop();\n            process.exit(options.exitCode ?? 0);\n        }"
+  },
+  { find: '        process.on("SIGINT", ignoreSigint);', replace: '        process.on("SIGINT", ignoreSigint);\n        this.expSuspended = true;' },
+  { find: '        process.once("SIGCONT", () => {\n            clearInterval(suspendKeepAlive);', replace: '        process.once("SIGCONT", () => {\n            this.expSuspended = false;\n            clearInterval(suspendKeepAlive);' },
+  {
+    find: '            clearInterval(suspendKeepAlive);\n            process.removeListener("SIGINT", ignoreSigint);\n            throw error;',
+    replace: '            this.expSuspended = false;\n            clearInterval(suspendKeepAlive);\n            process.removeListener("SIGINT", ignoreSigint);\n            throw error;'
   },
   // `/export` wrote HTML whatever the name said (`/export notes.txt` was an HTML file). It writes
   // `.html` or `.jsonl` and refuses any other name.

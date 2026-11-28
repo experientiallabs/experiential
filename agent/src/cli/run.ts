@@ -32,6 +32,7 @@ import {
   startModel,
   wantsDefaultModel
 } from "./model-choice.js";
+import { createSessionLockExtension, installSessionLocks } from "./session-lock.js";
 import { ensureSearchTools, markUpstreamChangelogSeen } from "./startup.js";
 import { checkForUpdate, parseUpdateArgs, selfUpdate, UPDATE_HELP } from "./update.js";
 
@@ -208,6 +209,8 @@ async function runCliWith(args: string[], env: NodeJS.ProcessEnv, earlyInput: Ea
   }
   if (interactive) earlyInput?.handOff();
   else earlyInput?.release();
+  // One process per session file: Pi's startup claims the session it opens (session-lock.ts).
+  const sessionLocks = installSessionLocks(join(agentDir, "session-locks"));
   await main(finalArgs, {
     extensionFactories: [
       {
@@ -223,6 +226,7 @@ async function runCliWith(args: string[], env: NodeJS.ProcessEnv, earlyInput: Ea
       { name: "exp-code-branding", hidden: true, factory: createBrandingExtension(EXP_CODE_VERSION, updateNotice, startNotes) },
       { name: "exp-code-commands", hidden: true, factory: createSupportCommandsExtension({ version: EXP_CODE_VERSION }) },
       { name: "exp-code-prompt-stash", hidden: true, factory: createPromptStashExtension({ agentDir }) },
+      { name: "exp-code-session-lock", hidden: true, factory: createSessionLockExtension(sessionLocks) },
       // Last, so its preamble swap sees every other prompt edit.
       { name: "exp-code-identity", hidden: true, factory: createIdentityExtension() }
     ]
