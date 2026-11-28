@@ -281,6 +281,11 @@ the order the model produced.
   and per-rung narrowing prefers a rung that carries it.
 - An empty string where a non-empty one is required (an empty `model`) is named as empty:
   "expected a non-empty string, but got an empty string instead".
+- A Chat-spelled top-level `reasoning_effort` sent to Responses names the control Responses
+  spells as `reasoning.effort`, so it is folded in (merged into any `reasoning` object) and
+  disclosed as `reasoning_effort->translated(reasoning.effort)`. An explicit `reasoning.effort`
+  wins, disclosed as `reasoning_effort->ignored(explicit_reasoning.effort)`. A value that names
+  no effort tier is a 400 naming `reasoning_effort`.
 - DeepSeek's reasoning switch, `thinking: {"type": "enabled" | "disabled"}` (Anthropic's
   `adaptive` included), is folded into the Responses reasoning control as Chat already folds it
   into `reasoning_effort`: `disabled` becomes `reasoning.effort: "none"`, `enabled` and
