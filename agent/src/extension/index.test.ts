@@ -6,14 +6,17 @@ import { COWORK_SECTION, COWORK_SECTION_NAME, EXP_CODE_PREAMBLE, UPSTREAM_PREAMB
 /** A minimal recorder for the parts of Pi's ExtensionAPI the extension uses. */
 function fakePi() {
   const tools: string[] = [];
+  const commands: string[] = [];
   const providers: { name: string; config: { models?: { id: string }[] } }[] = [];
   const handlers = new Map<string, ((event: unknown, ctx: unknown) => unknown)[]>();
   const api = {
     registerTool: (tool: { name: string }) => tools.push(tool.name),
+    registerCommand: (name: string) => commands.push(name),
+    registerEntryRenderer: () => {},
     registerProvider: (name: string, config: { models?: { id: string }[] }) => providers.push({ name, config }),
     on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => handlers.set(event, [...(handlers.get(event) ?? []), handler])
   };
-  return { api, tools, providers, handlers };
+  return { api, tools, commands, providers, handlers };
 }
 
 const gateway: GatewayConfig = { kind: "local", baseUrl: "http://127.0.0.1:1/v1", apiKey: "k" };
@@ -23,6 +26,7 @@ describe("exp-code extension", () => {
     const pi = fakePi();
     await createExpCodeExtension({ gateway, provider: { models: [{ id: "m1" }, { id: "m2" }] } })(pi.api as never);
     expect(pi.tools).toEqual(["todo_write", "ask_user", "web_fetch", "web_search"]);
+    expect(pi.commands).toEqual(["usage", "cost"]);
     expect(pi.providers.map((provider) => [provider.name, provider.config.models?.map((model) => model.id)])).toEqual([["experiential", ["m1", "m2"]]]);
     const options = { sections: {} as Record<string, string> };
     for (const handler of pi.handlers.get("before_agent_start") ?? []) await handler({ systemPromptOptions: options }, {});

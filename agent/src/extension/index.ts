@@ -12,6 +12,7 @@ import { type GatewayProviderOptions, registerGatewayProvider } from "../gateway
 import { createPlatformTools, tracesSkillDir } from "../platform/index.js";
 import { createAskUserTool } from "./ask-user.js";
 import { addCoworkSection, addDocsSection, withExpCodePreamble } from "./prompt.js";
+import { registerUsageCommand } from "../usage/command.js";
 import { resolveSkillsDir } from "./skills.js";
 import { createTodoTool } from "./todo.js";
 import { createWebFetchTool } from "./web-fetch.js";
@@ -69,6 +70,7 @@ export function createExpCodeExtension(options: ExpCodeExtensionOptions): Extens
         if (ctx.hasUI) ctx.ui.notify(problem, "warning");
       });
     }
+    registerUsageCommand(pi, { gateway: options.gateway, fetch: options.provider?.fetch });
   };
 }
 
