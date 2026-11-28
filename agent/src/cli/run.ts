@@ -69,6 +69,11 @@ export function unknownSubcommandMessage(args: readonly string[], exists: (path:
   ].join("\n");
 }
 
+/** Why `--api-key` is refused, and what to use instead. */
+export const API_KEY_FLAG_HELP =
+  "--api-key is not supported: a key on the command line is visible to other local users. " +
+  "Set EXP_API_KEY (EXP_GATEWAY_KEY for a local `exp` gateway) or run `exp-code login`.";
+
 /** Run the CLI with the given arguments (without the node and script paths). */
 export async function runCli(args: string[], env: NodeJS.ProcessEnv = process.env, earlyInput?: EarlyInput): Promise<void> {
   try {
@@ -102,6 +107,13 @@ async function runCliWith(args: string[], env: NodeJS.ProcessEnv, earlyInput: Ea
     return;
   }
   if (parsed.help) process.stdout.write(`${HELP_PREFACE}\n`);
+  if (parsed.apiKey !== undefined && !parsed.help) {
+    // Pi's --api-key would key the model calls but not the gateway's listing, and a key on the
+    // command line is visible to every local user through the process list.
+    console.error(`exp-code: ${API_KEY_FLAG_HELP}`);
+    process.exitCode = 2;
+    return;
+  }
 
   const home = expCodeHome(env);
   const agentDir = join(home, "agent");
@@ -127,28 +139,34 @@ async function runCliWith(args: string[], env: NodeJS.ProcessEnv, earlyInput: Ea
   }
   const cacheDir = join(home, "cache");
   const gateway = resolution.config;
+  // One-line notes about the start model and the gateway: on stderr, or in the terminal UI, which
+  // would cover a line printed before it starts. Each distinct note is shown once.
+  const interactive = !parsed.help && isInteractiveStart(parsed);
+  const startNotes: string[] = [];
+  const noted = new Set<string>();
+  const note = (line: string): void => {
+    if (noted.has(line)) return;
+    noted.add(line);
+    if (interactive) startNotes.push(line);
+    else console.error(`exp-code: ${line}`);
+  };
+  const onStaleListing = (error: Error, ageMs: number): void =>
+    note(`${error.message} Using the model list cached ${describeAge(ageMs)} ago.`);
+
   // The gateway's aliases, listed once and only when a choice below needs them.
   let listing: Promise<string[] | undefined> | undefined;
   const listedIds = (): Promise<string[] | undefined> => {
     listing ??=
       gateway === null
         ? Promise.resolve(undefined)
-        : fetchGatewayModels(gateway, { cacheDir }).then(
+        : fetchGatewayModels(gateway, { cacheDir, onStaleListing }).then(
             (models) => models.map((model) => model.id),
             (error: unknown) => {
-              console.error(`exp-code: ${(error as Error).message}`);
+              note((error as Error).message);
               return undefined;
             }
           );
     return listing;
-  };
-
-  // One-line notes about the start model: on stderr, or in the terminal UI, which would cover them.
-  const interactive = !parsed.help && isInteractiveStart(parsed);
-  const startNotes: string[] = [];
-  const note = (line: string): void => {
-    if (interactive) startNotes.push(line);
-    else console.error(`exp-code: ${line}`);
   };
 
   // Selections that name one of Pi's direct providers move to the gateway.
@@ -195,7 +213,7 @@ async function runCliWith(args: string[], env: NodeJS.ProcessEnv, earlyInput: Ea
           gateway: resolution.config,
           gatewayProblem: resolution.problem,
           platformTools: platformToolsEnabled(env),
-          provider: { cacheDir, wire, onListingError: (error) => console.error(`exp-code: ${error.message}`) }
+          provider: { cacheDir, wire, onStaleListing, onListingError: (error) => note(error.message) }
         })
       },
       { name: "exp-code-branding", hidden: true, factory: createBrandingExtension(EXP_CODE_VERSION, updateNotice, startNotes) },
@@ -221,6 +239,14 @@ async function runUpdateCommand(args: string[], env: NodeJS.ProcessEnv): Promise
     code = typeof process.exitCode === "number" ? process.exitCode : 0;
   }
   return code;
+}
+
+/** A cache age in words: "40 seconds", "12 minutes", "3 hours", "2 days". */
+export function describeAge(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  const [value, unit] =
+    seconds < 90 ? [seconds, "second"] : seconds < 90 * 60 ? [Math.round(seconds / 60), "minute"] : seconds < 36 * 3600 ? [Math.round(seconds / 3600), "hour"] : [Math.round(seconds / 86400), "day"];
+  return `${value} ${unit}${value === 1 ? "" : "s"}`;
 }
 
 /** Whether this run opens the interactive terminal UI on a real terminal. */

@@ -170,7 +170,60 @@ describe("gateway models", () => {
 
   it("explains a refused listing", async () => {
     const fetch = (async () => new Response(JSON.stringify({ error: { message: "bad key" } }), { status: 401 })) as typeof globalThis.fetch;
-    await expect(fetchGatewayModels(hosted, { fetch })).rejects.toThrow(/refused the model listing \(401\): bad key\. Check EXP_API_KEY/);
+    await expect(fetchGatewayModels(hosted, { fetch })).rejects.toThrow(
+      "The gateway at https://gw.example/v1 refused the model listing (401): bad key. Check EXP_API_KEY, or run `exp-code login` to save a new key."
+    );
+  });
+
+  it("names why the gateway could not be reached, and what a non-listing answer was", async () => {
+    const refused = Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }) });
+    const down = (async () => {
+      throw refused;
+    }) as typeof globalThis.fetch;
+    await expect(fetchGatewayModels(hosted, { fetch: down })).rejects.toThrow("Could not reach the gateway at https://gw.example/v1 to list models (ECONNREFUSED).");
+    clearModelCache();
+    const slow = (async () => {
+      throw Object.assign(new Error("aborted"), { name: "TimeoutError" });
+    }) as typeof globalThis.fetch;
+    await expect(fetchGatewayModels(hosted, { fetch: slow })).rejects.toThrow(/\(no answer within 10 s\)\.$/);
+    clearModelCache();
+    const html = (async () => new Response("<html>502</html>", { headers: { "content-type": "text/html" } })) as typeof globalThis.fetch;
+    await expect(fetchGatewayModels(hosted, { fetch: html })).rejects.toThrow("answered the model listing with something that is not JSON (HTTP 200, text/html).");
+  });
+
+  it("asks once per start: a failure is shared by every caller for a moment", async () => {
+    let calls = 0;
+    const failing = (async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ error: { message: "boom" } }), { status: 500 });
+    }) as typeof globalThis.fetch;
+    let time = 1_000;
+    const now = () => time;
+    const results = await Promise.allSettled([fetchGatewayModels(hosted, { fetch: failing, now }), fetchGatewayModels(hosted, { fetch: failing, now })]);
+    await expect(fetchGatewayModels(hosted, { fetch: failing, now })).rejects.toThrow(/\(500\): boom\./);
+    expect(results.map((result) => result.status)).toEqual(["rejected", "rejected"]);
+    expect(calls).toBe(1);
+    time += 60_000;
+    await expect(fetchGatewayModels(hosted, { fetch: failing, now })).rejects.toThrow(/boom/);
+    expect(calls).toBe(2);
+  });
+
+  it("falls back to an older cached listing when the gateway cannot answer, but never for a refused key", async () => {
+    const ok = (async () => new Response(JSON.stringify({ data: [{ id: "cached-model" }] }))) as typeof globalThis.fetch;
+    let time = 0;
+    const now = () => time;
+    await fetchGatewayModels(hosted, { fetch: ok, cacheDir: dir, now });
+    clearModelCache();
+    time = 3 * 3_600_000;
+    const stale: Array<{ message: string; ageMs: number }> = [];
+    const onStaleListing = (error: Error, ageMs: number) => stale.push({ message: error.message, ageMs });
+    const outage = (async () => new Response("upstream down", { status: 503 })) as typeof globalThis.fetch;
+    expect((await fetchGatewayModels(hosted, { fetch: outage, cacheDir: dir, now, onStaleListing })).map((m) => m.id)).toEqual(["cached-model"]);
+    expect(stale).toEqual([{ message: "The gateway at https://gw.example/v1 refused the model listing (503).", ageMs: 3 * 3_600_000 }]);
+    clearModelCache();
+    const refused = (async () => new Response(JSON.stringify({ error: { message: "revoked" } }), { status: 401 })) as typeof globalThis.fetch;
+    await expect(fetchGatewayModels(hosted, { fetch: refused, cacheDir: dir, now, onStaleListing })).rejects.toThrow(/\(401\): revoked/);
+    expect(stale).toHaveLength(1);
   });
 });
 

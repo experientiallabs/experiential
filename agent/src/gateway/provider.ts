@@ -17,7 +17,10 @@ export interface GatewayProviderOptions extends FetchModelsOptions {
   wire?: GatewayWireApi;
   /** Register exactly these aliases instead of listing them (the headless runner knows its model). */
   models?: ListedModel[];
-  /** Called with the reason when the listing fails; the provider is then registered without models. */
+  /**
+   * Called with the reason when the listing fails or lists nothing; the provider is then
+   * registered without models.
+   */
   onListingError?: (error: Error) => void;
 }
 
@@ -103,6 +106,7 @@ export async function registerGatewayProvider(pi: ExtensionAPI, config: GatewayC
   if (options.models === undefined) {
     try {
       listed = await fetchGatewayModels(config, options);
+      if (listed.length === 0) options.onListingError?.(new Error(`The gateway at ${config.baseUrl} lists no models this key can call.`));
     } catch (error) {
       options.onListingError?.(error instanceof Error ? error : new Error(String(error)));
     }

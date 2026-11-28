@@ -203,6 +203,8 @@ export interface FetchModelsOptions {
   cacheDir?: string;
   ttlMs?: number;
   now?: () => number;
+  /** Called when a failed listing was answered from an older cached one: why, and the cache's age. */
+  onStaleListing?: (error: Error, ageMs: number) => void;
 }
 
 interface CachedListing {
@@ -259,25 +261,91 @@ async function writeDiskCache(dir: string, path: string, listing: CachedListing)
   }
 }
 
+/**
+ * A listing that failed. `transient` marks failures a cached listing may stand in for (the gateway
+ * unreachable or slow, a 408/429/5xx, a body that is not a listing); a refused key is never one.
+ */
+export class ListingError extends Error {
+  constructor(
+    message: string,
+    readonly transient: boolean
+  ) {
+    super(message);
+    this.name = "ListingError";
+  }
+}
+
 /** Describe a failed listing response in words a user can act on. */
-async function listingError(response: Response, config: GatewayConfig): Promise<Error> {
+async function listingError(response: Response, config: GatewayConfig): Promise<ListingError> {
   let detail = "";
   try {
     const body = (await response.json()) as { error?: { message?: string } };
-    detail = body.error?.message ?? "";
+    detail = typeof body.error?.message === "string" ? body.error.message : "";
   } catch {
     // Keep the status alone.
   }
   const hint =
-    response.status === 401
+    response.status === 401 || response.status === 403
       ? config.kind === "hosted"
-        ? " Check EXP_API_KEY, or run `exp login` and launch with `exp code`."
+        ? " Check EXP_API_KEY, or run `exp-code login` to save a new key."
         : " Check EXP_GATEWAY_KEY against the key your local gateway issued."
       : "";
-  return new Error(`The gateway at ${config.baseUrl} refused the model listing (${response.status})${detail ? `: ${detail.replace(/\.$/, "")}.` : "."}${hint}`);
+  const transient = response.status === 408 || response.status === 429 || response.status >= 500;
+  return new ListingError(
+    `The gateway at ${config.baseUrl} refused the model listing (${response.status})${detail ? `: ${detail.replace(/\.$/, "")}.` : "."}${hint}`,
+    transient
+  );
 }
 
-/** List the gateway's callable models, from a fresh cache entry when one exists. */
+/** Why the listing request never got an answer, in words (the gateway down, DNS, TLS, a timeout). */
+function unreachable(error: unknown, config: GatewayConfig): ListingError {
+  const failure = error as { name?: string; message?: string; cause?: { code?: string; message?: string } };
+  const reason =
+    failure.name === "TimeoutError"
+      ? `no answer within ${LISTING_TIMEOUT_MS / 1000} s`
+      : (failure.cause?.code ?? failure.cause?.message ?? failure.message ?? String(error));
+  return new ListingError(`Could not reach the gateway at ${config.baseUrl} to list models (${reason}).`, true);
+}
+
+/** How long a failed listing is remembered, so one start neither asks nor reports twice. */
+const FAILURE_MEMO_MS = 15_000;
+const failures = new Map<string, { at: number; error: ListingError }>();
+const inFlight = new Map<string, Promise<CachedListing>>();
+
+async function requestListing(config: GatewayConfig, options: FetchModelsOptions, now: () => number): Promise<CachedListing> {
+  let response: Response;
+  try {
+    response = await (options.fetch ?? globalThis.fetch)(`${config.baseUrl}/models`, {
+      headers: { authorization: `Bearer ${config.apiKey}`, accept: "application/json" },
+      signal: AbortSignal.timeout(LISTING_TIMEOUT_MS)
+    });
+  } catch (error) {
+    throw unreachable(error, config);
+  }
+  if (!response.ok) throw await listingError(response, config);
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch (error) {
+    if ((error as { name?: string }).name === "TimeoutError") throw unreachable(error, config);
+    const type = response.headers.get("content-type") ?? "no content type";
+    throw new ListingError(`The gateway at ${config.baseUrl} answered the model listing with something that is not JSON (HTTP ${response.status}, ${type}).`, true);
+  }
+  try {
+    return { fetchedAt: now(), models: parseModelListing(body) };
+  } catch (error) {
+    throw new ListingError(`The gateway at ${config.baseUrl} answered the model listing without a model list: ${(error as Error).message}`, true);
+  }
+}
+
+/**
+ * List the gateway's callable models, from a fresh cache entry when one exists.
+ *
+ * When the gateway cannot be asked (down, slow, a 5xx) and an older listing is cached, the older
+ * listing is returned and `onStaleListing` is told why, so an outage of the listing alone does not
+ * take every model away. A refused key always fails. A failure is remembered briefly, so the
+ * several callers of one start share one request and one error.
+ */
 export async function fetchGatewayModels(config: GatewayConfig, options: FetchModelsOptions = {}): Promise<ListedModel[]> {
   const now = options.now ?? Date.now;
   const ttl = options.ttlMs ?? MODEL_CACHE_TTL_MS;
@@ -286,19 +354,33 @@ export async function fetchGatewayModels(config: GatewayConfig, options: FetchMo
   const memory = memoryCache.get(key);
   if (fresh(memory)) return memory!.models;
   const diskPath = options.cacheDir === undefined ? undefined : join(options.cacheDir, `models-${LISTING_CACHE_VERSION}-${key}.json`);
-  if (diskPath !== undefined) {
-    const disk = await readDiskCache(diskPath);
-    if (fresh(disk)) {
-      memoryCache.set(key, disk!);
-      return disk!.models;
-    }
+  const disk = diskPath === undefined ? undefined : await readDiskCache(diskPath);
+  if (fresh(disk)) {
+    memoryCache.set(key, disk!);
+    return disk!.models;
   }
-  const response = await (options.fetch ?? globalThis.fetch)(`${config.baseUrl}/models`, {
-    headers: { authorization: `Bearer ${config.apiKey}`, accept: "application/json" },
-    signal: AbortSignal.timeout(LISTING_TIMEOUT_MS)
-  });
-  if (!response.ok) throw await listingError(response, config);
-  const listing: CachedListing = { fetchedAt: now(), models: parseModelListing(await response.json()) };
+  const fallback = (error: ListingError): ListedModel[] => {
+    const stale = memory ?? disk;
+    if (!error.transient || stale === undefined) throw error;
+    options.onStaleListing?.(error, Math.max(0, now() - stale.fetchedAt));
+    return stale.models;
+  };
+  const failed = failures.get(key);
+  if (failed !== undefined && now() - failed.at < FAILURE_MEMO_MS) return fallback(failed.error);
+  let pending = inFlight.get(key);
+  if (pending === undefined) {
+    pending = requestListing(config, options, now).finally(() => inFlight.delete(key));
+    inFlight.set(key, pending);
+  }
+  let listing: CachedListing;
+  try {
+    listing = await pending;
+  } catch (error) {
+    const failure = error instanceof ListingError ? error : new ListingError((error as Error).message, true);
+    failures.set(key, { at: now(), error: failure });
+    return fallback(failure);
+  }
+  failures.delete(key);
   memoryCache.set(key, listing);
   if (diskPath !== undefined && options.cacheDir !== undefined) await writeDiskCache(options.cacheDir, diskPath, listing);
   return listing.models;
@@ -307,4 +389,6 @@ export async function fetchGatewayModels(config: GatewayConfig, options: FetchMo
 /** Forget in-memory listings (tests and explicit refreshes). */
 export function clearModelCache(): void {
   memoryCache.clear();
+  failures.clear();
+  inFlight.clear();
 }

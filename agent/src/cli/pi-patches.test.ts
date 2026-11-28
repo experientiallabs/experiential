@@ -72,7 +72,7 @@ describe("command list and sign-in guidance", () => {
       formatNoApiKeyFoundMessage(provider: string): string;
     };
     expect(formatNoApiKeyFoundMessage("unknown")).toBe(
-      "No API key found for the selected model.\n\nRun `exp-code login` in a terminal to sign in to Experiential, or set EXP_API_KEY to an xpl_ key (EXP_GATEWAY_KEY for a local `exp` gateway).\n`exp-code login --status` shows which key is in use; `exp-code --list-models` lists the models it can call."
+      "No gateway model is available (the reason is above).\n\nRun `exp-code login` in a terminal to sign in to Experiential, or set EXP_API_KEY to an xpl_ key (EXP_GATEWAY_KEY for a local `exp` gateway).\n`exp-code login --status` shows which key is in use; `exp-code --list-models` lists the models it can call."
     );
   });
 });
