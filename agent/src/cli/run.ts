@@ -17,7 +17,7 @@ import { platformToolsEnabled } from "../platform/index.js";
 import { createPromptStashExtension } from "../stash/extension.js";
 import { EXP_CODE_VERSION } from "../version.js";
 import { createBrandingExtension } from "./branding.js";
-import { createSupportCommandsExtension } from "./commands.js";
+import { createSupportCommandsExtension, DOCS_URL } from "./commands.js";
 import { expCodeHome } from "./environment.js";
 import {
   directProviderIds,
@@ -34,7 +34,7 @@ import { ensureSearchTools, markUpstreamChangelogSeen } from "./startup.js";
 import { checkForUpdate, parseUpdateArgs, selfUpdate, UPDATE_HELP } from "./update.js";
 
 /** Where exp-code's documentation lives. */
-export const DOCS_URL = "https://github.com/experientiallabs/experiential/tree/main/agent#readme";
+export { DOCS_URL } from "./commands.js";
 
 const HELP_PREFACE = `exp-code ${EXP_CODE_VERSION}: Experiential's coding and cowork agent.
 
