@@ -145,6 +145,11 @@ export function toProviderModel(listed: ListedModel, config: GatewayConfig, wire
   const levels = thinkingLevelMap(listed.reasoningEfforts);
   // A route whose only effort is `none` cannot think, whatever `supports_reasoning` says.
   const thinks = levels === undefined ? (listed.reasoning ?? api !== "openai-completions") : listed.reasoning !== false && Object.entries(levels).some(([level, effort]) => level !== "off" && effort !== null);
+  // A Claude route that states an effort ladder takes adaptive thinking (`thinking.type: adaptive`
+  // plus `output_config.effort`). Pi only knows that for its own model ids, so a gateway alias would
+  // otherwise get budget-based thinking (`budget_tokens`), which Claude 4.6 and later refuse: every
+  // turn on claude-sonnet-5.5 or claude-haiku-5.5 failed with a 400 at the default level.
+  const adaptive = api === "anthropic-messages" && thinks && levels !== undefined;
   return {
     type: "chat",
     id: listed.id,
@@ -154,6 +159,7 @@ export function toProviderModel(listed: ListedModel, config: GatewayConfig, wire
     baseUrl: api === "anthropic-messages" ? config.baseUrl.replace(/\/v1$/, "") : config.baseUrl,
     reasoning: thinks,
     ...(thinks && levels !== undefined ? { thinkingLevelMap: levels } : {}),
+    ...(adaptive ? { compat: { forceAdaptiveThinking: true } } : {}),
     input: listed.vision === true ? ["text", "image"] : ["text"],
     // The gateway reports the settled cost of every call; catalog prices are not needed.
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
