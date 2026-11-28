@@ -882,7 +882,8 @@ async fn stream_responses(
         // Retention runs before the terminal frames flush; a bounded
         // retention failure truncates the stream before its terminal, the
         // same observable behavior as the python service.
-        let retained = matches!(terminal, Some(Event::Failed(_)))
+        let retained = matches!(terminal.as_ref(), Some(Event::Failed(failure))
+            if failure.failure_class != FailureClass::Refusal)
             || remember_continuation(
                 &state,
                 &admission.request_id,

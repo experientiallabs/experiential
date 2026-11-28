@@ -178,3 +178,27 @@ def test_large_boundary_cut_uses_a_configurable_token_heuristic() -> None:
     )
     assert 2900 <= len(state.encode()) <= 3000
     assert '"current_user_request":"please"' in state
+
+
+def test_agent_authored_text_is_not_human_user_content() -> None:
+    """An agent-to-agent envelope stays excluded even under a user transport role."""
+    from exp.runtime.openai_protocol.requests import decode_responses
+
+    request = decode_responses(
+        {
+            "model": "fixture",
+            "input": [
+                {"role": "user", "content": "human request"},
+                {
+                    "type": "agent_message",
+                    "author": "/root/worker",
+                    "recipient": "/root",
+                    "content": [{"type": "input_text", "text": "AGENT OUTPUT"}],
+                },
+                {"role": "user", "content": "continue"},
+            ],
+        }
+    ).request
+    state = _window().state(request)
+    assert "human request" in state and "continue" in state
+    assert "AGENT OUTPUT" not in state

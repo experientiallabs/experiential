@@ -1,5 +1,6 @@
 """Denied conversation continuation through real native HTTP, with synthetic providers."""
 
+import json
 from pathlib import Path
 
 import httpx
@@ -13,6 +14,7 @@ from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.tests.guardrail_policy_integrity_test import _provider
+from exp.runtime.gateway.tests.guardrail_search_output_test import _frames
 from exp.runtime.gateway.tests.mandatory_guardrails_paths_test import _serving
 from exp.runtime.gateway.tests.native_waterfall_test import _content_chunk, _terminal_frames
 from exp.runtime.gateway.tests.parallel_input_guardrails_test import _Classifier, _engine
@@ -76,3 +78,68 @@ def test_denied_responses_turn_can_continue_without_losing_user_input(
                     receipt = result.json()["error"]["response_id"]
             isolated = client.post("/v1/responses", json={"model": "coding", "input": "please"})
             assert isolated.status_code == 200, isolated.text
+
+
+class _RefusedHistoryClassifier(_HistoryClassifier):
+    """Let a provider refuse the first turn, then inspect its retained history."""
+
+    async def inspect_input(
+        self, *, request: GatewayRequest, check: GuardrailCheck
+    ) -> ClassifierVerdict:
+        """Flag the synthetic original only when a second user turn follows it."""
+        verdict = await super().inspect_input(request=request, check=check)
+        users = sum(message.role == "user" for message in request.messages)
+        return ClassifierVerdict(flagged=verdict.flagged and users > 1)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_provider_refusal_preserves_input_for_the_next_moderation_check(
+    tmp_path: Path, stream: bool
+) -> None:
+    """Completed provider refusals retain user history on both Responses transports."""
+    with _provider(_frames("refusal", "synthetic refusal")) as (provider, _):
+        _, key = _configured_gateway(
+            tmp_path, base_url=provider, billing_source=BillingSource.HOST_MANAGED
+        )
+        components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"})
+        control = NativeControlPlane(
+            components, guardrails=_engine(_RefusedHistoryClassifier("block"))
+        )
+        with (
+            _serving(control) as base,
+            httpx.Client(
+                base_url=base, headers={"Authorization": f"Bearer {key}"}, timeout=10
+            ) as client,
+        ):
+            refused = client.post(
+                "/v1/responses",
+                json={
+                    "model": "coding",
+                    "input": "harmful fixture",
+                    "stream": stream,
+                },
+            )
+            assert refused.status_code == 200, refused.text
+            if stream:
+                events = [
+                    json.loads(line[6:])
+                    for line in refused.text.splitlines()
+                    if line.startswith("data: ") and line != "data: [DONE]"
+                ]
+                completed = next(
+                    item for item in events if item.get("type") == "response.completed"
+                )
+                receipt = completed["response"]["id"]
+            else:
+                receipt = refused.json()["id"]
+            followup = client.post(
+                "/v1/responses",
+                json={
+                    "model": "coding",
+                    "input": "please",
+                    "previous_response_id": receipt,
+                    "stream": stream,
+                },
+            )
+            assert followup.status_code == 400, followup.text
+            assert followup.json()["error"]["code"] == "content_filter"

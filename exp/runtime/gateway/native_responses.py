@@ -217,13 +217,21 @@ def remember_turn(
         # shared previous_response_not_found error because it was never stored.
         return
     if bool(data.get("refusal")):
+        encrypted_input = any(
+            block.kind == "encrypted_reasoning"
+            for message in context.messages
+            for block in message.provider_reasoning
+        )
+        binding = route_binding or context.required_route_binding
+        if encrypted_input and binding is None:
+            raise ValueError("Responses encrypted reasoning requires route authority binding")
         continuations.remember_now(
             namespace=context.namespace,
             response_id=context.response_id,
             state=ContinuationState(
                 episode_key=context.episode_key,
                 messages=context.messages,
-                route_binding=context.required_route_binding,
+                route_binding=binding if encrypted_input else None,
             ),
         )
         return

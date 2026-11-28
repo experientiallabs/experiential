@@ -714,3 +714,37 @@ def test_refused_turn_retains_input_only_and_honors_store_false() -> None:
 
     with pytest.raises(OpenAIProtocolError):
         store.resolve_now(namespace=private.namespace, previous_response_id=private.response_id)
+
+
+@pytest.mark.parametrize("winning", [False, True])
+def test_refused_encrypted_input_keeps_its_route_authority(winning: bool) -> None:
+    """Refusal cannot detach encrypted input from its authorized deployment."""
+    store = BoundedContinuationStore()
+    context = replace(
+        _context(),
+        messages=(
+            GatewayMessage(
+                role="assistant",
+                provider_reasoning=(
+                    EncryptedReasoningBlock(
+                        encrypted_content="synthetic-ciphertext", id="reasoning-one"
+                    ),
+                ),
+            ),
+        ),
+    )
+    binding = _binding()
+    if not winning:
+        context = replace(context, required_route_binding=binding)
+    remember_turn(
+        store, context=context, data={"refusal": True}, route_binding=binding if winning else None
+    )
+    retained = store.resolve_now(
+        namespace=context.namespace, previous_response_id=context.response_id
+    )
+    assert retained.route_binding == binding
+    assert retained.messages == context.messages
+    with pytest.raises(ValueError, match="route authority binding"):
+        remember_turn(
+            store, context=replace(context, required_route_binding=None), data={"refusal": True}
+        )

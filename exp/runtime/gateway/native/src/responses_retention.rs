@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 use crate::dialects::MAXIMUM_RETAINED_OUTPUT_BYTES;
 use crate::encode::compact_json;
-use crate::errors::PublicError;
+use crate::errors::{FailureClass, PublicError};
 use crate::events::{
     CompletedToolCall, Event, ProviderAssistantMessagePhase, ProviderOutputItemKind,
     ProviderOutputItemStatus,
@@ -208,7 +208,11 @@ impl ResponsesRetention {
             Event::Completed | Event::StoppedAtSequence(_) => {
                 self.finish_open_items(ProviderOutputItemStatus::Completed)
             }
-            Event::Incomplete | Event::Failed(_) => {
+            Event::Failed(failure) => {
+                self.refusal |= failure.failure_class == FailureClass::Refusal;
+                self.finish_open_items(ProviderOutputItemStatus::Incomplete);
+            }
+            Event::Incomplete => {
                 self.finish_open_items(ProviderOutputItemStatus::Incomplete);
             }
             _ => {}
