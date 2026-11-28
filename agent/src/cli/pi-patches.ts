@@ -189,6 +189,52 @@ export const AGENT_COMMAND_UNSET = ["EXP_API_KEY", "EXP_GATEWAY_KEY", "EXPLABS_A
 /** Pi's shell-tool guideline names its own variables; exp-code renames them (core/tools/bash.js). */
 const SESSION_ENV_GUIDELINE = '"You can inspect PI_* environment variables for current model and session details."';
 const EXP_SESSION_ENV_GUIDELINE = '"You can inspect the EXP_CODE_SESSION_* environment variables for the current model and session details."';
+/**
+ * Pi's `readPipedStdin` (main.js), bounded. Pi reads stdin to its end whenever stdin is not a
+ * terminal, so a run whose stdin is a pipe that never closes (a CI step, an editor or a script
+ * that spawns exp-code with a pipe and never writes to it) waited forever before its first model
+ * call, printing nothing, even when the prompt was already on the command line. When the command
+ * line carries a prompt or @file and no byte arrives within EXP_STDIN_WAIT_MS, exp-code stops
+ * reading, says so on stderr, and runs the prompt alone. Input that starts arriving is still read
+ * to its end, and a run with no prompt on the command line keeps waiting, as stdin is all it has.
+ */
+const READ_PIPED_STDIN = `/** exp-code: how long a run with a prompt waits for the first byte of piped stdin. */
+const EXP_STDIN_WAIT_MS = 5000;
+async function readPipedStdin(hasPrompt = false) {
+    // If stdin is a TTY, we're running interactively - don't read stdin
+    if (process.stdin.isTTY) {
+        return undefined;
+    }
+    return new Promise((resolve) => {
+        let data = "";
+        let idle;
+        const finish = (value) => {
+            clearTimeout(idle);
+            process.stdin.off("data", onData);
+            process.stdin.off("end", onEnd);
+            process.stdin.off("error", onEnd);
+            resolve(value);
+        };
+        const onData = (chunk) => {
+            data += chunk;
+            clearTimeout(idle);
+        };
+        const onEnd = () => finish(data.trim() || undefined);
+        process.stdin.setEncoding("utf8");
+        process.stdin.on("data", onData);
+        process.stdin.on("end", onEnd);
+        process.stdin.on("error", onEnd);
+        if (hasPrompt) {
+            idle = setTimeout(() => {
+                console.error(chalk.yellow(\`Warning: nothing arrived on stdin within \${EXP_STDIN_WAIT_MS / 1000}s, so exp-code runs the prompt without it. Redirect stdin from /dev/null (< /dev/null) when there is nothing to pipe.\`));
+                process.stdin.destroy();
+                finish(undefined);
+            }, EXP_STDIN_WAIT_MS);
+        }
+        process.stdin.resume();
+    });
+}
+`;
 
 /** The patch table for the pinned Pi release (1.5.1). */
 export const PI_PATCHES: FilePatch[] = [
@@ -236,7 +282,11 @@ export const PI_PATCHES: FilePatch[] = [
   {
     pkg: "pi-coding-agent",
     file: "main.js",
-    edits: [{ find: '"Error: PI_STARTUP_BENCHMARK only supports interactive mode"', replace: '"Error: EXP_CODE_STARTUP_BENCHMARK only supports interactive mode"' }]
+    edits: [
+      { find: '"Error: PI_STARTUP_BENCHMARK only supports interactive mode"', replace: '"Error: EXP_CODE_STARTUP_BENCHMARK only supports interactive mode"' },
+      { from: "/**\n * Read all content from piped stdin.", to: "function reportDiagnostics(diagnostics) {", replace: READ_PIPED_STDIN },
+      { find: "stdinContent = await readPipedStdin();", replace: "stdinContent = await readPipedStdin(parsed.messages.length > 0 || parsed.fileArgs.length > 0);" }
+    ]
   },
   {
     pkg: "pi-coding-agent",

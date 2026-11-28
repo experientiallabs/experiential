@@ -165,6 +165,11 @@ exp-code --model experiential/<alias>     # pick a model
 exp-code -c                               # continue the last session
 ```
 
+Text piped into exp-code (`git diff | exp-code -p "Review this"`) is added before the prompt.
+When the prompt is on the command line and nothing arrives on a piped stdin within 5 seconds,
+exp-code warns on stderr and runs the prompt alone, so a script or CI step that leaves stdin open
+never hangs. Redirect stdin from `/dev/null` when there is nothing to pipe.
+
 `exp-code --help` lists every flag. The JSON and RPC formats are described in the reference
 docs linked under [Acknowledgements](#acknowledgements).
 

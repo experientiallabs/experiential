@@ -204,6 +204,38 @@ describe("exp-code CLI", () => {
     expect(sent).not.toContain("PI_* environment");
   });
 
+  it("runs a command-line prompt when piped stdin stays open and silent, and still reads input that arrives", async () => {
+    const env = { PATH: process.env.PATH, HOME: home, EXP_CODE_HOME: join(home, ".exp-code"), EXP_GATEWAY_KEY: "local-key", EXP_CODE_BASE_URL: gateway.baseUrl };
+    /** Run the CLI with a stdin pipe the caller controls. */
+    const withStdin = (args: string[], feed: (stdin: NodeJS.WritableStream) => void) =>
+      new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
+        const child = execFile(process.execPath, [cli, ...args], { cwd: home, env, timeout: 30_000 }, (error, stdout, stderr) =>
+          resolve({ code: error ? (typeof error.code === "number" ? error.code : 1) : 0, stdout, stderr })
+        );
+        feed(child.stdin!);
+      });
+
+    // Before the fix this waited for an end of input that never came, and the run timed out.
+    gateway.script([{ text: "ran without stdin" }]);
+    let open: NodeJS.WritableStream | undefined;
+    const silent = await withStdin(["-p", "say hello"], (stdin) => {
+      open = stdin;
+    });
+    open?.end();
+    expect(silent.code).toBe(0);
+    expect(silent.stdout.trim()).toBe("ran without stdin");
+    expect(silent.stderr).toContain("nothing arrived on stdin");
+
+    gateway.script([{ text: "read the pipe" }]);
+    const piped = await withStdin(["-p", "summarize"], (stdin) => {
+      setTimeout(() => stdin.write("first part "), 200);
+      setTimeout(() => stdin.end("second part"), 400);
+    });
+    expect(piped.stdout.trim()).toBe("read the pipe");
+    expect(piped.stderr).not.toContain("nothing arrived on stdin");
+    expect(JSON.stringify(gateway.completions().at(-1)!.messages)).toContain("first part second part");
+  });
+
   it("emits Pi's JSON event stream in --mode json", async () => {
     gateway.script([{ text: "json mode" }]);
     const result = await runCli(["--mode", "json", "hi"], { EXP_GATEWAY_KEY: "local-key", EXP_CODE_BASE_URL: gateway.baseUrl });
