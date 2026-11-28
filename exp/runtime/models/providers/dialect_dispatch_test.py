@@ -485,6 +485,42 @@ def test_deepseek_origin_declines_a_forced_tool_choice_while_thinking(choice: st
     assert dialect_stream_payload(relay, request)["tool_choice"] is not None
 
 
+@pytest.mark.parametrize("choice", ("required", "named"))
+def test_a_declared_rung_declines_every_forced_tool_choice(choice: str) -> None:
+    """A relay serving a model that refuses forced choices declares it per rung.
+
+    The rung declines ``required`` and a named choice as ``forced_tool_choice``
+    whatever the reasoning effort, so admission prefers a rung that can force the
+    tool or discloses ``auto``; ``auto`` and an undeclared rung travel unchanged.
+    """
+    from exp.runtime.gateway.contracts import GatewayNamedToolChoice
+
+    declared = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://relay.example.test/v1",
+        model_id="deepseek/flash",
+        refuses_forced_tool_choice=True,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+        tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+        tool_choice="required" if choice == "required" else GatewayNamedToolChoice(name="lookup"),
+    )
+    for effort in (None, "none"):
+        with pytest.raises(ProviderCapabilityError) as raised:
+            dialect_stream_payload(
+                declared, request.model_copy(update={"reasoning_effort": effort})
+            )
+        assert raised.value.capability == "forced_tool_choice"
+    relaxed = request.model_copy(update={"tool_choice": "auto"})
+    assert dialect_stream_payload(declared, relaxed)["tool_choice"] == "auto"
+    undeclared = GatewayWireProfile(
+        dialect="openai_compatible", url="https://relay.example.test/v1", model_id="deepseek/flash"
+    )
+    assert dialect_stream_payload(undeclared, request)["tool_choice"] is not None
+
+
 _NOVITA_URL = "https://api.novita.ai/v3/openai/chat/completions"
 
 

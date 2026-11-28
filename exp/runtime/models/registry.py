@@ -462,6 +462,7 @@ class RuntimeModelCatalog:
                     reasoning_effort=capabilities.reasoning_effort,
                     chat_max_tokens_field=capabilities.chat_max_tokens_field,
                     sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
+                    supports_forced_tool_choice=capabilities.supports_forced_tool_choice,
                 )
                 return ResolvedModel(
                     alias,
@@ -633,6 +634,7 @@ class RuntimeModelCatalog:
                 reasoning_effort=capabilities.reasoning_effort,
                 chat_max_tokens_field=capabilities.chat_max_tokens_field,
                 sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
+                supports_forced_tool_choice=capabilities.supports_forced_tool_choice,
             )
             return ResolvedModel(
                 alias,
@@ -728,6 +730,7 @@ class RuntimeModelCatalog:
             http_kwargs["system_messages_leading_only"] = _supports_flag(
                 capabilities, "system_messages_leading_only"
             )
+            http_kwargs["supports_forced_tool_choice"] = capabilities.supports_forced_tool_choice
         if provider == "anthropic":
             http_kwargs["inference_geo"] = connection.inference_geo
             http_kwargs["supports_forced_tool_choice"] = capabilities.supports_forced_tool_choice

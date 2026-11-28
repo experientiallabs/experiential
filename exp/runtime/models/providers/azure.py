@@ -236,6 +236,7 @@ class AzureClient(OpenAICompatibleClient):
         reasoning_effort: ReasoningEffort | None = None,
         chat_max_tokens_field: ChatMaxTokensField | None = None,
         sampling_requires_reasoning_none: bool = False,
+        supports_forced_tool_choice: bool | None = None,
     ) -> None:
         """Create a client bound to one endpoint, key, API version, and deployment.
 
@@ -249,6 +250,8 @@ class AzureClient(OpenAICompatibleClient):
             retry_policy: Bounded same-endpoint retry policy.
             timeout_seconds: Per-attempt timeout floor. Completion calls scale above it from the
                 requested maximum output tokens.
+            supports_forced_tool_choice: ``False`` declares the deployment refuses a forced
+                ``tool_choice``, so the rung declines one before dispatch.
 
         Raises:
             ValueError: The key, endpoint, API version, or timeout is missing or invalid.
@@ -292,6 +295,7 @@ class AzureClient(OpenAICompatibleClient):
             reasoning_effort=reasoning_effort,
             chat_max_tokens_field=chat_max_tokens_field,
             sampling_requires_reasoning_none=sampling_requires_reasoning_none,
+            supports_forced_tool_choice=supports_forced_tool_choice,
         )
         self._api_version = api_version
         self._api_surface = api_surface

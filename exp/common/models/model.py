@@ -661,9 +661,11 @@ class ModelCapabilities(ContractModel):
 
     ``None`` is unknown and forces as requested; only an explicit ``False`` makes the Anthropic
     clients send ``auto`` with the single offered tool instead, and refuse a forced choice among
-    several tools before dispatch. Like the other wire declarations it stays out of the identity
-    digest, and an unset value stays out of serialization, so a structured completion profile
-    that binds these capabilities changes only when a catalog declares the fact.
+    several tools before dispatch. On an OpenAI-compatible rung ``False`` declines every forced
+    choice before dispatch, so admission prefers a rung that can force the tool and otherwise
+    discloses the relaxation to ``auto``. Like the other wire declarations it stays out of the
+    identity digest, and an unset value stays out of serialization, so a structured completion
+    profile that binds these capabilities changes only when a catalog declares the fact.
     """
     chat_max_tokens_field: ChatMaxTokensField | None = None
     minimum_temperature: float | None = Field(default=None, ge=0, le=2)

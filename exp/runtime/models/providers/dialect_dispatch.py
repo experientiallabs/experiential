@@ -687,13 +687,19 @@ def dialect_stream_payload(
         raise ProviderCapabilityError(capability="forced_tool_choice")
     if (
         provider_request.tools
-        and profile.deepseek_reasoning_history
         and _forces_tool_choice(provider_request)
-        and (provider_request.reasoning_effort or profile.reasoning_effort) != "none"
+        and (
+            profile.refuses_forced_tool_choice
+            or (
+                profile.deepseek_reasoning_history
+                and (provider_request.reasoning_effort or profile.reasoning_effort) != "none"
+            )
+        )
     ):
         # DeepSeek's own origin thinks by default and refuses a forced choice
         # while thinking ("Thinking mode does not support this tool_choice",
-        # production 2026-10-18). Like Anthropic's budgeted thinking, admission
+        # production 2026-10-18); a relay serving such a model declares the
+        # refusal per rung instead. Like Anthropic's budgeted thinking, admission
         # then prefers a rung that can force the tool or discloses ``auto``.
         raise ProviderCapabilityError(capability="forced_tool_choice")
     require_thinking_budget_support(profile, provider_request)

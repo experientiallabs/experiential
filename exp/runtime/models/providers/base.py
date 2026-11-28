@@ -345,6 +345,14 @@ class GatewayWireProfile:
     builder folds every instruction turn past the first into user text on a
     declared rung and leaves every other rung's messages untouched."""
 
+    refuses_forced_tool_choice: bool = False
+    """Whether this rung answers a ``required`` or named ``tool_choice`` with an error.
+
+    A catalog stamp (``ModelCapabilities.supports_forced_tool_choice = False``) on
+    an OpenAI-compatible rung, never a hostname rule: the rung declines a forced
+    choice as ``forced_tool_choice`` before dispatch, so admission prefers a rung
+    that can force the tool and otherwise discloses the relaxation to ``auto``."""
+
     token_limit_key: ChatMaxTokensField = "max_tokens"
     """Wire field carrying the output-token ceiling on Chat Completions."""
 

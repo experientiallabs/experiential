@@ -431,6 +431,7 @@ class VertexOpenAIClient(OpenAICompatibleClient):
         reasoning_effort: ReasoningEffort | None = None,
         chat_max_tokens_field: ChatMaxTokensField | None = None,
         sampling_requires_reasoning_none: bool = False,
+        supports_forced_tool_choice: bool | None = None,
     ) -> None:
         """Create one MaaS client with explicit generation gates for one Vertex endpoint root.
 
@@ -456,6 +457,8 @@ class VertexOpenAIClient(OpenAICompatibleClient):
             chat_max_tokens_field: Wire field carrying the output-token ceiling.
             sampling_requires_reasoning_none: Whether sampling controls are only accepted
                 with reasoning disabled.
+            supports_forced_tool_choice: ``False`` declares the model refuses a forced
+                ``tool_choice``, so the rung declines one before dispatch.
         """
         _require_vertex_host(base_url)
         super().__init__(
@@ -475,6 +478,7 @@ class VertexOpenAIClient(OpenAICompatibleClient):
             reasoning_effort=reasoning_effort,
             chat_max_tokens_field=chat_max_tokens_field,
             sampling_requires_reasoning_none=sampling_requires_reasoning_none,
+            supports_forced_tool_choice=supports_forced_tool_choice,
         )
         self._token_provider = token_provider or ServiceAccountTokenProvider(api_key)
         self._wire_model_id = vertex_openapi_model_id(model.model_id)

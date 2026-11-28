@@ -982,6 +982,63 @@ def test_resolution_threads_system_messages_leading_only_to_compatible_rungs() -
     assert resolved.client.gateway_wire_profile().system_messages_leading_only is True
 
 
+@pytest.mark.parametrize(("declared", "refuses"), [(False, True), (True, False), (None, False)])
+def test_resolution_threads_a_forced_tool_choice_refusal_to_compatible_rungs(
+    declared: bool | None, refuses: bool
+) -> None:
+    """Only an explicit ``supports_forced_tool_choice = False`` marks the compatible rung."""
+    catalog = RuntimeModelCatalog(
+        _catalog(
+            provider="openai-compatible",
+            base_url="https://relay.example.test/v1",
+            capabilities=ModelCapabilities(supports_forced_tool_choice=declared),
+        ),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    resolved = catalog.resolve("fixture-model")
+    assert isinstance(resolved.client, OpenAICompatibleClient)
+    assert resolved.client.gateway_wire_profile().refuses_forced_tool_choice is refuses
+
+
+@pytest.mark.parametrize("surface", ("azure_openai", "azure_foundry", "vertex_maas"))
+def test_forced_tool_choice_refusal_reaches_azure_and_vertex_compatible_clients(
+    surface: str,
+) -> None:
+    """Azure Chat, Foundry and Vertex Model Garden MaaS clients carry the declaration too."""
+    capabilities = ModelCapabilities(supports_completions=True, supports_forced_tool_choice=False)
+    match surface:
+        case "vertex_maas":
+            catalog = _catalog(
+                provider="vertex",
+                base_url="https://aiplatform.googleapis.com/v1/projects/test/locations/global",
+                capabilities=capabilities,
+            )
+            catalog.models["fixture-model"] = catalog.models["fixture-model"].model_copy(
+                update={"model": "deepseek-ai/deepseek-v3.2-maas"}
+            )
+        case _:
+            foundry = surface == "azure_foundry"
+            catalog = _catalog(
+                provider="azure",
+                base_url="https://resource.services.ai.azure.com"
+                if foundry
+                else "https://resource.openai.azure.com",
+                api_version="2024-05-01-preview" if foundry else "v1",
+                azure_api_surface="model_inference" if foundry else "openai_deployments",
+                capabilities=capabilities,
+            )
+    runtime = RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+        vertex_token_provider_factory=lambda credentials_json: lambda: "fixture-bearer",
+    )
+    client = runtime.resolve("fixture-model").client
+    assert isinstance(client, OpenAICompatibleClient)
+    assert client.gateway_wire_profile().refuses_forced_tool_choice is True
+
+
 def test_anthropic_connection_geography_reaches_both_client_paths() -> None:
     """Catalog construction supplies both gateway and ordinary completion constraints."""
     catalog = _catalog(provider="anthropic")
