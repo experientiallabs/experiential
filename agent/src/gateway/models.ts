@@ -34,6 +34,13 @@ export type GatewayWireApi = "openai-completions" | "openai-responses" | "anthro
 
 export const DEFAULT_CONTEXT_WINDOW = 128_000;
 export const DEFAULT_MAX_TOKENS = 32_000;
+/**
+ * The smallest context window exp-code offers a model with. Its system prompt and tool
+ * definitions take several thousand tokens before the conversation starts, so on a smaller window
+ * (a 4K model) the output allowance left was one token: every turn ended "length" with nothing to
+ * show, and was still billed.
+ */
+export const MIN_AGENT_CONTEXT_WINDOW = 16_384;
 /** How long a listing is reused before the gateway is asked again. */
 export const MODEL_CACHE_TTL_MS = 5 * 60_000;
 const LISTING_TIMEOUT_MS = 10_000;
@@ -41,7 +48,7 @@ const LISTING_TIMEOUT_MS = 10_000;
  * Bumped when the cached shape or its selection changes, so a listing an older release cached
  * (without the limits this one reads, or with aliases it can no longer run) is fetched again.
  */
-const LISTING_CACHE_VERSION = "v3";
+const LISTING_CACHE_VERSION = "v4";
 
 const WIRE_ALIASES: Record<string, GatewayWireApi> = {
   completions: "openai-completions",
@@ -131,12 +138,14 @@ export function thinkingLevelMap(efforts: string[] | undefined): ThinkingLevelMa
  * Whether exp-code can run on a listed alias. Every turn is a chat request that carries the agent's
  * tools, so an alias the listing states does not serve chat (`supports_completions: false`: speech,
  * transcription, embeddings, image and video models) or does not take tools (`supports_tools:
- * false`) can only fail: the gateway refuses it with a 400 before any call. An unstated capability
- * (a local gateway's listing) keeps the alias.
+ * false`) can only fail: the gateway refuses it with a 400 before any call. Nor can one whose
+ * context window is below MIN_AGENT_CONTEXT_WINDOW hold the agent's prompt. An unstated capability
+ * or window (a local gateway's listing) keeps the alias.
  */
 export function agentCanUse(entry: unknown): boolean {
   const object = record(entry);
-  return object?.supports_completions !== false && object?.supports_tools !== false;
+  const window = positiveInteger(object?.context_window_tokens);
+  return object?.supports_completions !== false && object?.supports_tools !== false && (window === undefined || window >= MIN_AGENT_CONTEXT_WINDOW);
 }
 
 /** Parse a `GET /v1/models` body into the aliases exp-code can run, dropping malformed entries. */

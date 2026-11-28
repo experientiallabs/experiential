@@ -6,6 +6,7 @@
  * factories, starts on a gateway model by default, and shows its own name, mark and version.
  */
 
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { main, parseArgs } from "@earendil-works/pi-coding-agent";
 import { readCredentials } from "../auth/credentials.js";
@@ -18,6 +19,7 @@ import { createPromptStashExtension } from "../stash/extension.js";
 import { EXP_CODE_VERSION } from "../version.js";
 import { createBrandingExtension } from "./branding.js";
 import { createSupportCommandsExtension, DOCS_URL } from "./commands.js";
+import type { EarlyInput } from "./early-input.js";
 import { expCodeHome } from "./environment.js";
 import {
   directProviderIds,
@@ -47,8 +49,44 @@ your organization's Experiential data (request log, usage, models, evals). Every
 gateway. \`exp-code update\` updates exp-code. Documentation: ${DOCS_URL}
 `;
 
+/** The subcommands exp-code runs itself or hands to Pi; any other bare first word is refused. */
+export const SUBCOMMANDS: readonly string[] = ["login", "logout", "whoami", "update", "install", "remove", "list", "mcp", "help"];
+
+/**
+ * Why the arguments start with an unknown subcommand, or undefined when they do not. A first
+ * argument that is one bare word (letters, digits, `-`, `_`; no spaces, path or option) and neither
+ * a subcommand nor a file here would otherwise go to the model as the first message, and cost
+ * money: `exp-code frobnicate` is a mistyped command far more often than a one-word prompt.
+ */
+export function unknownSubcommandMessage(args: readonly string[], exists: (path: string) => boolean = existsSync): string | undefined {
+  const first = args[0];
+  if (first === undefined || !/^[A-Za-z][A-Za-z0-9_-]*$/.test(first)) return undefined;
+  if (SUBCOMMANDS.includes(first) || first === "auth" || first === "uninstall" || exists(first)) return undefined;
+  return [
+    `exp-code: unknown command "${first}".`,
+    `Commands: ${SUBCOMMANDS.filter((name) => name !== "help").join(", ")} (exp-code --help shows every option).`,
+    `To send a prompt, quote it: exp-code "${first} ..." (a one-word prompt: exp-code -- ${first}).`
+  ].join("\n");
+}
+
 /** Run the CLI with the given arguments (without the node and script paths). */
-export async function runCli(args: string[], env: NodeJS.ProcessEnv = process.env): Promise<void> {
+export async function runCli(args: string[], env: NodeJS.ProcessEnv = process.env, earlyInput?: EarlyInput): Promise<void> {
+  try {
+    await runCliWith(args, env, earlyInput);
+  } finally {
+    // Anything but the terminal UI gets stdin back as it was.
+    earlyInput?.release();
+  }
+}
+
+async function runCliWith(args: string[], env: NodeJS.ProcessEnv, earlyInput: EarlyInput | undefined): Promise<void> {
+  if (args.length === 1 && args[0] === "help") args = ["--help"];
+  const unknown = unknownSubcommandMessage(args);
+  if (unknown !== undefined) {
+    console.error(unknown);
+    process.exitCode = 2;
+    return;
+  }
   const auth = parseAuthCommand(args);
   if (auth !== undefined) {
     process.exitCode = await runAuthCommand(auth, env);
@@ -69,6 +107,7 @@ export async function runCli(args: string[], env: NodeJS.ProcessEnv = process.en
   const agentDir = join(home, "agent");
   let resolution: GatewayResolution = resolveGateway(env, await readCredentials(env));
   // An interactive start with no key anywhere offers to log in rather than starting keyless.
+  if (resolution.missingKey === true && !parsed.help && isInteractiveStart(parsed)) earlyInput?.release();
   if (resolution.missingKey === true && !parsed.help && isInteractiveStart(parsed) && (await confirmLogin())) {
     const code = await runLoginInTerminal(env, false);
     if (code !== 0) {
@@ -145,6 +184,8 @@ export async function runCli(args: string[], env: NodeJS.ProcessEnv = process.en
     markUpstreamChangelogSeen(agentDir);
     await ensureSearchTools(parsed.offline === true);
   }
+  if (interactive) earlyInput?.handOff();
+  else earlyInput?.release();
   await main(finalArgs, {
     extensionFactories: [
       {

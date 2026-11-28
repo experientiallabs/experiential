@@ -24,6 +24,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { ExtensionContext, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { type Component, isKeyRelease, type KeyId, isKeyRepeat, matchesKey, type TUI, truncateToWidth } from "@earendil-works/pi-tui";
+import { setHotkeys } from "../cli/hotkeys.js";
 import { type Composer, editorComposer, isMainEditor, textComposer } from "./composer.js";
 import { keyLabel, loadStashKeys } from "./keys.js";
 import {
@@ -195,6 +196,10 @@ export function createPromptStashExtension(options: PromptStashOptions): Extensi
 
     pi.on("session_start", (_event, ctx) => {
       if (ctx.mode !== "tui") return;
+      setHotkeys(
+        "prompt-stash",
+        keys.map((key) => ({ key: keyLabel(key), action: "Stash the prompt; on an empty prompt, bring the stashed one back (also /stash)" }))
+      );
       live?.unsubscribe();
       const folder = folderFor(ctx.cwd);
       const session: NonNullable<typeof live> = { ctx, folder, tui: undefined, unsubscribe: () => {} };

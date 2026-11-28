@@ -11,6 +11,7 @@ import {
   clearModelCache,
   DEFAULT_CONTEXT_WINDOW,
   fetchGatewayModels,
+  MIN_AGENT_CONTEXT_WINDOW,
   parseModelListing,
   parseWireApi,
   thinkingLevelMap,
@@ -77,6 +78,14 @@ describe("gateway models", () => {
     });
     expect(listed.map((model) => model.id)).toEqual(["coder", "local-alias"]);
     expect(agentCanUse({ id: "x", supports_tools: null, supports_completions: null })).toBe(true);
+  });
+
+  it("leaves out models whose window cannot hold the agent's prompt", () => {
+    // A 4K window left one output token after the system prompt: every turn ended "length", billed.
+    expect(agentCanUse({ id: "tiny", context_window_tokens: 4_096 })).toBe(false);
+    expect(agentCanUse({ id: "edge", context_window_tokens: MIN_AGENT_CONTEXT_WINDOW })).toBe(true);
+    expect(agentCanUse({ id: "unstated" })).toBe(true);
+    expect(parseModelListing({ data: [{ id: "tiny", context_window_tokens: 4_096 }, { id: "big", context_window_tokens: 128_000 }] }).map((model) => model.id)).toEqual(["big"]);
   });
 
   it("no longer reads the OpenRouter-style names neither gateway sends", () => {

@@ -7,111 +7,19 @@
  * stash that works here also proves Ctrl+S reaches exp-code instead of freezing the output.
  */
 
-import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type FakeGateway, startFakeGateway } from "../testing/fake-gateway.js";
+import { findPython, pause, Terminal } from "../testing/pty.js";
 
 const packageDir = fileURLToPath(new URL("../..", import.meta.url));
 // A build of its own, beside dist/, so this file never races the CLI tests' build.
 const outDir = join(packageDir, ".e2e-dist");
 const python = findPython();
-
-/** Relay stdin to a child in a pseudo-terminal and its output to stdout; report IXON on fd 3. */
-const RELAY = String.raw`
-import os, pty, sys, select, termios, fcntl, struct
-pid, fd = pty.fork()
-if pid == 0:
-    os.execvp(sys.argv[1], sys.argv[1:])
-fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 110, 0, 0))
-sys.stderr.write("IXON-AT-START %d\n" % (1 if termios.tcgetattr(fd)[0] & termios.IXON else 0)); sys.stderr.flush()
-inp = sys.stdin.fileno()
-while True:
-    r, _, _ = select.select([fd, inp], [], [], 0.5)
-    if fd in r:
-        try:
-            data = os.read(fd, 65536)
-        except OSError:
-            break
-        if not data:
-            break
-        os.write(1, data)
-    if inp in r:
-        data = os.read(inp, 65536)
-        if data == b"\x00IXON?":
-            sys.stderr.write("IXON-NOW %d\n" % (1 if termios.tcgetattr(fd)[0] & termios.IXON else 0)); sys.stderr.flush()
-        elif data:
-            os.write(fd, data)
-_, status = os.waitpid(pid, 0)
-sys.exit(os.waitstatus_to_exitcode(status))
-`;
-
-function findPython(): string | undefined {
-  if (process.platform === "win32") return undefined;
-  for (const candidate of ["python3", "python"]) {
-    try {
-      execFileSync(candidate, ["-c", "import pty, termios"], { stdio: "ignore" });
-      return candidate;
-    } catch {
-      // try the next one
-    }
-  }
-  return undefined;
-}
-
-const strip = (text: string) => text.replace(/\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)|\x1b[@-_]/g, "");
-
-class Terminal {
-  output = "";
-  log = "";
-  readonly exited: Promise<number>;
-  private readonly child: ChildProcessWithoutNullStreams;
-
-  constructor(env: NodeJS.ProcessEnv, cwd: string) {
-    this.child = spawn(python!, ["-c", RELAY, process.execPath, join(outDir, "cli.js")], { cwd, env });
-    this.child.stdout.on("data", (chunk: Buffer) => (this.output += chunk.toString("utf8")));
-    this.child.stderr.on("data", (chunk: Buffer) => (this.log += chunk.toString("utf8")));
-    this.exited = new Promise((resolve) => this.child.once("exit", (code) => resolve(code ?? -1)));
-  }
-
-  send(keys: string): void {
-    this.child.stdin.write(keys);
-  }
-
-  /** Type one character at a time, like a person (a burst would arrive as one paste-like chunk). */
-  async type(text: string): Promise<void> {
-    for (const char of text) {
-      this.send(char);
-      await pause(4);
-    }
-  }
-
-  screen(): string {
-    return strip(this.output);
-  }
-
-  async waitFor(check: () => boolean, what: string, ms = 30_000): Promise<void> {
-    const end = Date.now() + ms;
-    while (!check()) {
-      if (Date.now() > end) throw new Error(`timed out waiting for ${what}\n--- screen ---\n${this.screen().slice(-3000)}\n--- log ---\n${this.log}`);
-      await pause(50);
-    }
-  }
-
-  async waitForText(text: string, after = 0): Promise<number> {
-    await this.waitFor(() => this.screen().indexOf(text, after) >= 0, JSON.stringify(text));
-    return this.screen().indexOf(text, after) + text.length;
-  }
-
-  kill(): void {
-    this.child.kill("SIGKILL");
-  }
-}
-
-const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let home: string;
 let gateway: FakeGateway;
@@ -145,7 +53,7 @@ describe.skipIf(python === undefined)("prompt stash in a real terminal", () => {
     const env = { PATH: process.env.PATH, HOME: home, EXP_CODE_HOME: join(home, ".exp-code"), EXP_GATEWAY_KEY: "k", EXP_CODE_BASE_URL: gateway.baseUrl, TERM: "xterm-256color", PI_OFFLINE: "1" };
     const stashDir = join(home, ".exp-code", "agent", "prompt-stash");
 
-    const first = new Terminal(env, project);
+    const first = new Terminal(join(outDir, "cli.js"), env, project);
     try {
       await first.waitForText("fake-model");
       expect(first.log).toContain("IXON-AT-START 1");
@@ -183,7 +91,7 @@ describe.skipIf(python === undefined)("prompt stash in a real terminal", () => {
     }
     expect(readdirSync(stashDir).filter((name) => name.endsWith(".json"))).toHaveLength(1);
 
-    const second = new Terminal(env, project);
+    const second = new Terminal(join(outDir, "cli.js"), env, project);
     try {
       await second.waitForText("Restored the prompt you stashed in an earlier exp-code session.");
       expect(readdirSync(stashDir).filter((name) => name.endsWith(".json"))).toHaveLength(0);

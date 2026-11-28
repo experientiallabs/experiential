@@ -128,13 +128,19 @@ export async function registerGatewayProvider(pi: ExtensionAPI, config: GatewayC
     const billing = reportedBilling(event.data);
     if (billing !== undefined) pending = billing;
   });
+  // The gateway names the model that served a call in each response (`experiential-small-model`
+  // answers as `experiential/gpt-6-luna`), which Pi keeps as `responseModel` and then shows in
+  // /session and attributes cost to. exp-code shows the model the user chose everywhere: the
+  // served model is the gateway's routing, which the user did not pick and cannot select.
   pi.on("message_end", (event) => {
     const message = event.message;
-    if (message.role !== "assistant" || message.provider !== GATEWAY_PROVIDER_ID || pending === undefined) return;
+    if (message.role !== "assistant" || message.provider !== GATEWAY_PROVIDER_ID) return;
+    const { responseModel, ...requested } = message;
+    if (pending === undefined) return responseModel === undefined ? undefined : { message: requested };
     const billing = pending;
     pending = undefined;
     return {
-      message: { ...message, usage: { ...message.usage, cost: { ...message.usage.cost, total: billing.cost, totalFromProvider: true } }, gatewayBilling: billing }
+      message: { ...requested, usage: { ...message.usage, cost: { ...message.usage.cost, total: billing.cost, totalFromProvider: true } }, gatewayBilling: billing }
     };
   });
   return models;
