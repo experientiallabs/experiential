@@ -136,15 +136,15 @@ describe("experiential_search_requests", () => {
     const first = await exec(search, { status: "error", model: "gpt-6-luna", limit: 2 });
     expect(first.isError).toBeUndefined();
     const firstText = text(first);
-    expect(firstText).toContain("2 requests from the last 24h, model=gpt-6-luna, status=error (newest first)");
-    expect(firstText).toContain("| 2026-11-25 14:03:11Z | gpt-6-luna | completed | 12k (10k cached) / 340 | $0.0123 | 3.21s (ttft 800ms) | 0123456789ab | req_1 |");
+    expect(firstText).toContain("2 requests from the last 24h, model=gpt-6-luna, status=error across every key of the organization (newest first)");
+    expect(firstText).toContain("| 2026-11-25 14:03:11Z | gpt-6-luna | completed | 12k (10k cached) / 340 | $0.0123 | 3.21s (ttft 800ms) | ci | 0123456789ab | req_1 |");
     expect(firstText).toContain("failed: provider_timeout");
     const cursor = first.details.next_cursor as string;
     expect(firstText).toContain(`cursor="${cursor}"`);
     expect(platform!.calls(LIST)[0]?.query).toEqual({ window: "24h", model: "gpt-6-luna", status: "error", limit: "2" });
 
     const second = await exec(search, { cursor, model: "ignored" });
-    expect(text(second)).toContain("1 request from the last 24h, model=gpt-6-luna, status=error (newest first, continued)");
+    expect(text(second)).toContain("1 request from the last 24h, model=gpt-6-luna, status=error across every key of the organization (newest first, continued)");
     expect(second.details.next_cursor).toBeNull();
     expect(platform!.calls(LIST)[1]?.query).toEqual({
       window: "24h",
@@ -156,6 +156,17 @@ describe("experiential_search_requests", () => {
       cursor_after: "2026-11-24T15:00:00Z"
     });
     expect(platform!.calls("/api/whoami")).toHaveLength(1);
+  });
+
+  it("names each row's key, scopes a key filter, and explains why a global name matches nothing", async () => {
+    const { search } = await tools({ [`GET ${LIST}`]: (request) => ({ body: { requests: request.query.model ? [] : [item({ key_label: null }), item({ request_id: "req_2", key_label: null, api_key_id: null })], next_cursor: null } }) });
+    const rows = text(await exec(search, { api_key_id: "6f1c9a52-0000-4000-8000-000000000000" }));
+    expect(rows).not.toContain("across every key");
+    expect(rows).toContain("| (deleted key) | 0123456789ab | req_1 |");
+    expect(rows).toContain("| - | 0123456789ab | req_2 |");
+    const global = text(await exec(search, { model: "experiential-medium-model" }));
+    expect(global).toContain("experiential-medium-model is a global name: the log records the model each call resolved to");
+    expect(text(await exec(search, { model: "gpt-6-luna" }))).toContain("No requests matched. Widen the time range or drop a filter.");
   });
 
   it("carries a sorted page's value and upper bound", async () => {

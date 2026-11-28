@@ -12,6 +12,7 @@ import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type PlatformClient, PlatformError } from "./client.js";
 import { count, duration, failure, failureFrom, isoOrUndefined, parseRelative, result, table, timestamp, tokens, UNTRUSTED_NOTE, usd , literalUnion } from "./format.js";
+import { GLOBAL_MODEL_NAMES } from "./catalog.js";
 import { renderCapturedContent } from "./transcript.js";
 
 /** Terminal states of a request, plus `error` (every state but completed). */
@@ -219,9 +220,24 @@ function latencyCell(item: RequestItem): string {
   return item.ttft_ms === null ? duration(item.latency_ms) : `${duration(item.latency_ms)} (ttft ${duration(item.ttft_ms)})`;
 }
 
+/** The key column: the API key's name, so a reader can tell one key's calls from another's. */
+function keyCell(item: RequestItem): string {
+  if (item.key_label) return item.key_label;
+  return item.api_key_id ? "(deleted key)" : "-";
+}
+
 /** The compact row a search returns per request. */
 export function requestRow(item: RequestItem): string[] {
-  return [timestamp(item.created_at), item.model, outcome(item), tokenCell(item), costCell(item), latencyCell(item), item.conversation_group ?? "-", item.request_id];
+  return [timestamp(item.created_at), item.model, outcome(item), tokenCell(item), costCell(item), latencyCell(item), keyCell(item), item.conversation_group ?? "-", item.request_id];
+}
+
+/**
+ * Why a search that filters by model found nothing, when the likely reason is the name: the log
+ * records the model that served a call, so a global name (experiential-large-model) never matches.
+ */
+function emptyModelHint(query: Query): string | undefined {
+  if (typeof query.model !== "string" || !(GLOBAL_MODEL_NAMES as readonly string[]).includes(query.model)) return undefined;
+  return `${query.model} is a global name: the log records the model each call resolved to, so filter by that model (experiential_models, or drop the model filter and read the model column).`;
 }
 
 function rangeText(query: Query): string {
@@ -268,11 +284,12 @@ export function createSearchRequestsTool(client: PlatformClient) {
         const rows = Array.isArray(page?.requests) ? page.requests : [];
         const next = page?.next_cursor ? encodeCursor({ q: query, c: page.next_cursor }) : undefined;
         const order = typeof query.sort === "string" ? SORT_TEXT[query.sort] : "newest first";
-        const lines = [`${rows.length} request${rows.length === 1 ? "" : "s"} from ${rangeText(query)}${filterText(query)} (${order}${paging.cursor_id ? ", continued" : ""}).`];
+        const scope = query.api_key_id === undefined ? " across every key of the organization" : "";
+        const lines = [`${rows.length} request${rows.length === 1 ? "" : "s"} from ${rangeText(query)}${filterText(query)}${scope} (${order}${paging.cursor_id ? ", continued" : ""}).`];
         if (rows.length > 0) {
-          lines.push("", table(["time (UTC)", "model", "outcome", "tokens in / out", "cost", "latency", "conversation", "request id"], rows.map(requestRow)));
+          lines.push("", table(["time (UTC)", "model", "outcome", "tokens in / out", "cost", "latency", "key", "conversation", "request id"], rows.map(requestRow)));
         } else {
-          lines.push("No requests matched. Widen the time range or drop a filter.");
+          lines.push(emptyModelHint(query) ?? "No requests matched. Widen the time range or drop a filter.");
         }
         if (next !== undefined) lines.push("", `More requests match. For the next page call experiential_search_requests with cursor="${next}".`);
         return result(lines.join("\n"), { query, requests: rows, next_cursor: next ?? null });
