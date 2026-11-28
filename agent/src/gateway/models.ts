@@ -38,10 +38,10 @@ export const DEFAULT_MAX_TOKENS = 32_000;
 export const MODEL_CACHE_TTL_MS = 5 * 60_000;
 const LISTING_TIMEOUT_MS = 10_000;
 /**
- * Bumped when the cached shape changes, so a listing an older release cached (without the limits
- * this one reads) is fetched again instead of reused.
+ * Bumped when the cached shape or its selection changes, so a listing an older release cached
+ * (without the limits this one reads, or with aliases it can no longer run) is fetched again.
  */
-const LISTING_CACHE_VERSION = "v2";
+const LISTING_CACHE_VERSION = "v3";
 
 const WIRE_ALIASES: Record<string, GatewayWireApi> = {
   completions: "openai-completions",
@@ -127,11 +127,26 @@ export function thinkingLevelMap(efforts: string[] | undefined): ThinkingLevelMa
   return map;
 }
 
-/** Parse a `GET /v1/models` body into listed models, dropping malformed entries. */
+/**
+ * Whether exp-code can run on a listed alias. Every turn is a chat request that carries the agent's
+ * tools, so an alias the listing states does not serve chat (`supports_completions: false`: speech,
+ * transcription, embeddings, image and video models) or does not take tools (`supports_tools:
+ * false`) can only fail: the gateway refuses it with a 400 before any call. An unstated capability
+ * (a local gateway's listing) keeps the alias.
+ */
+export function agentCanUse(entry: unknown): boolean {
+  const object = record(entry);
+  return object?.supports_completions !== false && object?.supports_tools !== false;
+}
+
+/** Parse a `GET /v1/models` body into the aliases exp-code can run, dropping malformed entries. */
 export function parseModelListing(body: unknown): ListedModel[] {
   const data = record(body)?.data;
   if (!Array.isArray(data)) throw new Error("The gateway's model listing has no data array.");
-  return data.map(parseListedModel).filter((model): model is ListedModel => model !== undefined);
+  return data
+    .filter(agentCanUse)
+    .map(parseListedModel)
+    .filter((model): model is ListedModel => model !== undefined);
 }
 
 /** Convert one listed alias into a Pi chat model definition for the gateway provider. */
